@@ -1,23 +1,22 @@
-"""Autonomous loop — the core OODA (Observe-Orient-Decide-Act) execution loop.
+"""Autonomous execution loop — 24/7 agent operation engine.
 
 Implements:
-1. OODA loop cycle management
-2. Observe phase (gather data from tools/models)
-3. Orient phase (analyze and contextualize)
-4. Decide phase (select next action)
-5. Act phase (execute action)
-6. Loop termination conditions
-7. Phase timing and metrics
-8. Fallback and recovery within loop
+1. Continuous assessment cycle
+2. Stagnation detection
+3. Dynamic strategy adjustment
+4. Sleep/wake scheduling
+5. Finding deduplication
+6. Progress tracking
+7. Automatic recovery from failures
+8. Resource budget management
 """
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Awaitable
+from typing import Any
 
 import structlog
 
@@ -25,118 +24,136 @@ logger = structlog.get_logger()
 
 
 class LoopPhase(str, Enum):
-    OBSERVE = "observe"
-    ORIENT = "orient"
-    DECIDE = "decide"
-    ACT = "act"
-    REVIEW = "review"
-
-
-class LoopStatus(str, Enum):
-    IDLE = "idle"
-    RUNNING = "running"
-    PAUSED = "paused"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    STARTING = "starting"
+    RECON = "recon"
+    SCANNING = "scanning"
+    ANALYSIS = "analysis"
+    EXPLOITATION = "exploitation"
+    VALIDATION = "validation"
+    REPORTING = "reporting"
+    SLEEPING = "sleeping"
+    RECOVERING = "recovering"
     STOPPED = "stopped"
 
 
-class StopReason(str, Enum):
-    GOAL_ACHIEVED = "goal_achieved"
-    BUDGET_EXHAUSTED = "budget_exhausted"
-    CONVERGED = "converged"
-    MAX_CYCLES = "max_cycles"
-    USER_STOP = "user_stop"
-    ERROR = "error"
-    TIMEOUT = "timeout"
+class StagnationType(str, Enum):
+    NO_NEW_FINDINGS = "no_new_findings"
+    COVERAGE_PLATEAU = "coverage_plateau"
+    REPEATED_FAILURES = "repeated_failures"
+    BUDGET_LOW = "budget_low"
 
 
 @dataclass
-class LoopCycle:
-    """Record of a single OODA cycle."""
-    cycle_number: int = 0
-    started_at: float = 0.0
+class LoopIteration:
+    """One iteration of the autonomous loop."""
+    iteration_id: int = 0
+    phase: LoopPhase = LoopPhase.STARTING
+    started_at: float = field(default_factory=time.time)
     completed_at: float = 0.0
-    phase_durations: dict[str, float] = field(default_factory=dict)
-    observations: list[str] = field(default_factory=list)
-    orientation: str = ""
-    decision: str = ""
-    action_taken: str = ""
-    action_result: str = ""
+    findings_count: int = 0
+    tools_run: int = 0
     tokens_used: int = 0
-    findings_this_cycle: int = 0
-    error: str = ""
-
-    @property
-    def duration_s(self) -> float:
-        end = self.completed_at or time.time()
-        return end - self.started_at if self.started_at > 0 else 0.0
+    errors: int = 0
+    stagnation: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "cycle": self.cycle_number,
-            "duration": round(self.duration_s, 1),
-            "action": self.action_taken[:30],
-            "findings": self.findings_this_cycle,
+            "iteration": self.iteration_id,
+            "phase": self.phase.value,
+            "findings": self.findings_count,
+            "tools": self.tools_run,
             "tokens": self.tokens_used,
+            "errors": self.errors,
         }
 
 
 @dataclass
 class LoopConfig:
     """Configuration for the autonomous loop."""
-    max_cycles: int = 100
-    max_tokens: int = 100000
-    max_duration_s: int = 3600
-    min_progress_per_cycle: float = 0.01
-    stagnation_threshold: int = 5     # Cycles without progress before changing strategy
-    observe_timeout_s: int = 120
-    act_timeout_s: int = 300
+    max_iterations: int = 1000
+    max_tokens_total: int = 10_000_000
+    max_time_s: float = 86400.0  # 24 hours
+    sleep_between_phases_s: float = 5.0
+    stagnation_threshold: int = 5     # Iterations with no new findings
+    min_findings_per_iteration: int = 0
+    auto_strategy_switch: bool = True
+    max_errors_before_stop: int = 10
+    dedup_findings: bool = True
+    checkpoint_interval: int = 5     # Checkpoint every N iterations
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "max_cycles": self.max_cycles,
-            "max_tokens": self.max_tokens,
-            "max_duration": self.max_duration_s,
+            "max_iterations": self.max_iterations,
+            "max_tokens": self.max_tokens_total,
+            "max_time_s": self.max_time_s,
+            "stagnation_threshold": self.stagnation_threshold,
         }
 
 
 @dataclass
 class LoopState:
-    """Current state of the loop."""
-    status: LoopStatus = LoopStatus.IDLE
-    current_phase: LoopPhase = LoopPhase.OBSERVE
-    cycle_count: int = 0
-    total_tokens: int = 0
+    """Current state of the autonomous loop."""
+    current_iteration: int = 0
+    current_phase: LoopPhase = LoopPhase.STARTING
     total_findings: int = 0
-    started_at: float = 0.0
-    stagnation_counter: int = 0
-    last_progress_cycle: int = 0
-    stop_reason: StopReason | None = None
-    current_strategy: str = ""
-    current_target: str = ""
-
-    @property
-    def elapsed_s(self) -> float:
-        return time.time() - self.started_at if self.started_at > 0 else 0.0
+    total_tokens_used: int = 0
+    total_tools_run: int = 0
+    total_errors: int = 0
+    started_at: float = field(default_factory=time.time)
+    last_finding_at: float = 0.0
+    stagnation_count: int = 0
+    iterations: list[LoopIteration] = field(default_factory=list)
+    unique_finding_hashes: set[str] = field(default_factory=set)
 
     def to_dict(self) -> dict[str, Any]:
+        elapsed = time.time() - self.started_at
         return {
-            "status": self.status.value,
+            "iteration": self.current_iteration,
             "phase": self.current_phase.value,
-            "cycles": self.cycle_count,
-            "tokens": self.total_tokens,
             "findings": self.total_findings,
-            "elapsed_m": round(self.elapsed_s / 60, 1),
-            "stagnation": self.stagnation_counter,
+            "tokens": self.total_tokens_used,
+            "tools_run": self.total_tools_run,
+            "errors": self.total_errors,
+            "elapsed_s": round(elapsed, 0),
+            "stagnation": self.stagnation_count,
         }
 
 
-class AutonomousLoop:
-    """The core OODA execution loop for autonomous operation.
+# ── Phase transition strategy ────────────────────────────────
 
-    Runs observe-orient-decide-act cycles continuously,
-    with termination conditions and recovery.
+PHASE_ORDER: list[LoopPhase] = [
+    LoopPhase.RECON,
+    LoopPhase.SCANNING,
+    LoopPhase.ANALYSIS,
+    LoopPhase.EXPLOITATION,
+    LoopPhase.VALIDATION,
+    LoopPhase.REPORTING,
+]
+
+PHASE_TOKEN_BUDGETS: dict[str, float] = {
+    "recon": 0.15,
+    "scanning": 0.30,
+    "analysis": 0.20,
+    "exploitation": 0.20,
+    "validation": 0.10,
+    "reporting": 0.05,
+}
+
+STAGNATION_STRATEGIES: dict[str, str] = {
+    "no_new_findings": "switch_to_deeper_scan",
+    "coverage_plateau": "try_different_tools",
+    "repeated_failures": "reduce_scope",
+    "budget_low": "prioritize_validation",
+}
+
+
+class AutonomousLoop:
+    """24/7 autonomous execution engine.
+
+    Manages continuous assessment cycles,
+    detects stagnation, adjusts strategies,
+    and ensures progress toward comprehensive
+    coverage.
     """
 
     def __init__(
@@ -145,191 +162,154 @@ class AutonomousLoop:
     ) -> None:
         self._config = config or LoopConfig()
         self._state = LoopState()
-        self._cycles: list[LoopCycle] = []
-        self._observers: list[Callable[..., Awaitable[list[str]]]] = []
-        self._orienters: list[Callable[..., Awaitable[str]]] = []
-        self._deciders: list[Callable[..., Awaitable[str]]] = []
-        self._actors: list[Callable[..., Awaitable[dict[str, Any]]]] = []
         self._log = logger.bind(component="autonomous_loop")
 
-    def register_observer(self, fn: Callable[..., Awaitable[list[str]]]) -> None:
-        self._observers.append(fn)
-
-    def register_orienter(self, fn: Callable[..., Awaitable[str]]) -> None:
-        self._orienters.append(fn)
-
-    def register_decider(self, fn: Callable[..., Awaitable[str]]) -> None:
-        self._deciders.append(fn)
-
-    def register_actor(self, fn: Callable[..., Awaitable[dict[str, Any]]]) -> None:
-        self._actors.append(fn)
-
-    async def run(
-        self,
-        target: str = "",
-        strategy: str = "",
-    ) -> LoopState:
-        """Run the autonomous OODA loop."""
-        self._state.status = LoopStatus.RUNNING
-        self._state.started_at = time.time()
-        self._state.current_target = target
-        self._state.current_strategy = strategy
-
-        try:
-            while self._should_continue():
-                cycle = await self._execute_cycle()
-                self._cycles.append(cycle)
-
-                if cycle.error:
-                    self._state.stagnation_counter += 1
-                elif cycle.findings_this_cycle > 0:
-                    self._state.stagnation_counter = 0
-                    self._state.last_progress_cycle = self._state.cycle_count
-                else:
-                    self._state.stagnation_counter += 1
-
-                # Stagnation handling
-                if self._state.stagnation_counter >= self._config.stagnation_threshold:
-                    self._state.current_strategy = "diversify"
-                    self._state.stagnation_counter = 0
-
-            if not self._state.stop_reason:
-                self._state.stop_reason = StopReason.CONVERGED
-            self._state.status = LoopStatus.COMPLETED
-
-        except Exception as exc:
-            self._state.status = LoopStatus.FAILED
-            self._state.stop_reason = StopReason.ERROR
-            self._log.error("loop_error", error=str(exc))
-
+    @property
+    def state(self) -> LoopState:
         return self._state
 
-    def _should_continue(self) -> bool:
+    def should_continue(self) -> bool:
         """Check if the loop should continue."""
-        if self._state.status != LoopStatus.RUNNING:
+        # Max iterations
+        if self._state.current_iteration >= self._config.max_iterations:
+            self._log.info("loop_stop_max_iterations")
             return False
 
-        if self._state.cycle_count >= self._config.max_cycles:
-            self._state.stop_reason = StopReason.MAX_CYCLES
+        # Max tokens
+        if self._state.total_tokens_used >= self._config.max_tokens_total:
+            self._log.info("loop_stop_max_tokens")
             return False
 
-        if self._state.total_tokens >= self._config.max_tokens:
-            self._state.stop_reason = StopReason.BUDGET_EXHAUSTED
+        # Max time
+        elapsed = time.time() - self._state.started_at
+        if elapsed >= self._config.max_time_s:
+            self._log.info("loop_stop_max_time")
             return False
 
-        if self._state.elapsed_s >= self._config.max_duration_s:
-            self._state.stop_reason = StopReason.TIMEOUT
+        # Max errors
+        if self._state.total_errors >= self._config.max_errors_before_stop:
+            self._log.info("loop_stop_max_errors")
             return False
 
         return True
 
-    async def _execute_cycle(self) -> LoopCycle:
-        """Execute a single OODA cycle."""
-        self._state.cycle_count += 1
-        cycle = LoopCycle(
-            cycle_number=self._state.cycle_count,
-            started_at=time.time(),
+    def start_iteration(self) -> LoopIteration:
+        """Start a new iteration."""
+        self._state.current_iteration += 1
+        iteration = LoopIteration(
+            iteration_id=self._state.current_iteration,
+            phase=self._get_current_phase(),
+        )
+        self._state.iterations.append(iteration)
+        self._state.current_phase = iteration.phase
+        return iteration
+
+    def complete_iteration(
+        self,
+        iteration: LoopIteration,
+        findings_count: int = 0,
+        tools_run: int = 0,
+        tokens_used: int = 0,
+        errors: int = 0,
+    ) -> None:
+        """Complete an iteration and update state."""
+        iteration.completed_at = time.time()
+        iteration.findings_count = findings_count
+        iteration.tools_run = tools_run
+        iteration.tokens_used = tokens_used
+        iteration.errors = errors
+
+        self._state.total_findings += findings_count
+        self._state.total_tokens_used += tokens_used
+        self._state.total_tools_run += tools_run
+        self._state.total_errors += errors
+
+        if findings_count > 0:
+            self._state.last_finding_at = time.time()
+            self._state.stagnation_count = 0
+        else:
+            self._state.stagnation_count += 1
+
+    def check_stagnation(self) -> StagnationType | None:
+        """Check if the loop is stagnating."""
+        if self._state.stagnation_count >= self._config.stagnation_threshold:
+            return StagnationType.NO_NEW_FINDINGS
+
+        # Coverage plateau: last N iterations found same count
+        recent = self._state.iterations[-5:]
+        if len(recent) >= 5:
+            findings_counts = [i.findings_count for i in recent]
+            if all(c == findings_counts[0] for c in findings_counts):
+                return StagnationType.COVERAGE_PLATEAU
+
+        # Repeated failures
+        recent_errors = sum(i.errors for i in self._state.iterations[-3:])
+        if recent_errors > 5:
+            return StagnationType.REPEATED_FAILURES
+
+        # Budget low
+        budget_used = self._state.total_tokens_used / max(1, self._config.max_tokens_total)
+        if budget_used > 0.9:
+            return StagnationType.BUDGET_LOW
+
+        return None
+
+    def get_stagnation_strategy(self, stagnation: StagnationType) -> str:
+        """Get the strategy for handling stagnation."""
+        return STAGNATION_STRATEGIES.get(stagnation.value, "continue")
+
+    def is_duplicate_finding(self, finding_hash: str) -> bool:
+        """Check if a finding is a duplicate."""
+        if not self._config.dedup_findings:
+            return False
+        if finding_hash in self._state.unique_finding_hashes:
+            return True
+        self._state.unique_finding_hashes.add(finding_hash)
+        return False
+
+    def _get_current_phase(self) -> LoopPhase:
+        """Determine the current phase based on iteration."""
+        if not self._state.iterations:
+            return LoopPhase.RECON
+
+        phase_idx = (self._state.current_iteration - 1) % len(PHASE_ORDER)
+        return PHASE_ORDER[phase_idx]
+
+    def get_phase_budget(self, phase: LoopPhase) -> int:
+        """Get token budget for a phase."""
+        fraction = PHASE_TOKEN_BUDGETS.get(phase.value, 0.1)
+        return int(self._config.max_tokens_total * fraction)
+
+    def should_checkpoint(self) -> bool:
+        """Check if we should save a checkpoint."""
+        return (
+            self._state.current_iteration > 0
+            and self._state.current_iteration % self._config.checkpoint_interval == 0
         )
 
-        try:
-            # OBSERVE
-            phase_start = time.time()
-            self._state.current_phase = LoopPhase.OBSERVE
-            observations = await self._observe()
-            cycle.observations = observations
-            cycle.phase_durations["observe"] = time.time() - phase_start
+    def get_progress(self) -> dict[str, Any]:
+        """Get overall progress metrics."""
+        elapsed = time.time() - self._state.started_at
+        token_pct = self._state.total_tokens_used / max(1, self._config.max_tokens_total) * 100
+        iter_pct = self._state.current_iteration / max(1, self._config.max_iterations) * 100
+        time_pct = elapsed / max(1, self._config.max_time_s) * 100
 
-            # ORIENT
-            phase_start = time.time()
-            self._state.current_phase = LoopPhase.ORIENT
-            orientation = await self._orient(observations)
-            cycle.orientation = orientation
-            cycle.phase_durations["orient"] = time.time() - phase_start
-
-            # DECIDE
-            phase_start = time.time()
-            self._state.current_phase = LoopPhase.DECIDE
-            decision = await self._decide(orientation)
-            cycle.decision = decision
-            cycle.phase_durations["decide"] = time.time() - phase_start
-
-            # ACT
-            phase_start = time.time()
-            self._state.current_phase = LoopPhase.ACT
-            result = await self._act(decision)
-            cycle.action_taken = decision
-            cycle.action_result = str(result)[:200]
-            cycle.tokens_used = result.get("tokens", 0)
-            cycle.findings_this_cycle = result.get("findings", 0)
-            cycle.phase_durations["act"] = time.time() - phase_start
-
-            self._state.total_tokens += cycle.tokens_used
-            self._state.total_findings += cycle.findings_this_cycle
-
-        except Exception as exc:
-            cycle.error = str(exc)[:200]
-
-        cycle.completed_at = time.time()
-        return cycle
-
-    async def _observe(self) -> list[str]:
-        """Gather observations from all registered observers."""
-        observations = []
-        for observer in self._observers:
-            try:
-                result = await asyncio.wait_for(
-                    observer(),
-                    timeout=self._config.observe_timeout_s,
-                )
-                observations.extend(result)
-            except (asyncio.TimeoutError, Exception):
-                pass
-        return observations
-
-    async def _orient(self, observations: list[str]) -> str:
-        """Analyze and contextualize observations."""
-        for orienter in self._orienters:
-            try:
-                return await orienter(observations)
-            except Exception:
-                pass
-        return "; ".join(observations[:5])
-
-    async def _decide(self, orientation: str) -> str:
-        """Decide on next action."""
-        for decider in self._deciders:
-            try:
-                return await decider(orientation, self._state.current_strategy)
-            except Exception:
-                pass
-        return "continue_scanning"
-
-    async def _act(self, decision: str) -> dict[str, Any]:
-        """Execute the decided action."""
-        for actor in self._actors:
-            try:
-                return await asyncio.wait_for(
-                    actor(decision, self._state.current_target),
-                    timeout=self._config.act_timeout_s,
-                )
-            except (asyncio.TimeoutError, Exception):
-                pass
-        return {"tokens": 0, "findings": 0}
-
-    def stop(self, reason: StopReason = StopReason.USER_STOP) -> None:
-        """Stop the loop."""
-        self._state.status = LoopStatus.STOPPED
-        self._state.stop_reason = reason
-
-    def pause(self) -> None:
-        self._state.status = LoopStatus.PAUSED
-
-    def resume(self) -> None:
-        self._state.status = LoopStatus.RUNNING
+        return {
+            "iteration_pct": round(iter_pct, 1),
+            "token_pct": round(token_pct, 1),
+            "time_pct": round(time_pct, 1),
+            "findings_per_iteration": round(
+                self._state.total_findings / max(1, self._state.current_iteration), 2,
+            ),
+            "tokens_per_finding": (
+                round(self._state.total_tokens_used / max(1, self._state.total_findings), 0)
+                if self._state.total_findings > 0 else 0
+            ),
+        }
 
     def get_stats(self) -> dict[str, Any]:
         return {
             "state": self._state.to_dict(),
-            "cycles": len(self._cycles),
+            "progress": self.get_progress(),
             "config": self._config.to_dict(),
         }
