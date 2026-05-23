@@ -1,18 +1,19 @@
-"""Convergence monitor — detects when to stop or pivot.
+"""Convergence monitor — detects stagnation and diminishing returns.
 
 Implements:
-1. Progress tracking metrics
-2. Diminishing returns detection
-3. Coverage estimation
-4. Stagnation detection
-5. Strategy pivot recommendations
-6. Time-based convergence
-7. Finding rate analysis
+1. Finding rate tracking over time windows
+2. Stagnation detection (no new findings for N cycles)
+3. Diminishing returns estimation
+4. Coverage estimation
+5. Budget efficiency tracking
+6. Auto-termination recommendations
+7. Phase transition triggers
 """
 
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -23,244 +24,273 @@ logger = structlog.get_logger()
 
 
 class ConvergenceState(str, Enum):
-    EXPLORING = "exploring"         # Active discovery
-    PROGRESSING = "progressing"     # Finding new things
-    PLATEAU = "plateau"             # Slowing down
-    DIMINISHING = "diminishing"     # Very slow progress
-    CONVERGED = "converged"         # No new progress
-    STAGNANT = "stagnant"          # Stuck
+    EXPLORING = "exploring"           # Actively finding new things
+    PRODUCTIVE = "productive"         # Good finding rate
+    SLOWING = "slowing"               # Finding rate decreasing
+    STAGNANT = "stagnant"             # No new findings
+    DIMINISHING = "diminishing"       # Returns not worth cost
+    CONVERGED = "converged"           # Effectively done
 
 
-class PivotReason(str, Enum):
-    DIMINISHING_RETURNS = "diminishing_returns"
-    COVERAGE_COMPLETE = "coverage_complete"
-    TIME_LIMIT = "time_limit"
-    BUDGET_EXHAUSTED = "budget_exhausted"
-    REPEATED_FAILURES = "repeated_failures"
-    NO_FINDINGS = "no_findings"
+class ConvergenceAction(str, Enum):
+    CONTINUE = "continue"             # Keep going
+    CHANGE_STRATEGY = "change_strategy"  # Try different approach
+    CHANGE_TOOL = "change_tool"       # Try different tool
+    DEEPER_SCAN = "deeper_scan"       # Go deeper on current area
+    WIDER_SCAN = "wider_scan"         # Expand scope
+    ESCALATE = "escalate"             # Move to next phase
+    TERMINATE = "terminate"           # Stop this branch
 
 
 @dataclass
-class ProgressSnapshot:
-    """A point-in-time progress snapshot."""
+class ConvergenceSample:
+    """A data point for convergence tracking."""
     timestamp: float = field(default_factory=time.time)
-    findings_count: int = 0
-    tools_run: int = 0
+    findings: int = 0
     tokens_used: int = 0
-    unique_vulns: int = 0
-    coverage_estimate: float = 0.0
+    tool_calls: int = 0
+    unique_endpoints: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "findings": self.findings_count,
-            "tools": self.tools_run,
-            "coverage": round(self.coverage_estimate, 2),
+            "findings": self.findings,
+            "tokens": self.tokens_used,
+            "tools": self.tool_calls,
         }
 
 
 @dataclass
-class PivotRecommendation:
-    """A recommendation to change strategy."""
-    reason: PivotReason = PivotReason.DIMINISHING_RETURNS
-    current_phase: str = ""
-    recommended_phase: str = ""
-    explanation: str = ""
-    confidence: float = 0.5
+class ConvergenceReport:
+    """Report on convergence status."""
+    state: ConvergenceState = ConvergenceState.EXPLORING
+    recommended_action: ConvergenceAction = ConvergenceAction.CONTINUE
+    finding_rate: float = 0.0          # Findings per minute
+    token_efficiency: float = 0.0      # Findings per 1K tokens
+    estimated_coverage: float = 0.0    # 0-1 estimated coverage
+    stagnation_cycles: int = 0
+    total_findings: int = 0
+    total_tokens: int = 0
+    reasoning: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "reason": self.reason.value,
-            "from": self.current_phase[:15],
-            "to": self.recommended_phase[:15],
-            "confidence": round(self.confidence, 2),
+            "state": self.state.value,
+            "action": self.recommended_action.value,
+            "finding_rate": round(self.finding_rate, 3),
+            "efficiency": round(self.token_efficiency, 4),
+            "coverage": round(self.estimated_coverage, 2),
+            "stagnation": self.stagnation_cycles,
         }
 
 
 class ConvergenceMonitor:
-    """Monitors assessment progress and detects convergence.
+    """Monitors assessment convergence.
 
-    Tracks finding rate, coverage, and progress
-    to determine when to stop or pivot strategy.
+    Tracks finding rates, detects stagnation,
+    estimates coverage, and recommends actions
+    based on convergence analysis.
     """
 
     def __init__(
         self,
-        window_size: int = 5,
-        diminishing_threshold: float = 0.1,
-        stagnation_minutes: float = 10.0,
+        window_size: int = 20,
+        stagnation_threshold: int = 5,
     ) -> None:
-        self._snapshots: list[ProgressSnapshot] = []
-        self._window_size = window_size
-        self._diminishing_threshold = diminishing_threshold
-        self._stagnation_minutes = stagnation_minutes
-        self._state = ConvergenceState.EXPLORING
+        self._samples: deque[ConvergenceSample] = deque(maxlen=window_size)
+        self._stagnation_threshold = stagnation_threshold
+        self._total_findings = 0
+        self._total_tokens = 0
+        self._unique_findings: set[str] = set()
         self._start_time = time.time()
         self._log = logger.bind(component="convergence_monitor")
 
-    def record_snapshot(
+    def record_sample(
         self,
-        findings_count: int,
-        tools_run: int = 0,
+        findings: int = 0,
         tokens_used: int = 0,
-        unique_vulns: int = 0,
-    ) -> ProgressSnapshot:
-        """Record a progress snapshot."""
-        coverage = self._estimate_coverage(findings_count, tools_run)
-
-        snapshot = ProgressSnapshot(
-            findings_count=findings_count,
-            tools_run=tools_run,
+        tool_calls: int = 0,
+        unique_endpoints: int = 0,
+        finding_ids: list[str] | None = None,
+    ) -> None:
+        """Record a convergence sample."""
+        sample = ConvergenceSample(
+            findings=findings,
             tokens_used=tokens_used,
-            unique_vulns=unique_vulns,
-            coverage_estimate=coverage,
+            tool_calls=tool_calls,
+            unique_endpoints=unique_endpoints,
         )
-        self._snapshots.append(snapshot)
+        self._samples.append(sample)
+        self._total_findings += findings
+        self._total_tokens += tokens_used
 
-        # Update state
-        self._update_state()
+        if finding_ids:
+            for fid in finding_ids:
+                self._unique_findings.add(fid)
 
-        return snapshot
+    def analyze(self) -> ConvergenceReport:
+        """Analyze convergence state."""
+        if len(self._samples) < 2:
+            return ConvergenceReport(
+                state=ConvergenceState.EXPLORING,
+                recommended_action=ConvergenceAction.CONTINUE,
+                total_findings=self._total_findings,
+                total_tokens=self._total_tokens,
+            )
 
-    def _estimate_coverage(
-        self,
-        findings: int,
-        tools: int,
-    ) -> float:
-        """Estimate assessment coverage (0-1)."""
-        # Heuristic: coverage based on tool diversity and finding rate
-        tool_coverage = min(1.0, tools / 15)  # Assume 15 tools is full coverage
-        finding_signal = min(1.0, findings / 20)  # Assume 20 findings is thorough
+        # Calculate finding rate
+        elapsed_s = time.time() - self._start_time
+        finding_rate = self._total_findings / max(1, elapsed_s / 60)
 
-        return tool_coverage * 0.6 + finding_signal * 0.4
+        # Token efficiency
+        token_efficiency = 0.0
+        if self._total_tokens > 0:
+            token_efficiency = self._total_findings / (self._total_tokens / 1000)
 
-    def _update_state(self) -> None:
-        """Update convergence state based on recent snapshots."""
-        if len(self._snapshots) < 2:
-            self._state = ConvergenceState.EXPLORING
-            return
+        # Count stagnation (consecutive zero-finding samples)
+        stagnation = 0
+        for sample in reversed(self._samples):
+            if sample.findings == 0:
+                stagnation += 1
+            else:
+                break
 
-        # Get recent window
-        window = self._snapshots[-self._window_size:]
+        # Recent vs early finding rate
+        half = len(self._samples) // 2
+        early_samples = list(self._samples)[:max(1, half)]
+        recent_samples = list(self._samples)[max(1, half):]
 
-        # Calculate finding rate (findings per snapshot)
-        rates = []
-        for i in range(1, len(window)):
-            delta = window[i].findings_count - window[i - 1].findings_count
-            rates.append(delta)
+        early_findings = sum(s.findings for s in early_samples)
+        recent_findings = sum(s.findings for s in recent_samples)
 
-        if not rates:
-            return
-
-        avg_rate = sum(rates) / len(rates)
-        latest_rate = rates[-1]
-
-        # Detect stagnation (no new findings for N minutes)
-        if len(self._snapshots) >= 3:
-            recent_3 = self._snapshots[-3:]
-            if all(s.findings_count == recent_3[0].findings_count for s in recent_3):
-                time_since_progress = time.time() - self._snapshots[-3].timestamp
-                if time_since_progress > self._stagnation_minutes * 60:
-                    self._state = ConvergenceState.STAGNANT
-                    return
-
-        if avg_rate <= 0:
-            self._state = ConvergenceState.CONVERGED
-        elif avg_rate < self._diminishing_threshold:
-            self._state = ConvergenceState.DIMINISHING
-        elif latest_rate < avg_rate * 0.5:
-            self._state = ConvergenceState.PLATEAU
-        elif latest_rate > 0:
-            self._state = ConvergenceState.PROGRESSING
-        else:
-            self._state = ConvergenceState.EXPLORING
-
-    @property
-    def state(self) -> ConvergenceState:
-        return self._state
-
-    @property
-    def should_pivot(self) -> bool:
-        """Whether the current strategy should be changed."""
-        return self._state in (
-            ConvergenceState.DIMINISHING,
-            ConvergenceState.CONVERGED,
-            ConvergenceState.STAGNANT,
+        # Determine state
+        state = self._determine_state(
+            stagnation=stagnation,
+            early_findings=early_findings,
+            recent_findings=recent_findings,
+            finding_rate=finding_rate,
         )
 
-    @property
-    def should_stop(self) -> bool:
-        """Whether the assessment should stop."""
-        return self._state == ConvergenceState.CONVERGED
+        # Determine action
+        action = self._determine_action(state, stagnation)
 
-    def get_pivot_recommendation(
+        # Estimate coverage (asymptotic)
+        coverage = self._estimate_coverage()
+
+        return ConvergenceReport(
+            state=state,
+            recommended_action=action,
+            finding_rate=finding_rate,
+            token_efficiency=token_efficiency,
+            estimated_coverage=coverage,
+            stagnation_cycles=stagnation,
+            total_findings=self._total_findings,
+            total_tokens=self._total_tokens,
+            reasoning=f"State={state.value}, stagnation={stagnation}, "
+                      f"early={early_findings}, recent={recent_findings}",
+        )
+
+    def _determine_state(
         self,
-        current_phase: str,
-    ) -> PivotRecommendation | None:
-        """Get a pivot recommendation if appropriate."""
-        if not self.should_pivot:
-            return None
+        stagnation: int,
+        early_findings: int,
+        recent_findings: int,
+        finding_rate: float,
+    ) -> ConvergenceState:
+        """Determine convergence state."""
+        if stagnation >= self._stagnation_threshold * 2:
+            return ConvergenceState.CONVERGED
 
-        phase_transitions = {
-            "reconnaissance": ("scanning", "Move to vulnerability scanning"),
-            "scanning": ("exploitation", "Move to exploitation of found vulns"),
-            "exploitation": ("validation", "Move to finding validation"),
-            "validation": ("reporting", "Move to report generation"),
+        if stagnation >= self._stagnation_threshold:
+            return ConvergenceState.STAGNANT
+
+        if early_findings > 0 and recent_findings == 0:
+            return ConvergenceState.DIMINISHING
+
+        if early_findings > recent_findings > 0:
+            return ConvergenceState.SLOWING
+
+        if recent_findings > 0:
+            return ConvergenceState.PRODUCTIVE
+
+        return ConvergenceState.EXPLORING
+
+    def _determine_action(
+        self,
+        state: ConvergenceState,
+        stagnation: int,
+    ) -> ConvergenceAction:
+        """Determine recommended action."""
+        action_map = {
+            ConvergenceState.EXPLORING: ConvergenceAction.CONTINUE,
+            ConvergenceState.PRODUCTIVE: ConvergenceAction.CONTINUE,
+            ConvergenceState.SLOWING: ConvergenceAction.CHANGE_STRATEGY,
+            ConvergenceState.STAGNANT: ConvergenceAction.WIDER_SCAN,
+            ConvergenceState.DIMINISHING: ConvergenceAction.ESCALATE,
+            ConvergenceState.CONVERGED: ConvergenceAction.TERMINATE,
         }
 
-        next_phase, explanation = phase_transitions.get(
-            current_phase,
-            ("reporting", "Assessment converged"),
-        )
+        action = action_map.get(state, ConvergenceAction.CONTINUE)
 
-        return PivotRecommendation(
-            reason=PivotReason.DIMINISHING_RETURNS,
-            current_phase=current_phase,
-            recommended_phase=next_phase,
-            explanation=explanation,
-            confidence=0.7,
-        )
+        # Override for specific conditions
+        if state == ConvergenceState.STAGNANT and stagnation >= self._stagnation_threshold + 2:
+            action = ConvergenceAction.ESCALATE
 
-    def get_finding_rate(self) -> float:
-        """Get the current finding rate per minute."""
-        if len(self._snapshots) < 2:
+        return action
+
+    def _estimate_coverage(self) -> float:
+        """Estimate coverage using asymptotic model.
+
+        Uses the ratio of unique findings in recent
+        samples vs total to estimate how much of the
+        attack surface has been explored.
+        """
+        if not self._samples or self._total_findings == 0:
             return 0.0
 
-        recent = self._snapshots[-2:]
-        time_delta = recent[1].timestamp - recent[0].timestamp
-        if time_delta <= 0:
-            return 0.0
+        # Simple model: coverage approaches 1 as finding rate approaches 0
+        recent_count = min(5, len(self._samples))
+        recent = list(self._samples)[-recent_count:]
+        recent_findings = sum(s.findings for s in recent)
+        avg_recent = recent_findings / max(1, recent_count)
 
-        finding_delta = recent[1].findings_count - recent[0].findings_count
-        return finding_delta / (time_delta / 60)
+        # If average is 0, we're likely at high coverage
+        if avg_recent == 0:
+            return min(0.95, 0.5 + (len(self._samples) / 100))
+
+        # Use decay model
+        total_samples = len(self._samples)
+        rate_ratio = avg_recent / max(0.01, self._total_findings / total_samples)
+        coverage = 1.0 - rate_ratio
+        return max(0.0, min(0.99, coverage))
+
+    def should_terminate(self) -> bool:
+        """Check if assessment should terminate."""
+        report = self.analyze()
+        return report.state == ConvergenceState.CONVERGED
 
     def build_convergence_prompt(self) -> str:
-        """Build a prompt about convergence status."""
-        if not self._snapshots:
-            return ""
-
-        latest = self._snapshots[-1]
-        elapsed = time.time() - self._start_time
-
+        """Build convergence context for LLM."""
+        report = self.analyze()
         lines = [
-            "## Assessment Progress\n",
-            f"State: {self._state.value}",
-            f"Findings: {latest.findings_count}",
-            f"Coverage: {latest.coverage_estimate:.0%}",
-            f"Finding rate: {self.get_finding_rate():.1f}/min",
-            f"Elapsed: {elapsed / 60:.0f} min",
+            "## Convergence Status\n",
+            f"State: {report.state.value}",
+            f"Recommended: {report.recommended_action.value}",
+            f"Finding rate: {report.finding_rate:.2f}/min",
+            f"Efficiency: {report.token_efficiency:.4f} findings/K-tokens",
+            f"Coverage: {report.estimated_coverage:.0%}",
+            f"Stagnation: {report.stagnation_cycles} cycles",
+            f"Total: {report.total_findings} findings, {report.total_tokens} tokens",
         ]
-
-        if self.should_pivot:
-            lines.append(f"\nRECOMMENDATION: Consider pivoting strategy ({self._state.value})")
-
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
+        report = self.analyze()
         return {
-            "state": self._state.value,
-            "snapshots": len(self._snapshots),
-            "finding_rate": round(self.get_finding_rate(), 2),
-            "should_pivot": self.should_pivot,
-            "should_stop": self.should_stop,
-            "elapsed_min": round((time.time() - self._start_time) / 60, 1),
+            "state": report.state.value,
+            "action": report.recommended_action.value,
+            "finding_rate": round(report.finding_rate, 3),
+            "coverage": round(report.estimated_coverage, 2),
+            "total_findings": self._total_findings,
+            "unique_findings": len(self._unique_findings),
+            "samples": len(self._samples),
         }
