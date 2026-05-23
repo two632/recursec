@@ -1,28 +1,24 @@
-"""Agent introspection — real-time monitoring and analysis of agent behavior.
+"""Introspection engine — agent self-awareness and self-monitoring.
 
-Provides visibility into:
-1. Agent decision-making process
-2. Resource consumption patterns
-3. Communication patterns between agents
-4. Performance bottlenecks
-5. Anomaly detection in agent behavior
-6. Execution timeline and gantt visualization data
-7. Agent health metrics
+Implements:
+1. Performance self-assessment
+2. Cognitive load monitoring
+3. Confidence calibration
+4. Blind spot detection
+5. Decision quality review
+6. Behavioral pattern analysis
+7. Self-correction triggers
+8. Meta-cognitive monitoring
 
-Used for:
-- Debugging agent behavior
-- Optimizing performance
-- Detecting stuck or looping agents
-- Understanding multi-agent dynamics
-- Generating execution reports
+Allows agents to reason about their own reasoning,
+detect when they're stuck, and self-correct.
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import structlog
@@ -30,373 +26,346 @@ import structlog
 logger = structlog.get_logger()
 
 
-class EventType(str, Enum):
-    AGENT_START = "agent_start"
-    AGENT_STOP = "agent_stop"
-    AGENT_ERROR = "agent_error"
-    TASK_START = "task_start"
-    TASK_COMPLETE = "task_complete"
-    TASK_FAIL = "task_fail"
-    TOOL_CALL = "tool_call"
-    TOOL_RESULT = "tool_result"
-    LLM_REQUEST = "llm_request"
-    LLM_RESPONSE = "llm_response"
-    FINDING_ADDED = "finding_added"
-    MESSAGE_SENT = "message_sent"
-    MESSAGE_RECEIVED = "message_received"
-    STATE_CHANGE = "state_change"
-    DECISION = "decision"
-    BUDGET_ALERT = "budget_alert"
-    SPAWN_AGENT = "spawn_agent"
-    COLLECT_RESULT = "collect_result"
-
-
 @dataclass
-class IntrospectionEvent:
-    """A single event in the agent execution timeline."""
-    event_id: str = ""
-    event_type: EventType = EventType.AGENT_START
-    agent_id: str = ""
-    timestamp: float = field(default_factory=time.time)
-    duration_ms: float = 0.0
-    data: dict[str, Any] = field(default_factory=dict)
-    parent_event_id: str = ""
+class CognitiveState:
+    """Current cognitive state of an agent."""
+    # Performance
+    actions_taken: int = 0
+    actions_successful: int = 0
+    actions_failed: int = 0
+    findings_produced: int = 0
+    confidence_avg: float = 0.5
+
+    # Load
+    token_usage: int = 0
+    time_elapsed_s: float = 0.0
+    context_size: int = 0
+    pending_tasks: int = 0
+
+    # Quality
+    false_positives: int = 0
+    validated_findings: int = 0
+    unique_techniques: int = 0
+
+    # Patterns
+    repeated_actions: int = 0
+    strategy_switches: int = 0
+    help_requests: int = 0
+
+    @property
+    def success_rate(self) -> float:
+        if self.actions_taken == 0:
+            return 0.0
+        return self.actions_successful / self.actions_taken
+
+    @property
+    def cognitive_load(self) -> float:
+        """0 = idle, 1 = overloaded."""
+        load = 0.0
+        if self.pending_tasks > 5:
+            load += 0.3
+        if self.context_size > 3000:
+            load += 0.2
+        if self.actions_taken > 50:
+            load += 0.2
+        if self.repeated_actions > 5:
+            load += 0.3
+        return min(1.0, load)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.event_id,
-            "type": self.event_type.value,
-            "agent": self.agent_id,
-            "time": self.timestamp,
-            "duration_ms": round(self.duration_ms, 1),
-            "data": {k: str(v)[:200] for k, v in list(self.data.items())[:5]},
+            "success_rate": round(self.success_rate, 2),
+            "cognitive_load": round(self.cognitive_load, 2),
+            "confidence": round(self.confidence_avg, 2),
+            "actions": self.actions_taken,
+            "findings": self.findings_produced,
+            "fp_rate": round(
+                self.false_positives / max(1, self.findings_produced), 2
+            ),
         }
 
 
 @dataclass
-class AgentProfile:
-    """Performance profile for a single agent."""
-    agent_id: str = ""
-    agent_role: str = ""
-    total_events: int = 0
-    total_llm_calls: int = 0
-    total_tool_calls: int = 0
-    total_findings: int = 0
-    total_messages_sent: int = 0
-    total_messages_received: int = 0
-    total_tokens_used: int = 0
-    total_time_ms: float = 0.0
-    avg_llm_latency_ms: float = 0.0
-    avg_tool_latency_ms: float = 0.0
-    error_count: int = 0
-    state_transitions: list[str] = field(default_factory=list)
-    decisions_made: list[dict[str, str]] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "agent": self.agent_id,
-            "role": self.agent_role,
-            "events": self.total_events,
-            "llm_calls": self.total_llm_calls,
-            "tool_calls": self.total_tool_calls,
-            "findings": self.total_findings,
-            "tokens": self.total_tokens_used,
-            "time_ms": round(self.total_time_ms, 1),
-            "errors": self.error_count,
-        }
-
-
-@dataclass
-class AnomalyAlert:
-    """An anomaly detected in agent behavior."""
-    alert_id: str = ""
-    agent_id: str = ""
-    anomaly_type: str = ""  # stuck_loop, excessive_tokens, no_progress, etc.
+class IntrospectionInsight:
+    """An insight from self-reflection."""
+    category: str = ""        # performance, pattern, blind_spot, quality, meta
     description: str = ""
-    severity: str = "warning"  # info, warning, critical
+    severity: str = "info"    # info, warning, critical
+    action_suggested: str = ""
+    confidence: float = 0.5
     timestamp: float = field(default_factory=time.time)
-    data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.alert_id,
-            "agent": self.agent_id,
-            "type": self.anomaly_type,
+            "category": self.category,
+            "description": self.description[:100],
             "severity": self.severity,
-            "description": self.description[:200],
+            "action": self.action_suggested[:100],
+            "confidence": round(self.confidence, 2),
         }
 
 
-class AgentIntrospection:
-    """Real-time monitoring and analysis of agent behavior.
+@dataclass
+class ConfidenceRecord:
+    """Record of a confidence prediction and its outcome."""
+    prediction_id: str = ""
+    predicted_confidence: float = 0.5
+    actual_outcome: float = 0.0   # 0 = wrong, 1 = correct
+    domain: str = ""
+    timestamp: float = field(default_factory=time.time)
 
-    Collects events from all agents and provides:
-    - Timeline visualization data
-    - Performance profiling
-    - Anomaly detection
-    - Communication graph
+
+class IntrospectionEngine:
+    """Self-monitoring and meta-cognitive engine.
+
+    Allows agents to assess their own performance,
+    detect patterns, identify blind spots, and self-correct.
     """
 
-    def __init__(self, max_events: int = 10000) -> None:
-        self._events: deque[IntrospectionEvent] = deque(maxlen=max_events)
-        self._profiles: dict[str, AgentProfile] = {}
-        self._anomalies: list[AnomalyAlert] = []
-        self._event_counter = 0
-
-        # Anomaly detection state
-        self._agent_action_counts: dict[str, int] = defaultdict(int)
-        self._agent_last_finding: dict[str, float] = {}
-        self._agent_repeated_actions: dict[str, list[str]] = defaultdict(list)
-
+    def __init__(self) -> None:
+        self._state = CognitiveState()
+        self._insights: list[IntrospectionInsight] = []
+        self._confidence_records: list[ConfidenceRecord] = []
+        self._action_history: list[str] = []
+        self._technique_coverage: set[str] = set()
+        self._domain_performance: dict[str, list[float]] = defaultdict(list)
+        self._record_counter = 0
         self._log = logger.bind(component="introspection")
 
-    def record(
+    # ── State Updates ────────────────────────────────────
+
+    def record_action(self, action: str, success: bool, confidence: float = 0.5) -> None:
+        """Record an action and its outcome."""
+        self._state.actions_taken += 1
+        if success:
+            self._state.actions_successful += 1
+        else:
+            self._state.actions_failed += 1
+
+        self._action_history.append(action)
+        if len(self._action_history) > 200:
+            self._action_history = self._action_history[-200:]
+
+        # Track repetitions
+        if len(self._action_history) > 1 and action == self._action_history[-2]:
+            self._state.repeated_actions += 1
+
+        # Update confidence
+        n = self._state.actions_taken
+        self._state.confidence_avg = (
+            self._state.confidence_avg * (n - 1) + confidence
+        ) / n
+
+    def record_finding(self, is_validated: bool = False) -> None:
+        self._state.findings_produced += 1
+        if is_validated:
+            self._state.validated_findings += 1
+
+    def record_false_positive(self) -> None:
+        self._state.false_positives += 1
+
+    def record_technique(self, technique: str) -> None:
+        self._technique_coverage.add(technique)
+        self._state.unique_techniques = len(self._technique_coverage)
+
+    def update_context(self, token_usage: int, context_size: int, pending: int) -> None:
+        self._state.token_usage = token_usage
+        self._state.context_size = context_size
+        self._state.pending_tasks = pending
+
+    def record_time(self, elapsed_s: float) -> None:
+        self._state.time_elapsed_s = elapsed_s
+
+    # ── Confidence Calibration ───────────────────────────
+
+    def record_confidence_prediction(
         self,
-        event_type: EventType,
-        agent_id: str,
-        data: dict[str, Any] | None = None,
-        duration_ms: float = 0.0,
-        parent_event_id: str = "",
-    ) -> str:
-        """Record an event."""
-        self._event_counter += 1
-        event = IntrospectionEvent(
-            event_id=f"evt-{self._event_counter}",
-            event_type=event_type,
-            agent_id=agent_id,
-            duration_ms=duration_ms,
-            data=data or {},
-            parent_event_id=parent_event_id,
-        )
-
-        self._events.append(event)
-        self._update_profile(event)
-        self._check_anomalies(event)
-
-        return event.event_id
-
-    def get_profile(self, agent_id: str) -> AgentProfile | None:
-        return self._profiles.get(agent_id)
-
-    def get_all_profiles(self) -> dict[str, dict[str, Any]]:
-        return {aid: p.to_dict() for aid, p in self._profiles.items()}
-
-    def get_timeline(
-        self,
-        agent_id: str = "",
-        event_type: EventType | None = None,
-        limit: int = 100,
-    ) -> list[dict[str, Any]]:
-        """Get event timeline, optionally filtered."""
-        events = list(self._events)
-        if agent_id:
-            events = [e for e in events if e.agent_id == agent_id]
-        if event_type:
-            events = [e for e in events if e.event_type == event_type]
-        return [e.to_dict() for e in events[-limit:]]
-
-    def get_communication_graph(self) -> dict[str, Any]:
-        """Get the inter-agent communication graph."""
-        edges: dict[str, int] = defaultdict(int)
-        for event in self._events:
-            if event.event_type == EventType.MESSAGE_SENT:
-                sender = event.agent_id
-                receiver = event.data.get("to", "")
-                if receiver:
-                    edges[f"{sender}->{receiver}"] += 1
-
-        nodes = list(self._profiles.keys())
-        return {
-            "nodes": nodes,
-            "edges": [
-                {"from": e.split("->")[0], "to": e.split("->")[1], "count": c}
-                for e, c in edges.items()
-            ],
-        }
-
-    def get_gantt_data(self, agent_id: str = "") -> list[dict[str, Any]]:
-        """Get Gantt chart data for execution timeline."""
-        tasks = []
-        for event in self._events:
-            if agent_id and event.agent_id != agent_id:
-                continue
-            if event.event_type in (EventType.TASK_START, EventType.TOOL_CALL, EventType.LLM_REQUEST):
-                tasks.append({
-                    "agent": event.agent_id,
-                    "type": event.event_type.value,
-                    "start": event.timestamp,
-                    "duration_ms": event.duration_ms,
-                    "label": event.data.get("name", event.data.get("tool", ""))[:50],
-                })
-        return tasks
-
-    def get_anomalies(self, limit: int = 20) -> list[dict[str, Any]]:
-        return [a.to_dict() for a in self._anomalies[-limit:]]
-
-    # ── Performance Analysis ─────────────────────────────
-
-    def get_bottlenecks(self) -> list[dict[str, Any]]:
-        """Identify performance bottlenecks."""
-        bottlenecks = []
-
-        for agent_id, profile in self._profiles.items():
-            # Slow LLM calls
-            if profile.avg_llm_latency_ms > 5000:
-                bottlenecks.append({
-                    "agent": agent_id,
-                    "type": "slow_llm",
-                    "avg_latency_ms": round(profile.avg_llm_latency_ms, 1),
-                })
-
-            # Too many errors
-            if profile.error_count > 5:
-                bottlenecks.append({
-                    "agent": agent_id,
-                    "type": "high_error_rate",
-                    "errors": profile.error_count,
-                })
-
-            # Excessive tokens
-            if profile.total_tokens_used > 100000:
-                bottlenecks.append({
-                    "agent": agent_id,
-                    "type": "excessive_tokens",
-                    "tokens": profile.total_tokens_used,
-                })
-
-        return bottlenecks
-
-    def get_summary(self) -> dict[str, Any]:
-        """Get overall execution summary."""
-        total_events = len(self._events)
-        total_findings = sum(p.total_findings for p in self._profiles.values())
-        total_tokens = sum(p.total_tokens_used for p in self._profiles.values())
-        total_errors = sum(p.error_count for p in self._profiles.values())
-
-        events_by_type: dict[str, int] = defaultdict(int)
-        for event in self._events:
-            events_by_type[event.event_type.value] += 1
-
-        return {
-            "total_events": total_events,
-            "total_agents": len(self._profiles),
-            "total_findings": total_findings,
-            "total_tokens": total_tokens,
-            "total_errors": total_errors,
-            "total_anomalies": len(self._anomalies),
-            "events_by_type": dict(events_by_type),
-            "bottlenecks": len(self.get_bottlenecks()),
-        }
-
-    # ── Internal ─────────────────────────────────────────
-
-    def _update_profile(self, event: IntrospectionEvent) -> None:
-        """Update agent profile from event."""
-        agent_id = event.agent_id
-        if agent_id not in self._profiles:
-            self._profiles[agent_id] = AgentProfile(
-                agent_id=agent_id,
-                agent_role=event.data.get("role", ""),
-            )
-
-        profile = self._profiles[agent_id]
-        profile.total_events += 1
-
-        if event.event_type == EventType.LLM_REQUEST:
-            profile.total_llm_calls += 1
-            if event.duration_ms > 0:
-                n = profile.total_llm_calls
-                profile.avg_llm_latency_ms = (
-                    profile.avg_llm_latency_ms * (n - 1) + event.duration_ms
-                ) / n
-            profile.total_tokens_used += event.data.get("tokens", 0)
-
-        elif event.event_type == EventType.TOOL_CALL:
-            profile.total_tool_calls += 1
-            if event.duration_ms > 0:
-                n = profile.total_tool_calls
-                profile.avg_tool_latency_ms = (
-                    profile.avg_tool_latency_ms * (n - 1) + event.duration_ms
-                ) / n
-
-        elif event.event_type == EventType.FINDING_ADDED:
-            profile.total_findings += 1
-            self._agent_last_finding[agent_id] = time.time()
-
-        elif event.event_type == EventType.AGENT_ERROR:
-            profile.error_count += 1
-
-        elif event.event_type == EventType.MESSAGE_SENT:
-            profile.total_messages_sent += 1
-
-        elif event.event_type == EventType.MESSAGE_RECEIVED:
-            profile.total_messages_received += 1
-
-        elif event.event_type == EventType.STATE_CHANGE:
-            profile.state_transitions.append(event.data.get("state", ""))
-
-        elif event.event_type == EventType.DECISION:
-            profile.decisions_made.append({
-                "decision": event.data.get("decision", ""),
-                "reasoning": event.data.get("reasoning", "")[:100],
-            })
-            if len(profile.decisions_made) > 50:
-                profile.decisions_made = profile.decisions_made[-50:]
-
-    def _check_anomalies(self, event: IntrospectionEvent) -> None:
-        """Check for behavioral anomalies."""
-        agent_id = event.agent_id
-
-        # Track action repetition
-        action_key = f"{event.event_type.value}:{event.data.get('name', '')}"
-        self._agent_repeated_actions[agent_id].append(action_key)
-        recent = self._agent_repeated_actions[agent_id][-10:]
-
-        # Stuck loop detection: same action repeated 5+ times
-        if len(recent) >= 5 and len(set(recent[-5:])) == 1:
-            self._add_anomaly(
-                agent_id=agent_id,
-                anomaly_type="stuck_loop",
-                description=f"Agent repeating same action: {recent[-1][:50]}",
-                severity="warning",
-            )
-
-        # No progress detection
-        self._agent_action_counts[agent_id] += 1
-        if self._agent_action_counts[agent_id] > 50:
-            last_finding = self._agent_last_finding.get(agent_id, 0)
-            if time.time() - last_finding > 300:  # 5 min without finding
-                self._add_anomaly(
-                    agent_id=agent_id,
-                    anomaly_type="no_progress",
-                    description="Agent has performed 50+ actions with no findings in 5 minutes",
-                    severity="warning",
-                )
-                self._agent_action_counts[agent_id] = 0
-
-        # Trim stored actions
-        if len(self._agent_repeated_actions[agent_id]) > 100:
-            self._agent_repeated_actions[agent_id] = self._agent_repeated_actions[agent_id][-100:]
-
-    def _add_anomaly(
-        self,
-        agent_id: str,
-        anomaly_type: str,
-        description: str,
-        severity: str = "warning",
+        confidence: float,
+        actual: float,
+        domain: str = "",
     ) -> None:
-        """Add an anomaly alert."""
-        alert = AnomalyAlert(
-            alert_id=f"anomaly-{len(self._anomalies)}",
-            agent_id=agent_id,
-            anomaly_type=anomaly_type,
-            description=description,
-            severity=severity,
+        """Record a confidence prediction and its actual outcome."""
+        self._record_counter += 1
+        record = ConfidenceRecord(
+            prediction_id=f"conf-{self._record_counter}",
+            predicted_confidence=confidence,
+            actual_outcome=actual,
+            domain=domain,
         )
-        self._anomalies.append(alert)
-        self._log.warning(
-            "anomaly_detected",
-            agent=agent_id,
-            type=anomaly_type,
-            severity=severity,
+        self._confidence_records.append(record)
+        if len(self._confidence_records) > 500:
+            self._confidence_records = self._confidence_records[-500:]
+
+        self._domain_performance[domain].append(actual)
+
+    def get_calibration_error(self) -> float:
+        """Calculate expected calibration error (ECE)."""
+        if not self._confidence_records:
+            return 0.0
+
+        # Bin predictions into 10 buckets
+        bins: dict[int, list[ConfidenceRecord]] = defaultdict(list)
+        for record in self._confidence_records:
+            bucket = min(9, int(record.predicted_confidence * 10))
+            bins[bucket].append(record)
+
+        total_error = 0.0
+        total_samples = len(self._confidence_records)
+
+        for records in bins.values():
+            if not records:
+                continue
+            avg_confidence = sum(r.predicted_confidence for r in records) / len(records)
+            avg_accuracy = sum(r.actual_outcome for r in records) / len(records)
+            weight = len(records) / total_samples
+            total_error += weight * abs(avg_confidence - avg_accuracy)
+
+        return total_error
+
+    # ── Self-Assessment ──────────────────────────────────
+
+    def introspect(self) -> list[IntrospectionInsight]:
+        """Perform self-assessment and generate insights."""
+        insights = []
+
+        # Performance check
+        insights.extend(self._check_performance())
+
+        # Pattern detection
+        insights.extend(self._detect_patterns())
+
+        # Blind spot detection
+        insights.extend(self._detect_blind_spots())
+
+        # Quality assessment
+        insights.extend(self._assess_quality())
+
+        # Cognitive load
+        insights.extend(self._check_cognitive_load())
+
+        self._insights.extend(insights)
+        return insights
+
+    def _check_performance(self) -> list[IntrospectionInsight]:
+        insights = []
+
+        if self._state.actions_taken > 10 and self._state.success_rate < 0.3:
+            insights.append(IntrospectionInsight(
+                category="performance",
+                description=f"Low success rate: {self._state.success_rate:.0%}",
+                severity="warning",
+                action_suggested="Consider changing approach or tools",
+                confidence=0.8,
+            ))
+
+        if self._state.actions_taken > 20 and self._state.findings_produced == 0:
+            insights.append(IntrospectionInsight(
+                category="performance",
+                description="No findings after 20+ actions",
+                severity="warning",
+                action_suggested="Reassess target or switch strategy",
+                confidence=0.7,
+            ))
+
+        return insights
+
+    def _detect_patterns(self) -> list[IntrospectionInsight]:
+        insights = []
+
+        if self._state.repeated_actions > 5:
+            insights.append(IntrospectionInsight(
+                category="pattern",
+                description=f"High action repetition: {self._state.repeated_actions} repeats",
+                severity="warning",
+                action_suggested="Break out of repetitive loop",
+                confidence=0.9,
+            ))
+
+        # Check for oscillation (A→B→A→B)
+        if len(self._action_history) >= 6:
+            last_6 = self._action_history[-6:]
+            if last_6[0] == last_6[2] == last_6[4] and last_6[1] == last_6[3] == last_6[5]:
+                insights.append(IntrospectionInsight(
+                    category="pattern",
+                    description="Oscillating between two actions",
+                    severity="critical",
+                    action_suggested="Break oscillation — try a completely different approach",
+                    confidence=0.95,
+                ))
+
+        return insights
+
+    def _detect_blind_spots(self) -> list[IntrospectionInsight]:
+        insights = []
+
+        standard_techniques = {
+            "port_scan", "web_scan", "vuln_scan",
+            "auth_test", "injection_test", "config_check",
+        }
+        missing = standard_techniques - self._technique_coverage
+        if self._state.actions_taken > 15 and len(missing) > 3:
+            insights.append(IntrospectionInsight(
+                category="blind_spot",
+                description=f"Missing coverage: {', '.join(list(missing)[:3])}",
+                severity="info",
+                action_suggested="Consider testing these areas",
+                confidence=0.6,
+            ))
+
+        # Overconfidence detection
+        calibration_error = self.get_calibration_error()
+        if calibration_error > 0.2 and len(self._confidence_records) > 10:
+            insights.append(IntrospectionInsight(
+                category="blind_spot",
+                description=f"Confidence miscalibration: ECE={calibration_error:.2f}",
+                severity="warning",
+                action_suggested="Reduce confidence in predictions",
+                confidence=0.8,
+            ))
+
+        return insights
+
+    def _assess_quality(self) -> list[IntrospectionInsight]:
+        insights = []
+
+        fp_rate = (
+            self._state.false_positives / max(1, self._state.findings_produced)
         )
+        if fp_rate > 0.3 and self._state.findings_produced > 5:
+            insights.append(IntrospectionInsight(
+                category="quality",
+                description=f"High false positive rate: {fp_rate:.0%}",
+                severity="warning",
+                action_suggested="Increase validation rigor",
+                confidence=0.8,
+            ))
+
+        return insights
+
+    def _check_cognitive_load(self) -> list[IntrospectionInsight]:
+        insights = []
+
+        if self._state.cognitive_load > 0.8:
+            insights.append(IntrospectionInsight(
+                category="meta",
+                description=f"High cognitive load: {self._state.cognitive_load:.0%}",
+                severity="warning",
+                action_suggested="Reduce pending tasks or simplify context",
+                confidence=0.7,
+            ))
+
+        return insights
+
+    def get_state(self) -> CognitiveState:
+        return self._state
+
+    def get_insights(self, limit: int = 20) -> list[dict[str, Any]]:
+        return [i.to_dict() for i in self._insights[-limit:]]
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            **self._state.to_dict(),
+            "calibration_error": round(self.get_calibration_error(), 3),
+            "insights": len(self._insights),
+            "techniques_covered": len(self._technique_coverage),
+        }
