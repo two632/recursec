@@ -1,13 +1,12 @@
-"""Context manager — manages agent context across recursion levels.
+"""Context manager — manages context windows for agents.
 
 Implements:
-1. Hierarchical context propagation
-2. Context window budgeting
-3. Context compression/summarization
-4. Parent→child context inheritance
-5. Shared context between agents
-6. Context versioning
-7. Rolling context window
+1. Context window size tracking per model
+2. Context pruning strategies (sliding, importance, recency)
+3. Context compression for long conversations
+4. Multi-tier context (system, knowledge, conversation, working)
+5. Token counting and budget enforcement
+6. Context serialization for agent checkpointing
 """
 
 from __future__ import annotations
@@ -22,298 +21,327 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ContextScope(str, Enum):
-    GLOBAL = "global"           # Shared across all agents
-    ASSESSMENT = "assessment"    # Assessment-level
-    AGENT = "agent"              # Agent-private
-    INHERITED = "inherited"      # From parent agent
+class ContextTier(str, Enum):
+    SYSTEM = "system"           # System prompt (always retained)
+    KNOWLEDGE = "knowledge"     # Injected KB content
+    TOOL_DOCS = "tool_docs"     # Tool documentation
+    FINDINGS = "findings"       # Current findings context
+    CONVERSATION = "conversation"  # Agent conversation history
+    WORKING = "working"         # Current working memory
 
 
-class ContextPriority(str, Enum):
-    CRITICAL = "critical"       # Never drop (target, constraints)
-    HIGH = "high"               # Drop last (findings, tool results)
-    MEDIUM = "medium"           # Drop early (history, examples)
-    LOW = "low"                 # Drop first (verbose data)
+class PruneStrategy(str, Enum):
+    SLIDING_WINDOW = "sliding_window"   # Keep most recent
+    IMPORTANCE = "importance"           # Keep highest priority
+    SUMMARIZE = "summarize"             # Compress old context
+    HYBRID = "hybrid"                   # Sliding + importance
 
 
 @dataclass
 class ContextEntry:
-    """A context entry."""
+    """A single context entry."""
     entry_id: str = ""
-    key: str = ""
-    value: str = ""
-    scope: ContextScope = ContextScope.AGENT
-    priority: ContextPriority = ContextPriority.MEDIUM
+    tier: ContextTier = ContextTier.CONVERSATION
+    content: str = ""
     token_estimate: int = 0
-    created_at: float = field(default_factory=time.time)
-    expires_at: float = 0.0
-    version: int = 1
-    source_agent: str = ""
+    priority: int = 0
+    timestamp: float = field(default_factory=time.time)
+    pinned: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.entry_id[:10],
-            "key": self.key[:15],
-            "scope": self.scope.value,
-            "priority": self.priority.value,
+            "tier": self.tier.value,
             "tokens": self.token_estimate,
+            "priority": self.priority,
+            "pinned": self.pinned,
         }
 
 
 @dataclass
 class ContextWindow:
-    """A context window for an agent."""
-    agent_id: str = ""
+    """A complete context window for a model."""
+    window_id: str = ""
+    model_id: str = ""
     max_tokens: int = 4096
     entries: list[ContextEntry] = field(default_factory=list)
-    total_tokens: int = 0
-    dropped_entries: int = 0
+    prune_strategy: PruneStrategy = PruneStrategy.HYBRID
+
+    @property
+    def used_tokens(self) -> int:
+        return sum(e.token_estimate for e in self.entries)
+
+    @property
+    def available_tokens(self) -> int:
+        return max(0, self.max_tokens - self.used_tokens)
+
+    @property
+    def utilization(self) -> float:
+        if self.max_tokens == 0:
+            return 0.0
+        return self.used_tokens / self.max_tokens
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "agent": self.agent_id[:10],
+            "model": self.model_id[:15],
+            "used": self.used_tokens,
             "max": self.max_tokens,
-            "used": self.total_tokens,
             "entries": len(self.entries),
-            "dropped": self.dropped_entries,
+            "util": round(self.utilization, 2),
         }
 
 
-class ContextManager:
-    """Manages agent context across recursion levels.
+# ── Model context sizes ──────────────────────────────────────
 
-    Handles context propagation from parent to child,
-    context window budgeting, and shared context.
+MODEL_CONTEXT_SIZES: dict[str, int] = {
+    "whiterabbitneo-7b": 8192,
+    "qwen-coder-14b": 32768,
+    "qwen-coder-7b": 32768,
+    "deepseek-r1-7b": 32768,
+    "deepseek-math-7b": 4096,
+    "hermes-14b": 8192,
+    "llama-3.1-8b": 131072,
+    "dolphin-8b": 8192,
+    "mistral-7b": 32768,
+    "codellama-13b": 16384,
+    "codellama-7b": 16384,
+    "yi-9b-200k": 200000,
+    "phi-3.5-mini": 128000,
+    "nomic-embed": 8192,
+    "llama-guard-3": 8192,
+    "functiongemma": 8192,
+}
+
+
+# ── Tier budget ratios ────────────────────────────────────────
+
+TIER_BUDGETS: dict[str, float] = {
+    "system": 0.10,         # 10% for system prompt
+    "knowledge": 0.25,      # 25% for knowledge base
+    "tool_docs": 0.10,      # 10% for tool documentation
+    "findings": 0.15,       # 15% for current findings
+    "conversation": 0.30,   # 30% for conversation history
+    "working": 0.10,        # 10% for working memory
+}
+
+
+class ContextManager:
+    """Manages context windows for LLM agents.
+
+    Tracks token usage, enforces budgets,
+    and prunes context using configurable
+    strategies.
     """
 
-    def __init__(self, default_max_tokens: int = 4096) -> None:
+    def __init__(self) -> None:
         self._windows: dict[str, ContextWindow] = {}
-        self._global_context: dict[str, ContextEntry] = {}
         self._counter = 0
-        self._default_max_tokens = default_max_tokens
         self._log = logger.bind(component="context_manager")
 
     def create_window(
         self,
-        agent_id: str,
+        model_id: str,
+        prune_strategy: PruneStrategy = PruneStrategy.HYBRID,
         max_tokens: int = 0,
     ) -> ContextWindow:
-        """Create a context window for an agent."""
+        """Create a context window for a model."""
+        self._counter += 1
+
+        if max_tokens == 0:
+            max_tokens = MODEL_CONTEXT_SIZES.get(model_id, 4096)
+
         window = ContextWindow(
-            agent_id=agent_id,
-            max_tokens=max_tokens or self._default_max_tokens,
+            window_id=f"ctx-{self._counter}",
+            model_id=model_id,
+            max_tokens=max_tokens,
+            prune_strategy=prune_strategy,
         )
-        self._windows[agent_id] = window
+        self._windows[window.window_id] = window
         return window
 
-    def add_context(
+    def add_entry(
         self,
-        agent_id: str,
-        key: str,
-        value: str,
-        scope: ContextScope = ContextScope.AGENT,
-        priority: ContextPriority = ContextPriority.MEDIUM,
-        expires_in_s: float = 0,
+        window_id: str,
+        content: str,
+        tier: ContextTier = ContextTier.CONVERSATION,
+        priority: int = 0,
+        pinned: bool = False,
     ) -> ContextEntry | None:
-        """Add a context entry."""
-        window = self._windows.get(agent_id)
+        """Add content to a context window."""
+        window = self._windows.get(window_id)
         if not window:
             return None
 
-        self._counter += 1
-        token_estimate = len(value) // 4
+        tokens = self._estimate_tokens(content)
 
         entry = ContextEntry(
-            entry_id=f"ctx-{self._counter}",
-            key=key,
-            value=value,
-            scope=scope,
+            entry_id=f"entry-{window_id}-{len(window.entries)}",
+            tier=tier,
+            content=content,
+            token_estimate=tokens,
             priority=priority,
-            token_estimate=token_estimate,
-            source_agent=agent_id,
+            pinned=pinned,
         )
 
-        if expires_in_s > 0:
-            entry.expires_at = time.time() + expires_in_s
+        window.entries.append(entry)
 
-        # Check if we need to evict
-        while window.total_tokens + token_estimate > window.max_tokens:
-            if not self._evict_lowest_priority(window):
-                break
-
-        if window.total_tokens + token_estimate <= window.max_tokens:
-            window.entries.append(entry)
-            window.total_tokens += token_estimate
-        else:
-            window.dropped_entries += 1
-            return None
-
-        # Also add to global if scope is global
-        if scope == ContextScope.GLOBAL:
-            self._global_context[key] = entry
+        # Auto-prune if over budget
+        if window.used_tokens > window.max_tokens:
+            self._prune(window)
 
         return entry
 
-    def _evict_lowest_priority(self, window: ContextWindow) -> bool:
-        """Evict the lowest priority entry from a window."""
-        priority_order = [
-            ContextPriority.LOW,
-            ContextPriority.MEDIUM,
-            ContextPriority.HIGH,
-            ContextPriority.CRITICAL,
-        ]
+    def _prune(self, window: ContextWindow) -> int:
+        """Prune context to fit within budget."""
+        if window.prune_strategy == PruneStrategy.SLIDING_WINDOW:
+            return self._prune_sliding(window)
+        elif window.prune_strategy == PruneStrategy.IMPORTANCE:
+            return self._prune_importance(window)
+        elif window.prune_strategy == PruneStrategy.HYBRID:
+            return self._prune_hybrid(window)
+        return 0
 
-        for priority in priority_order:
-            for i, entry in enumerate(window.entries):
-                if entry.priority == priority:
-                    window.total_tokens -= entry.token_estimate
-                    window.entries.pop(i)
-                    window.dropped_entries += 1
-                    return True
+    def _prune_sliding(self, window: ContextWindow) -> int:
+        """Keep most recent entries, drop oldest."""
+        pruned = 0
+        while window.used_tokens > window.max_tokens and window.entries:
+            # Find oldest unpinned entry
+            for idx, entry in enumerate(window.entries):
+                if not entry.pinned and entry.tier != ContextTier.SYSTEM:
+                    window.entries.pop(idx)
+                    pruned += 1
+                    break
+            else:
+                break
+        return pruned
 
-        return False
-
-    def inherit_context(
-        self,
-        parent_id: str,
-        child_id: str,
-        max_inherit_tokens: int = 2048,
-    ) -> int:
-        """Inherit context from parent to child agent."""
-        parent = self._windows.get(parent_id)
-        child = self._windows.get(child_id)
-        if not parent or not child:
-            return 0
-
-        inherited = 0
-        # Inherit entries by priority (critical first)
-        sorted_entries = sorted(
-            parent.entries,
-            key=lambda e: {
-                ContextPriority.CRITICAL: 0,
-                ContextPriority.HIGH: 1,
-                ContextPriority.MEDIUM: 2,
-                ContextPriority.LOW: 3,
-            }.get(e.priority, 4),
-        )
-
-        for entry in sorted_entries:
-            if inherited + entry.token_estimate > max_inherit_tokens:
+    def _prune_importance(self, window: ContextWindow) -> int:
+        """Drop lowest priority entries."""
+        pruned = 0
+        while window.used_tokens > window.max_tokens and window.entries:
+            # Find lowest priority unpinned entry
+            candidates = [
+                (idx, e) for idx, e in enumerate(window.entries)
+                if not e.pinned and e.tier != ContextTier.SYSTEM
+            ]
+            if not candidates:
                 break
 
-            # Don't inherit agent-private context
-            if entry.scope == ContextScope.AGENT:
-                continue
+            candidates.sort(key=lambda x: x[1].priority)
+            idx, _ = candidates[0]
+            window.entries.pop(idx)
+            pruned += 1
 
-            self.add_context(
-                child_id,
-                key=entry.key,
-                value=entry.value,
-                scope=ContextScope.INHERITED,
-                priority=entry.priority,
-            )
-            inherited += entry.token_estimate
+        return pruned
 
-        # Also inject global context
-        for key, entry in self._global_context.items():
-            if inherited + entry.token_estimate > max_inherit_tokens:
+    def _prune_hybrid(self, window: ContextWindow) -> int:
+        """Hybrid pruning: old conversation + low importance."""
+        pruned = 0
+        while window.used_tokens > window.max_tokens and window.entries:
+            candidates = [
+                (idx, e) for idx, e in enumerate(window.entries)
+                if not e.pinned and e.tier != ContextTier.SYSTEM
+            ]
+            if not candidates:
                 break
-            self.add_context(
-                child_id,
-                key=entry.key,
-                value=entry.value,
-                scope=ContextScope.GLOBAL,
-                priority=entry.priority,
-            )
-            inherited += entry.token_estimate
 
-        return inherited
+            # Score: lower is more pruneable
+            now = time.time()
+            scored = []
+            for idx, entry in candidates:
+                age_s = now - entry.timestamp
+                age_score = min(1.0, age_s / 3600)  # Normalized to 1 hour
+                prio_score = entry.priority / 100.0
+                # Higher score = keep, lower score = prune
+                keep_score = prio_score * 0.6 + (1.0 - age_score) * 0.4
+                scored.append((idx, keep_score))
 
-    def get_context_text(
+            scored.sort(key=lambda x: x[1])
+            idx, _ = scored[0]
+            window.entries.pop(idx)
+            pruned += 1
+
+        return pruned
+
+    def get_tier_content(
         self,
-        agent_id: str,
-        max_tokens: int = 0,
+        window_id: str,
+        tier: ContextTier,
     ) -> str:
-        """Get the full context text for an agent."""
-        window = self._windows.get(agent_id)
+        """Get all content for a specific tier."""
+        window = self._windows.get(window_id)
         if not window:
             return ""
 
-        # Remove expired entries
-        now = time.time()
-        window.entries = [
-            e for e in window.entries
-            if e.expires_at == 0 or e.expires_at > now
+        return "\n".join(
+            e.content for e in window.entries
+            if e.tier == tier
+        )
+
+    def get_full_context(self, window_id: str) -> str:
+        """Get full assembled context."""
+        window = self._windows.get(window_id)
+        if not window:
+            return ""
+
+        # Order by tier priority
+        tier_order = [
+            ContextTier.SYSTEM,
+            ContextTier.KNOWLEDGE,
+            ContextTier.TOOL_DOCS,
+            ContextTier.FINDINGS,
+            ContextTier.CONVERSATION,
+            ContextTier.WORKING,
         ]
 
         parts = []
-        tokens_used = 0
-        max_t = max_tokens or window.max_tokens
-
-        # Output in priority order
-        sorted_entries = sorted(
-            window.entries,
-            key=lambda e: {
-                ContextPriority.CRITICAL: 0,
-                ContextPriority.HIGH: 1,
-                ContextPriority.MEDIUM: 2,
-                ContextPriority.LOW: 3,
-            }.get(e.priority, 4),
-        )
-
-        for entry in sorted_entries:
-            if tokens_used + entry.token_estimate > max_t:
-                break
-            parts.append(f"[{entry.key}]\n{entry.value}")
-            tokens_used += entry.token_estimate
+        for tier in tier_order:
+            tier_content = self.get_tier_content(window_id, tier)
+            if tier_content:
+                parts.append(tier_content)
 
         return "\n\n".join(parts)
 
-    def update_context(
+    def get_tier_budget(
         self,
-        agent_id: str,
-        key: str,
-        value: str,
-    ) -> bool:
-        """Update an existing context entry."""
-        window = self._windows.get(agent_id)
+        window_id: str,
+        tier: ContextTier,
+    ) -> int:
+        """Get token budget for a specific tier."""
+        window = self._windows.get(window_id)
         if not window:
-            return False
+            return 0
 
+        ratio = TIER_BUDGETS.get(tier.value, 0.1)
+        return int(window.max_tokens * ratio)
+
+    def get_tier_usage(
+        self,
+        window_id: str,
+    ) -> dict[str, int]:
+        """Get token usage by tier."""
+        window = self._windows.get(window_id)
+        if not window:
+            return {}
+
+        usage: dict[str, int] = {}
         for entry in window.entries:
-            if entry.key == key:
-                old_tokens = entry.token_estimate
-                entry.value = value
-                entry.token_estimate = len(value) // 4
-                entry.version += 1
-                window.total_tokens += entry.token_estimate - old_tokens
-                return True
+            tier_name = entry.tier.value
+            usage[tier_name] = usage.get(tier_name, 0) + entry.token_estimate
 
-        return False
+        return usage
 
-    def remove_context(self, agent_id: str, key: str) -> bool:
-        """Remove a context entry."""
-        window = self._windows.get(agent_id)
-        if not window:
-            return False
-
-        for i, entry in enumerate(window.entries):
-            if entry.key == key:
-                window.total_tokens -= entry.token_estimate
-                window.entries.pop(i)
-                return True
-
-        return False
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count (~4 chars per token)."""
+        return len(text) // 4
 
     def get_stats(self) -> dict[str, Any]:
-        total_entries = sum(len(w.entries) for w in self._windows.values())
-        total_tokens = sum(w.total_tokens for w in self._windows.values())
-        total_dropped = sum(w.dropped_entries for w in self._windows.values())
-
+        total_tokens = sum(w.used_tokens for w in self._windows.values())
         return {
             "windows": len(self._windows),
-            "total_entries": total_entries,
             "total_tokens": total_tokens,
-            "total_dropped": total_dropped,
-            "global_entries": len(self._global_context),
+            "avg_utilization": round(
+                sum(w.utilization for w in self._windows.values()) /
+                max(1, len(self._windows)), 2,
+            ),
         }
