@@ -1,20 +1,18 @@
-"""Hypothesis engine — scientific method for vulnerability discovery.
+"""Hypothesis engine — generates and validates security hypotheses.
 
 Implements:
-1. Hypothesis generation from observations
-2. Evidence collection and evaluation
-3. Hypothesis testing and validation
-4. Bayesian belief updating
-5. Competing hypothesis analysis
-6. Evidence weighting
-7. Confidence interval estimation
-8. Hypothesis prioritization
+1. Hypothesis generation from partial information
+2. Evidence collection planning
+3. Hypothesis validation/refutation
+4. Bayesian confidence updating
+5. Alternative hypothesis generation
+6. Evidence chain building
+7. False positive elimination
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -30,15 +28,22 @@ class HypothesisStatus(str, Enum):
     CONFIRMED = "confirmed"
     REFUTED = "refuted"
     INCONCLUSIVE = "inconclusive"
+    SUPERSEDED = "superseded"
 
 
 class EvidenceType(str, Enum):
     TOOL_OUTPUT = "tool_output"
     LLM_ANALYSIS = "llm_analysis"
-    PATTERN_MATCH = "pattern_match"
-    BEHAVIORAL = "behavioral"
-    NEGATIVE = "negative"        # Evidence AGAINST hypothesis
-    CORROBORATING = "corroborating"
+    MANUAL_CHECK = "manual_check"
+    CORRELATION = "correlation"
+    NEGATIVE = "negative"          # Absence of expected indicator
+
+
+class EvidenceStrength(str, Enum):
+    STRONG = "strong"         # Direct proof
+    MODERATE = "moderate"     # Supports hypothesis
+    WEAK = "weak"            # Partial/indirect
+    CONTRADICTORY = "contradictory"  # Against hypothesis
 
 
 @dataclass
@@ -46,315 +51,283 @@ class Evidence:
     """A piece of evidence for or against a hypothesis."""
     evidence_id: str = ""
     evidence_type: EvidenceType = EvidenceType.TOOL_OUTPUT
-    source: str = ""              # Which tool or model produced it
+    strength: EvidenceStrength = EvidenceStrength.MODERATE
+    source: str = ""           # Tool name or model ID
     description: str = ""
-    supports: bool = True         # True = supports, False = contradicts
-    strength: float = 0.5         # 0-1, how strong is this evidence
-    reliability: float = 0.8      # 0-1, how reliable is the source
+    raw_data: str = ""
+    supports_hypothesis: bool = True
     timestamp: float = field(default_factory=time.time)
-
-    @property
-    def weighted_strength(self) -> float:
-        """Evidence strength weighted by source reliability."""
-        return self.strength * self.reliability
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.evidence_id[:10],
             "type": self.evidence_type.value,
+            "strength": self.strength.value,
             "source": self.source[:15],
-            "supports": self.supports,
-            "strength": round(self.weighted_strength, 2),
+            "supports": self.supports_hypothesis,
+        }
+
+
+@dataclass
+class TestPlan:
+    """A plan to test a hypothesis."""
+    plan_id: str = ""
+    hypothesis_id: str = ""
+    tool_name: str = ""
+    tool_args: list[str] = field(default_factory=list)
+    expected_if_true: str = ""      # What to expect if hypothesis is correct
+    expected_if_false: str = ""     # What to expect if hypothesis is wrong
+    priority: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.plan_id[:10],
+            "tool": self.tool_name,
+            "priority": self.priority,
         }
 
 
 @dataclass
 class Hypothesis:
-    """A hypothesis about a vulnerability or security issue."""
+    """A security hypothesis to test."""
     hypothesis_id: str = ""
-    statement: str = ""           # The hypothesis statement
-    category: str = ""            # xss, sqli, auth_bypass, etc.
-    target: str = ""
     status: HypothesisStatus = HypothesisStatus.PROPOSED
-    prior_probability: float = 0.5
-    posterior_probability: float = 0.5
+    description: str = ""
+    category: str = ""          # e.g., "injection", "auth_bypass"
+    target: str = ""
+    prior_confidence: float = 0.5  # Initial probability
+    current_confidence: float = 0.5
     evidence: list[Evidence] = field(default_factory=list)
-    tests_planned: list[str] = field(default_factory=list)
-    tests_completed: list[str] = field(default_factory=list)
+    test_plans: list[TestPlan] = field(default_factory=list)
+    alternatives: list[str] = field(default_factory=list)  # Alternative hypothesis IDs
     created_at: float = field(default_factory=time.time)
     resolved_at: float = 0.0
-    parent_hypothesis: str = ""   # For sub-hypotheses
-    child_hypotheses: list[str] = field(default_factory=list)
-
-    @property
-    def evidence_count(self) -> int:
-        return len(self.evidence)
-
-    @property
-    def supporting_evidence(self) -> list[Evidence]:
-        return [e for e in self.evidence if e.supports]
-
-    @property
-    def contradicting_evidence(self) -> list[Evidence]:
-        return [e for e in self.evidence if not e.supports]
-
-    @property
-    def confidence(self) -> float:
-        """Confidence in the hypothesis (distance from 0.5)."""
-        return abs(self.posterior_probability - 0.5) * 2
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.hypothesis_id[:10],
-            "statement": self.statement[:40],
             "status": self.status.value,
-            "prior": round(self.prior_probability, 3),
-            "posterior": round(self.posterior_probability, 3),
-            "confidence": round(self.confidence, 2),
-            "evidence": self.evidence_count,
-            "supporting": len(self.supporting_evidence),
-            "contradicting": len(self.contradicting_evidence),
+            "desc": self.description[:30],
+            "confidence": round(self.current_confidence, 2),
+            "evidence_count": len(self.evidence),
+            "tests_planned": len(self.test_plans),
         }
 
 
-class HypothesisEngine:
-    """Scientific method for vulnerability discovery.
+# ── Bayesian update weights ──────────────────────────────────
 
-    Uses Bayesian reasoning to generate, test, and update
-    hypotheses about security vulnerabilities. Each hypothesis
-    is treated as a scientific claim to be validated or refuted
-    through evidence collection.
+EVIDENCE_LIKELIHOOD_RATIOS: dict[str, dict[str, float]] = {
+    "strong": {"supports": 4.0, "contradicts": 0.1},
+    "moderate": {"supports": 2.0, "contradicts": 0.3},
+    "weak": {"supports": 1.3, "contradicts": 0.7},
+    "contradictory": {"supports": 0.2, "contradicts": 3.0},
+}
+
+# ── Hypothesis generation templates ──────────────────────────
+
+HYPOTHESIS_TEMPLATES: dict[str, list[dict[str, Any]]] = {
+    "open_port": [
+        {"desc": "Service running on port {port} is vulnerable to known exploits",
+         "category": "service_vuln", "prior": 0.3,
+         "tests": [{"tool": "nmap", "args": ["--script", "vuln", "-p", "{port}"]}]},
+        {"desc": "Service on port {port} has default credentials",
+         "category": "default_creds", "prior": 0.4,
+         "tests": [{"tool": "hydra", "args": ["-C", "default-creds.txt"]}]},
+        {"desc": "Service on port {port} leaks version information",
+         "category": "info_disclosure", "prior": 0.6,
+         "tests": [{"tool": "nmap", "args": ["-sV", "-p", "{port}"]}]},
+    ],
+    "web_endpoint": [
+        {"desc": "Endpoint {url} is vulnerable to SQL injection",
+         "category": "injection", "prior": 0.2,
+         "tests": [{"tool": "sqlmap", "args": ["-u", "{url}", "--batch"]}]},
+        {"desc": "Endpoint {url} is vulnerable to XSS",
+         "category": "xss", "prior": 0.3,
+         "tests": [{"tool": "dalfox", "args": ["url", "{url}"]}]},
+        {"desc": "Endpoint {url} has broken access control",
+         "category": "access_control", "prior": 0.35,
+         "tests": [{"tool": "custom", "args": ["test_idor"]}]},
+    ],
+    "authentication": [
+        {"desc": "Authentication mechanism is vulnerable to brute force",
+         "category": "brute_force", "prior": 0.3,
+         "tests": [{"tool": "hydra", "args": ["-L", "users.txt", "-P", "pass.txt"]}]},
+        {"desc": "Session management has predictable tokens",
+         "category": "session", "prior": 0.2},
+        {"desc": "Password reset flow is exploitable",
+         "category": "auth_bypass", "prior": 0.25},
+    ],
+}
+
+
+def _bayesian_update(prior: float, likelihood_ratio: float) -> float:
+    """Update probability using Bayes' rule."""
+    odds = prior / max(0.001, 1.0 - prior)
+    posterior_odds = odds * likelihood_ratio
+    posterior = posterior_odds / (1.0 + posterior_odds)
+    return max(0.01, min(0.99, posterior))
+
+
+class HypothesisEngine:
+    """Generates and validates security hypotheses.
+
+    Uses Bayesian reasoning to track confidence
+    in security hypotheses and plan evidence
+    collection.
     """
 
-    def __init__(
-        self,
-        confirmation_threshold: float = 0.85,
-        refutation_threshold: float = 0.15,
-    ) -> None:
+    def __init__(self) -> None:
         self._hypotheses: dict[str, Hypothesis] = {}
         self._counter = 0
-        self._confirmation_threshold = confirmation_threshold
-        self._refutation_threshold = refutation_threshold
+        self._evidence_counter = 0
+        self._plan_counter = 0
         self._log = logger.bind(component="hypothesis_engine")
 
-    def propose(
+    def generate_hypotheses(
         self,
-        statement: str,
-        category: str = "",
-        target: str = "",
-        prior: float = 0.5,
-        parent: str = "",
-        tests: list[str] | None = None,
-    ) -> Hypothesis:
-        """Propose a new hypothesis."""
-        self._counter += 1
+        context_type: str,
+        context_data: dict[str, Any],
+    ) -> list[Hypothesis]:
+        """Generate hypotheses from context."""
+        templates = HYPOTHESIS_TEMPLATES.get(context_type, [])
+        generated: list[Hypothesis] = []
 
-        h = Hypothesis(
-            hypothesis_id=f"hyp-{self._counter}",
-            statement=statement,
-            category=category,
-            target=target,
-            prior_probability=prior,
-            posterior_probability=prior,
-            tests_planned=tests or [],
-            parent_hypothesis=parent,
-        )
+        for tmpl in templates:
+            self._counter += 1
+            desc = tmpl["desc"]
+            for key, value in context_data.items():
+                desc = desc.replace("{" + key + "}", str(value))
 
-        self._hypotheses[h.hypothesis_id] = h
+            hyp = Hypothesis(
+                hypothesis_id=f"hyp-{self._counter}",
+                description=desc,
+                category=tmpl.get("category", ""),
+                target=context_data.get("target", ""),
+                prior_confidence=tmpl.get("prior", 0.5),
+                current_confidence=tmpl.get("prior", 0.5),
+            )
 
-        # Link to parent
-        if parent and parent in self._hypotheses:
-            self._hypotheses[parent].child_hypotheses.append(h.hypothesis_id)
+            # Generate test plans
+            for test in tmpl.get("tests", []):
+                self._plan_counter += 1
+                args = []
+                for arg in test.get("args", []):
+                    for k, v in context_data.items():
+                        arg = arg.replace("{" + k + "}", str(v))
+                    args.append(arg)
 
-        return h
+                plan = TestPlan(
+                    plan_id=f"plan-{self._plan_counter}",
+                    hypothesis_id=hyp.hypothesis_id,
+                    tool_name=test.get("tool", ""),
+                    tool_args=args,
+                )
+                hyp.test_plans.append(plan)
+
+            self._hypotheses[hyp.hypothesis_id] = hyp
+            generated.append(hyp)
+
+        return generated
 
     def add_evidence(
         self,
         hypothesis_id: str,
         evidence_type: EvidenceType,
+        strength: EvidenceStrength,
         source: str,
         description: str,
-        supports: bool,
-        strength: float = 0.5,
-        reliability: float = 0.8,
+        supports: bool = True,
+        raw_data: str = "",
     ) -> Evidence | None:
-        """Add evidence and update hypothesis probability."""
-        h = self._hypotheses.get(hypothesis_id)
-        if not h:
+        """Add evidence and update confidence."""
+        hyp = self._hypotheses.get(hypothesis_id)
+        if not hyp:
             return None
 
-        self._counter += 1
+        self._evidence_counter += 1
         evidence = Evidence(
-            evidence_id=f"ev-{self._counter}",
+            evidence_id=f"ev-{self._evidence_counter}",
             evidence_type=evidence_type,
+            strength=strength,
             source=source,
             description=description,
-            supports=supports,
-            strength=strength,
-            reliability=reliability,
+            supports_hypothesis=supports,
+            raw_data=raw_data,
         )
-
-        h.evidence.append(evidence)
+        hyp.evidence.append(evidence)
 
         # Bayesian update
-        self._bayesian_update(h, evidence)
+        ratios = EVIDENCE_LIKELIHOOD_RATIOS.get(strength.value, {})
+        if supports:
+            lr = ratios.get("supports", 1.5)
+        else:
+            lr = ratios.get("contradicts", 0.5)
 
-        # Check if hypothesis is resolved
-        if h.posterior_probability >= self._confirmation_threshold:
-            h.status = HypothesisStatus.CONFIRMED
-            h.resolved_at = time.time()
-        elif h.posterior_probability <= self._refutation_threshold:
-            h.status = HypothesisStatus.REFUTED
-            h.resolved_at = time.time()
+        hyp.current_confidence = _bayesian_update(hyp.current_confidence, lr)
+
+        # Auto-resolve
+        if hyp.current_confidence >= 0.90:
+            hyp.status = HypothesisStatus.CONFIRMED
+            hyp.resolved_at = time.time()
+        elif hyp.current_confidence <= 0.10:
+            hyp.status = HypothesisStatus.REFUTED
+            hyp.resolved_at = time.time()
 
         return evidence
 
-    def _bayesian_update(self, h: Hypothesis, evidence: Evidence) -> None:
-        """Update hypothesis probability using Bayes' theorem.
-
-        P(H|E) = P(E|H) * P(H) / P(E)
-        P(E) = P(E|H) * P(H) + P(E|~H) * P(~H)
-        """
-        prior = h.posterior_probability
-        ws = evidence.weighted_strength
-
-        if evidence.supports:
-            # Likelihood: P(E|H) is high when evidence supports
-            p_e_given_h = 0.5 + ws * 0.5     # 0.5 to 1.0
-            p_e_given_not_h = 0.5 - ws * 0.4  # 0.1 to 0.5
-        else:
-            # Contradicting evidence
-            p_e_given_h = 0.5 - ws * 0.4     # 0.1 to 0.5
-            p_e_given_not_h = 0.5 + ws * 0.5  # 0.5 to 1.0
-
-        # Bayes' theorem
-        p_e = p_e_given_h * prior + p_e_given_not_h * (1 - prior)
-
-        if p_e > 0:
-            posterior = (p_e_given_h * prior) / p_e
-        else:
-            posterior = prior
-
-        # Clamp to [0.01, 0.99]
-        h.posterior_probability = max(0.01, min(0.99, posterior))
-
-    def mark_testing(self, hypothesis_id: str, test_name: str) -> bool:
-        """Mark a hypothesis as being tested."""
-        h = self._hypotheses.get(hypothesis_id)
-        if not h:
-            return False
-
-        h.status = HypothesisStatus.TESTING
-        h.tests_completed.append(test_name)
-        return True
-
-    def get_hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
-        """Get a hypothesis by ID."""
-        return self._hypotheses.get(hypothesis_id)
-
     def get_active_hypotheses(self) -> list[Hypothesis]:
-        """Get all active (unresolved) hypotheses."""
+        """Get hypotheses still being tested."""
         return [
             h for h in self._hypotheses.values()
             if h.status in (HypothesisStatus.PROPOSED, HypothesisStatus.TESTING)
         ]
 
     def get_confirmed(self) -> list[Hypothesis]:
-        """Get all confirmed hypotheses."""
+        """Get confirmed hypotheses."""
         return [
             h for h in self._hypotheses.values()
             if h.status == HypothesisStatus.CONFIRMED
         ]
 
-    def get_prioritized(self) -> list[Hypothesis]:
-        """Get active hypotheses prioritized by expected value.
+    def get_next_test_plan(self) -> TestPlan | None:
+        """Get the highest priority untested plan."""
+        for hyp in self.get_active_hypotheses():
+            if hyp.test_plans:
+                return hyp.test_plans[0]
+        return None
 
-        Priority = posterior_probability * (1 - confidence)
-        This favors hypotheses that are likely true but not yet
-        confirmed (most value from additional testing).
-        """
+    def consume_test_plan(self, hypothesis_id: str) -> TestPlan | None:
+        """Pop the next test plan for a hypothesis."""
+        hyp = self._hypotheses.get(hypothesis_id)
+        if not hyp or not hyp.test_plans:
+            return None
+        plan = hyp.test_plans.pop(0)
+        hyp.status = HypothesisStatus.TESTING
+        return plan
+
+    def build_hypothesis_prompt(self, max_hypotheses: int = 5) -> str:
+        """Build hypothesis context for LLM."""
+        lines = ["## Active Hypotheses\n"]
         active = self.get_active_hypotheses()
-        active.sort(
-            key=lambda h: h.posterior_probability * (1 - h.confidence),
-            reverse=True,
-        )
-        return active
-
-    def generate_competing(
-        self,
-        observation: str,
-        category: str = "",
-        target: str = "",
-        count: int = 3,
-    ) -> list[Hypothesis]:
-        """Generate competing hypotheses for an observation.
-
-        For a given observation (e.g., "server returns 500"),
-        generate multiple competing explanations.
-        """
-        competing_templates = {
-            "500_error": [
-                "Server-side injection vulnerability (SQLi/SSTI)",
-                "Application error due to malformed input handling",
-                "Rate limiting or WAF blocking the request",
-            ],
-            "auth_bypass": [
-                "Authentication logic has a bypass vulnerability",
-                "Session management is misconfigured",
-                "Default credentials are in use",
-            ],
-            "data_exposure": [
-                "Sensitive data exposed through API response",
-                "Debug mode is enabled in production",
-                "Access control is missing for this endpoint",
-            ],
-            "redirect": [
-                "Open redirect vulnerability exists",
-                "Server-side redirect is intentional behavior",
-                "URL rewriting rule is misconfigured",
-            ],
-        }
-
-        templates = competing_templates.get(category, [
-            f"Observation '{observation[:30]}' indicates a security vulnerability",
-            f"Observation '{observation[:30]}' is benign behavior",
-            f"Observation '{observation[:30]}' is a false positive from the tool",
-        ])
-
-        hypotheses = []
-        for i, template in enumerate(templates[:count]):
-            # Assign priors that sum to ~1
-            prior = 1.0 / count
-            h = self.propose(
-                statement=template,
-                category=category,
-                target=target,
-                prior=prior,
+        for hyp in active[:max_hypotheses]:
+            lines.append(
+                f"- [{hyp.current_confidence:.0%}] {hyp.description} "
+                f"({len(hyp.evidence)} evidence, {len(hyp.test_plans)} tests remaining)"
             )
-            hypotheses.append(h)
-
-        return hypotheses
-
-    def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
-        category_counts: dict[str, int] = defaultdict(int)
-        for h in self._hypotheses.values():
-            status_counts[h.status.value] += 1
-            if h.category:
-                category_counts[h.category] += 1
-
-        total_evidence = sum(h.evidence_count for h in self._hypotheses.values())
-        avg_confidence = 0.0
         confirmed = self.get_confirmed()
         if confirmed:
-            avg_confidence = sum(h.confidence for h in confirmed) / len(confirmed)
+            lines.append("\n## Confirmed Findings:")
+            for hyp in confirmed[:5]:
+                lines.append(f"- {hyp.description} ({hyp.current_confidence:.0%})")
+        return "\n".join(lines)
+
+    def get_stats(self) -> dict[str, Any]:
+        status_counts: dict[str, int] = {}
+        for h in self._hypotheses.values():
+            status_counts[h.status.value] = status_counts.get(h.status.value, 0) + 1
 
         return {
-            "hypotheses": len(self._hypotheses),
-            "active": len(self.get_active_hypotheses()),
-            "confirmed": len(confirmed),
-            "total_evidence": total_evidence,
-            "avg_confirmed_confidence": round(avg_confidence, 2),
-            "by_status": dict(status_counts),
-            "by_category": dict(category_counts),
+            "total": len(self._hypotheses),
+            "by_status": status_counts,
+            "total_evidence": sum(len(h.evidence) for h in self._hypotheses.values()),
         }
