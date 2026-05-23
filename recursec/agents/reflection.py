@@ -1,18 +1,19 @@
-"""Agent self-reflection — metacognitive monitoring and self-improvement.
+"""Reflection engine — post-action analysis and learning.
 
-Implements systematic self-reflection for agents:
-1. Action review: Was the last action effective?
-2. Strategy assessment: Is the current approach working?
-3. Knowledge gaps: What don't we know that we should?
-4. Blind spot detection: What are we missing?
-5. Bias detection: Are we favoring certain approaches?
-6. Performance monitoring: Are we getting better or worse?
-7. Self-critique: What would a human expert do differently?
+After each phase, task, or assessment, the reflection engine:
+1. Analyzes what went well and what didn't
+2. Identifies patterns in successes and failures
+3. Extracts lessons for future assessments
+4. Suggests strategy adjustments
+5. Evaluates tool effectiveness
+6. Detects blind spots and missed opportunities
+7. Generates improvement recommendations
 
-Reflection happens at three scales:
-- Micro: After each action (quick check)
-- Meso: After each phase (strategy review)
-- Macro: After assessment (full retrospective)
+Reflection types:
+- Micro: After each tool execution or LLM call
+- Phase: After each assessment phase completes
+- Assessment: After an entire assessment
+- Meta: Periodic cross-assessment reflection
 """
 
 from __future__ import annotations
@@ -32,494 +33,392 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
-class ReflectionScale(str, Enum):
-    MICRO = "micro"    # After each action
-    MESO = "meso"      # After each phase
-    MACRO = "macro"    # After full assessment
+class ReflectionLevel(str, Enum):
+    MICRO = "micro"         # After individual actions
+    PHASE = "phase"         # After assessment phases
+    ASSESSMENT = "assessment"  # After complete assessments
+    META = "meta"           # Cross-assessment patterns
 
 
-class InsightType(str, Enum):
-    STRATEGY_CHANGE = "strategy_change"
-    KNOWLEDGE_GAP = "knowledge_gap"
+class ReflectionCategory(str, Enum):
+    STRATEGY = "strategy"
+    TOOL_USE = "tool_use"
+    COVERAGE = "coverage"
+    EFFICIENCY = "efficiency"
+    ACCURACY = "accuracy"
     BLIND_SPOT = "blind_spot"
-    BIAS_DETECTED = "bias_detected"
-    EFFICIENCY_ISSUE = "efficiency_issue"
-    MISSED_OPPORTUNITY = "missed_opportunity"
-    SUCCESS_PATTERN = "success_pattern"
-    FAILURE_PATTERN = "failure_pattern"
 
 
 @dataclass
-class Insight:
-    """An insight from self-reflection."""
-    insight_type: InsightType
-    description: str
-    severity: str = "medium"  # low, medium, high
-    actionable: bool = True
+class ReflectionInsight:
+    """A single insight from reflection."""
+    insight_id: str = ""
+    level: ReflectionLevel = ReflectionLevel.MICRO
+    category: ReflectionCategory = ReflectionCategory.STRATEGY
+    description: str = ""
+    lesson: str = ""
+    actionable: bool = False
     suggested_action: str = ""
     confidence: float = 0.5
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "type": self.insight_type.value,
+            "id": self.insight_id,
+            "level": self.level.value,
+            "category": self.category.value,
             "description": self.description[:200],
-            "severity": self.severity,
+            "lesson": self.lesson[:200],
             "actionable": self.actionable,
-            "action": self.suggested_action[:200],
+            "action": self.suggested_action[:200] if self.actionable else "",
             "confidence": round(self.confidence, 2),
         }
 
 
 @dataclass
-class ReflectionResult:
-    """Result of a reflection session."""
-    scale: ReflectionScale
-    insights: list[Insight] = field(default_factory=list)
-    overall_assessment: str = ""
-    confidence: float = 0.5
-    should_change_approach: bool = False
-    suggested_changes: list[str] = field(default_factory=list)
-    timestamp: float = field(default_factory=time.time)
+class ReflectionReport:
+    """Comprehensive reflection report."""
+    level: ReflectionLevel = ReflectionLevel.ASSESSMENT
+    insights: list[ReflectionInsight] = field(default_factory=list)
+    what_worked: list[str] = field(default_factory=list)
+    what_failed: list[str] = field(default_factory=list)
+    improvements: list[str] = field(default_factory=list)
+    tool_effectiveness: dict[str, float] = field(default_factory=dict)
+    coverage_gaps: list[str] = field(default_factory=list)
+    overall_quality: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "scale": self.scale.value,
-            "insights": [i.to_dict() for i in self.insights],
-            "assessment": self.overall_assessment[:300],
-            "confidence": round(self.confidence, 2),
-            "change_approach": self.should_change_approach,
-            "changes": self.suggested_changes[:5],
+            "level": self.level.value,
+            "insights": len(self.insights),
+            "worked": self.what_worked[:5],
+            "failed": self.what_failed[:5],
+            "improvements": self.improvements[:5],
+            "coverage_gaps": self.coverage_gaps[:5],
+            "quality": round(self.overall_quality, 2),
         }
 
 
 # ── Prompt Templates ────────────────────────────────────────
 
-MICRO_REFLECTION_PROMPT = """Quickly review the last action. Was it effective?
+MICRO_REFLECT_PROMPT = """Briefly reflect on this action's result.
 
 Action: {action}
+Tool used: {tool}
+Target: {target}
 Result: {result}
-Goal: {goal}
+Success: {success}
+Duration: {duration}s
 
-In 2-3 sentences: Was this useful? Should we adjust our approach?
+In 2-3 sentences:
+1. Was this the right action?
+2. What did we learn?
+3. What should we do next?
+
 Respond as JSON:
 {{
-  "effective": true/false,
-  "insight": "what we learned",
-  "adjustment": "what to change (or empty)",
+  "assessment": "good|ok|poor",
+  "lesson": "what we learned",
+  "next_action": "what to do next",
   "confidence": 0.X
 }}"""
 
-MESO_REFLECTION_PROMPT = """Review the current phase of security assessment.
+PHASE_REFLECT_PROMPT = """Reflect on this completed assessment phase.
 
 Phase: {phase}
-Actions taken so far: {actions}
-Findings so far: {findings}
-Goals: {goals}
-Time elapsed: {elapsed_s}s
-Budget remaining: {budget}
+Tasks completed: {tasks_completed}
+Tasks failed: {tasks_failed}
+Findings: {findings_count}
+Duration: {duration}s
+Tools used: {tools_used}
 
 Analyze:
-1. Are we making good progress?
-2. What are we missing?
-3. Are we biased toward certain approaches?
-4. What would an expert do differently?
-5. Should we change strategy?
+1. What went well in this phase?
+2. What could have been done better?
+3. Were the right tools used?
+4. What coverage gaps exist?
+5. What should the next phase focus on?
 
 Respond as JSON:
 {{
-  "progress_assessment": "good|fair|poor",
-  "missing": ["things we should check"],
-  "biases": ["detected biases"],
-  "expert_would": ["what an expert would do"],
-  "change_strategy": true/false,
-  "strategy_suggestion": "...",
-  "knowledge_gaps": ["what we don't know"],
-  "confidence": 0.X
+  "what_worked": ["things that went well"],
+  "what_failed": ["things that didn't work"],
+  "improvements": ["suggestions for improvement"],
+  "coverage_gaps": ["areas not adequately tested"],
+  "tool_effectiveness": {{"tool_name": 0.X}},
+  "next_phase_focus": ["priorities for next phase"],
+  "quality": 0.X
 }}"""
 
-MACRO_REFLECTION_PROMPT = """Conduct a full retrospective of this security assessment.
+ASSESSMENT_REFLECT_PROMPT = """Reflect on this completed security assessment.
 
 Target: {target}
-Total actions: {total_actions}
+Goal: {goal}
+Duration: {duration}s
 Total findings: {findings_count}
-Findings by severity: {by_severity}
+Critical findings: {critical_count}
 Phases completed: {phases}
-Total time: {total_time_s}s
+Agents used: {agents_count}
 Tools used: {tools_used}
-Models used: {models_used}
 
-Retrospective questions:
-1. What went well?
-2. What went poorly?
-3. What vulnerabilities might we have missed?
-4. Were our tool selections optimal?
-5. Was our model usage efficient?
-6. What would we do differently next time?
-7. Overall confidence in the assessment completeness?
+Top findings:
+{top_findings}
 
-Respond as JSON:
-{{
-  "what_went_well": ["..."],
-  "what_went_poorly": ["..."],
-  "potentially_missed": ["vulnerability types we may have missed"],
-  "tool_optimization": "suggestions for better tool usage",
-  "model_optimization": "suggestions for better model usage",
-  "improvements": ["what to do differently"],
-  "completeness_confidence": 0.X,
-  "overall_quality": "excellent|good|fair|poor"
-}}"""
-
-BLIND_SPOT_PROMPT = """Identify potential blind spots in this security assessment.
-
-Target type: {target_type}
-Approaches used: {approaches}
-Findings: {findings}
-Tools NOT used: {unused_tools}
-Areas NOT tested: {untested_areas}
-
-What are we likely missing? What attack vectors have we overlooked?
-Consider: supply chain, social engineering, physical, wireless, insider threats,
-logic bugs, race conditions, business logic, API abuse, etc.
+Analyze comprehensively:
+1. Was the assessment thorough?
+2. Were the right strategies used?
+3. What was missed?
+4. How could coverage be improved?
+5. Were there efficiency issues?
+6. What lessons should be learned for future assessments?
 
 Respond as JSON:
 {{
-  "blind_spots": [
-    {{
-      "area": "description of blind spot",
-      "severity": "high|medium|low",
-      "recommendation": "how to address it"
-    }}
-  ]
-}}"""
-
-BIAS_DETECTION_PROMPT = """Analyze these security assessment actions for cognitive biases.
-
-Action history: {actions}
-Finding distribution: {findings}
-Tool usage distribution: {tool_usage}
-
-Check for:
-1. Confirmation bias (only looking for expected vulns)
-2. Anchoring (over-focusing on first finding)
-3. Availability bias (using familiar tools over better ones)
-4. Automation bias (trusting tool output without verification)
-5. Recency bias (over-weighting recent findings)
-
-Respond as JSON:
-{{
-  "biases_detected": [
-    {{
-      "bias_type": "...",
-      "evidence": "...",
-      "impact": "high|medium|low",
-      "mitigation": "..."
-    }}
-  ],
-  "overall_bias_risk": "high|medium|low"
+  "thoroughness": 0.X,
+  "what_worked": ["successful strategies"],
+  "what_failed": ["unsuccessful approaches"],
+  "missed_areas": ["things we should have tested"],
+  "efficiency_issues": ["time/resource waste"],
+  "key_lessons": ["important takeaways"],
+  "improvements": ["concrete suggestions"],
+  "overall_quality": 0.X
 }}"""
 
 
 class ReflectionEngine:
-    """Metacognitive monitoring and self-improvement for agents.
+    """Reflection engine for post-action analysis and learning.
 
-    Implements systematic self-reflection at multiple scales to
-    detect problems, identify blind spots, and improve performance.
+    Analyzes actions, phases, and assessments to extract
+    lessons and improve future performance.
     """
 
-    def __init__(self, model_router: ModelRouter) -> None:
+    def __init__(self, model_router: ModelRouter | None = None) -> None:
         self._router = model_router
-        self._insights: list[Insight] = []
-        self._reflections: list[ReflectionResult] = []
-        self._action_history: list[dict[str, Any]] = []
+        self._insights: list[ReflectionInsight] = []
+        self._reports: list[ReflectionReport] = []
+        self._insight_counter = 0
         self._log = logger.bind(component="reflection")
 
-    async def micro_reflect(
+    async def reflect_micro(
         self,
-        action: dict[str, Any],
-        result: dict[str, Any],
-        goal: str = "",
-    ) -> ReflectionResult:
-        """Quick reflection after a single action."""
-        prompt = MICRO_REFLECTION_PROMPT.format(
-            action=json.dumps(action)[:500],
-            result=json.dumps(result)[:500],
-            goal=goal[:200],
+        action: str,
+        tool: str,
+        target: str,
+        result: str,
+        success: bool,
+        duration_s: float,
+    ) -> ReflectionInsight:
+        """Micro-reflection after a single action."""
+        insight = ReflectionInsight(
+            level=ReflectionLevel.MICRO,
+            category=ReflectionCategory.TOOL_USE,
         )
 
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="fast",
-            temperature=0.1,
-            max_tokens=256,
-        )
+        if self._router:
+            prompt = MICRO_REFLECT_PROMPT.format(
+                action=action[:200], tool=tool, target=target,
+                result=result[:500], success=success,
+                duration=round(duration_s, 1),
+            )
 
-        data = self._parse_json(response)
-        rr = ReflectionResult(scale=ReflectionScale.MICRO)
+            response = await self._router.generate(
+                messages=[{"role": "user", "content": prompt}],
+                task_type="reasoning",
+                temperature=0.2,
+                max_tokens=256,
+            )
 
-        if not data.get("effective", True):
-            rr.insights.append(Insight(
-                insight_type=InsightType.EFFICIENCY_ISSUE,
-                description=data.get("insight", "Action was not effective"),
-                suggested_action=data.get("adjustment", ""),
-                confidence=data.get("confidence", 0.5),
-            ))
-            rr.should_change_approach = bool(data.get("adjustment"))
+            data = self._parse_json(response)
+            insight.description = data.get("lesson", "")
+            insight.lesson = data.get("lesson", "")
+            insight.suggested_action = data.get("next_action", "")
+            insight.actionable = bool(insight.suggested_action)
+            insight.confidence = data.get("confidence", 0.5)
+        else:
+            insight.description = f"{'Success' if success else 'Failure'}: {action[:100]}"
+            insight.lesson = f"Tool {tool} {'worked' if success else 'failed'} on {target}"
 
-        rr.confidence = data.get("confidence", 0.5)
-        self._action_history.append(action)
-        self._reflections.append(rr)
+        return self._store_insight(insight)
 
-        return rr
-
-    async def meso_reflect(
+    async def reflect_phase(
         self,
         phase: str,
-        actions: list[dict[str, Any]],
-        findings: list[dict[str, Any]],
-        goals: list[str],
-        elapsed_s: float = 0.0,
-        budget_remaining: dict[str, Any] | None = None,
-    ) -> ReflectionResult:
-        """Phase-level reflection — assess overall strategy."""
-        actions_summary = json.dumps([
-            {"type": a.get("type", ""), "tool": a.get("tool", ""), "success": a.get("success", False)}
-            for a in actions[-20:]
-        ])
+        tasks_completed: int,
+        tasks_failed: int,
+        findings_count: int,
+        duration_s: float,
+        tools_used: list[str],
+    ) -> ReflectionReport:
+        """Reflection after an assessment phase."""
+        report = ReflectionReport(level=ReflectionLevel.PHASE)
 
-        prompt = MESO_REFLECTION_PROMPT.format(
-            phase=phase,
-            actions=actions_summary,
-            findings=json.dumps(findings[:10])[:1000],
-            goals=json.dumps(goals),
-            elapsed_s=round(elapsed_s),
-            budget=json.dumps(budget_remaining or {}),
-        )
+        if self._router:
+            prompt = PHASE_REFLECT_PROMPT.format(
+                phase=phase,
+                tasks_completed=tasks_completed,
+                tasks_failed=tasks_failed,
+                findings_count=findings_count,
+                duration=round(duration_s, 1),
+                tools_used=", ".join(tools_used[:10]),
+            )
 
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="reasoning",
-            temperature=0.2,
-            max_tokens=1024,
-        )
+            response = await self._router.generate(
+                messages=[{"role": "user", "content": prompt}],
+                task_type="reasoning",
+                temperature=0.3,
+                max_tokens=512,
+            )
 
-        data = self._parse_json(response)
-        rr = ReflectionResult(scale=ReflectionScale.MESO)
+            data = self._parse_json(response)
+            report.what_worked = data.get("what_worked", [])
+            report.what_failed = data.get("what_failed", [])
+            report.improvements = data.get("improvements", [])
+            report.coverage_gaps = data.get("coverage_gaps", [])
+            report.tool_effectiveness = data.get("tool_effectiveness", {})
+            report.overall_quality = data.get("quality", 0.5)
 
-        # Extract insights
-        for gap in data.get("knowledge_gaps", []):
-            rr.insights.append(Insight(
-                insight_type=InsightType.KNOWLEDGE_GAP,
-                description=gap,
-                suggested_action=f"Investigate: {gap}",
-            ))
+            # Convert improvements to insights
+            for improvement in report.improvements[:5]:
+                insight = ReflectionInsight(
+                    level=ReflectionLevel.PHASE,
+                    category=ReflectionCategory.STRATEGY,
+                    description=improvement,
+                    lesson=improvement,
+                    actionable=True,
+                    suggested_action=improvement,
+                )
+                self._store_insight(insight)
 
-        for bias in data.get("biases", []):
-            rr.insights.append(Insight(
-                insight_type=InsightType.BIAS_DETECTED,
-                description=bias,
-                severity="medium",
-            ))
+        else:
+            report.overall_quality = findings_count / max(1, tasks_completed) if tasks_completed > 0 else 0
+            if tasks_failed > 0:
+                report.what_failed.append(f"{tasks_failed} tasks failed")
+            report.what_worked.append(f"Completed {tasks_completed} tasks")
 
-        for missing in data.get("missing", []):
-            rr.insights.append(Insight(
-                insight_type=InsightType.BLIND_SPOT,
-                description=missing,
-                suggested_action=f"Check: {missing}",
-            ))
+        self._reports.append(report)
+        return report
 
-        for expert_action in data.get("expert_would", []):
-            rr.insights.append(Insight(
-                insight_type=InsightType.MISSED_OPPORTUNITY,
-                description=expert_action,
-            ))
-
-        rr.should_change_approach = data.get("change_strategy", False)
-        if data.get("strategy_suggestion"):
-            rr.suggested_changes.append(data["strategy_suggestion"])
-
-        rr.overall_assessment = data.get("progress_assessment", "fair")
-        rr.confidence = data.get("confidence", 0.5)
-
-        self._insights.extend(rr.insights)
-        self._reflections.append(rr)
-
-        self._log.info(
-            "meso_reflection",
-            insights=len(rr.insights),
-            change_approach=rr.should_change_approach,
-        )
-
-        return rr
-
-    async def macro_reflect(
+    async def reflect_assessment(
         self,
         target: str,
-        total_actions: int,
+        goal: str,
+        duration_s: float,
         findings: list[dict[str, Any]],
-        phases_completed: list[str],
-        total_time_s: float,
+        phases: list[str],
+        agents_count: int,
         tools_used: list[str],
-        models_used: list[str],
-    ) -> ReflectionResult:
-        """Full retrospective after assessment completion."""
-        by_severity: dict[str, int] = defaultdict(int)
-        for f in findings:
-            sev = f.get("severity", "info")
-            by_severity[sev] += 1
+    ) -> ReflectionReport:
+        """Full reflection after an assessment."""
+        report = ReflectionReport(level=ReflectionLevel.ASSESSMENT)
+        critical_count = sum(1 for f in findings if f.get("severity") == "critical")
 
-        prompt = MACRO_REFLECTION_PROMPT.format(
-            target=target,
-            total_actions=total_actions,
-            findings_count=len(findings),
-            by_severity=json.dumps(dict(by_severity)),
-            phases=json.dumps(phases_completed),
-            total_time_s=round(total_time_s),
-            tools_used=json.dumps(tools_used[:20]),
-            models_used=json.dumps(models_used[:10]),
+        top_findings_text = "\n".join(
+            f"- [{f.get('severity', 'N/A')}] {f.get('title', 'N/A')}"
+            for f in findings[:10]
         )
 
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="reasoning",
-            temperature=0.3,
-            max_tokens=2048,
-        )
-
-        data = self._parse_json(response)
-        rr = ReflectionResult(scale=ReflectionScale.MACRO)
-
-        for item in data.get("what_went_well", []):
-            rr.insights.append(Insight(
-                insight_type=InsightType.SUCCESS_PATTERN,
-                description=item,
-            ))
-
-        for item in data.get("what_went_poorly", []):
-            rr.insights.append(Insight(
-                insight_type=InsightType.FAILURE_PATTERN,
-                description=item,
-                severity="high",
-            ))
-
-        for item in data.get("potentially_missed", []):
-            rr.insights.append(Insight(
-                insight_type=InsightType.BLIND_SPOT,
-                description=item,
-                severity="high",
-                suggested_action=f"Test for: {item}",
-            ))
-
-        for item in data.get("improvements", []):
-            rr.suggested_changes.append(item)
-
-        rr.overall_assessment = data.get("overall_quality", "fair")
-        rr.confidence = data.get("completeness_confidence", 0.5)
-
-        self._insights.extend(rr.insights)
-        self._reflections.append(rr)
-
-        return rr
-
-    async def detect_blind_spots(
-        self,
-        target_type: str,
-        approaches_used: list[str],
-        findings: list[dict[str, Any]],
-        unused_tools: list[str],
-        untested_areas: list[str],
-    ) -> list[Insight]:
-        """Specifically check for blind spots."""
-        prompt = BLIND_SPOT_PROMPT.format(
-            target_type=target_type,
-            approaches=json.dumps(approaches_used),
-            findings=json.dumps(findings[:10])[:1000],
-            unused_tools=json.dumps(unused_tools[:20]),
-            untested_areas=json.dumps(untested_areas),
-        )
-
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="security",
-            temperature=0.3,
-            max_tokens=1024,
-        )
-
-        data = self._parse_json(response)
-        insights = []
-        for bs in data.get("blind_spots", []):
-            insight = Insight(
-                insight_type=InsightType.BLIND_SPOT,
-                description=bs.get("area", ""),
-                severity=bs.get("severity", "medium"),
-                suggested_action=bs.get("recommendation", ""),
+        if self._router:
+            prompt = ASSESSMENT_REFLECT_PROMPT.format(
+                target=target, goal=goal[:200],
+                duration=round(duration_s, 1),
+                findings_count=len(findings),
+                critical_count=critical_count,
+                phases=", ".join(phases),
+                agents_count=agents_count,
+                tools_used=", ".join(tools_used[:15]),
+                top_findings=top_findings_text or "None",
             )
-            insights.append(insight)
-            self._insights.append(insight)
 
-        return insights
-
-    async def detect_biases(
-        self,
-        actions: list[dict[str, Any]],
-        findings: list[dict[str, Any]],
-        tool_usage: dict[str, int],
-    ) -> list[Insight]:
-        """Detect cognitive biases in the assessment approach."""
-        prompt = BIAS_DETECTION_PROMPT.format(
-            actions=json.dumps([
-                {"type": a.get("type", ""), "tool": a.get("tool", "")}
-                for a in actions[-30:]
-            ]),
-            findings=json.dumps([
-                {"severity": f.get("severity", ""), "category": f.get("category", "")}
-                for f in findings
-            ]),
-            tool_usage=json.dumps(tool_usage),
-        )
-
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="reasoning",
-            temperature=0.2,
-            max_tokens=1024,
-        )
-
-        data = self._parse_json(response)
-        insights = []
-        for bias in data.get("biases_detected", []):
-            insight = Insight(
-                insight_type=InsightType.BIAS_DETECTED,
-                description=f"{bias.get('bias_type', '')}: {bias.get('evidence', '')}",
-                severity=bias.get("impact", "medium"),
-                suggested_action=bias.get("mitigation", ""),
+            response = await self._router.generate(
+                messages=[{"role": "user", "content": prompt}],
+                task_type="reasoning",
+                temperature=0.3,
+                max_tokens=1024,
             )
-            insights.append(insight)
-            self._insights.append(insight)
 
-        return insights
+            data = self._parse_json(response)
+            report.what_worked = data.get("what_worked", [])
+            report.what_failed = data.get("what_failed", [])
+            report.improvements = data.get("improvements", [])
+            report.coverage_gaps = data.get("missed_areas", [])
+            report.overall_quality = data.get("overall_quality", 0.5)
 
-    def get_all_insights(self, min_severity: str = "low") -> list[dict[str, Any]]:
-        """Get all accumulated insights."""
-        severity_order = {"low": 0, "medium": 1, "high": 2}
-        min_level = severity_order.get(min_severity, 0)
-        return [
-            i.to_dict() for i in self._insights
-            if severity_order.get(i.severity, 0) >= min_level
-        ]
+            for lesson in data.get("key_lessons", []):
+                insight = ReflectionInsight(
+                    level=ReflectionLevel.ASSESSMENT,
+                    category=ReflectionCategory.STRATEGY,
+                    description=lesson,
+                    lesson=lesson,
+                )
+                self._store_insight(insight)
 
-    def get_summary(self) -> dict[str, Any]:
-        by_type: dict[str, int] = defaultdict(int)
-        for i in self._insights:
-            by_type[i.insight_type.value] += 1
-        return {
-            "total_reflections": len(self._reflections),
-            "total_insights": len(self._insights),
-            "by_type": dict(by_type),
-            "micro": sum(1 for r in self._reflections if r.scale == ReflectionScale.MICRO),
-            "meso": sum(1 for r in self._reflections if r.scale == ReflectionScale.MESO),
-            "macro": sum(1 for r in self._reflections if r.scale == ReflectionScale.MACRO),
-        }
+        else:
+            report.overall_quality = min(1.0, len(findings) * 0.05)
+            report.what_worked.append(f"Found {len(findings)} findings")
+
+        self._reports.append(report)
+        return report
+
+    def reflect_meta(self) -> ReflectionReport:
+        """Cross-assessment meta-reflection using accumulated insights."""
+        report = ReflectionReport(level=ReflectionLevel.META)
+
+        # Analyze patterns across all insights
+        category_counts: dict[str, int] = defaultdict(int)
+        for insight in self._insights:
+            category_counts[insight.category.value] += 1
+
+        # Find most common improvement areas
+        lesson_freq: dict[str, int] = defaultdict(int)
+        for insight in self._insights:
+            if insight.lesson:
+                key = insight.lesson[:50]
+                lesson_freq[key] += 1
+
+        # Generate meta-insights
+        if category_counts:
+            most_common = max(category_counts, key=category_counts.get)
+            report.improvements.append(
+                f"Most frequent issue area: {most_common} ({category_counts[most_common]} instances)"
+            )
+
+        # Calculate average quality from assessment reports
+        assessment_reports = [r for r in self._reports if r.level == ReflectionLevel.ASSESSMENT]
+        if assessment_reports:
+            report.overall_quality = sum(r.overall_quality for r in assessment_reports) / len(assessment_reports)
+
+        self._reports.append(report)
+        return report
+
+    # ── Insight Management ───────────────────────────────
+
+    def _store_insight(self, insight: ReflectionInsight) -> ReflectionInsight:
+        self._insight_counter += 1
+        insight.insight_id = f"insight-{self._insight_counter}"
+        self._insights.append(insight)
+        if len(self._insights) > 1000:
+            self._insights = self._insights[-1000:]
+        return insight
+
+    def get_insights(
+        self,
+        level: ReflectionLevel | None = None,
+        category: ReflectionCategory | None = None,
+        actionable_only: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Get insights, optionally filtered."""
+        insights = self._insights
+        if level:
+            insights = [i for i in insights if i.level == level]
+        if category:
+            insights = [i for i in insights if i.category == category]
+        if actionable_only:
+            insights = [i for i in insights if i.actionable]
+        return [i.to_dict() for i in insights[-limit:]]
+
+    def get_reports(self, limit: int = 10) -> list[dict[str, Any]]:
+        return [r.to_dict() for r in self._reports[-limit:]]
 
     def _parse_json(self, text: str) -> dict[str, Any]:
         try:
@@ -530,3 +429,16 @@ class ReflectionEngine:
             return json.loads(text.strip())
         except (json.JSONDecodeError, IndexError):
             return {}
+
+    def get_stats(self) -> dict[str, Any]:
+        by_level: dict[str, int] = defaultdict(int)
+        by_category: dict[str, int] = defaultdict(int)
+        for i in self._insights:
+            by_level[i.level.value] += 1
+            by_category[i.category.value] += 1
+        return {
+            "total_insights": len(self._insights),
+            "total_reports": len(self._reports),
+            "by_level": dict(by_level),
+            "by_category": dict(by_category),
+        }
