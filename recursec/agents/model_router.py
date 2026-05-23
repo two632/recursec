@@ -1,19 +1,20 @@
-"""Model router intelligence — task-aware LLM routing.
+"""Model router — intelligent routing of tasks to models.
 
-Routes queries to the optimal model based on:
-1. Task type classification
-2. Model capability matching
-3. Context window requirements
-4. Load balancing
-5. Latency requirements
-6. Cost optimization
-7. Fallback chains
-8. Historical performance
+Implements:
+1. Task-type to model mapping
+2. Load-balanced routing
+3. Capability-based selection
+4. Context-size aware routing
+5. Performance-based routing
+6. Fallback chains
+7. Hot model switching
 """
 
 from __future__ import annotations
 
+import random
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -26,425 +27,319 @@ logger = structlog.get_logger()
 class TaskType(str, Enum):
     SECURITY_ANALYSIS = "security_analysis"
     CODE_REVIEW = "code_review"
-    EXPLOITATION = "exploitation"
     REASONING = "reasoning"
     PLANNING = "planning"
-    SUMMARIZATION = "summarization"
-    TOOL_CALL = "tool_call"
+    FAST_QUERY = "fast_query"
+    LONG_CONTEXT = "long_context"
+    TOOL_ROUTING = "tool_routing"
     EMBEDDING = "embedding"
     SAFETY_CHECK = "safety_check"
-    LONG_CONTEXT = "long_context"
-    FAST_QUERY = "fast_query"
     GENERAL = "general"
+    EXPLOIT_DEV = "exploit_dev"
+    VULN_ANALYSIS = "vuln_analysis"
 
 
 class RoutingStrategy(str, Enum):
-    BEST_FIT = "best_fit"         # Best model for the task
-    ROUND_ROBIN = "round_robin"   # Distribute evenly
-    LEAST_LOADED = "least_loaded"  # Route to least busy
-    LOWEST_LATENCY = "lowest_latency"
-    HIGHEST_QUALITY = "highest_quality"
-    FALLBACK = "fallback"         # Try in order until one works
+    BEST_FIT = "best_fit"           # Highest capability score
+    ROUND_ROBIN = "round_robin"      # Distribute evenly
+    LEAST_LOADED = "least_loaded"    # Lowest current load
+    RANDOM_WEIGHTED = "random_weighted"  # Random, weighted by score
+    FALLBACK_CHAIN = "fallback_chain"    # Try in order
 
 
 @dataclass
-class ModelProfile:
-    """Profile of a configured model."""
+class ModelScore:
+    """A model's score for a task type."""
     model_id: str = ""
-    name: str = ""
-    port: int = 0
-    context_window: int = 4096
-    strengths: list[str] = field(default_factory=list)
-    weight: float = 1.0
-    max_concurrent: int = 4
+    score: float = 0.0
+    is_primary: bool = False
+    context_size: int = 0
+    avg_latency_ms: float = 0.0
     current_load: int = 0
-    avg_latency_ms: float = 500.0
-    error_count: int = 0
-    total_requests: int = 0
-    total_tokens: int = 0
-    available: bool = True
-
-    @property
-    def utilization(self) -> float:
-        return self.current_load / max(1, self.max_concurrent)
-
-    @property
-    def error_rate(self) -> float:
-        return self.error_count / max(1, self.total_requests)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.model_id[:15],
-            "port": self.port,
-            "ctx": self.context_window,
-            "weight": self.weight,
-            "load": f"{self.current_load}/{self.max_concurrent}",
-            "latency": round(self.avg_latency_ms, 0),
-            "available": self.available,
+            "model": self.model_id[:15],
+            "score": round(self.score, 2),
+            "primary": self.is_primary,
         }
 
 
 @dataclass
 class RoutingDecision:
-    """A routing decision with reasoning."""
-    model_id: str = ""
-    strategy: RoutingStrategy = RoutingStrategy.BEST_FIT
+    """A routing decision."""
+    decision_id: str = ""
+    task_type: TaskType = TaskType.GENERAL
+    selected_model: str = ""
     score: float = 0.0
-    reason: str = ""
-    fallback_models: list[str] = field(default_factory=list)
+    alternatives: list[str] = field(default_factory=list)
+    strategy_used: RoutingStrategy = RoutingStrategy.BEST_FIT
+    context_required: int = 0
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model_id[:15],
-            "strategy": self.strategy.value,
+            "id": self.decision_id[:10],
+            "task": self.task_type.value[:15],
+            "model": self.selected_model[:15],
             "score": round(self.score, 2),
-            "reason": self.reason[:30],
-            "fallbacks": len(self.fallback_models),
+            "alts": len(self.alternatives),
         }
 
 
-# ── Default model configurations ─────────────────────────────
+# ── Task→Model capability matrix ─────────────────────────────
 
-DEFAULT_MODELS: list[dict[str, Any]] = [
-    {
-        "id": "whiterabbitneo-7b", "name": "WhiteRabbitNeo-7B",
-        "port": 8100, "ctx": 4096, "weight": 2.0, "max_concurrent": 4,
-        "strengths": ["security_analysis", "exploitation", "reasoning"],
+CAPABILITY_MATRIX: dict[str, dict[str, float]] = {
+    "security_analysis": {
+        "whiterabbitneo-7b": 2.0,
+        "dolphin-8b": 1.3,
+        "qwen-coder-14b": 1.2,
+        "hermes-14b": 1.0,
+        "qwen-coder-7b": 0.9,
+        "mistral-7b": 0.7,
+        "llama-3.1-8b": 0.6,
     },
-    {
-        "id": "qwen-coder-14b", "name": "Qwen2.5-Coder-14B",
-        "port": 8101, "ctx": 8192, "weight": 1.8, "max_concurrent": 2,
-        "strengths": ["code_review", "exploitation", "reasoning"],
+    "code_review": {
+        "qwen-coder-14b": 2.0,
+        "qwen-coder-7b": 1.7,
+        "codellama-13b": 1.6,
+        "codellama-7b": 1.3,
+        "deepseek-r1-7b": 1.0,
+        "yi-9b-200k": 0.9,
     },
-    {
-        "id": "qwen-coder-7b", "name": "Qwen2.5-Coder-7B",
-        "port": 8102, "ctx": 8192, "weight": 1.2, "max_concurrent": 4,
-        "strengths": ["code_review", "fast_query"],
+    "reasoning": {
+        "deepseek-r1-7b": 2.0,
+        "hermes-14b": 1.5,
+        "qwen-coder-14b": 1.3,
+        "deepseek-math-7b": 1.2,
+        "llama-3.1-8b": 1.0,
+        "mistral-7b": 0.8,
     },
-    {
-        "id": "deepseek-r1-7b", "name": "DeepSeek-R1-Distill-Qwen-7B",
-        "port": 8103, "ctx": 8192, "weight": 1.6, "max_concurrent": 4,
-        "strengths": ["reasoning", "planning"],
+    "planning": {
+        "deepseek-r1-7b": 1.8,
+        "hermes-14b": 1.6,
+        "qwen-coder-14b": 1.2,
+        "llama-3.1-8b": 1.0,
+        "mistral-7b": 0.8,
     },
-    {
-        "id": "deepseek-math-7b", "name": "DeepSeek-Math-7B",
-        "port": 8104, "ctx": 4096, "weight": 1.0, "max_concurrent": 4,
-        "strengths": ["reasoning"],
+    "fast_query": {
+        "phi-3.5-mini": 2.0,
+        "mistral-7b": 1.5,
+        "functiongemma": 1.3,
+        "llama-3.1-8b": 1.0,
     },
-    {
-        "id": "hermes-14b", "name": "Hermes-4-14B",
-        "port": 8105, "ctx": 8192, "weight": 1.5, "max_concurrent": 2,
-        "strengths": ["general", "reasoning", "planning", "summarization"],
+    "long_context": {
+        "yi-9b-200k": 2.0,       # 200K context
+        "llama-3.1-8b": 1.8,     # 131K context
+        "qwen-coder-14b": 1.3,   # 32K context
+        "qwen-coder-7b": 1.2,    # 32K context
+        "mistral-7b": 1.0,       # 32K context
     },
-    {
-        "id": "llama-3.1-8b", "name": "Llama-3.1-8B",
-        "port": 8106, "ctx": 131072, "weight": 1.2, "max_concurrent": 4,
-        "strengths": ["general", "long_context", "summarization"],
+    "tool_routing": {
+        "functiongemma": 2.0,
+        "phi-3.5-mini": 1.2,
+        "mistral-7b": 0.8,
     },
-    {
-        "id": "dolphin-8b", "name": "Dolphin-2.9-Llama3-8B",
-        "port": 8107, "ctx": 8192, "weight": 1.2, "max_concurrent": 4,
-        "strengths": ["general", "security_analysis", "exploitation"],
+    "embedding": {
+        "nomic-embed": 2.0,
     },
-    {
-        "id": "mistral-7b", "name": "Mistral-7B",
-        "port": 8108, "ctx": 8192, "weight": 1.0, "max_concurrent": 8,
-        "strengths": ["fast_query", "general", "summarization"],
+    "safety_check": {
+        "llama-guard-3": 2.0,
     },
-    {
-        "id": "codellama-13b", "name": "CodeLlama-13B",
-        "port": 8109, "ctx": 16384, "weight": 1.4, "max_concurrent": 2,
-        "strengths": ["code_review", "exploitation"],
+    "exploit_dev": {
+        "whiterabbitneo-7b": 2.0,
+        "dolphin-8b": 1.5,
+        "qwen-coder-14b": 1.3,
+        "codellama-13b": 1.0,
     },
-    {
-        "id": "codellama-7b", "name": "CodeLlama-7B",
-        "port": 8110, "ctx": 16384, "weight": 1.0, "max_concurrent": 4,
-        "strengths": ["code_review", "fast_query"],
+    "vuln_analysis": {
+        "whiterabbitneo-7b": 2.0,
+        "qwen-coder-14b": 1.5,
+        "deepseek-r1-7b": 1.3,
+        "hermes-14b": 1.0,
+        "dolphin-8b": 0.9,
     },
-    {
-        "id": "yi-9b-200k", "name": "Yi-9B-200K",
-        "port": 8111, "ctx": 200000, "weight": 1.3, "max_concurrent": 2,
-        "strengths": ["long_context", "code_review", "summarization"],
+    "general": {
+        "hermes-14b": 1.5,
+        "llama-3.1-8b": 1.2,
+        "mistral-7b": 1.0,
+        "dolphin-8b": 1.0,
+        "yi-9b-200k": 0.9,
     },
-    {
-        "id": "phi-3.5-mini", "name": "Phi-3.5-mini",
-        "port": 8112, "ctx": 4096, "weight": 0.8, "max_concurrent": 16,
-        "strengths": ["fast_query", "tool_call"],
-    },
-    {
-        "id": "nomic-embed", "name": "Nomic-Embed-Text",
-        "port": 8113, "ctx": 8192, "weight": 1.0, "max_concurrent": 8,
-        "strengths": ["embedding"],
-    },
-    {
-        "id": "llama-guard-3", "name": "Llama-Guard-3",
-        "port": 8114, "ctx": 4096, "weight": 1.0, "max_concurrent": 8,
-        "strengths": ["safety_check"],
-    },
-    {
-        "id": "functiongemma", "name": "FunctionGemma-270m",
-        "port": 8115, "ctx": 2048, "weight": 0.5, "max_concurrent": 16,
-        "strengths": ["tool_call", "fast_query"],
-    },
-]
+}
 
+# ── Model context sizes ──────────────────────────────────────
 
-# ── Task→Model preference matrix ─────────────────────────────
-
-TASK_MODEL_PREFERENCES: dict[str, list[str]] = {
-    "security_analysis": ["whiterabbitneo-7b", "dolphin-8b", "hermes-14b", "qwen-coder-14b"],
-    "code_review": ["qwen-coder-14b", "codellama-13b", "yi-9b-200k", "qwen-coder-7b"],
-    "exploitation": ["whiterabbitneo-7b", "dolphin-8b", "qwen-coder-14b"],
-    "reasoning": ["deepseek-r1-7b", "hermes-14b", "qwen-coder-14b", "whiterabbitneo-7b"],
-    "planning": ["hermes-14b", "deepseek-r1-7b", "llama-3.1-8b"],
-    "summarization": ["hermes-14b", "mistral-7b", "llama-3.1-8b"],
-    "tool_call": ["functiongemma", "phi-3.5-mini", "mistral-7b"],
-    "embedding": ["nomic-embed"],
-    "safety_check": ["llama-guard-3"],
-    "long_context": ["yi-9b-200k", "llama-3.1-8b"],
-    "fast_query": ["phi-3.5-mini", "mistral-7b", "functiongemma", "qwen-coder-7b"],
-    "general": ["hermes-14b", "llama-3.1-8b", "mistral-7b", "dolphin-8b"],
+MODEL_CONTEXT_SIZES: dict[str, int] = {
+    "whiterabbitneo-7b": 4096,
+    "qwen-coder-14b": 32768,
+    "qwen-coder-7b": 32768,
+    "deepseek-r1-7b": 32768,
+    "deepseek-math-7b": 4096,
+    "hermes-14b": 8192,
+    "llama-3.1-8b": 131072,
+    "dolphin-8b": 8192,
+    "mistral-7b": 32768,
+    "codellama-13b": 16384,
+    "codellama-7b": 16384,
+    "yi-9b-200k": 200000,
+    "phi-3.5-mini": 4096,
+    "nomic-embed": 8192,
+    "llama-guard-3": 4096,
+    "functiongemma": 2048,
 }
 
 
 class ModelRouter:
-    """Intelligent model routing for multi-LLM orchestration.
+    """Intelligent model routing.
 
-    Routes each query to the optimal model based on task type,
-    current load, latency requirements, and historical performance.
+    Routes tasks to the best available model
+    based on task type, context requirements,
+    and model performance.
     """
 
-    def __init__(self) -> None:
-        self._models: dict[str, ModelProfile] = {}
-        self._decisions: list[RoutingDecision] = []
+    def __init__(
+        self,
+        strategy: RoutingStrategy = RoutingStrategy.BEST_FIT,
+        online_models: list[str] | None = None,
+    ) -> None:
+        self._strategy = strategy
+        self._online_models: set[str] = set(online_models or MODEL_CONTEXT_SIZES.keys())
+        self._counter = 0
+        self._routing_history: list[RoutingDecision] = []
+        self._model_loads: dict[str, int] = defaultdict(int)
+        self._round_robin_idx: dict[str, int] = defaultdict(int)
         self._log = logger.bind(component="model_router")
-        self._load_default_models()
-
-    def _load_default_models(self) -> None:
-        """Load default model configurations."""
-        for data in DEFAULT_MODELS:
-            profile = ModelProfile(
-                model_id=data["id"],
-                name=data["name"],
-                port=data["port"],
-                context_window=data["ctx"],
-                weight=data["weight"],
-                max_concurrent=data["max_concurrent"],
-                strengths=data.get("strengths", []),
-            )
-            self._models[profile.model_id] = profile
 
     def route(
         self,
         task_type: TaskType,
         context_tokens: int = 0,
-        strategy: RoutingStrategy = RoutingStrategy.BEST_FIT,
-        exclude_models: list[str] | None = None,
+        strategy: RoutingStrategy | None = None,
     ) -> RoutingDecision:
         """Route a task to the best model."""
-        exclude = set(exclude_models or [])
+        self._counter += 1
+        strategy = strategy or self._strategy
 
-        candidates = [
-            m for m in self._models.values()
-            if m.available and m.model_id not in exclude
-        ]
+        # Get scores for this task type
+        scores = self._get_scores(task_type, context_tokens)
 
-        if not candidates:
+        if not scores:
             return RoutingDecision(
-                model_id="",
-                reason="No available models",
+                decision_id=f"route-{self._counter}",
+                task_type=task_type,
+                selected_model="",
+                score=0.0,
+                strategy_used=strategy,
             )
-
-        # Filter by context window
-        if context_tokens > 0:
-            candidates = [m for m in candidates if m.context_window >= context_tokens]
-            if not candidates:
-                return RoutingDecision(
-                    model_id="",
-                    reason=f"No model with context >= {context_tokens}",
-                )
 
         if strategy == RoutingStrategy.BEST_FIT:
-            decision = self._route_best_fit(candidates, task_type)
+            selected = self._best_fit(scores)
         elif strategy == RoutingStrategy.ROUND_ROBIN:
-            decision = self._route_round_robin(candidates, task_type)
+            selected = self._round_robin(scores, task_type)
         elif strategy == RoutingStrategy.LEAST_LOADED:
-            decision = self._route_least_loaded(candidates, task_type)
-        elif strategy == RoutingStrategy.LOWEST_LATENCY:
-            decision = self._route_lowest_latency(candidates, task_type)
-        elif strategy == RoutingStrategy.HIGHEST_QUALITY:
-            decision = self._route_highest_quality(candidates, task_type)
+            selected = self._least_loaded(scores)
+        elif strategy == RoutingStrategy.RANDOM_WEIGHTED:
+            selected = self._random_weighted(scores)
         else:
-            decision = self._route_best_fit(candidates, task_type)
+            selected = self._best_fit(scores)
 
-        # Add fallbacks
-        fallback_ids = [
-            m.model_id for m in candidates
-            if m.model_id != decision.model_id
-        ][:3]
-        decision.fallback_models = fallback_ids
+        decision = RoutingDecision(
+            decision_id=f"route-{self._counter}",
+            task_type=task_type,
+            selected_model=selected.model_id,
+            score=selected.score,
+            alternatives=[s.model_id for s in scores if s.model_id != selected.model_id][:3],
+            strategy_used=strategy,
+            context_required=context_tokens,
+        )
 
-        self._decisions.append(decision)
+        self._routing_history.append(decision)
+        self._model_loads[selected.model_id] += 1
+
         return decision
 
-    def _route_best_fit(
+    def _get_scores(
         self,
-        candidates: list[ModelProfile],
         task_type: TaskType,
-    ) -> RoutingDecision:
-        """Route to the best model for the task type."""
-        preferences = TASK_MODEL_PREFERENCES.get(task_type.value, [])
+        context_tokens: int,
+    ) -> list[ModelScore]:
+        """Get scored models for a task type."""
+        cap_scores = CAPABILITY_MATRIX.get(task_type.value, {})
+        scores = []
 
-        best = None
-        best_score = -1.0
+        for model_id, score in cap_scores.items():
+            if model_id not in self._online_models:
+                continue
 
-        for model in candidates:
-            score = model.weight
+            context_size = MODEL_CONTEXT_SIZES.get(model_id, 4096)
+            if context_tokens > 0 and context_size < context_tokens:
+                continue
 
-            # Preference bonus
-            if model.model_id in preferences:
-                rank = preferences.index(model.model_id)
-                score += (len(preferences) - rank) * 0.5
+            scores.append(ModelScore(
+                model_id=model_id,
+                score=score,
+                is_primary=score >= 2.0,
+                context_size=context_size,
+                current_load=self._model_loads.get(model_id, 0),
+            ))
 
-            # Strength match bonus
-            if task_type.value in model.strengths:
-                score += 1.0
+        scores.sort(key=lambda s: s.score, reverse=True)
+        return scores
 
-            # Load penalty
-            score -= model.utilization * 0.5
+    def _best_fit(self, scores: list[ModelScore]) -> ModelScore:
+        """Select highest scoring model."""
+        return scores[0]
 
-            # Error penalty
-            score -= model.error_rate * 2.0
-
-            if score > best_score:
-                best_score = score
-                best = model
-
-        if best:
-            return RoutingDecision(
-                model_id=best.model_id,
-                strategy=RoutingStrategy.BEST_FIT,
-                score=best_score,
-                reason=f"Best fit for {task_type.value}",
-            )
-
-        return RoutingDecision(reason="No suitable model found")
-
-    def _route_round_robin(
+    def _round_robin(
         self,
-        candidates: list[ModelProfile],
+        scores: list[ModelScore],
         task_type: TaskType,
-    ) -> RoutingDecision:
-        """Route round-robin among candidates."""
-        # Pick the model with fewest total requests
-        best = min(candidates, key=lambda m: m.total_requests)
-        return RoutingDecision(
-            model_id=best.model_id,
-            strategy=RoutingStrategy.ROUND_ROBIN,
-            score=1.0,
-            reason="Round-robin selection",
-        )
+    ) -> ModelScore:
+        """Round-robin among top models."""
+        key = task_type.value
+        idx = self._round_robin_idx[key] % len(scores)
+        self._round_robin_idx[key] += 1
+        return scores[idx]
 
-    def _route_least_loaded(
-        self,
-        candidates: list[ModelProfile],
-        task_type: TaskType,
-    ) -> RoutingDecision:
-        """Route to the least loaded model."""
-        best = min(candidates, key=lambda m: m.utilization)
-        return RoutingDecision(
-            model_id=best.model_id,
-            strategy=RoutingStrategy.LEAST_LOADED,
-            score=1.0 - best.utilization,
-            reason=f"Least loaded ({best.utilization:.0%})",
-        )
+    def _least_loaded(self, scores: list[ModelScore]) -> ModelScore:
+        """Select the least loaded model."""
+        return min(scores, key=lambda s: s.current_load)
 
-    def _route_lowest_latency(
-        self,
-        candidates: list[ModelProfile],
-        task_type: TaskType,
-    ) -> RoutingDecision:
-        """Route to the lowest latency model."""
-        best = min(candidates, key=lambda m: m.avg_latency_ms)
-        return RoutingDecision(
-            model_id=best.model_id,
-            strategy=RoutingStrategy.LOWEST_LATENCY,
-            score=1000.0 / max(1, best.avg_latency_ms),
-            reason=f"Lowest latency ({best.avg_latency_ms:.0f}ms)",
-        )
+    def _random_weighted(self, scores: list[ModelScore]) -> ModelScore:
+        """Random selection weighted by score."""
+        total = sum(s.score for s in scores)
+        if total == 0:
+            return scores[0]
 
-    def _route_highest_quality(
-        self,
-        candidates: list[ModelProfile],
-        task_type: TaskType,
-    ) -> RoutingDecision:
-        """Route to the highest quality model."""
-        best = max(candidates, key=lambda m: m.weight)
-        return RoutingDecision(
-            model_id=best.model_id,
-            strategy=RoutingStrategy.HIGHEST_QUALITY,
-            score=best.weight,
-            reason=f"Highest quality (weight {best.weight})",
-        )
+        r = random.random() * total
+        cumulative = 0.0
+        for s in scores:
+            cumulative += s.score
+            if cumulative >= r:
+                return s
+        return scores[-1]
 
-    def acquire(self, model_id: str) -> bool:
-        """Acquire a model slot (increment load)."""
-        model = self._models.get(model_id)
-        if not model or not model.available:
-            return False
-        if model.current_load >= model.max_concurrent:
-            return False
-        model.current_load += 1
-        return True
+    def set_model_online(self, model_id: str) -> None:
+        """Mark a model as online."""
+        self._online_models.add(model_id)
 
-    def release(
-        self,
-        model_id: str,
-        latency_ms: float = 0.0,
-        tokens: int = 0,
-        success: bool = True,
-    ) -> None:
-        """Release a model slot (decrement load)."""
-        model = self._models.get(model_id)
-        if not model:
-            return
-        model.current_load = max(0, model.current_load - 1)
-        model.total_requests += 1
-        model.total_tokens += tokens
-
-        # EMA update for latency
-        if latency_ms > 0:
-            model.avg_latency_ms = 0.9 * model.avg_latency_ms + 0.1 * latency_ms
-
-        if not success:
-            model.error_count += 1
-
-    def mark_unavailable(self, model_id: str) -> None:
-        """Mark a model as unavailable."""
-        if model_id in self._models:
-            self._models[model_id].available = False
-
-    def mark_available(self, model_id: str) -> None:
-        """Mark a model as available."""
-        if model_id in self._models:
-            self._models[model_id].available = True
-
-    def get_model(self, model_id: str) -> ModelProfile | None:
-        """Get a model profile."""
-        return self._models.get(model_id)
+    def set_model_offline(self, model_id: str) -> None:
+        """Mark a model as offline."""
+        self._online_models.discard(model_id)
 
     def get_stats(self) -> dict[str, Any]:
-        available = sum(1 for m in self._models.values() if m.available)
-        total_load = sum(m.current_load for m in self._models.values())
-        total_capacity = sum(m.max_concurrent for m in self._models.values())
+        task_counts: dict[str, int] = defaultdict(int)
+        model_counts: dict[str, int] = defaultdict(int)
+
+        for decision in self._routing_history:
+            task_counts[decision.task_type.value] += 1
+            model_counts[decision.selected_model] += 1
 
         return {
-            "models": len(self._models),
-            "available": available,
-            "total_load": total_load,
-            "total_capacity": total_capacity,
-            "utilization": round(total_load / max(1, total_capacity), 2),
-            "decisions": len(self._decisions),
-            "model_details": {k: v.to_dict() for k, v in self._models.items()},
+            "total_routes": len(self._routing_history),
+            "online_models": len(self._online_models),
+            "strategy": self._strategy.value,
+            "by_task": dict(task_counts),
+            "by_model": dict(model_counts),
         }
