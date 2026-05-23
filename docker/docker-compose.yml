@@ -1,0 +1,159 @@
+version: "3.9"
+
+services:
+  # ── RecurSec Engine ──────────────────────────────────
+  recursec:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: recursec
+    restart: unless-stopped
+    ports:
+      - "8080:8080"  # Dashboard
+    volumes:
+      - ../configs:/opt/recursec/configs
+      - recursec-data:/data
+      - recursec-workspace:/workspace
+    environment:
+      - RECURSEC_LOG_LEVEL=INFO
+    networks:
+      - recursec-net
+    depends_on:
+      - redis
+    cap_add:
+      - NET_RAW      # For nmap, masscan
+      - NET_ADMIN     # For network tools
+    # Resource limits — adjust based on your hardware
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: "4.0"
+        reservations:
+          memory: 2G
+          cpus: "1.0"
+
+  # ── Redis (for task queue and caching) ───────────────
+  redis:
+    image: redis:7-alpine
+    container_name: recursec-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - recursec-net
+
+  # ── vLLM Server (example — GPU required) ─────────────
+  # Uncomment and configure for each model you want to serve
+  #
+  # vllm-deepseek:
+  #   image: vllm/vllm-openai:latest
+  #   container_name: vllm-deepseek
+  #   restart: unless-stopped
+  #   runtime: nvidia
+  #   environment:
+  #     - NVIDIA_VISIBLE_DEVICES=0
+  #   ports:
+  #     - "8000:8000"
+  #   command: >
+  #     --model deepseek-ai/deepseek-coder-v2-lite-instruct
+  #     --max-model-len 16384
+  #     --gpu-memory-utilization 0.9
+  #     --dtype auto
+  #   networks:
+  #     - recursec-net
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #
+  # vllm-qwen:
+  #   image: vllm/vllm-openai:latest
+  #   container_name: vllm-qwen
+  #   restart: unless-stopped
+  #   runtime: nvidia
+  #   environment:
+  #     - NVIDIA_VISIBLE_DEVICES=1
+  #   ports:
+  #     - "8001:8000"
+  #   command: >
+  #     --model Qwen/Qwen2.5-72B-Instruct-AWQ
+  #     --quantization awq
+  #     --max-model-len 8192
+  #     --gpu-memory-utilization 0.9
+  #   networks:
+  #     - recursec-net
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+
+  # ── llama.cpp Server (CPU or GPU) ────────────────────
+  # Uncomment to serve GGUF models
+  #
+  # llamacpp:
+  #   image: ghcr.io/ggerganov/llama.cpp:server
+  #   container_name: llamacpp
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ./models:/models
+  #   command: >
+  #     -m /models/your-model.gguf
+  #     --host 0.0.0.0
+  #     --port 8080
+  #     -ngl 99
+  #     -c 8192
+  #   networks:
+  #     - recursec-net
+
+  # ── SGLang Server (fastest latency) ──────────────────
+  # Uncomment for SGLang backend
+  #
+  # sglang:
+  #   image: lmsysorg/sglang:latest
+  #   container_name: sglang
+  #   restart: unless-stopped
+  #   runtime: nvidia
+  #   ports:
+  #     - "30000:30000"
+  #   command: >
+  #     python -m sglang.launch_server
+  #     --model-path meta-llama/Meta-Llama-3.1-70B-Instruct
+  #     --port 30000
+  #     --host 0.0.0.0
+  #   networks:
+  #     - recursec-net
+
+  # ── LiteLLM Proxy (universal router) ─────────────────
+  # Uncomment to use LiteLLM as a unified proxy
+  #
+  # litellm:
+  #   image: ghcr.io/berriai/litellm:main-latest
+  #   container_name: litellm
+  #   restart: unless-stopped
+  #   ports:
+  #     - "4000:4000"
+  #   volumes:
+  #     - ./litellm-config.yaml:/app/config.yaml
+  #   command: --config /app/config.yaml --port 4000
+  #   networks:
+  #     - recursec-net
+
+volumes:
+  recursec-data:
+  recursec-workspace:
+  redis-data:
+
+networks:
+  recursec-net:
+    driver: bridge
