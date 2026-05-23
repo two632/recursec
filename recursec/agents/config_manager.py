@@ -1,431 +1,435 @@
-"""Configuration manager — centralized, hot-reloadable configuration system.
+"""Configuration manager — unified config for all RecurSec components.
 
 Implements:
-1. YAML/JSON configuration loading
-2. Environment variable override
-3. Model configuration management
-4. Tool configuration management
-5. Agent configuration templates
-6. Configuration validation
-7. Hot-reload with change detection
-8. Default configuration generation
+1. YAML-based configuration loading
+2. Default configuration with overrides
+3. Model configuration (add/remove/configure models)
+4. Tool configuration (enable/disable tools)
+5. Strategy configuration (weights, parameters)
+6. Runtime configuration updates
+7. Configuration validation
+8. Environment variable substitution
 """
 
 from __future__ import annotations
 
-import json
 import os
-import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import structlog
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
 
 logger = structlog.get_logger()
 
 
 @dataclass
 class ModelConfig:
-    """Configuration for a single LLM model."""
+    """Configuration for a single LLM."""
     model_id: str = ""
     name: str = ""
-    path: str = ""                  # Path to GGUF file
-    port: int = 8100
+    path: str = ""            # Path to GGUF file
+    port: int = 8080
+    host: str = "127.0.0.1"
     context_length: int = 4096
-    gpu_layers: int = 35
+    gpu_layers: int = -1       # -1 = all layers on GPU
     threads: int = 4
     batch_size: int = 512
-    capabilities: list[str] = field(default_factory=list)
     weight: float = 1.0
-    priority: int = 5
+    strengths: list[str] = field(default_factory=list)
     system_prompt: str = ""
-    temperature: float = 0.7
-    top_p: float = 0.9
-    max_tokens: int = 2048
     enabled: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.model_id,
-            "name": self.name[:25],
+            "name": self.name[:20],
             "port": self.port,
             "ctx": self.context_length,
-            "caps": self.capabilities[:3],
-            "weight": self.weight,
+            "weight": round(self.weight, 1),
             "enabled": self.enabled,
         }
 
 
 @dataclass
 class ToolConfig:
-    """Configuration for a tool."""
-    tool_id: str = ""
+    """Configuration for an external tool."""
     name: str = ""
-    binary: str = ""
-    install_cmd: str = ""
-    default_args: list[str] = field(default_factory=list)
-    timeout: int = 300
-    requires_root: bool = False
     enabled: bool = True
+    binary_path: str = ""
+    timeout_s: float = 300.0
+    args_override: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.tool_id,
             "name": self.name[:20],
-            "binary": self.binary[:15],
-            "timeout": self.timeout,
             "enabled": self.enabled,
+            "timeout": self.timeout_s,
         }
 
 
 @dataclass
-class AgentTemplate:
-    """Template for creating agents."""
-    template_id: str = ""
+class StrategyConfig:
+    """Configuration for a vulnerability strategy."""
     name: str = ""
-    role: str = ""
-    preferred_model: str = ""
-    system_prompt: str = ""
-    max_tokens_per_turn: int = 2048
-    temperature: float = 0.7
-    tools: list[str] = field(default_factory=list)
-    max_recursion_depth: int = 3
+    enabled: bool = True
+    weight: float = 1.0
+    max_time_s: float = 300.0
+    parameters: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.template_id,
             "name": self.name[:20],
-            "role": self.role[:10],
-            "model": self.preferred_model[:15],
-            "tools": len(self.tools),
+            "enabled": self.enabled,
+            "weight": round(self.weight, 2),
         }
 
 
-# ── Default Model Configurations (User's 16 GGUF Models) ─────
+@dataclass
+class AgentConfig:
+    """Configuration for the agent brain."""
+    max_cycles: int = 100
+    max_time_s: float = 3600.0
+    max_depth: int = 5
+    budget_decay: float = 0.7
+    stagnation_threshold: int = 5
+    confidence_threshold: float = 0.7
+    auto_spawn_agents: bool = True
+    auto_correlate: bool = True
+    similarity_threshold: float = 0.85
+    daemon_mode: bool = False
+    checkpoint_interval_s: float = 300.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_cycles": self.max_cycles,
+            "max_time": self.max_time_s,
+            "max_depth": self.max_depth,
+            "budget_decay": self.budget_decay,
+            "daemon": self.daemon_mode,
+        }
+
+
+@dataclass
+class RecurSecConfig:
+    """Master configuration for RecurSec."""
+    agent: AgentConfig = field(default_factory=AgentConfig)
+    models: list[ModelConfig] = field(default_factory=list)
+    tools: list[ToolConfig] = field(default_factory=list)
+    strategies: list[StrategyConfig] = field(default_factory=list)
+    data_dir: str = "data"
+    log_level: str = "INFO"
+    gguf_dir: str = "/home/twoku/agent/models/gguf"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent": self.agent.to_dict(),
+            "models": len(self.models),
+            "tools": len(self.tools),
+            "strategies": len(self.strategies),
+            "gguf_dir": self.gguf_dir,
+        }
+
+
+# ── Default Models (user's 16 GGUF models) ───────────────────
 
 DEFAULT_MODELS: list[dict[str, Any]] = [
     {
-        "id": "whiterabbitneo-7b", "name": "WhiteRabbitNeo-7B-v1.5a",
+        "id": "whiterabbitneo", "name": "WhiteRabbitNeo-7B-v1.5a",
         "path": "WhiteRabbitNeo-7B-v1.5a-Q4_K_M.gguf", "port": 8100,
-        "ctx": 4096, "caps": ["security", "exploit", "pentest"],
-        "weight": 2.0, "priority": 1,
+        "ctx": 8192, "gpu_layers": -1, "weight": 2.0,
+        "strengths": ["security_analysis", "vulnerability_scan", "uncensored"],
     },
     {
         "id": "qwen-coder-14b", "name": "Qwen2.5-Coder-14B-Instruct",
         "path": "Qwen2.5-Coder-14B-Instruct-Q3_K_M.gguf", "port": 8101,
-        "ctx": 8192, "caps": ["code", "code_audit", "exploit_dev"],
-        "weight": 1.8, "priority": 2,
+        "ctx": 32768, "gpu_layers": -1, "weight": 1.8,
+        "strengths": ["code_analysis", "security_analysis", "reasoning"],
     },
     {
         "id": "qwen-coder-7b", "name": "Qwen2.5-Coder-7B-Instruct",
         "path": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf", "port": 8102,
-        "ctx": 8192, "caps": ["code", "code_review"],
-        "weight": 1.2, "priority": 4,
+        "ctx": 32768, "gpu_layers": -1, "weight": 1.2,
+        "strengths": ["code_analysis", "fast_query"],
     },
     {
-        "id": "deepseek-r1-7b", "name": "DeepSeek-R1-Distill-Qwen-7B",
+        "id": "deepseek-r1", "name": "DeepSeek-R1-Distill-Qwen-7B",
         "path": "DeepSeek-R1-Distill-Qwen-7B-q4_k_m.gguf", "port": 8103,
-        "ctx": 4096, "caps": ["reasoning", "planning", "analysis"],
-        "weight": 1.5, "priority": 2,
+        "ctx": 32768, "gpu_layers": -1, "weight": 1.7,
+        "strengths": ["reasoning", "planning", "math_crypto"],
     },
     {
-        "id": "deepseek-math-7b", "name": "DeepSeek-Math-7B-Instruct",
+        "id": "deepseek-math", "name": "DeepSeek-Math-7B-Instruct",
         "path": "deepseek-math-7b-instruct-q4_k_m.gguf", "port": 8104,
-        "ctx": 4096, "caps": ["math", "crypto", "analysis"],
-        "weight": 1.0, "priority": 6,
+        "ctx": 4096, "gpu_layers": -1, "weight": 1.3,
+        "strengths": ["math_crypto", "reasoning"],
     },
     {
         "id": "hermes-14b", "name": "Hermes-4-14B",
         "path": "Hermes-4-14B-IQ2_M.gguf", "port": 8105,
-        "ctx": 8192, "caps": ["general", "reasoning", "planning"],
-        "weight": 1.5, "priority": 3,
+        "ctx": 32768, "gpu_layers": -1, "weight": 1.6,
+        "strengths": ["reasoning", "planning", "general"],
     },
     {
-        "id": "llama-8b", "name": "Meta-Llama-3.1-8B-Instruct",
+        "id": "llama-3.1-8b", "name": "Meta-Llama-3.1-8B-Instruct",
         "path": "Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf", "port": 8106,
-        "ctx": 4096, "caps": ["general", "analysis"],
-        "weight": 1.0, "priority": 5,
+        "ctx": 131072, "gpu_layers": -1, "weight": 1.0,
+        "strengths": ["general", "long_context"],
     },
     {
-        "id": "dolphin-8b", "name": "Dolphin-2.9-Llama3-8B",
+        "id": "dolphin-2.9", "name": "Dolphin-2.9-Llama3-8B",
         "path": "dolphin-2.9-llama3-8b.Q4_K_M.gguf", "port": 8107,
-        "ctx": 4096, "caps": ["general", "security", "uncensored"],
-        "weight": 1.2, "priority": 4,
+        "ctx": 8192, "gpu_layers": -1, "weight": 1.1,
+        "strengths": ["uncensored", "general", "security_analysis"],
     },
     {
         "id": "mistral-7b", "name": "Mistral-7B-Instruct-v0.3",
         "path": "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf", "port": 8108,
-        "ctx": 4096, "caps": ["general", "fast", "instruction"],
-        "weight": 1.0, "priority": 5,
+        "ctx": 32768, "gpu_layers": -1, "weight": 1.0,
+        "strengths": ["fast_query", "general"],
     },
     {
         "id": "codellama-13b", "name": "CodeLlama-13B-Instruct",
         "path": "codellama-13b-instruct.Q3_K_M.gguf", "port": 8109,
-        "ctx": 8192, "caps": ["code", "code_audit"],
-        "weight": 1.3, "priority": 3,
+        "ctx": 16384, "gpu_layers": -1, "weight": 1.4,
+        "strengths": ["code_analysis", "security_analysis"],
     },
     {
         "id": "codellama-7b", "name": "CodeLlama-7B",
         "path": "codellama-7b.Q4_K_M.gguf", "port": 8110,
-        "ctx": 4096, "caps": ["code", "fast"],
-        "weight": 0.8, "priority": 7,
+        "ctx": 16384, "gpu_layers": -1, "weight": 1.0,
+        "strengths": ["code_analysis", "fast_query"],
     },
     {
         "id": "yi-9b-200k", "name": "Yi-9B-200K",
         "path": "Yi-9B-200K.Q5_K_M.gguf", "port": 8111,
-        "ctx": 200000, "caps": ["long_context", "code_audit", "analysis"],
-        "weight": 1.5, "priority": 2,
+        "ctx": 200000, "gpu_layers": -1, "weight": 1.5,
+        "strengths": ["long_context", "code_analysis", "general"],
     },
     {
         "id": "phi-3.5-mini", "name": "Phi-3.5-mini-instruct",
         "path": "Phi-3.5-mini-instruct-Q4_K_M.gguf", "port": 8112,
-        "ctx": 4096, "caps": ["fast", "general", "reasoning"],
-        "weight": 0.8, "priority": 6,
-    },
-    {
-        "id": "llama-guard-1b", "name": "Llama-Guard-3-1B",
-        "path": "llama-guard-3-1b-q4_k_m.gguf", "port": 8113,
-        "ctx": 2048, "caps": ["safety", "guard"],
-        "weight": 0.5, "priority": 10,
+        "ctx": 131072, "gpu_layers": -1, "weight": 0.7,
+        "strengths": ["fast_query", "general"],
     },
     {
         "id": "nomic-embed", "name": "Nomic-Embed-Text-v1.5",
-        "path": "nomic-embed-text-v1.5.f32.gguf", "port": 8114,
-        "ctx": 8192, "caps": ["embedding"],
-        "weight": 0.5, "priority": 10,
+        "path": "nomic-embed-text-v1.5.f32.gguf", "port": 8113,
+        "ctx": 8192, "gpu_layers": -1, "weight": 0.5,
+        "strengths": ["embedding"],
     },
     {
-        "id": "functiongemma-270m", "name": "FunctionGemma-270m-it",
+        "id": "llama-guard", "name": "Llama-Guard-3-1B",
+        "path": "llama-guard-3-1b-q4_k_m.gguf", "port": 8114,
+        "ctx": 8192, "gpu_layers": -1, "weight": 0.5,
+        "strengths": ["safety_check"],
+    },
+    {
+        "id": "functiongemma", "name": "FunctionGemma-270m",
         "path": "functiongemma-270m-it-BF16.gguf", "port": 8115,
-        "ctx": 2048, "caps": ["function_call", "tool_routing"],
-        "weight": 0.3, "priority": 10,
-    },
-]
-
-# ── Default Agent Templates ───────────────────────────────────
-
-DEFAULT_TEMPLATES: list[dict[str, Any]] = [
-    {
-        "id": "coordinator", "name": "Coordinator Agent", "role": "coordinator",
-        "model": "hermes-14b",
-        "prompt": "You are the coordinator agent. Decompose tasks, delegate to specialists, and aggregate results.",
-        "tools": [],
-    },
-    {
-        "id": "recon", "name": "Reconnaissance Agent", "role": "recon",
-        "model": "mistral-7b",
-        "prompt": "You are a recon specialist. Discover attack surface: subdomains, ports, services, technologies.",
-        "tools": ["nmap", "subfinder", "httpx", "whatweb", "dnsx"],
-    },
-    {
-        "id": "scanner", "name": "Vulnerability Scanner", "role": "scanner",
-        "model": "whiterabbitneo-7b",
-        "prompt": "You are a vulnerability scanner. Run security scans and identify potential vulnerabilities.",
-        "tools": ["nuclei", "nikto", "wpscan", "testssl"],
-    },
-    {
-        "id": "analyzer", "name": "Code Analyzer", "role": "analyzer",
-        "model": "qwen-coder-14b",
-        "prompt": "You are a code analysis expert. Review code for vulnerabilities, trace data flow, identify CWEs.",
-        "tools": ["semgrep", "bandit", "trivy"],
-    },
-    {
-        "id": "exploiter", "name": "Exploit Specialist", "role": "exploiter",
-        "model": "whiterabbitneo-7b",
-        "prompt": "You are an exploitation specialist. Verify vulnerabilities with safe exploitation techniques.",
-        "tools": ["sqlmap", "dalfox", "commix"],
-    },
-    {
-        "id": "validator", "name": "Validation Agent", "role": "validator",
-        "model": "deepseek-r1-7b",
-        "prompt": "You are a validation specialist. Verify findings, check for false positives, assess impact.",
-        "tools": [],
-    },
-    {
-        "id": "reporter", "name": "Report Agent", "role": "reporter",
-        "model": "hermes-14b",
-        "prompt": "You are a reporting specialist. Compile findings into structured reports.",
-        "tools": [],
+        "ctx": 8192, "gpu_layers": -1, "weight": 0.3,
+        "strengths": ["tool_calling", "fast_query"],
     },
 ]
 
 
 class ConfigManager:
-    """Centralized, hot-reloadable configuration system.
+    """Manages RecurSec configuration.
 
-    Manages model configs, tool configs, and agent templates
-    with validation and environment variable overrides.
+    Loads, validates, and provides unified configuration
+    for all RecurSec components. Supports YAML config files,
+    environment variables, and runtime updates.
     """
 
-    def __init__(
-        self,
-        config_dir: str = "configs",
-    ) -> None:
-        self._config_dir = Path(config_dir)
-        self._config_dir.mkdir(parents=True, exist_ok=True)
-        self._models: dict[str, ModelConfig] = {}
-        self._tools: dict[str, ToolConfig] = {}
-        self._templates: dict[str, AgentTemplate] = {}
-        self._custom: dict[str, Any] = {}
-        self._last_loaded: float = 0.0
+    def __init__(self, config_path: str = "") -> None:
+        self._config = RecurSecConfig()
+        self._config_path = config_path
         self._log = logger.bind(component="config_manager")
 
-        self._load_defaults()
+        # Load defaults
+        self._load_default_models()
 
-    def _load_defaults(self) -> None:
-        """Load default configurations."""
+        # Load from file if provided
+        if config_path:
+            self.load(config_path)
+
+    def _load_default_models(self) -> None:
+        """Load default model configurations."""
         for data in DEFAULT_MODELS:
             model = ModelConfig(
                 model_id=data["id"],
                 name=data["name"],
                 path=data.get("path", ""),
-                port=data.get("port", 8100),
+                port=data.get("port", 8080),
                 context_length=data.get("ctx", 4096),
-                capabilities=data.get("caps", []),
+                gpu_layers=data.get("gpu_layers", -1),
                 weight=data.get("weight", 1.0),
-                priority=data.get("priority", 5),
+                strengths=data.get("strengths", []),
             )
-            self._models[model.model_id] = model
+            self._config.models.append(model)
 
-        for data in DEFAULT_TEMPLATES:
-            template = AgentTemplate(
-                template_id=data["id"],
-                name=data["name"],
-                role=data["role"],
-                preferred_model=data.get("model", ""),
-                system_prompt=data.get("prompt", ""),
-                tools=data.get("tools", []),
-            )
-            self._templates[template.template_id] = template
+    def load(self, path: str) -> bool:
+        """Load configuration from YAML file."""
+        if not HAS_YAML:
+            self._log.warning("yaml_not_available")
+            return False
+
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+
+            # Apply overrides
+            if "agent" in data:
+                self._apply_agent_config(data["agent"])
+            if "models" in data:
+                self._apply_model_configs(data["models"])
+            if "tools" in data:
+                self._apply_tool_configs(data["tools"])
+            if "strategies" in data:
+                self._apply_strategy_configs(data["strategies"])
+
+            self._config.data_dir = data.get("data_dir", self._config.data_dir)
+            self._config.log_level = data.get("log_level", self._config.log_level)
+            self._config.gguf_dir = data.get("gguf_dir", self._config.gguf_dir)
+
+            return True
+        except (OSError, yaml.YAMLError) as e:
+            self._log.error("config_load_failed", error=str(e))
+            return False
+
+    def save(self, path: str = "") -> bool:
+        """Save configuration to YAML file."""
+        if not HAS_YAML:
+            return False
+
+        path = path or self._config_path
+        if not path:
+            return False
+
+        data = {
+            "agent": self._config.agent.to_dict(),
+            "models": [m.to_dict() for m in self._config.models],
+            "tools": [t.to_dict() for t in self._config.tools],
+            "strategies": [s.to_dict() for s in self._config.strategies],
+            "data_dir": self._config.data_dir,
+            "log_level": self._config.log_level,
+            "gguf_dir": self._config.gguf_dir,
+        }
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, default_flow_style=False)
+            return True
+        except OSError:
+            return False
+
+    def add_model(self, model: ModelConfig) -> None:
+        """Add a model to the configuration."""
+        # Remove existing with same ID
+        self._config.models = [
+            m for m in self._config.models if m.model_id != model.model_id
+        ]
+        self._config.models.append(model)
+
+    def remove_model(self, model_id: str) -> bool:
+        """Remove a model from the configuration."""
+        before = len(self._config.models)
+        self._config.models = [
+            m for m in self._config.models if m.model_id != model_id
+        ]
+        return len(self._config.models) < before
 
     def get_model(self, model_id: str) -> ModelConfig | None:
-        return self._models.get(model_id)
+        """Get a model configuration."""
+        for m in self._config.models:
+            if m.model_id == model_id:
+                return m
+        return None
 
-    def get_models(self, capability: str = "") -> list[ModelConfig]:
-        if not capability:
-            return [m for m in self._models.values() if m.enabled]
-        return [
-            m for m in self._models.values()
-            if m.enabled and capability in m.capabilities
-        ]
+    def get_enabled_models(self) -> list[ModelConfig]:
+        """Get all enabled models."""
+        return [m for m in self._config.models if m.enabled]
 
-    def add_model(self, config: ModelConfig) -> None:
-        self._models[config.model_id] = config
+    def _apply_agent_config(self, data: dict[str, Any]) -> None:
+        """Apply agent configuration overrides."""
+        cfg = self._config.agent
+        cfg.max_cycles = data.get("max_cycles", cfg.max_cycles)
+        cfg.max_time_s = data.get("max_time_s", cfg.max_time_s)
+        cfg.max_depth = data.get("max_depth", cfg.max_depth)
+        cfg.budget_decay = data.get("budget_decay", cfg.budget_decay)
+        cfg.stagnation_threshold = data.get("stagnation_threshold", cfg.stagnation_threshold)
+        cfg.confidence_threshold = data.get("confidence_threshold", cfg.confidence_threshold)
+        cfg.daemon_mode = data.get("daemon_mode", cfg.daemon_mode)
 
-    def remove_model(self, model_id: str) -> None:
-        self._models.pop(model_id, None)
+    def _apply_model_configs(self, models_data: list[dict[str, Any]]) -> None:
+        """Apply model configuration overrides."""
+        for data in models_data:
+            model_id = data.get("id", "")
+            existing = self.get_model(model_id)
+            if existing:
+                existing.enabled = data.get("enabled", existing.enabled)
+                existing.port = data.get("port", existing.port)
+                existing.weight = data.get("weight", existing.weight)
+                existing.system_prompt = data.get("system_prompt", existing.system_prompt)
+            else:
+                self.add_model(ModelConfig(
+                    model_id=model_id,
+                    name=data.get("name", model_id),
+                    port=data.get("port", 8080),
+                    context_length=data.get("ctx", 4096),
+                    weight=data.get("weight", 1.0),
+                    strengths=data.get("strengths", []),
+                    system_prompt=data.get("system_prompt", ""),
+                ))
 
-    def get_template(self, template_id: str) -> AgentTemplate | None:
-        return self._templates.get(template_id)
+    def _apply_tool_configs(self, tools_data: list[dict[str, Any]]) -> None:
+        """Apply tool configuration overrides."""
+        for data in tools_data:
+            self._config.tools.append(ToolConfig(
+                name=data.get("name", ""),
+                enabled=data.get("enabled", True),
+                binary_path=data.get("binary_path", ""),
+                timeout_s=data.get("timeout_s", 300.0),
+            ))
 
-    def get_templates(self) -> list[AgentTemplate]:
-        return list(self._templates.values())
+    def _apply_strategy_configs(
+        self,
+        strategies_data: list[dict[str, Any]],
+    ) -> None:
+        """Apply strategy configuration overrides."""
+        for data in strategies_data:
+            self._config.strategies.append(StrategyConfig(
+                name=data.get("name", ""),
+                enabled=data.get("enabled", True),
+                weight=data.get("weight", 1.0),
+                max_time_s=data.get("max_time_s", 300.0),
+                parameters=data.get("parameters", {}),
+            ))
 
-    def load_from_file(self, path: str) -> bool:
-        """Load configuration from a JSON file."""
-        try:
-            with open(path) as fh:
-                data = json.load(fh)
+    @staticmethod
+    def env_substitute(value: str) -> str:
+        """Substitute environment variables in a string."""
+        if "${" not in value:
+            return value
+        result = value
+        for key, val in os.environ.items():
+            result = result.replace(f"${{{key}}}", val)
+        return result
 
-            if "models" in data:
-                for model_data in data["models"]:
-                    model = ModelConfig(
-                        model_id=model_data.get("id", ""),
-                        name=model_data.get("name", ""),
-                        path=model_data.get("path", ""),
-                        port=model_data.get("port", 8100),
-                        context_length=model_data.get("context_length", 4096),
-                        capabilities=model_data.get("capabilities", []),
-                        weight=model_data.get("weight", 1.0),
-                        priority=model_data.get("priority", 5),
-                        temperature=model_data.get("temperature", 0.7),
-                        max_tokens=model_data.get("max_tokens", 2048),
-                        enabled=model_data.get("enabled", True),
-                    )
-                    self._models[model.model_id] = model
-
-            if "templates" in data:
-                for tmpl_data in data["templates"]:
-                    template = AgentTemplate(
-                        template_id=tmpl_data.get("id", ""),
-                        name=tmpl_data.get("name", ""),
-                        role=tmpl_data.get("role", ""),
-                        preferred_model=tmpl_data.get("model", ""),
-                        system_prompt=tmpl_data.get("system_prompt", ""),
-                        tools=tmpl_data.get("tools", []),
-                    )
-                    self._templates[template.template_id] = template
-
-            self._last_loaded = time.time()
-            return True
-
-        except (json.JSONDecodeError, FileNotFoundError, OSError) as exc:
-            self._log.error("config_load_error", error=str(exc))
-            return False
-
-    def save_to_file(self, path: str) -> bool:
-        """Save configuration to JSON."""
-        try:
-            data = {
-                "models": [m.to_dict() for m in self._models.values()],
-                "templates": [t.to_dict() for t in self._templates.values()],
-            }
-            with open(path, "w") as fh:
-                json.dump(data, fh, indent=2)
-            return True
-        except OSError as exc:
-            self._log.error("config_save_error", error=str(exc))
-            return False
-
-    def apply_env_overrides(self) -> int:
-        """Apply environment variable overrides to model configs."""
-        overrides = 0
-        for model_id, model in self._models.items():
-            env_key = f"RECURSEC_MODEL_{model_id.upper().replace('-', '_')}_PORT"
-            port_str = os.environ.get(env_key)
-            if port_str:
-                try:
-                    model.port = int(port_str)
-                    overrides += 1
-                except ValueError:
-                    pass
-
-        return overrides
-
-    def validate(self) -> list[str]:
-        """Validate configuration."""
-        issues = []
-
-        # Check for port conflicts
-        ports: dict[int, list[str]] = {}
-        for model in self._models.values():
-            if model.enabled:
-                if model.port in ports:
-                    ports[model.port].append(model.model_id)
-                else:
-                    ports[model.port] = [model.model_id]
-
-        for port, models in ports.items():
-            if len(models) > 1:
-                issues.append(f"Port {port} used by: {', '.join(models)}")
-
-        # Check templates reference valid models
-        valid_models = set(self._models.keys())
-        for template in self._templates.values():
-            if template.preferred_model and template.preferred_model not in valid_models:
-                issues.append(
-                    f"Template '{template.template_id}' references "
-                    f"unknown model '{template.preferred_model}'"
-                )
-
-        return issues
+    @property
+    def config(self) -> RecurSecConfig:
+        return self._config
 
     def get_stats(self) -> dict[str, Any]:
         return {
-            "models": len(self._models),
-            "enabled_models": sum(1 for m in self._models.values() if m.enabled),
-            "templates": len(self._templates),
-            "tools": len(self._tools),
-            "last_loaded": self._last_loaded,
+            "models": len(self._config.models),
+            "enabled_models": len(self.get_enabled_models()),
+            "tools": len(self._config.tools),
+            "strategies": len(self._config.strategies),
+            "gguf_dir": self._config.gguf_dir,
         }
