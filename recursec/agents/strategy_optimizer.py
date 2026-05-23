@@ -1,22 +1,21 @@
-"""Strategy optimizer — optimizes agent strategies using reinforcement learning.
+"""Strategy optimizer — learns which strategies work best per context.
 
 Implements:
-1. Multi-armed bandit for strategy selection
-2. Upper Confidence Bound (UCB1) exploration
-3. Thompson sampling for uncertain strategies
-4. Contextual bandits (strategy depends on target features)
-5. Strategy performance tracking
-6. Exploration vs exploitation balance
-7. Strategy adaptation based on feedback
-8. Strategy portfolio management
+1. Strategy performance tracking (success/fail/tokens/time)
+2. Multi-armed bandit selection (UCB1)
+3. Contextual strategy recommendation
+4. Strategy composition (combining multiple)
+5. Adaptive exploration/exploitation balance
+6. Strategy decay (deprioritize stale strategies)
+7. LLM prompt for strategy decisions
 """
 
 from __future__ import annotations
 
 import math
-import random
-from collections import defaultdict
+import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -24,277 +23,319 @@ import structlog
 logger = structlog.get_logger()
 
 
+class StrategyCategory(str, Enum):
+    RECON = "recon"
+    SCANNING = "scanning"
+    EXPLOITATION = "exploitation"
+    POST_EXPLOIT = "post_exploit"
+    EVASION = "evasion"
+    LATERAL = "lateral"
+    PERSISTENCE = "persistence"
+
+
+class StrategyOutcome(str, Enum):
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILURE = "failure"
+    ERROR = "error"
+    BLOCKED = "blocked"
+
+
 @dataclass
 class Strategy:
-    """A strategy option."""
+    """A security testing strategy."""
     strategy_id: str = ""
     name: str = ""
+    category: StrategyCategory = StrategyCategory.SCANNING
     description: str = ""
-    category: str = ""             # recon, scanning, exploit, analysis
-    applicable_to: list[str] = field(default_factory=list)  # target types
-    # Performance stats
+    tools: list[str] = field(default_factory=list)
+    applicable_targets: list[str] = field(default_factory=list)  # web, network, api, etc.
+    prerequisites: list[str] = field(default_factory=list)
+    avg_duration_s: float = 300.0
+    avg_tokens: int = 5000
+
+    # Performance tracking
     total_uses: int = 0
-    total_reward: float = 0.0
     successes: int = 0
     failures: int = 0
-    avg_reward: float = 0.0
-    # Thompson sampling parameters
-    alpha: float = 1.0             # Beta distribution alpha (successes + 1)
-    beta_param: float = 1.0        # Beta distribution beta (failures + 1)
+    total_findings: int = 0
+    total_tokens_used: int = 0
+    total_duration_s: float = 0.0
+    last_used: float = 0.0
 
     @property
     def success_rate(self) -> float:
         if self.total_uses == 0:
-            return 0.0
-        return self.successes / self.total_uses
+            return 0.5  # Unknown, assume neutral
+        return (self.successes + 0.5 * (self.total_uses - self.successes - self.failures)) / self.total_uses
 
     @property
-    def ucb1_score(self) -> float:
-        """Upper Confidence Bound score."""
+    def avg_findings_per_use(self) -> float:
         if self.total_uses == 0:
-            return float("inf")
-        exploitation = self.avg_reward
-        exploration = math.sqrt(2.0 * math.log(max(1, self.total_uses * 10)) / self.total_uses)
-        return exploitation + exploration
+            return 0.0
+        return self.total_findings / self.total_uses
 
-    def thompson_sample(self) -> float:
-        """Sample from Beta distribution for Thompson sampling."""
-        return random.betavariate(self.alpha, self.beta_param)
+    @property
+    def efficiency(self) -> float:
+        """Findings per 1000 tokens."""
+        if self.total_tokens_used == 0:
+            return 0.0
+        return (self.total_findings / self.total_tokens_used) * 1000
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.strategy_id, "name": self.name[:40],
+            "id": self.strategy_id[:10],
+            "name": self.name[:20],
+            "category": self.category.value,
             "uses": self.total_uses,
             "success_rate": round(self.success_rate, 2),
-            "avg_reward": round(self.avg_reward, 2),
-            "ucb1": round(self.ucb1_score, 2) if self.total_uses > 0 else "inf",
+            "findings": self.total_findings,
+            "efficiency": round(self.efficiency, 2),
         }
 
 
 @dataclass
-class ContextFeatures:
-    """Features of the current context for contextual bandits."""
-    target_type: str = ""          # web, network, api, cloud
-    has_waf: bool = False
-    has_auth: bool = False
-    tech_stack: list[str] = field(default_factory=list)
-    open_ports: int = 0
-    previous_findings: int = 0
-    time_remaining_s: float = 3600.0
-    budget_remaining: float = 1.0  # 0.0-1.0
-
-    def to_feature_key(self) -> str:
-        """Convert to a hashable feature key."""
-        parts = [
-            self.target_type,
-            "waf" if self.has_waf else "no_waf",
-            "auth" if self.has_auth else "no_auth",
-            f"ports_{min(self.open_ports, 100)}",
-        ]
-        return ":".join(parts)
+class StrategyRun:
+    """A recorded strategy execution."""
+    run_id: str = ""
+    strategy_id: str = ""
+    outcome: StrategyOutcome = StrategyOutcome.FAILURE
+    target_type: str = ""
+    findings_count: int = 0
+    tokens_used: int = 0
+    duration_s: float = 0.0
+    notes: str = ""
+    timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "type": self.target_type,
-            "waf": self.has_waf,
-            "auth": self.has_auth,
-            "ports": self.open_ports,
-            "findings": self.previous_findings,
+            "strategy": self.strategy_id[:10],
+            "outcome": self.outcome.value,
+            "findings": self.findings_count,
         }
 
 
-# ── Default Strategies ────────────────────────────────────────
+# ── Default strategies ───────────────────────────────────────
 
 DEFAULT_STRATEGIES: list[dict[str, Any]] = [
     {
-        "name": "Breadth-first recon",
-        "desc": "Wide reconnaissance before deep analysis",
-        "cat": "recon", "applicable": ["web", "network", "api"],
+        "id": "strat-passive-recon", "name": "Passive Reconnaissance",
+        "category": "recon",
+        "desc": "Gather information without touching target directly",
+        "tools": ["subfinder", "amass", "theHarvester", "whois", "dig"],
+        "targets": ["web", "network", "api"],
     },
     {
-        "name": "Depth-first exploitation",
-        "desc": "Deep dive into first promising finding",
-        "cat": "exploit", "applicable": ["web", "api"],
+        "id": "strat-active-recon", "name": "Active Reconnaissance",
+        "category": "recon",
+        "desc": "Active scanning and enumeration of target",
+        "tools": ["nmap", "masscan", "httpx", "whatweb"],
+        "targets": ["web", "network", "api"],
     },
     {
-        "name": "Parallel multi-tool scan",
-        "desc": "Run multiple scanners simultaneously",
-        "cat": "scanning", "applicable": ["web", "network"],
+        "id": "strat-web-vuln", "name": "Web Vulnerability Scanning",
+        "category": "scanning",
+        "desc": "Automated web vulnerability scanning",
+        "tools": ["nuclei", "nikto", "zap"],
+        "targets": ["web", "api"],
     },
     {
-        "name": "Stealth progressive scan",
-        "desc": "Slow, careful scanning to avoid detection",
-        "cat": "scanning", "applicable": ["web", "network"],
+        "id": "strat-dir-discovery", "name": "Directory Discovery",
+        "category": "recon",
+        "desc": "Discover hidden directories and files",
+        "tools": ["ffuf", "gobuster", "feroxbuster"],
+        "targets": ["web"],
     },
     {
-        "name": "API fuzzing intensive",
-        "desc": "Heavy fuzzing of API endpoints",
-        "cat": "exploit", "applicable": ["api"],
+        "id": "strat-sqli", "name": "SQL Injection Testing",
+        "category": "exploitation",
+        "desc": "Test for SQL injection vulnerabilities",
+        "tools": ["sqlmap"],
+        "targets": ["web", "api"],
     },
     {
-        "name": "Credential-first approach",
-        "desc": "Prioritize finding valid credentials",
-        "cat": "exploit", "applicable": ["web", "network"],
+        "id": "strat-auth-test", "name": "Authentication Testing",
+        "category": "exploitation",
+        "desc": "Test authentication mechanisms",
+        "tools": ["hydra", "burpsuite", "jwt_tool"],
+        "targets": ["web", "api", "network"],
     },
     {
-        "name": "Configuration audit",
-        "desc": "Focus on misconfigurations and defaults",
-        "cat": "analysis", "applicable": ["web", "network", "cloud"],
+        "id": "strat-code-audit", "name": "Static Code Audit",
+        "category": "scanning",
+        "desc": "Static analysis of source code",
+        "tools": ["semgrep", "bandit", "codeql"],
+        "targets": ["code"],
     },
     {
-        "name": "Supply chain analysis",
-        "desc": "Analyze dependencies and third-party risks",
-        "cat": "analysis", "applicable": ["web", "api"],
+        "id": "strat-api-test", "name": "API Security Testing",
+        "category": "scanning",
+        "desc": "Test API endpoints for security issues",
+        "tools": ["nuclei", "ffuf", "graphw00f"],
+        "targets": ["api"],
     },
     {
-        "name": "Network lateral exploration",
-        "desc": "Map network topology and lateral paths",
-        "cat": "recon", "applicable": ["network"],
+        "id": "strat-privesc", "name": "Privilege Escalation",
+        "category": "post_exploit",
+        "desc": "Escalate privileges after initial access",
+        "tools": ["linpeas", "winpeas"],
+        "targets": ["host"],
     },
     {
-        "name": "Cloud resource enumeration",
-        "desc": "Enumerate cloud services and misconfigs",
-        "cat": "recon", "applicable": ["cloud"],
+        "id": "strat-lateral", "name": "Lateral Movement",
+        "category": "lateral",
+        "desc": "Move laterally through the network",
+        "tools": ["crackmapexec", "impacket"],
+        "targets": ["network", "ad"],
     },
 ]
 
 
 class StrategyOptimizer:
-    """Optimizes agent strategies using multi-armed bandit algorithms.
+    """Optimizes strategy selection using multi-armed bandit.
 
-    Balances exploration (trying new strategies) with
-    exploitation (using known-good strategies) based on
-    accumulated performance data.
+    Tracks strategy performance and uses UCB1
+    algorithm to balance exploration (trying
+    new strategies) with exploitation (using
+    proven strategies).
     """
 
-    def __init__(
-        self,
-        exploration_rate: float = 0.1,
-        method: str = "ucb1",       # ucb1, thompson, epsilon_greedy
-    ) -> None:
+    def __init__(self, exploration_weight: float = 1.41) -> None:
         self._strategies: dict[str, Strategy] = {}
-        self._method = method
-        self._exploration_rate = exploration_rate
-        self._strategy_counter = 0
-        self._selection_count = 0
-        # Contextual performance tracking
-        self._context_rewards: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-        self._context_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self._runs: list[StrategyRun] = []
+        self._exploration_weight = exploration_weight
+        self._total_rounds = 0
+        self._counter = 0
         self._log = logger.bind(component="strategy_optimizer")
+        self._load_defaults()
 
-        self._register_defaults()
-
-    def _register_defaults(self) -> None:
-        """Register default strategies."""
+    def _load_defaults(self) -> None:
+        """Load default strategies."""
         for data in DEFAULT_STRATEGIES:
-            self._strategy_counter += 1
-            strategy = Strategy(
-                strategy_id=f"strat-{self._strategy_counter}",
+            strat = Strategy(
+                strategy_id=data["id"],
                 name=data["name"],
+                category=StrategyCategory(data["category"]),
                 description=data.get("desc", ""),
-                category=data.get("cat", ""),
-                applicable_to=data.get("applicable", []),
+                tools=data.get("tools", []),
+                applicable_targets=data.get("targets", []),
             )
-            self._strategies[strategy.strategy_id] = strategy
+            self._strategies[strat.strategy_id] = strat
 
-    def select(
+    def recommend(
         self,
-        context: ContextFeatures | None = None,
-        category: str = "",
-    ) -> Strategy | None:
-        """Select the best strategy."""
-        self._selection_count += 1
+        target_type: str = "",
+        category: StrategyCategory | None = None,
+        top_k: int = 3,
+    ) -> list[Strategy]:
+        """Recommend strategies using UCB1."""
+        self._total_rounds += 1
+        candidates: list[tuple[float, Strategy]] = []
 
-        # Filter applicable strategies
-        candidates = list(self._strategies.values())
-        if context and context.target_type:
-            candidates = [
-                s for s in candidates
-                if not s.applicable_to or context.target_type in s.applicable_to
-            ]
-        if category:
-            candidates = [s for s in candidates if s.category == category]
+        for strat in self._strategies.values():
+            # Filter by target type
+            if target_type and strat.applicable_targets:
+                if target_type not in strat.applicable_targets:
+                    continue
 
-        if not candidates:
-            return None
+            # Filter by category
+            if category and strat.category != category:
+                continue
 
-        # Selection method
-        if self._method == "ucb1":
-            return self._ucb1_select(candidates)
-        elif self._method == "thompson":
-            return self._thompson_select(candidates)
-        else:
-            return self._epsilon_greedy_select(candidates)
+            # UCB1 score
+            score = self._ucb1_score(strat)
+            candidates.append((score, strat))
 
-    def _ucb1_select(self, candidates: list[Strategy]) -> Strategy:
-        """Select using UCB1 algorithm."""
-        return max(candidates, key=lambda s: s.ucb1_score)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return [strat for _, strat in candidates[:top_k]]
 
-    def _thompson_select(self, candidates: list[Strategy]) -> Strategy:
-        """Select using Thompson sampling."""
-        return max(candidates, key=lambda s: s.thompson_sample())
-
-    def _epsilon_greedy_select(self, candidates: list[Strategy]) -> Strategy:
-        """Select using epsilon-greedy."""
-        if random.random() < self._exploration_rate:
-            return random.choice(candidates)
-        # Exploit: best known
-        tried = [s for s in candidates if s.total_uses > 0]
-        if not tried:
-            return random.choice(candidates)
-        return max(tried, key=lambda s: s.avg_reward)
-
-    def record_reward(
+    def record_outcome(
         self,
         strategy_id: str,
-        reward: float,
-        success: bool = True,
-        context: ContextFeatures | None = None,
-    ) -> None:
-        """Record the outcome of using a strategy."""
-        strategy = self._strategies.get(strategy_id)
-        if not strategy:
-            return
+        outcome: StrategyOutcome,
+        target_type: str = "",
+        findings_count: int = 0,
+        tokens_used: int = 0,
+        duration_s: float = 0.0,
+        notes: str = "",
+    ) -> StrategyRun | None:
+        """Record a strategy execution outcome."""
+        strat = self._strategies.get(strategy_id)
+        if not strat:
+            return None
 
-        strategy.total_uses += 1
-        strategy.total_reward += reward
-        strategy.avg_reward = strategy.total_reward / strategy.total_uses
+        self._counter += 1
+        run = StrategyRun(
+            run_id=f"run-{self._counter}",
+            strategy_id=strategy_id,
+            outcome=outcome,
+            target_type=target_type,
+            findings_count=findings_count,
+            tokens_used=tokens_used,
+            duration_s=duration_s,
+            notes=notes,
+        )
+        self._runs.append(run)
 
-        if success:
-            strategy.successes += 1
-            strategy.alpha += 1.0
-        else:
-            strategy.failures += 1
-            strategy.beta_param += 1.0
+        # Update strategy stats
+        strat.total_uses += 1
+        strat.total_findings += findings_count
+        strat.total_tokens_used += tokens_used
+        strat.total_duration_s += duration_s
+        strat.last_used = time.time()
 
-        # Contextual tracking
-        if context:
-            ctx_key = context.to_feature_key()
-            self._context_rewards[ctx_key][strategy_id] += reward
-            self._context_counts[ctx_key][strategy_id] += 1
+        if outcome == StrategyOutcome.SUCCESS:
+            strat.successes += 1
+        elif outcome in (StrategyOutcome.FAILURE, StrategyOutcome.ERROR):
+            strat.failures += 1
 
-    def get_recommendations(
+        return run
+
+    def build_strategy_prompt(
         self,
-        context: ContextFeatures | None = None,
-        top_k: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Get top-k strategy recommendations."""
-        candidates = list(self._strategies.values())
-        if context and context.target_type:
-            candidates = [
-                s for s in candidates
-                if not s.applicable_to or context.target_type in s.applicable_to
-            ]
+        target_type: str = "",
+        max_strategies: int = 5,
+    ) -> str:
+        """Build strategy context for LLM."""
+        lines = ["## Strategy Recommendations\n"]
 
-        # Score by UCB1
-        scored = sorted(candidates, key=lambda s: s.ucb1_score, reverse=True)
-        return [s.to_dict() for s in scored[:top_k]]
+        recommended = self.recommend(target_type=target_type, top_k=max_strategies)
+        if recommended:
+            lines.append(f"Top strategies for {target_type or 'general'} target:")
+            for strat in recommended:
+                ucb = self._ucb1_score(strat)
+                lines.append(
+                    f"  [{strat.category.value[:4]}] {strat.name[:20]} "
+                    f"(UCB={ucb:.2f}, success={strat.success_rate:.0%}, "
+                    f"findings/use={strat.avg_findings_per_use:.1f})"
+                )
+                if strat.tools:
+                    lines.append(f"    Tools: {', '.join(strat.tools[:4])}")
+
+        return "\n".join(lines)
+
+    def _ucb1_score(self, strat: Strategy) -> float:
+        """Calculate UCB1 score for a strategy."""
+        if strat.total_uses == 0:
+            return float("inf")  # Unexplored → highest priority
+
+        exploitation = strat.success_rate
+        exploration = self._exploration_weight * math.sqrt(
+            math.log(max(1, self._total_rounds)) / strat.total_uses
+        )
+
+        # Bonus for high findings efficiency
+        efficiency_bonus = min(0.2, strat.efficiency * 0.01)
+
+        return exploitation + exploration + efficiency_bonus
 
     def get_stats(self) -> dict[str, Any]:
-        total_uses = sum(s.total_uses for s in self._strategies.values())
         return {
             "strategies": len(self._strategies),
-            "selections": self._selection_count,
-            "total_uses": total_uses,
-            "method": self._method,
+            "total_runs": len(self._runs),
+            "total_rounds": self._total_rounds,
+            "best_strategy": max(
+                self._strategies.values(),
+                key=lambda s: s.success_rate,
+            ).name if self._strategies else "",
         }
