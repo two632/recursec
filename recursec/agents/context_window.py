@@ -1,13 +1,13 @@
-"""Context window manager — multi-model context optimization.
+"""Context window manager — intelligent context management for LLMs.
 
 Implements:
-1. Context size tracking per model
-2. Priority-based context packing
-3. Sliding window for long conversations
-4. Context compression/summarization triggers
-5. Multi-model context adaptation
-6. Token counting estimation
-7. Context overflow prevention
+1. Context window tracking per model
+2. Priority-based section allocation
+3. Sliding window for conversation history
+4. Context compression (summarization)
+5. Dynamic context selection
+6. Section overflow handling
+7. Multi-model context adaptation
 """
 
 from __future__ import annotations
@@ -22,74 +22,75 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ContextPriority(str, Enum):
-    CRITICAL = "critical"     # System prompt, current task
-    HIGH = "high"             # Recent findings, active hypotheses
-    MEDIUM = "medium"         # Past tool outputs, knowledge base
-    LOW = "low"               # History, old findings
-    EPHEMERAL = "ephemeral"   # Single-use context
-
-
-class ContextItemType(str, Enum):
-    SYSTEM_PROMPT = "system_prompt"
-    TASK_CONTEXT = "task_context"
-    TOOL_OUTPUT = "tool_output"
-    FINDING = "finding"
-    HYPOTHESIS = "hypothesis"
-    KNOWLEDGE = "knowledge"
-    EXPERIENCE = "experience"
-    REASONING = "reasoning"
-    CONVERSATION = "conversation"
+class SectionPriority(str, Enum):
+    CRITICAL = "critical"      # Always included (system prompt, task)
+    HIGH = "high"             # Included unless space is tight
+    MEDIUM = "medium"         # Included if space available
+    LOW = "low"              # Only if plenty of space
+    OPTIONAL = "optional"    # First to be cut
 
 
 @dataclass
-class ContextItem:
-    """An item in the context window."""
-    item_id: str = ""
-    item_type: ContextItemType = ContextItemType.CONVERSATION
-    priority: ContextPriority = ContextPriority.MEDIUM
+class ContextSection:
+    """A section of context to include in the prompt."""
+    section_id: str = ""
+    name: str = ""
     content: str = ""
-    token_estimate: int = 0
-    created_at: float = field(default_factory=time.time)
-    accessed_at: float = field(default_factory=time.time)
-    access_count: int = 0
+    priority: SectionPriority = SectionPriority.MEDIUM
+    token_count: int = 0
+    max_tokens: int = 0       # 0 = no limit
     compressible: bool = True
+    compressed_content: str = ""
 
     @property
-    def age_s(self) -> float:
-        return time.time() - self.created_at
+    def effective_content(self) -> str:
+        """Return compressed content if available, else original."""
+        return self.compressed_content or self.content
 
     @property
-    def priority_score(self) -> float:
-        base = {
-            ContextPriority.CRITICAL: 1.0,
-            ContextPriority.HIGH: 0.75,
-            ContextPriority.MEDIUM: 0.5,
-            ContextPriority.LOW: 0.25,
-            ContextPriority.EPHEMERAL: 0.1,
-        }.get(self.priority, 0.5)
-        # Recency boost
-        recency = 1.0 / (1.0 + self.age_s / 3600)
-        return base * 0.7 + recency * 0.3
+    def effective_tokens(self) -> int:
+        """Token count of effective content."""
+        content = self.effective_content
+        return len(content) // 4
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.item_id[:10],
-            "type": self.item_type.value,
+            "id": self.section_id[:10],
+            "name": self.name[:15],
             "priority": self.priority.value,
-            "tokens": self.token_estimate,
+            "tokens": self.effective_tokens,
         }
 
 
-# ── Model context sizes ─────────────────────────────────────
+@dataclass
+class ModelContextSpec:
+    """Context window specification for a model."""
+    model_id: str = ""
+    context_size: int = 8192
+    reserved_output: int = 2048
+    reserved_system: int = 1024
 
-MODEL_CONTEXT_SIZES: dict[str, int] = {
+    @property
+    def available_tokens(self) -> int:
+        return self.context_size - self.reserved_output - self.reserved_system
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model_id[:15],
+            "context": self.context_size,
+            "available": self.available_tokens,
+        }
+
+
+# ── Model context sizes ──────────────────────────────────────
+
+MODEL_CONTEXTS: dict[str, int] = {
     "whiterabbitneo-7b": 8192,
     "qwen-coder-14b": 32768,
     "qwen-coder-7b": 32768,
     "deepseek-r1-7b": 32768,
-    "deepseek-math-7b": 8192,
-    "hermes-14b": 8192,
+    "deepseek-math-7b": 4096,
+    "hermes-14b": 32768,
     "llama-3.1-8b": 131072,
     "dolphin-8b": 8192,
     "mistral-7b": 32768,
@@ -97,194 +98,194 @@ MODEL_CONTEXT_SIZES: dict[str, int] = {
     "codellama-7b": 16384,
     "yi-9b-200k": 200000,
     "phi-3.5-mini": 128000,
-    "nomic-embed": 8192,
-    "llama-guard": 8192,
-    "functiongemma": 8192,
+    "nomic-embed": 2048,
+    "llama-guard-3": 8192,
+    "functiongemma-270m": 2048,
 }
 
-DEFAULT_CONTEXT_SIZE = 8192
-CONTEXT_RESERVE = 0.15  # Reserve 15% for response
 
+@dataclass
+class ConversationTurn:
+    """A single conversation turn."""
+    role: str = "user"        # user, assistant, system
+    content: str = ""
+    token_count: int = 0
+    timestamp: float = field(default_factory=time.time)
+    important: bool = False   # Mark important turns to keep
 
-def estimate_tokens(text: str) -> int:
-    """Estimate token count from text."""
-    return max(1, len(text) // 4)
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "tokens": self.token_count,
+            "important": self.important,
+        }
 
 
 class ContextWindowManager:
-    """Manages context windows for multiple models.
+    """Manages context window allocation for LLM interactions.
 
-    Packs context items by priority to fit
-    within model-specific context windows,
-    handles overflow, and triggers compression.
+    Intelligently allocates the limited context
+    window across system prompt, task, knowledge,
+    findings, history, and other sections.
     """
 
-    def __init__(self) -> None:
-        self._items: dict[str, ContextItem] = {}
+    def __init__(self, default_context_size: int = 8192) -> None:
+        self._sections: dict[str, ContextSection] = {}
+        self._history: list[ConversationTurn] = []
+        self._default_context = default_context_size
+        self._model_specs: dict[str, ModelContextSpec] = {}
         self._counter = 0
         self._log = logger.bind(component="context_window")
 
-    def add(
+        # Initialize model specs
+        for model_id, ctx_size in MODEL_CONTEXTS.items():
+            self._model_specs[model_id] = ModelContextSpec(
+                model_id=model_id,
+                context_size=ctx_size,
+            )
+
+    def add_section(
         self,
+        name: str,
         content: str,
-        item_type: ContextItemType = ContextItemType.CONVERSATION,
-        priority: ContextPriority = ContextPriority.MEDIUM,
+        priority: SectionPriority = SectionPriority.MEDIUM,
+        max_tokens: int = 0,
         compressible: bool = True,
-    ) -> ContextItem:
-        """Add an item to the context pool."""
+    ) -> ContextSection:
+        """Add or update a context section."""
         self._counter += 1
-        item = ContextItem(
-            item_id=f"ctx-{self._counter}",
-            item_type=item_type,
-            priority=priority,
+        section = ContextSection(
+            section_id=f"ctx-{self._counter}",
+            name=name,
             content=content,
-            token_estimate=estimate_tokens(content),
+            priority=priority,
+            token_count=len(content) // 4,
+            max_tokens=max_tokens,
             compressible=compressible,
         )
-        self._items[item.item_id] = item
-        return item
+        self._sections[name] = section
+        return section
 
-    def pack(
+    def add_history_turn(
         self,
-        model_id: str,
-        max_tokens: int = 0,
-        required_types: list[ContextItemType] | None = None,
-    ) -> list[ContextItem]:
-        """Pack context items to fit the model's window."""
-        if not max_tokens:
-            max_tokens = MODEL_CONTEXT_SIZES.get(model_id, DEFAULT_CONTEXT_SIZE)
-
-        # Reserve space for response
-        available = int(max_tokens * (1 - CONTEXT_RESERVE))
-
-        # Sort by priority score
-        sorted_items = sorted(
-            self._items.values(),
-            key=lambda i: i.priority_score,
-            reverse=True,
+        role: str,
+        content: str,
+        important: bool = False,
+    ) -> None:
+        """Add a conversation turn."""
+        turn = ConversationTurn(
+            role=role,
+            content=content,
+            token_count=len(content) // 4,
+            important=important,
         )
+        self._history.append(turn)
 
-        packed: list[ContextItem] = []
-        used_tokens = 0
-
-        # First pass: required types
-        if required_types:
-            for item in sorted_items:
-                if item.item_type in required_types:
-                    if used_tokens + item.token_estimate <= available:
-                        packed.append(item)
-                        used_tokens += item.token_estimate
-                        item.accessed_at = time.time()
-                        item.access_count += 1
-
-        # Second pass: everything else by priority
-        packed_ids = {i.item_id for i in packed}
-        for item in sorted_items:
-            if item.item_id in packed_ids:
-                continue
-            if used_tokens + item.token_estimate <= available:
-                packed.append(item)
-                used_tokens += item.token_estimate
-                item.accessed_at = time.time()
-                item.access_count += 1
-            elif item.compressible and item.token_estimate > 100:
-                # Try to fit a compressed version
-                compressed_est = item.token_estimate // 3
-                if used_tokens + compressed_est <= available:
-                    compressed = ContextItem(
-                        item_id=item.item_id + "-c",
-                        item_type=item.item_type,
-                        priority=item.priority,
-                        content=item.content[:compressed_est * 4],
-                        token_estimate=compressed_est,
-                        compressible=False,
-                    )
-                    packed.append(compressed)
-                    used_tokens += compressed_est
-
-        return packed
-
-    def build_context_string(
+    def assemble(
         self,
-        model_id: str,
-        max_tokens: int = 0,
-    ) -> str:
-        """Build a single context string for a model."""
-        packed = self.pack(model_id, max_tokens)
+        model_id: str = "",
+        include_history: bool = True,
+        max_history_turns: int = 20,
+    ) -> tuple[list[ContextSection], int]:
+        """Assemble context sections that fit in the model's window."""
+        spec = self._model_specs.get(model_id)
+        available = spec.available_tokens if spec else self._default_context
 
-        parts: list[str] = []
-        for item in packed:
-            parts.append(item.content)
-
-        return "\n\n".join(parts)
-
-    def get_utilization(self, model_id: str) -> dict[str, Any]:
-        """Get context utilization stats for a model."""
-        max_tokens = MODEL_CONTEXT_SIZES.get(model_id, DEFAULT_CONTEXT_SIZE)
-        total_tokens = sum(i.token_estimate for i in self._items.values())
-        packed = self.pack(model_id)
-        packed_tokens = sum(i.token_estimate for i in packed)
-
-        return {
-            "model": model_id[:15],
-            "context_size": max_tokens,
-            "total_items": len(self._items),
-            "total_tokens": total_tokens,
-            "packed_items": len(packed),
-            "packed_tokens": packed_tokens,
-            "utilization": round(packed_tokens / max_tokens, 2) if max_tokens else 0,
-            "overflow": total_tokens > max_tokens,
+        # Sort sections by priority
+        priority_order = {
+            SectionPriority.CRITICAL: 0,
+            SectionPriority.HIGH: 1,
+            SectionPriority.MEDIUM: 2,
+            SectionPriority.LOW: 3,
+            SectionPriority.OPTIONAL: 4,
         }
 
-    def should_compress(self, model_id: str) -> bool:
-        """Check if context needs compression."""
-        max_tokens = MODEL_CONTEXT_SIZES.get(model_id, DEFAULT_CONTEXT_SIZE)
-        total = sum(i.token_estimate for i in self._items.values())
-        return total > max_tokens * 0.8
+        sorted_sections = sorted(
+            self._sections.values(),
+            key=lambda s: priority_order.get(s.priority, 5),
+        )
 
-    def evict_low_priority(self, keep_count: int = 20) -> int:
-        """Evict lowest-priority items."""
-        if len(self._items) <= keep_count:
+        included: list[ContextSection] = []
+        tokens_used = 0
+
+        for section in sorted_sections:
+            section_tokens = section.effective_tokens
+
+            # Apply max_tokens limit
+            if section.max_tokens > 0:
+                section_tokens = min(section_tokens, section.max_tokens)
+
+            if tokens_used + section_tokens <= available:
+                included.append(section)
+                tokens_used += section_tokens
+            elif section.priority == SectionPriority.CRITICAL:
+                # Critical sections always included
+                included.append(section)
+                tokens_used += section_tokens
+            elif section.compressible and section.compressed_content:
+                # Try compressed version
+                compressed_tokens = len(section.compressed_content) // 4
+                if tokens_used + compressed_tokens <= available:
+                    included.append(section)
+                    tokens_used += compressed_tokens
+
+        # Add history if space allows
+        if include_history:
+            history_budget = available - tokens_used
+            history_tokens = 0
+            # Include recent turns, always include important ones
+            recent = self._history[-max_history_turns:]
+            for turn in reversed(recent):
+                if history_tokens + turn.token_count > history_budget:
+                    if not turn.important:
+                        continue
+                history_tokens += turn.token_count
+
+        return included, tokens_used
+
+    def get_model_context(self, model_id: str) -> int:
+        """Get available context size for a model."""
+        spec = self._model_specs.get(model_id)
+        return spec.available_tokens if spec else self._default_context
+
+    def compress_section(self, name: str, compressed: str) -> bool:
+        """Set compressed version of a section."""
+        section = self._sections.get(name)
+        if not section:
+            return False
+        section.compressed_content = compressed
+        return True
+
+    def trim_history(self, keep_last: int = 10) -> int:
+        """Trim conversation history, keeping important turns."""
+        if len(self._history) <= keep_last:
             return 0
 
-        sorted_items = sorted(
-            self._items.values(),
-            key=lambda i: i.priority_score,
-        )
-        to_remove = len(self._items) - keep_count
-        removed = 0
-
-        for item in sorted_items[:to_remove]:
-            if item.priority != ContextPriority.CRITICAL:
-                del self._items[item.item_id]
-                removed += 1
-
+        important = [t for t in self._history[:-keep_last] if t.important]
+        recent = self._history[-keep_last:]
+        removed = len(self._history) - len(important) - len(recent)
+        self._history = important + recent
         return removed
 
-    def build_context_prompt(self, model_id: str) -> str:
-        """Build context management info for LLM."""
-        util = self.get_utilization(model_id)
-        lines = [
-            f"## Context Window: {model_id[:15]}",
-            f"Size: {util['context_size']} tokens",
-            f"Used: {util['packed_tokens']} ({util['utilization']:.0%})",
-        ]
-        if util.get("overflow"):
-            lines.append("WARNING: Context overflow — some items excluded")
-        if self.should_compress(model_id):
-            lines.append("Note: Context compression recommended")
+    def build_context_prompt(self, model_id: str = "") -> str:
+        """Build context status for LLM."""
+        lines = ["## Context Status\n"]
+
+        ctx = self.get_model_context(model_id) if model_id else self._default_context
+        total_section_tokens = sum(s.effective_tokens for s in self._sections.values())
+        history_tokens = sum(t.token_count for t in self._history)
+
+        lines.append(f"Available: {ctx} tokens")
+        lines.append(f"Sections: {total_section_tokens} tokens ({len(self._sections)} sections)")
+        lines.append(f"History: {history_tokens} tokens ({len(self._history)} turns)")
+        lines.append(f"Utilization: {(total_section_tokens + history_tokens) / ctx:.0%}")
+
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        type_counts: dict[str, int] = {}
-        priority_counts: dict[str, int] = {}
-        for item in self._items.values():
-            type_counts[item.item_type.value] = type_counts.get(item.item_type.value, 0) + 1
-            priority_counts[item.priority.value] = priority_counts.get(item.priority.value, 0) + 1
-
         return {
-            "total_items": len(self._items),
-            "total_tokens": sum(i.token_estimate for i in self._items.values()),
-            "by_type": type_counts,
-            "by_priority": priority_counts,
+            "sections": len(self._sections),
+            "history_turns": len(self._history),
+            "total_section_tokens": sum(s.effective_tokens for s in self._sections.values()),
+            "models_configured": len(self._model_specs),
         }
