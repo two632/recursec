@@ -1,11 +1,11 @@
 """Supply chain security knowledge base.
 
 Deep knowledge about supply chain attacks:
-1. Dependency confusion attacks
-2. Typosquatting in package registries
-3. CI/CD pipeline poisoning
-4. Build system compromise
-5. Software composition analysis
+1. Dependency confusion / substitution
+2. Typosquatting attacks
+3. Compromised package detection
+4. CI/CD pipeline attacks
+5. Source code tampering
 """
 
 from __future__ import annotations
@@ -20,11 +20,11 @@ logger = structlog.get_logger()
 
 @dataclass
 class SupplyChainPattern:
-    """A supply chain attack pattern."""
+    """A supply chain security pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
-    severity: str = "critical"
+    severity: str = "high"
     description: str = ""
     detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
@@ -39,164 +39,174 @@ class SupplyChainPattern:
 
 SUPPLY_CHAIN_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "sc-001", "name": "Dependency Confusion",
+        "id": "sc-001", "name": "Dependency Confusion Attacks",
         "category": "dependency", "severity": "critical",
-        "desc": "Exploiting package manager resolution to inject malicious packages.",
+        "desc": "Exploiting dependency confusion in package managers.",
         "detection": (
             "DEPENDENCY CONFUSION:\n"
-            "ATTACK METHODOLOGY:\n"
-            "  1. Identify internal/private package names\n"
-            "     - Look at package.json, requirements.txt, go.mod\n"
-            "     - Check for internal namespace packages\n"
-            "     - Search error messages, docs, job postings\n"
-            "  2. Register same name on public registry\n"
-            "     - npm: npm publish with higher version\n"
-            "     - PyPI: python setup.py upload\n"
-            "     - RubyGems: gem push\n"
-            "  3. Package manager resolves public > private\n"
-            "     - npm prefers higher version from any source\n"
-            "     - pip prefers public PyPI over private index\n"
+            "CONCEPT:\n"
+            "  - Internal package names exist on private registry\n"
+            "  - Attacker publishes same name on public registry\n"
+            "  - Package manager prefers public (higher version)\n"
+            "  - Attacker's package executes on build\n"
+            "AFFECTED PACKAGE MANAGERS:\n"
+            "  - npm (Node.js): .npmrc scoped registries\n"
+            "  - pip (Python): --extra-index-url\n"
+            "  - gem (Ruby): custom sources\n"
+            "  - NuGet (.NET): package sources\n"
+            "  - Maven (Java): repository config\n"
             "DETECTION:\n"
-            "  # Check for internal package names on public registries\n"
-            "  npm view <internal-package-name>\n"
-            "  pip index versions <internal-package-name>\n"
-            "  # If package exists on public → potential confusion\n"
-            "PREVENTION:\n"
-            "  - Use scoped packages (@org/package)\n"
-            "  - Pin exact versions\n"
-            "  - Use package lock files\n"
-            "  - Configure private registry priority"
+            "  # Find internal package names\n"
+            "  - Parse package.json / requirements.txt / pom.xml\n"
+            "  - Check if name exists on public registry\n"
+            "  # npm\n"
+            "  npm view <package-name>  # 404 = private only\n"
+            "  # pip\n"
+            "  pip index versions <package>  # Check PyPI\n"
+            "PREVENTION CHECKS:\n"
+            "  - Scoped packages (@org/package in npm)\n"
+            "  - Pin exact versions in lockfiles\n"
+            "  - Registry whitelisting\n"
+            "  - Namespace reservation on public registries"
         ),
-        "tools": ["npm", "pip", "snyk"],
+        "tools": ["npm", "pip", "semgrep"],
     },
     {
-        "id": "sc-002", "name": "CI/CD Pipeline Poisoning",
-        "category": "cicd", "severity": "critical",
-        "desc": "Compromising CI/CD pipelines for code injection.",
+        "id": "sc-002", "name": "Typosquatting Detection",
+        "category": "typosquat", "severity": "high",
+        "desc": "Detecting typosquatted packages.",
         "detection": (
-            "CI/CD PIPELINE POISONING:\n"
+            "TYPOSQUATTING DETECTION:\n"
+            "COMMON PATTERNS:\n"
+            "  - Character swap: requsets → requests\n"
+            "  - Missing character: reques → requests\n"
+            "  - Extra character: requestss → requests\n"
+            "  - Hyphen/underscore: python-requests vs python_requests\n"
+            "  - Scope confusion: @popular/package vs popular-package\n"
+            "  - Combosquatting: requests-utils (popular prefix)\n"
+            "TOOLS:\n"
+            "  # npm\n"
+            "  npx npm-audit  # Check for known malicious packages\n"
+            "  socket.dev  # Real-time supply chain analysis\n"
+            "  # pip\n"
+            "  pip-audit  # Check for known vulnerabilities\n"
+            "  safety check  # Check installed packages\n"
+            "  # General\n"
+            "  snyk test  # Multi-language dependency check\n"
+            "  trivy fs .  # Filesystem vulnerability scan\n"
+            "ANALYSIS CHECKS:\n"
+            "  - Package age (recently published = suspicious)\n"
+            "  - Download count (very low = suspicious)\n"
+            "  - Author reputation\n"
+            "  - Install scripts (preinstall/postinstall hooks)\n"
+            "  - Network calls during install\n"
+            "  - Obfuscated code in package"
+        ),
+        "tools": ["pip-audit", "snyk", "trivy"],
+    },
+    {
+        "id": "sc-003", "name": "CI/CD Pipeline Attacks",
+        "category": "cicd", "severity": "critical",
+        "desc": "Attacking CI/CD pipelines for code injection.",
+        "detection": (
+            "CI/CD PIPELINE ATTACKS:\n"
             "ATTACK VECTORS:\n"
             "  GITHUB ACTIONS:\n"
-            "    - Workflow injection via pull_request_target\n"
-            "    - Secret exfiltration from environment\n"
-            "    - Self-hosted runner compromise\n"
-            "    - Malicious fork PRs triggering workflows\n"
-            "    - Actions from untrusted sources\n"
-            "  GITLAB CI:\n"
-            "    - .gitlab-ci.yml injection via MR\n"
-            "    - Shared runner exploitation\n"
-            "    - CI variable leakage\n"
+            "    - Poisoned PR: Modify .github/workflows/ in PR\n"
+            "    - pull_request_target: Runs with repo token + PR code\n"
+            "    - Workflow injection via issue/PR title\n"
+            "    - Compromised third-party actions\n"
+            "    - Secret exfiltration from forks\n"
             "  JENKINS:\n"
-            "    - Groovy sandbox escape\n"
+            "    - Groovy script console (if exposed)\n"
             "    - Pipeline script injection\n"
+            "    - Credential theft from Jenkins\n"
             "    - Plugin vulnerabilities\n"
-            "    - Credential enumeration\n"
+            "  GITLAB CI:\n"
+            "    - .gitlab-ci.yml modification\n"
+            "    - Variable exposure in logs\n"
+            "    - Runner escape\n"
             "DETECTION:\n"
-            "  # Audit CI configs\n"
-            "  - Check for pull_request_target with checkout\n"
-            "  - Check for env: GITHUB_TOKEN in workflow output\n"
+            "  # Audit workflow files\n"
+            "  - Check for pull_request_target with code checkout\n"
+            "  - Check for ${{ github.event.* }} in run: blocks\n"
             "  - Verify action versions are pinned to SHA\n"
-            "  - Check runner labels (self-hosted = higher risk)\n"
-            "  # Secret scanning\n"
-            "  trufflehog git <repo_url>\n"
-            "  gitleaks detect"
+            "  - Check for self-hosted runner risks\n"
+            "  # Secrets\n"
+            "  - gitleaks detect  # Find secrets in git history\n"
+            "  - trufflehog git <repo>  # Deep secret scanning"
         ),
-        "tools": ["trufflehog", "gitleaks", "semgrep"],
+        "tools": ["gitleaks", "trufflehog", "semgrep"],
     },
     {
-        "id": "sc-003", "name": "Typosquatting",
-        "category": "typosquatting", "severity": "high",
-        "desc": "Registering similar package names to intercept installations.",
+        "id": "sc-004", "name": "Container Image Supply Chain",
+        "category": "container", "severity": "high",
+        "desc": "Detecting compromised container images.",
         "detection": (
-            "TYPOSQUATTING:\n"
-            "TECHNIQUES:\n"
-            "  - Character swap: lodash → lodahs, lodsah\n"
-            "  - Missing character: express → expres, xpress\n"
-            "  - Extra character: react → reactt, reactjs-core\n"
-            "  - Homoglyph: crypto → ϲrypto (Cyrillic с)\n"
-            "  - Namespace confusion: @types/node → types-node\n"
-            "DETECTION:\n"
-            "  # Generate typo variants\n"
-            "  - Levenshtein distance = 1 from popular packages\n"
-            "  - Check if variant exists on registry\n"
-            "  - Compare package contents to original\n"
-            "  - Check publish date vs download count\n"
-            "  # Automated tools\n"
-            "  typofinder <package-name>  # Generate and check variants\n"
-            "  pip-audit  # Check for known malicious packages\n"
-            "  npm audit  # Built-in vulnerability check\n"
-            "INDICATORS OF MALICIOUS PACKAGE:\n"
-            "  - install/postinstall scripts executing code\n"
-            "  - Network calls in setup.py/setup.cfg\n"
-            "  - Obfuscated code in package\n"
-            "  - Very new package with suspicious name"
-        ),
-        "tools": ["npm", "pip", "snyk"],
-    },
-    {
-        "id": "sc-004", "name": "Build System Compromise",
-        "category": "build", "severity": "critical",
-        "desc": "Attacking build systems to inject malicious code.",
-        "detection": (
-            "BUILD SYSTEM COMPROMISE:\n"
-            "ATTACK VECTORS:\n"
-            "  - Compromised build dependencies\n"
-            "  - Malicious build plugins (Maven, Gradle, webpack)\n"
-            "  - Build cache poisoning\n"
-            "  - Compiler backdoors\n"
-            "  - Container image poisoning\n"
-            "CONTAINER IMAGE ATTACKS:\n"
-            "  # Scan base images\n"
+            "CONTAINER IMAGE SUPPLY CHAIN:\n"
+            "BASE IMAGE RISKS:\n"
+            "  - Unofficial base images (not from Docker Official)\n"
+            "  - Outdated base images with known CVEs\n"
+            "  - Images from untrusted registries\n"
+            "  - Multi-stage build leaks\n"
+            "ANALYSIS:\n"
+            "  # Scan for vulnerabilities\n"
             "  trivy image <image>:<tag>\n"
             "  grype <image>:<tag>\n"
-            "  # Check for:\n"
-            "  - Unnecessary SUID binaries\n"
-            "  - Embedded secrets in layers\n"
+            "  # Check image provenance\n"
+            "  cosign verify <image>  # Signature verification\n"
+            "  # Inspect image layers\n"
+            "  dive <image>  # Interactive layer analysis\n"
+            "  docker history <image>  # Layer commands\n"
+            "  # SBOM generation\n"
+            "  syft <image>  # Software Bill of Materials\n"
+            "  # Secret scanning in layers\n"
+            "  ggshield secret scan docker <image>\n"
+            "DOCKERFILE CHECKS:\n"
+            "  - Using :latest tag (unpinned)\n"
             "  - Running as root\n"
-            "  - Unsigned images\n"
-            "  - Images from untrusted registries\n"
-            "SBOM ANALYSIS:\n"
-            "  # Generate Software Bill of Materials\n"
-            "  syft <target> -o spdx-json\n"
-            "  # Check components against known vulns\n"
-            "  grype sbom:<sbom_file>\n"
-            "  # Track transitive dependencies\n"
-            "  npm ls --all\n"
-            "  pip freeze > requirements.txt"
+            "  - COPY . . (copying secrets)\n"
+            "  - Hardcoded tokens in ENV/ARG\n"
+            "  - Unnecessary packages installed\n"
+            "  - No health check defined"
         ),
-        "tools": ["trivy", "grype", "syft"],
+        "tools": ["trivy", "grype", "cosign", "syft"],
     },
     {
-        "id": "sc-005", "name": "Open Source Intelligence for Supply Chain",
-        "category": "osint_supply", "severity": "high",
-        "desc": "Using OSINT to identify supply chain risks.",
+        "id": "sc-005", "name": "Source Code Integrity",
+        "category": "source", "severity": "high",
+        "desc": "Verifying source code integrity and detecting tampering.",
         "detection": (
-            "SUPPLY CHAIN OSINT:\n"
-            "MAINTAINER ANALYSIS:\n"
-            "  - Check maintainer account age and activity\n"
-            "  - Look for maintainer account takeover indicators\n"
-            "  - Check for recent ownership transfers\n"
-            "  - Look for abandoned but popular packages\n"
-            "DEPENDENCY TREE ANALYSIS:\n"
-            "  # Map complete dependency tree\n"
-            "  npm ls --all --json > deps.json\n"
-            "  pipdeptree --json > deps.json\n"
-            "  # Identify:\n"
-            "  - Single-maintainer critical dependencies\n"
-            "  - Dependencies with no recent updates\n"
-            "  - Dependencies with known but unpatched vulns\n"
-            "  - Excessive transitive dependency depth\n"
-            "VULNERABILITY DATABASES:\n"
-            "  - NVD (nvd.nist.gov)\n"
-            "  - GitHub Advisory Database\n"
-            "  - OSV (osv.dev)\n"
-            "  - Snyk vulnerability DB\n"
-            "  # Automated checking\n"
-            "  osv-scanner --lockfile=package-lock.json\n"
-            "  snyk test\n"
-            "  safety check (Python)"
+            "SOURCE CODE INTEGRITY:\n"
+            "GIT HISTORY ANALYSIS:\n"
+            "  # Detect force pushes\n"
+            "  git reflog  # Check for rebase/reset\n"
+            "  # Detect author spoofing\n"
+            "  git log --format='%H %ae %ce' | sort\n"
+            "  # Verify GPG signatures\n"
+            "  git log --show-signature\n"
+            "  git verify-commit HEAD\n"
+            "  # Find suspicious commits\n"
+            "  git log --diff-filter=A --name-only  # New files\n"
+            "  git log --all --oneline -- '*.sh' '*.py' '*.js'\n"
+            "BACKDOOR PATTERNS:\n"
+            "  - Obfuscated code additions\n"
+            "  - eval() / exec() in new code\n"
+            "  - Network calls in build scripts\n"
+            "  - Encoded payloads in test files\n"
+            "  - Hidden functionality in unicode chars\n"
+            "TOOLS:\n"
+            "  semgrep --config 'p/security-audit' .  # Code patterns\n"
+            "  bandit -r .  # Python security linting\n"
+            "  gitleaks detect --source .  # Secret detection\n"
+            "REVIEW CHECKLIST:\n"
+            "  - Verify all contributors are authorized\n"
+            "  - Check for unsigned commits\n"
+            "  - Review changes to CI/CD configs\n"
+            "  - Audit dependency updates carefully\n"
+            "  - Monitor for unusual commit patterns"
         ),
-        "tools": ["osv-scanner", "snyk", "safety"],
+        "tools": ["semgrep", "bandit", "gitleaks"],
     },
 ]
 
@@ -204,7 +214,7 @@ SUPPLY_CHAIN_PATTERNS: list[dict[str, Any]] = [
 class SupplyChainKB:
     """Supply chain security knowledge base.
 
-    Provides supply chain attack patterns
+    Provides supply chain vulnerability patterns
     injected into agent prompts.
     """
 
@@ -220,7 +230,7 @@ class SupplyChainKB:
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
-                severity=data.get("severity", "critical"),
+                severity=data.get("severity", "high"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
@@ -239,7 +249,7 @@ class SupplyChainKB:
         categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
-        """Build supply chain prompt."""
+        """Build supply chain security prompt."""
         lines = ["## Supply Chain Security Patterns\n"]
         count = 0
         for pattern in self._patterns.values():

@@ -1,13 +1,13 @@
-"""Agent state machine — manages complex agent lifecycle states.
+"""Agent state machine — formal FSM for agent execution lifecycle.
 
 Implements:
-1. Finite state machine for agent execution
-2. State transitions with guards
-3. Event-driven state changes
-4. Timeout-based auto-transitions
-5. State history for debugging
-6. Parallel state tracking for multi-agent
-7. Error recovery state handling
+1. Assessment phase state machine
+2. Agent execution state machine
+3. Tool execution state machine
+4. Transition guards and actions
+5. State history tracking
+6. Timeout enforcement
+7. Error recovery states
 """
 
 from __future__ import annotations
@@ -22,273 +22,334 @@ import structlog
 logger = structlog.get_logger()
 
 
-class AgentState(str, Enum):
-    INITIALIZING = "initializing"
+# ── Assessment Phase FSM ─────────────────────────────────────
+
+class AssessmentPhase(str, Enum):
     IDLE = "idle"
-    PLANNING = "planning"
-    EXECUTING_TOOL = "executing_tool"
-    REASONING = "reasoning"
-    WAITING_LLM = "waiting_llm"
-    ANALYZING_OUTPUT = "analyzing_output"
+    INITIALIZING = "initializing"
+    RECON = "recon"
+    SCANNING = "scanning"
+    ANALYSIS = "analysis"
+    EXPLOITATION = "exploitation"
+    POST_EXPLOIT = "post_exploit"
+    VALIDATION = "validation"
     REPORTING = "reporting"
+    COMPLETED = "completed"
+    ABORTED = "aborted"
+
+
+PHASE_TRANSITIONS: dict[str, list[str]] = {
+    "idle": ["initializing"],
+    "initializing": ["recon", "aborted"],
+    "recon": ["scanning", "analysis", "aborted"],
+    "scanning": ["analysis", "exploitation", "recon", "aborted"],
+    "analysis": ["exploitation", "scanning", "validation", "reporting", "aborted"],
+    "exploitation": ["post_exploit", "validation", "analysis", "aborted"],
+    "post_exploit": ["validation", "analysis", "exploitation", "aborted"],
+    "validation": ["reporting", "analysis", "exploitation", "aborted"],
+    "reporting": ["completed", "analysis", "aborted"],
+    "completed": ["idle"],
+    "aborted": ["idle"],
+}
+
+
+# ── Agent Execution FSM ──────────────────────────────────────
+
+class AgentState(str, Enum):
+    CREATED = "created"
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    WAITING_TOOL = "waiting_tool"
+    ANALYZING = "analyzing"
     SPAWNING_CHILD = "spawning_child"
     WAITING_CHILD = "waiting_child"
-    DEBATING = "debating"
-    CHECKPOINTING = "checkpointing"
-    ERROR_RECOVERY = "error_recovery"
-    PAUSED = "paused"
-    TERMINATED = "terminated"
+    REFLECTING = "reflecting"
+    BACKTRACKING = "backtracking"
     COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
 
 
-class StateEvent(str, Enum):
-    START = "start"
-    PLAN_READY = "plan_ready"
-    TOOL_SELECTED = "tool_selected"
-    TOOL_COMPLETED = "tool_completed"
-    TOOL_FAILED = "tool_failed"
-    TOOL_TIMEOUT = "tool_timeout"
-    LLM_RESPONSE = "llm_response"
-    LLM_ERROR = "llm_error"
-    ANALYSIS_DONE = "analysis_done"
-    FINDING_FOUND = "finding_found"
-    CHILD_SPAWNED = "child_spawned"
-    CHILD_COMPLETED = "child_completed"
-    CHILD_FAILED = "child_failed"
-    DEBATE_STARTED = "debate_started"
-    DEBATE_RESOLVED = "debate_resolved"
-    CHECKPOINT_DONE = "checkpoint_done"
-    BUDGET_EXHAUSTED = "budget_exhausted"
-    CONVERGENCE_REACHED = "convergence_reached"
-    ERROR = "error"
-    RECOVER = "recover"
-    PAUSE = "pause"
-    RESUME = "resume"
-    TERMINATE = "terminate"
+AGENT_TRANSITIONS: dict[str, list[str]] = {
+    "created": ["planning"],
+    "planning": ["executing", "spawning_child", "completed", "failed"],
+    "executing": ["waiting_tool", "analyzing", "completed", "failed", "timed_out"],
+    "waiting_tool": ["analyzing", "executing", "failed", "timed_out"],
+    "analyzing": ["executing", "reflecting", "spawning_child", "completed", "backtracking"],
+    "spawning_child": ["waiting_child", "failed"],
+    "waiting_child": ["analyzing", "executing", "failed", "timed_out"],
+    "reflecting": ["executing", "backtracking", "completed"],
+    "backtracking": ["planning", "failed"],
+    "completed": [],
+    "failed": [],
+    "timed_out": [],
+}
+
+
+# ── Tool Execution FSM ───────────────────────────────────────
+
+class ToolState(str, Enum):
+    QUEUED = "queued"
+    VALIDATING = "validating"
+    EXECUTING = "executing"
+    PARSING = "parsing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    SKIPPED = "skipped"
+
+
+TOOL_TRANSITIONS: dict[str, list[str]] = {
+    "queued": ["validating", "skipped"],
+    "validating": ["executing", "skipped", "failed"],
+    "executing": ["parsing", "failed", "timed_out"],
+    "parsing": ["completed", "failed"],
+    "completed": [],
+    "failed": [],
+    "timed_out": [],
+    "skipped": [],
+}
 
 
 @dataclass
 class StateTransition:
-    """A transition from one state to another."""
-    from_state: AgentState = AgentState.IDLE
-    event: StateEvent = StateEvent.START
-    to_state: AgentState = AgentState.IDLE
-    guard: str = ""           # Condition name
-    action: str = ""          # Action to perform
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "from": self.from_state.value,
-            "event": self.event.value,
-            "to": self.to_state.value,
-        }
-
-
-@dataclass
-class StateHistoryEntry:
-    """An entry in the state history."""
-    from_state: AgentState = AgentState.IDLE
-    to_state: AgentState = AgentState.IDLE
-    event: StateEvent = StateEvent.START
+    """A recorded state transition."""
+    from_state: str = ""
+    to_state: str = ""
+    trigger: str = ""
     timestamp: float = field(default_factory=time.time)
-    context: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "from": self.from_state.value,
-            "to": self.to_state.value,
-            "event": self.event.value,
+            "from": self.from_state,
+            "to": self.to_state,
+            "trigger": self.trigger[:20],
         }
 
 
 @dataclass
-class AgentSM:
-    """State machine for a single agent."""
-    agent_id: str = ""
-    current_state: AgentState = AgentState.INITIALIZING
-    history: list[StateHistoryEntry] = field(default_factory=list)
-    error_count: int = 0
-    max_errors: int = 3
+class StateMachineInstance:
+    """An instance of a state machine."""
+    instance_id: str = ""
+    machine_type: str = ""   # assessment, agent, tool
+    current_state: str = ""
+    history: list[StateTransition] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
-    last_transition: float = field(default_factory=time.time)
+    timeout_s: float = 3600.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def age_s(self) -> float:
+        return time.time() - self.created_at
+
+    @property
+    def is_terminal(self) -> bool:
+        transitions = _get_transitions(self.machine_type)
+        return not transitions.get(self.current_state, [])
+
+    @property
+    def is_timed_out(self) -> bool:
+        return self.age_s > self.timeout_s
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "agent": self.agent_id[:10],
-            "state": self.current_state.value,
+            "id": self.instance_id[:10],
+            "type": self.machine_type,
+            "state": self.current_state,
+            "age": round(self.age_s, 1),
             "transitions": len(self.history),
-            "errors": self.error_count,
+            "terminal": self.is_terminal,
         }
 
 
-# ── Transition table ──────────────────────────────────────────
-
-TRANSITIONS: list[StateTransition] = [
-    # Initialization
-    StateTransition(AgentState.INITIALIZING, StateEvent.START, AgentState.PLANNING, action="load_context"),
-
-    # Planning
-    StateTransition(AgentState.PLANNING, StateEvent.PLAN_READY, AgentState.REASONING, action="start_reasoning"),
-    StateTransition(AgentState.PLANNING, StateEvent.ERROR, AgentState.ERROR_RECOVERY),
-
-    # Reasoning (LLM query)
-    StateTransition(AgentState.REASONING, StateEvent.TOOL_SELECTED, AgentState.EXECUTING_TOOL, action="execute_tool"),
-    StateTransition(AgentState.REASONING, StateEvent.CHILD_SPAWNED, AgentState.SPAWNING_CHILD),
-    StateTransition(AgentState.REASONING, StateEvent.DEBATE_STARTED, AgentState.DEBATING),
-    StateTransition(AgentState.REASONING, StateEvent.ANALYSIS_DONE, AgentState.REPORTING),
-    StateTransition(AgentState.REASONING, StateEvent.LLM_ERROR, AgentState.ERROR_RECOVERY),
-    StateTransition(AgentState.REASONING, StateEvent.BUDGET_EXHAUSTED, AgentState.REPORTING),
-    StateTransition(AgentState.REASONING, StateEvent.CONVERGENCE_REACHED, AgentState.REPORTING),
-
-    # Tool execution
-    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.TOOL_COMPLETED, AgentState.ANALYZING_OUTPUT, action="parse_output"),
-    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.TOOL_FAILED, AgentState.REASONING, action="report_failure"),
-    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.TOOL_TIMEOUT, AgentState.REASONING, action="report_timeout"),
-
-    # Output analysis
-    StateTransition(AgentState.ANALYZING_OUTPUT, StateEvent.FINDING_FOUND, AgentState.REASONING, action="record_finding"),
-    StateTransition(AgentState.ANALYZING_OUTPUT, StateEvent.ANALYSIS_DONE, AgentState.REASONING),
-
-    # Child agent management
-    StateTransition(AgentState.SPAWNING_CHILD, StateEvent.CHILD_SPAWNED, AgentState.WAITING_CHILD),
-    StateTransition(AgentState.WAITING_CHILD, StateEvent.CHILD_COMPLETED, AgentState.REASONING, action="aggregate_child"),
-    StateTransition(AgentState.WAITING_CHILD, StateEvent.CHILD_FAILED, AgentState.REASONING, action="handle_child_failure"),
-
-    # Debate
-    StateTransition(AgentState.DEBATING, StateEvent.DEBATE_RESOLVED, AgentState.REASONING, action="apply_verdict"),
-
-    # Reporting
-    StateTransition(AgentState.REPORTING, StateEvent.CHECKPOINT_DONE, AgentState.COMPLETED),
-
-    # Error recovery
-    StateTransition(AgentState.ERROR_RECOVERY, StateEvent.RECOVER, AgentState.REASONING),
-    StateTransition(AgentState.ERROR_RECOVERY, StateEvent.TERMINATE, AgentState.TERMINATED),
-
-    # Pause/Resume
-    StateTransition(AgentState.REASONING, StateEvent.PAUSE, AgentState.PAUSED),
-    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.PAUSE, AgentState.PAUSED),
-    StateTransition(AgentState.PAUSED, StateEvent.RESUME, AgentState.REASONING),
-
-    # Global terminate
-    StateTransition(AgentState.REASONING, StateEvent.TERMINATE, AgentState.TERMINATED),
-    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.TERMINATE, AgentState.TERMINATED),
-    StateTransition(AgentState.WAITING_CHILD, StateEvent.TERMINATE, AgentState.TERMINATED),
-]
+def _get_transitions(machine_type: str) -> dict[str, list[str]]:
+    """Get transitions for a machine type."""
+    if machine_type == "assessment":
+        return PHASE_TRANSITIONS
+    if machine_type == "agent":
+        return AGENT_TRANSITIONS
+    if machine_type == "tool":
+        return TOOL_TRANSITIONS
+    return {}
 
 
 class AgentStateMachine:
-    """Manages state machines for multiple agents.
+    """Manages state machines for agents and assessments.
 
-    Each agent has its own state machine tracking
-    its lifecycle through planning, execution,
-    analysis, and reporting phases.
+    Enforces valid transitions, tracks history,
+    handles timeouts, and provides state context
+    for LLM prompts.
     """
 
     def __init__(self) -> None:
-        self._agents: dict[str, AgentSM] = {}
-        self._transition_table: dict[tuple[str, str], StateTransition] = {}
+        self._instances: dict[str, StateMachineInstance] = {}
+        self._counter = 0
         self._log = logger.bind(component="agent_state_machine")
-        self._build_transition_table()
 
-    def _build_transition_table(self) -> None:
-        """Build lookup table for transitions."""
-        for t in TRANSITIONS:
-            key = (t.from_state.value, t.event.value)
-            self._transition_table[key] = t
+    def create_assessment(
+        self,
+        assessment_id: str = "",
+        timeout_s: float = 14400.0,
+    ) -> StateMachineInstance:
+        """Create an assessment state machine."""
+        return self._create(
+            instance_id=assessment_id or self._next_id("asm"),
+            machine_type="assessment",
+            initial_state="idle",
+            timeout_s=timeout_s,
+        )
 
-    def create_agent(self, agent_id: str) -> AgentSM:
-        """Create a new agent state machine."""
-        sm = AgentSM(agent_id=agent_id)
-        self._agents[agent_id] = sm
-        return sm
+    def create_agent_sm(
+        self,
+        agent_id: str = "",
+        timeout_s: float = 3600.0,
+    ) -> StateMachineInstance:
+        """Create an agent state machine."""
+        return self._create(
+            instance_id=agent_id or self._next_id("agt"),
+            machine_type="agent",
+            initial_state="created",
+            timeout_s=timeout_s,
+        )
+
+    def create_tool_sm(
+        self,
+        tool_id: str = "",
+        timeout_s: float = 300.0,
+    ) -> StateMachineInstance:
+        """Create a tool execution state machine."""
+        return self._create(
+            instance_id=tool_id or self._next_id("tl"),
+            machine_type="tool",
+            initial_state="queued",
+            timeout_s=timeout_s,
+        )
 
     def transition(
         self,
-        agent_id: str,
-        event: StateEvent,
-        context: str = "",
-    ) -> AgentState | None:
-        """Attempt a state transition."""
-        sm = self._agents.get(agent_id)
-        if not sm:
-            return None
+        instance_id: str,
+        to_state: str,
+        trigger: str = "",
+    ) -> bool:
+        """Transition a state machine."""
+        instance = self._instances.get(instance_id)
+        if not instance:
+            return False
 
-        key = (sm.current_state.value, event.value)
-        trans = self._transition_table.get(key)
+        transitions = _get_transitions(instance.machine_type)
+        allowed = transitions.get(instance.current_state, [])
 
-        if not trans:
+        if to_state not in allowed:
             self._log.warning(
                 "invalid_transition",
-                agent=agent_id[:10],
-                state=sm.current_state.value,
-                event=event.value,
+                instance=instance_id[:10],
+                current=instance.current_state,
+                requested=to_state,
+                allowed=allowed,
             )
-            return None
+            return False
 
-        # Record history
-        entry = StateHistoryEntry(
-            from_state=sm.current_state,
-            to_state=trans.to_state,
-            event=event,
-            context=context,
+        # Record transition
+        transition = StateTransition(
+            from_state=instance.current_state,
+            to_state=to_state,
+            trigger=trigger,
         )
-        sm.history.append(entry)
+        instance.history.append(transition)
+        instance.current_state = to_state
 
-        # Track errors
-        if event in (StateEvent.ERROR, StateEvent.TOOL_FAILED, StateEvent.LLM_ERROR):
-            sm.error_count += 1
-            if sm.error_count >= sm.max_errors:
-                sm.current_state = AgentState.TERMINATED
-                return AgentState.TERMINATED
+        return True
 
-        old_state = sm.current_state
-        sm.current_state = trans.to_state
-        sm.last_transition = time.time()
+    def check_timeouts(self) -> list[str]:
+        """Check and enforce timeouts."""
+        timed_out: list[str] = []
+        for inst_id, inst in self._instances.items():
+            if inst.is_timed_out and not inst.is_terminal:
+                # Force to timed_out state if available
+                transitions = _get_transitions(inst.machine_type)
+                allowed = transitions.get(inst.current_state, [])
+                if "timed_out" in allowed:
+                    self.transition(inst_id, "timed_out", "timeout_enforcement")
+                    timed_out.append(inst_id)
+                elif "failed" in allowed:
+                    self.transition(inst_id, "failed", "timeout_enforcement")
+                    timed_out.append(inst_id)
+                elif "aborted" in allowed:
+                    self.transition(inst_id, "aborted", "timeout_enforcement")
+                    timed_out.append(inst_id)
+        return timed_out
 
-        self._log.debug(
-            "state_transition",
-            agent=agent_id[:10],
-            old=old_state.value,
-            new=trans.to_state.value,
-            event=event.value,
-        )
+    def get_state(self, instance_id: str) -> str:
+        """Get current state."""
+        instance = self._instances.get(instance_id)
+        return instance.current_state if instance else ""
 
-        return trans.to_state
+    def get_allowed(self, instance_id: str) -> list[str]:
+        """Get allowed transitions."""
+        instance = self._instances.get(instance_id)
+        if not instance:
+            return []
+        transitions = _get_transitions(instance.machine_type)
+        return transitions.get(instance.current_state, [])
 
-    def get_state(self, agent_id: str) -> AgentState | None:
-        """Get current state of an agent."""
-        sm = self._agents.get(agent_id)
-        return sm.current_state if sm else None
+    def build_state_prompt(self, instance_id: str = "") -> str:
+        """Build state context for LLM."""
+        lines = ["## State Machine Status\n"]
 
-    def get_active_agents(self) -> list[AgentSM]:
-        """Get all active (non-terminal) agents."""
-        terminal = {AgentState.COMPLETED, AgentState.TERMINATED}
-        return [
-            sm for sm in self._agents.values()
-            if sm.current_state not in terminal
-        ]
+        if instance_id:
+            inst = self._instances.get(instance_id)
+            if inst:
+                lines.append(f"Current state: {inst.current_state}")
+                allowed = self.get_allowed(instance_id)
+                lines.append(f"Allowed transitions: {', '.join(allowed)}")
+                lines.append(f"Age: {inst.age_s:.0f}s / {inst.timeout_s:.0f}s timeout")
+        else:
+            # Show all active instances
+            active = [
+                i for i in self._instances.values()
+                if not i.is_terminal
+            ]
+            for inst in active[:5]:
+                lines.append(
+                    f"  [{inst.machine_type}] {inst.instance_id[:10]}: "
+                    f"{inst.current_state} ({inst.age_s:.0f}s)"
+                )
 
-    def get_stalled_agents(
+        return "\n".join(lines)
+
+    def _create(
         self,
-        stall_threshold_s: float = 300.0,
-    ) -> list[AgentSM]:
-        """Get agents that haven't transitioned recently."""
-        now = time.time()
-        return [
-            sm for sm in self._agents.values()
-            if sm.current_state not in (AgentState.COMPLETED, AgentState.TERMINATED)
-            and (now - sm.last_transition) > stall_threshold_s
-        ]
+        instance_id: str,
+        machine_type: str,
+        initial_state: str,
+        timeout_s: float,
+    ) -> StateMachineInstance:
+        """Create a state machine instance."""
+        instance = StateMachineInstance(
+            instance_id=instance_id,
+            machine_type=machine_type,
+            current_state=initial_state,
+            timeout_s=timeout_s,
+        )
+        self._instances[instance_id] = instance
+        return instance
+
+    def _next_id(self, prefix: str) -> str:
+        """Generate next instance ID."""
+        self._counter += 1
+        return f"{prefix}-{self._counter}"
 
     def get_stats(self) -> dict[str, Any]:
-        state_counts: dict[str, int] = {}
-        for sm in self._agents.values():
-            state_counts[sm.current_state.value] = state_counts.get(
-                sm.current_state.value, 0,
-            ) + 1
+        type_counts: dict[str, int] = {}
+        terminal_count = 0
+        for inst in self._instances.values():
+            type_counts[inst.machine_type] = type_counts.get(inst.machine_type, 0) + 1
+            if inst.is_terminal:
+                terminal_count += 1
 
         return {
-            "total_agents": len(self._agents),
-            "by_state": state_counts,
-            "total_transitions": sum(len(sm.history) for sm in self._agents.values()),
+            "total_instances": len(self._instances),
+            "by_type": type_counts,
+            "terminal": terminal_count,
+            "active": len(self._instances) - terminal_count,
         }
