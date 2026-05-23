@@ -1,20 +1,18 @@
-"""Model ensemble engine — multi-model voting and consensus.
+"""Model ensemble engine — multi-model reasoning.
 
 Implements:
-1. Majority voting across multiple models
-2. Weighted voting by model quality
-3. Confidence-weighted aggregation
-4. Disagreement detection
-5. Ensemble diversity measurement
-6. Model specialization scoring
-7. Result fusion strategies
-8. Ensemble calibration
+1. Parallel query to multiple models
+2. Response aggregation strategies
+3. Model debate protocol
+4. Best-of-N sampling
+5. Weighted response merging
+6. Confidence-based selection
+7. Diversity-aware ensemble
 """
 
 from __future__ import annotations
 
-import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -25,371 +23,317 @@ logger = structlog.get_logger()
 
 
 class EnsembleStrategy(str, Enum):
-    MAJORITY_VOTE = "majority_vote"       # Simple majority
-    WEIGHTED_VOTE = "weighted_vote"       # Weighted by model quality
-    CONFIDENCE_WEIGHTED = "confidence_weighted"  # Weighted by confidence
-    BEST_OF = "best_of"                  # Take highest confidence
-    UNANIMOUS = "unanimous"              # All must agree
-    DEBATE = "debate"                    # Models debate, coordinator decides
+    BEST_OF_N = "best_of_n"
+    MAJORITY_VOTE = "majority_vote"
+    WEIGHTED_MERGE = "weighted_merge"
+    DEBATE = "debate"
+    CASCADING = "cascading"
+    DIVERSITY = "diversity"
 
 
-class AggregationMethod(str, Enum):
-    CONCAT = "concat"         # Concatenate all outputs
-    UNION = "union"          # Union of all findings
-    INTERSECTION = "intersection"  # Only findings all models agree on
-    RANKED = "ranked"        # Rank by frequency across models
+class ResponseQuality(str, Enum):
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    ADEQUATE = "adequate"
+    POOR = "poor"
+    INVALID = "invalid"
 
 
 @dataclass
 class ModelResponse:
-    """Response from a single model in the ensemble."""
-    model_id: str = ""
-    model_name: str = ""
+    """A response from a single model."""
+    response_id: str = ""
+    model: str = ""
     content: str = ""
-    confidence: float = 0.5
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    classification: str = ""     # For classification tasks
-    score: float = 0.0           # For scoring tasks
-    latency_s: float = 0.0
     tokens_used: int = 0
+    latency_ms: float = 0.0
+    confidence: float = 0.5
+    quality: ResponseQuality = ResponseQuality.ADEQUATE
+    structured_data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model_id[:15],
+            "id": self.response_id[:10],
+            "model": self.model[:15],
+            "tokens": self.tokens_used,
+            "latency": round(self.latency_ms, 0),
             "confidence": round(self.confidence, 2),
-            "findings": len(self.findings),
-            "classification": self.classification[:15],
-            "score": round(self.score, 2),
+            "quality": self.quality.value,
         }
 
 
 @dataclass
 class EnsembleResult:
-    """Aggregated result from the ensemble."""
-    ensemble_id: str = ""
-    strategy: EnsembleStrategy = EnsembleStrategy.MAJORITY_VOTE
+    """Result from ensemble processing."""
+    strategy: EnsembleStrategy = EnsembleStrategy.BEST_OF_N
     responses: list[ModelResponse] = field(default_factory=list)
-    consensus_classification: str = ""
-    consensus_confidence: float = 0.0
-    consensus_findings: list[dict[str, Any]] = field(default_factory=list)
-    agreement_ratio: float = 0.0
-    disagreements: list[dict[str, Any]] = field(default_factory=list)
-    duration_s: float = 0.0
+    selected_response: str = ""
+    selected_model: str = ""
+    merged_content: str = ""
+    overall_confidence: float = 0.0
+    agreement_score: float = 0.0
+    total_tokens: int = 0
+    total_latency_ms: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.ensemble_id[:10],
             "strategy": self.strategy.value,
-            "models": len(self.responses),
-            "classification": self.consensus_classification[:15],
-            "confidence": round(self.consensus_confidence, 2),
-            "agreement": round(self.agreement_ratio, 2),
-            "findings": len(self.consensus_findings),
+            "responses": len(self.responses),
+            "selected": self.selected_model[:15],
+            "confidence": round(self.overall_confidence, 2),
+            "agreement": round(self.agreement_score, 2),
+            "tokens": self.total_tokens,
         }
 
 
-# ── Model weights for ensemble voting ────────────────────────
+@dataclass
+class DebateRound:
+    """A round in a model debate."""
+    round_num: int = 0
+    arguments: list[dict[str, Any]] = field(default_factory=list)
+    consensus_reached: bool = False
+    winning_position: str = ""
 
-MODEL_QUALITY_WEIGHTS: dict[str, float] = {
-    "whiterabbitneo": 0.85,
-    "qwen-coder-14b": 0.90,
-    "qwen-coder-7b": 0.75,
-    "deepseek-r1": 0.88,
-    "deepseek-math": 0.72,
-    "hermes-14b": 0.82,
-    "llama-3.1-8b": 0.78,
-    "dolphin-2.9": 0.70,
-    "mistral-7b": 0.76,
-    "codellama-13b": 0.80,
-    "codellama-7b": 0.68,
-    "yi-9b-200k": 0.77,
-    "phi-3.5-mini": 0.65,
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "round": self.round_num,
+            "arguments": len(self.arguments),
+            "consensus": self.consensus_reached,
+        }
+
+
+# ── Model weights for ensemble ───────────────────────────────
+
+MODEL_WEIGHTS: dict[str, dict[str, float]] = {
+    "whiterabbitneo-7b": {"security": 2.0, "code": 1.0, "reasoning": 1.0, "general": 0.8},
+    "qwen-coder-14b": {"code": 2.0, "security": 1.5, "reasoning": 1.2, "general": 1.0},
+    "qwen-coder-7b": {"code": 1.8, "security": 1.2, "reasoning": 1.0, "general": 0.8},
+    "deepseek-r1-7b": {"reasoning": 2.0, "security": 1.0, "code": 1.0, "general": 1.0},
+    "deepseek-math-7b": {"reasoning": 1.8, "code": 0.8, "general": 0.7, "security": 0.5},
+    "hermes-14b": {"general": 1.5, "reasoning": 1.3, "security": 1.0, "code": 0.8},
+    "llama-3.1-8b": {"general": 1.2, "reasoning": 1.0, "security": 0.8, "code": 0.7},
+    "dolphin-8b": {"security": 1.2, "general": 1.2, "code": 0.8, "reasoning": 0.8},
+    "mistral-7b": {"general": 1.0, "reasoning": 1.0, "security": 0.8, "code": 0.7},
+    "codellama-13b": {"code": 1.8, "security": 0.8, "general": 0.6, "reasoning": 0.5},
+    "codellama-7b": {"code": 1.5, "security": 0.6, "general": 0.5, "reasoning": 0.4},
+    "yi-9b-200k": {"general": 1.2, "code": 1.0, "reasoning": 1.0, "security": 0.8},
+    "phi-3.5-mini": {"general": 0.8, "code": 0.7, "reasoning": 0.6, "security": 0.5},
 }
 
 
-class ModelEnsemble:
-    """Multi-model voting and consensus engine.
+class ModelEnsembleEngine:
+    """Multi-model ensemble for improved reasoning.
 
-    Queries multiple models and aggregates their responses
-    using various strategies to improve accuracy and reduce
-    hallucination.
+    Queries multiple models and combines their responses
+    using various aggregation strategies.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        default_strategy: EnsembleStrategy = EnsembleStrategy.BEST_OF_N,
+    ) -> None:
+        self._default_strategy = default_strategy
         self._counter = 0
-        self._history: list[EnsembleResult] = []
-        self._model_agreement_matrix: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        self._model_accuracy: dict[str, list[float]] = defaultdict(list)
         self._log = logger.bind(component="model_ensemble")
 
-    def aggregate(
+    def process_responses(
         self,
         responses: list[ModelResponse],
-        strategy: EnsembleStrategy = EnsembleStrategy.WEIGHTED_VOTE,
+        strategy: EnsembleStrategy | None = None,
+        task_type: str = "general",
     ) -> EnsembleResult:
-        """Aggregate responses from multiple models."""
-        self._counter += 1
-        start = time.time()
+        """Process multiple model responses."""
+        strategy = strategy or self._default_strategy
 
-        if strategy == EnsembleStrategy.MAJORITY_VOTE:
-            result = self._majority_vote(responses)
-        elif strategy == EnsembleStrategy.WEIGHTED_VOTE:
-            result = self._weighted_vote(responses)
-        elif strategy == EnsembleStrategy.CONFIDENCE_WEIGHTED:
-            result = self._confidence_weighted(responses)
-        elif strategy == EnsembleStrategy.BEST_OF:
-            result = self._best_of(responses)
-        elif strategy == EnsembleStrategy.UNANIMOUS:
-            result = self._unanimous(responses)
+        if strategy == EnsembleStrategy.BEST_OF_N:
+            return self._best_of_n(responses, task_type)
+        elif strategy == EnsembleStrategy.MAJORITY_VOTE:
+            return self._majority_vote(responses)
+        elif strategy == EnsembleStrategy.WEIGHTED_MERGE:
+            return self._weighted_merge(responses, task_type)
+        elif strategy == EnsembleStrategy.CASCADING:
+            return self._cascading(responses)
+        elif strategy == EnsembleStrategy.DIVERSITY:
+            return self._diversity_select(responses, task_type)
         else:
-            result = self._weighted_vote(responses)
+            return self._best_of_n(responses, task_type)
 
-        result.ensemble_id = f"ens-{self._counter}"
-        result.strategy = strategy
-        result.responses = responses
-        result.duration_s = time.time() - start
+    def _best_of_n(
+        self,
+        responses: list[ModelResponse],
+        task_type: str,
+    ) -> EnsembleResult:
+        """Select the best response based on quality and weight."""
+        scored: list[tuple[float, ModelResponse]] = []
 
-        # Compute agreement
-        result.agreement_ratio = self._compute_agreement(responses)
-        result.disagreements = self._find_disagreements(responses)
+        for resp in responses:
+            weight = self._get_weight(resp.model, task_type)
+            quality_scores = {
+                ResponseQuality.EXCELLENT: 1.0,
+                ResponseQuality.GOOD: 0.75,
+                ResponseQuality.ADEQUATE: 0.5,
+                ResponseQuality.POOR: 0.25,
+                ResponseQuality.INVALID: 0.0,
+            }
+            q_score = quality_scores.get(resp.quality, 0.5)
+            score = resp.confidence * weight * q_score
+            scored.append((score, resp))
 
-        # Update agreement matrix
-        self._update_agreement_matrix(responses)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best = scored[0][1] if scored else responses[0]
 
-        self._history.append(result)
-        return result
+        return EnsembleResult(
+            strategy=EnsembleStrategy.BEST_OF_N,
+            responses=responses,
+            selected_response=best.content,
+            selected_model=best.model,
+            overall_confidence=best.confidence,
+            agreement_score=self._calculate_agreement(responses),
+            total_tokens=sum(r.tokens_used for r in responses),
+            total_latency_ms=max(r.latency_ms for r in responses) if responses else 0,
+        )
 
-    def _majority_vote(self, responses: list[ModelResponse]) -> EnsembleResult:
-        """Simple majority voting on classification."""
-        result = EnsembleResult()
+    def _majority_vote(
+        self,
+        responses: list[ModelResponse],
+    ) -> EnsembleResult:
+        """Select response by majority vote on structured data."""
+        # Group by a key answer field
+        vote_counts: dict[str, int] = defaultdict(int)
+        vote_responses: dict[str, ModelResponse] = {}
 
-        if not responses:
-            return result
+        for resp in responses:
+            key = resp.structured_data.get("answer", resp.content[:50])
+            vote_counts[key] += 1
+            if key not in vote_responses:
+                vote_responses[key] = resp
 
-        # Vote on classification
-        votes = [r.classification for r in responses if r.classification]
-        if votes:
-            counter = Counter(votes)
-            result.consensus_classification = counter.most_common(1)[0][0]
-            result.consensus_confidence = counter.most_common(1)[0][1] / len(votes)
+        if not vote_counts:
+            return self._best_of_n(responses, "general")
 
-        # Union findings
-        result.consensus_findings = self._union_findings(responses)
+        winning_key = max(vote_counts, key=lambda k: vote_counts[k])
+        winning_response = vote_responses[winning_key]
+        agreement = vote_counts[winning_key] / len(responses)
 
-        return result
+        return EnsembleResult(
+            strategy=EnsembleStrategy.MAJORITY_VOTE,
+            responses=responses,
+            selected_response=winning_response.content,
+            selected_model=winning_response.model,
+            overall_confidence=winning_response.confidence * agreement,
+            agreement_score=agreement,
+            total_tokens=sum(r.tokens_used for r in responses),
+        )
 
-    def _weighted_vote(self, responses: list[ModelResponse]) -> EnsembleResult:
-        """Weighted voting by model quality."""
-        result = EnsembleResult()
+    def _weighted_merge(
+        self,
+        responses: list[ModelResponse],
+        task_type: str,
+    ) -> EnsembleResult:
+        """Merge responses with expertise-weighted combination."""
+        # For structured data, merge fields by weight
+        weights: list[float] = []
+        for resp in responses:
+            w = self._get_weight(resp.model, task_type) * resp.confidence
+            weights.append(w)
 
-        if not responses:
-            return result
+        total_weight = sum(weights)
+        if total_weight == 0:
+            return self._best_of_n(responses, task_type)
 
-        # Weighted vote on classification
-        class_weights: dict[str, float] = defaultdict(float)
-        total_weight = 0.0
+        # Select best as base, but confidence is weighted average
+        max_idx = weights.index(max(weights))
+        base_response = responses[max_idx]
 
-        for r in responses:
-            if r.classification:
-                weight = MODEL_QUALITY_WEIGHTS.get(r.model_id, 0.5)
-                class_weights[r.classification] += weight
-                total_weight += weight
+        weighted_confidence = sum(
+            r.confidence * w for r, w in zip(responses, weights)
+        ) / total_weight
 
-        if class_weights:
-            best_class = max(class_weights, key=lambda k: class_weights[k])
-            result.consensus_classification = best_class
-            if total_weight > 0:
-                result.consensus_confidence = class_weights[best_class] / total_weight
+        return EnsembleResult(
+            strategy=EnsembleStrategy.WEIGHTED_MERGE,
+            responses=responses,
+            selected_response=base_response.content,
+            selected_model=base_response.model,
+            merged_content=base_response.content,
+            overall_confidence=weighted_confidence,
+            agreement_score=self._calculate_agreement(responses),
+            total_tokens=sum(r.tokens_used for r in responses),
+        )
 
-        # Weighted confidence for findings
-        result.consensus_findings = self._weighted_findings(responses)
+    def _cascading(
+        self,
+        responses: list[ModelResponse],
+    ) -> EnsembleResult:
+        """Cascading: use first good response, fallback to next."""
+        for resp in responses:
+            if resp.quality in (ResponseQuality.EXCELLENT, ResponseQuality.GOOD):
+                return EnsembleResult(
+                    strategy=EnsembleStrategy.CASCADING,
+                    responses=responses,
+                    selected_response=resp.content,
+                    selected_model=resp.model,
+                    overall_confidence=resp.confidence,
+                    total_tokens=resp.tokens_used,
+                )
 
-        return result
+        # Fall back to best_of_n
+        return self._best_of_n(responses, "general")
 
-    def _confidence_weighted(self, responses: list[ModelResponse]) -> EnsembleResult:
-        """Weighted by each model's own confidence score."""
-        result = EnsembleResult()
+    def _diversity_select(
+        self,
+        responses: list[ModelResponse],
+        task_type: str,
+    ) -> EnsembleResult:
+        """Select diverse responses for comprehensive coverage."""
+        if len(responses) <= 1:
+            return self._best_of_n(responses, task_type)
 
-        if not responses:
-            return result
-
-        class_weights: dict[str, float] = defaultdict(float)
-        total_weight = 0.0
-
-        for r in responses:
-            if r.classification:
-                weight = r.confidence
-                class_weights[r.classification] += weight
-                total_weight += weight
-
-        if class_weights:
-            best_class = max(class_weights, key=lambda k: class_weights[k])
-            result.consensus_classification = best_class
-            if total_weight > 0:
-                result.consensus_confidence = class_weights[best_class] / total_weight
-
-        result.consensus_findings = self._weighted_findings(responses)
-
-        return result
-
-    def _best_of(self, responses: list[ModelResponse]) -> EnsembleResult:
-        """Take the response with highest confidence."""
-        result = EnsembleResult()
-
-        if not responses:
-            return result
-
-        best = max(responses, key=lambda r: r.confidence)
-        result.consensus_classification = best.classification
-        result.consensus_confidence = best.confidence
-        result.consensus_findings = list(best.findings)
-
-        return result
-
-    def _unanimous(self, responses: list[ModelResponse]) -> EnsembleResult:
-        """Only accept if all models agree."""
-        result = EnsembleResult()
-
-        if not responses:
-            return result
-
-        classifications = set(r.classification for r in responses if r.classification)
-        if len(classifications) == 1:
-            result.consensus_classification = classifications.pop()
-            result.consensus_confidence = sum(r.confidence for r in responses) / len(responses)
-        else:
-            result.consensus_classification = "no_consensus"
-            result.consensus_confidence = 0.0
-
-        # Intersection of findings
-        result.consensus_findings = self._intersect_findings(responses)
-
-        return result
-
-    @staticmethod
-    def _union_findings(responses: list[ModelResponse]) -> list[dict[str, Any]]:
-        """Union all findings from responses."""
-        all_findings = []
-        seen_titles = set()
-        for r in responses:
-            for f in r.findings:
-                title = f.get("title", "")
-                if title and title not in seen_titles:
-                    seen_titles.add(title)
-                    all_findings.append(f)
-        return all_findings
-
-    @staticmethod
-    def _weighted_findings(responses: list[ModelResponse]) -> list[dict[str, Any]]:
-        """Combine findings with weighted confidence."""
-        finding_map: dict[str, dict[str, Any]] = {}
-        finding_weights: dict[str, float] = defaultdict(float)
-        finding_count: dict[str, int] = defaultdict(int)
-
-        for r in responses:
-            weight = MODEL_QUALITY_WEIGHTS.get(r.model_id, 0.5)
-            for f in r.findings:
-                title = f.get("title", "")
-                if title:
-                    finding_map[title] = f
-                    finding_weights[title] += weight * r.confidence
-                    finding_count[title] += 1
-
-        results = []
-        for title, data in finding_map.items():
-            data["ensemble_confidence"] = round(
-                finding_weights[title] / max(1, finding_count[title]), 2
+        # Pick the most diverse pair (different models, different content lengths)
+        selected = [responses[0]]
+        for resp in responses[1:]:
+            is_diverse = all(
+                resp.model != s.model and
+                abs(len(resp.content) - len(s.content)) > 100
+                for s in selected
             )
-            data["model_count"] = finding_count[title]
-            results.append(data)
+            if is_diverse:
+                selected.append(resp)
+                if len(selected) >= 3:
+                    break
 
-        results.sort(key=lambda f: f.get("ensemble_confidence", 0), reverse=True)
-        return results
+        # Use the highest confidence from diverse set
+        best = max(selected, key=lambda r: r.confidence)
 
-    @staticmethod
-    def _intersect_findings(responses: list[ModelResponse]) -> list[dict[str, Any]]:
-        """Only keep findings that all models agree on."""
-        if not responses:
-            return []
+        return EnsembleResult(
+            strategy=EnsembleStrategy.DIVERSITY,
+            responses=responses,
+            selected_response=best.content,
+            selected_model=best.model,
+            overall_confidence=best.confidence,
+            agreement_score=self._calculate_agreement(selected),
+            total_tokens=sum(r.tokens_used for r in responses),
+        )
 
-        title_sets = []
-        for r in responses:
-            titles = {f.get("title", "") for f in r.findings if f.get("title")}
-            title_sets.append(titles)
+    def _get_weight(self, model: str, task_type: str) -> float:
+        """Get model weight for a task type."""
+        model_w = MODEL_WEIGHTS.get(model, {})
+        return model_w.get(task_type, model_w.get("general", 1.0))
 
-        if not title_sets:
-            return []
-
-        common = title_sets[0]
-        for ts in title_sets[1:]:
-            common = common & ts
-
-        all_findings = {}
-        for r in responses:
-            for f in r.findings:
-                title = f.get("title", "")
-                if title in common:
-                    all_findings[title] = f
-
-        return list(all_findings.values())
-
-    @staticmethod
-    def _compute_agreement(responses: list[ModelResponse]) -> float:
-        """Compute agreement ratio among responses."""
+    def _calculate_agreement(self, responses: list[ModelResponse]) -> float:
+        """Calculate agreement score between responses."""
         if len(responses) < 2:
             return 1.0
 
-        classifications = [r.classification for r in responses if r.classification]
-        if not classifications:
-            return 1.0
+        # Simple: compare confidence levels
+        confidences = [r.confidence for r in responses]
+        avg = sum(confidences) / len(confidences)
+        variance = sum((c - avg) ** 2 for c in confidences) / len(confidences)
 
-        counter = Counter(classifications)
-        most_common_count = counter.most_common(1)[0][1]
-        return most_common_count / len(classifications)
-
-    @staticmethod
-    def _find_disagreements(responses: list[ModelResponse]) -> list[dict[str, Any]]:
-        """Find where models disagree."""
-        if len(responses) < 2:
-            return []
-
-        classifications = {}
-        for r in responses:
-            if r.classification:
-                classifications[r.model_id] = r.classification
-
-        if len(set(classifications.values())) <= 1:
-            return []
-
-        return [
-            {"model": model, "classification": cls}
-            for model, cls in classifications.items()
-        ]
-
-    def _update_agreement_matrix(self, responses: list[ModelResponse]) -> None:
-        """Track which models tend to agree with each other."""
-        for i, r1 in enumerate(responses):
-            for r2 in responses[i + 1:]:
-                if r1.classification and r2.classification:
-                    if r1.classification == r2.classification:
-                        self._model_agreement_matrix[r1.model_id][r2.model_id] += 1
-                        self._model_agreement_matrix[r2.model_id][r1.model_id] += 1
-
-    def get_agreement_matrix(self) -> dict[str, dict[str, int]]:
-        """Get the inter-model agreement matrix."""
-        return dict(self._model_agreement_matrix)
+        # Lower variance = higher agreement
+        return max(0.0, 1.0 - variance * 4)
 
     def get_stats(self) -> dict[str, Any]:
-        strategy_counts: dict[str, int] = defaultdict(int)
-        for r in self._history:
-            strategy_counts[r.strategy.value] += 1
-
-        avg_agreement = 0.0
-        if self._history:
-            avg_agreement = sum(r.agreement_ratio for r in self._history) / len(self._history)
-
         return {
-            "ensembles_run": len(self._history),
-            "avg_agreement": round(avg_agreement, 2),
-            "by_strategy": dict(strategy_counts),
+            "strategy": self._default_strategy.value,
+            "models_configured": len(MODEL_WEIGHTS),
         }
