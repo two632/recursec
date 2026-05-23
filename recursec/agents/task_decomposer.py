@@ -1,13 +1,13 @@
-"""Task decomposer — recursive task breakdown.
+"""Task decomposer — intelligent task breakdown for recursive agents.
 
 Implements:
-1. High-level task decomposition into subtasks
-2. Dependency graph construction
-3. Parallel/sequential ordering
-4. Budget-aware decomposition
-5. Depth-limited recursion
-6. Task templates for common patterns
-7. Dynamic re-decomposition on failure
+1. Goal decomposition into sub-tasks
+2. Dependency graph between tasks
+3. Task priority and ordering (topological sort)
+4. Parallel task identification
+5. Task estimation (tokens, time)
+6. Dynamic re-planning when tasks fail
+7. Task context generation for agent spawning
 """
 
 from __future__ import annotations
@@ -24,11 +24,12 @@ logger = structlog.get_logger()
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
-    READY = "ready"          # Dependencies met
-    RUNNING = "running"
+    READY = "ready"           # All deps met, can start
+    IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
-    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+    BLOCKED = "blocked"
 
 
 class TaskPriority(str, Enum):
@@ -38,311 +39,325 @@ class TaskPriority(str, Enum):
     LOW = "low"
 
 
-class ExecutionMode(str, Enum):
-    SEQUENTIAL = "sequential"
-    PARALLEL = "parallel"
-    CONDITIONAL = "conditional"  # Execute based on parent result
-
-
 @dataclass
-class Task:
-    """A decomposed task."""
+class SubTask:
+    """A decomposed sub-task."""
     task_id: str = ""
-    name: str = ""
+    parent_id: str = ""
+    title: str = ""
     description: str = ""
     status: TaskStatus = TaskStatus.PENDING
     priority: TaskPriority = TaskPriority.MEDIUM
-    execution_mode: ExecutionMode = ExecutionMode.SEQUENTIAL
-    parent_task: str = ""
-    subtasks: list[str] = field(default_factory=list)
-    dependencies: list[str] = field(default_factory=list)
+    agent_role: str = ""      # Role of agent to handle this
+    tool_hints: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)  # Task IDs that must complete first
+    children: list[str] = field(default_factory=list)
+
+    # Estimation
+    estimated_tokens: int = 5000
+    estimated_duration_s: float = 60.0
+    actual_tokens: int = 0
+    actual_duration_s: float = 0.0
+
+    # Execution
     assigned_agent: str = ""
-    assigned_model: str = ""
-    tools: list[str] = field(default_factory=list)
-    token_budget: int = 0
-    time_budget_s: float = 0.0
-    depth: int = 0
-    max_depth: int = 3
     result: str = ""
+    error: str = ""
+    findings_count: int = 0
+
     created_at: float = field(default_factory=time.time)
+    started_at: float = 0.0
     completed_at: float = 0.0
+
+    @property
+    def is_leaf(self) -> bool:
+        return len(self.children) == 0
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.status == TaskStatus.BLOCKED
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.task_id[:10],
-            "name": self.name[:25],
+            "title": self.title[:25],
             "status": self.status.value,
             "priority": self.priority.value,
-            "depth": self.depth,
-            "subtasks": len(self.subtasks),
+            "role": self.agent_role[:10],
+            "deps": len(self.dependencies),
+            "children": len(self.children),
         }
 
 
-@dataclass
-class TaskGraph:
-    """A graph of decomposed tasks."""
-    graph_id: str = ""
-    root_task: str = ""
-    tasks: dict[str, Task] = field(default_factory=dict)
-    total_tasks: int = 0
-    completed_tasks: int = 0
-
-    @property
-    def progress(self) -> float:
-        if self.total_tasks == 0:
-            return 0.0
-        return self.completed_tasks / self.total_tasks
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.graph_id[:10],
-            "root": self.root_task[:10],
-            "total": self.total_tasks,
-            "completed": self.completed_tasks,
-            "progress": round(self.progress * 100, 1),
-        }
-
-
-# ── Task decomposition templates ─────────────────────────────
+# ── Task templates for common security operations ────────────
 
 TASK_TEMPLATES: dict[str, list[dict[str, Any]]] = {
     "full_assessment": [
-        {"name": "Target profiling", "priority": "critical", "mode": "sequential",
-         "tools": ["nmap", "whatweb", "httpx"], "time": 300},
-        {"name": "Subdomain enumeration", "priority": "high", "mode": "parallel",
-         "tools": ["subfinder", "amass"], "time": 300},
-        {"name": "Port scanning", "priority": "critical", "mode": "parallel",
-         "tools": ["nmap", "masscan"], "time": 600},
-        {"name": "Vulnerability scanning", "priority": "critical", "mode": "parallel",
-         "tools": ["nuclei", "nikto"], "time": 600},
-        {"name": "Web application testing", "priority": "high", "mode": "sequential",
-         "tools": ["sqlmap", "dalfox", "ffuf"], "time": 600},
-        {"name": "Finding validation", "priority": "high", "mode": "sequential",
-         "tools": ["nuclei", "curl"], "time": 300},
-        {"name": "Report generation", "priority": "medium", "mode": "sequential",
-         "tools": [], "time": 120},
+        {"title": "Passive Reconnaissance", "role": "recon", "priority": "high",
+         "tools": ["subfinder", "amass", "theHarvester", "whois"], "deps": []},
+        {"title": "Active Reconnaissance", "role": "recon", "priority": "high",
+         "tools": ["nmap", "masscan", "httpx"], "deps": ["Passive Reconnaissance"]},
+        {"title": "Technology Fingerprinting", "role": "scanner", "priority": "medium",
+         "tools": ["whatweb", "wappalyzer"], "deps": ["Active Reconnaissance"]},
+        {"title": "Vulnerability Scanning", "role": "scanner", "priority": "high",
+         "tools": ["nuclei", "nikto"], "deps": ["Technology Fingerprinting"]},
+        {"title": "Web Application Testing", "role": "exploiter", "priority": "high",
+         "tools": ["sqlmap", "ffuf", "burpsuite"], "deps": ["Vulnerability Scanning"]},
+        {"title": "Authentication Testing", "role": "exploiter", "priority": "medium",
+         "tools": ["hydra", "jwt_tool"], "deps": ["Technology Fingerprinting"]},
+        {"title": "Exploitation", "role": "exploiter", "priority": "critical",
+         "tools": ["metasploit"], "deps": ["Web Application Testing"]},
+        {"title": "Finding Validation", "role": "validator", "priority": "high",
+         "tools": [], "deps": ["Exploitation", "Vulnerability Scanning"]},
+        {"title": "Report Generation", "role": "analyst", "priority": "medium",
+         "tools": [], "deps": ["Finding Validation"]},
     ],
     "web_assessment": [
-        {"name": "Technology fingerprinting", "priority": "high", "mode": "sequential",
-         "tools": ["whatweb", "httpx"], "time": 120},
-        {"name": "Directory enumeration", "priority": "high", "mode": "parallel",
-         "tools": ["ffuf", "gobuster"], "time": 300},
-        {"name": "Injection testing", "priority": "critical", "mode": "sequential",
-         "tools": ["sqlmap", "dalfox"], "time": 300},
-        {"name": "Authentication testing", "priority": "high", "mode": "sequential",
-         "tools": ["hydra", "ffuf"], "time": 300},
-        {"name": "Business logic testing", "priority": "medium", "mode": "sequential",
-         "tools": [], "time": 300},
+        {"title": "Subdomain Enumeration", "role": "recon", "priority": "high",
+         "tools": ["subfinder", "amass"], "deps": []},
+        {"title": "HTTP Probing", "role": "recon", "priority": "high",
+         "tools": ["httpx"], "deps": ["Subdomain Enumeration"]},
+        {"title": "Directory Fuzzing", "role": "scanner", "priority": "medium",
+         "tools": ["ffuf", "gobuster"], "deps": ["HTTP Probing"]},
+        {"title": "Vulnerability Scanning", "role": "scanner", "priority": "high",
+         "tools": ["nuclei"], "deps": ["HTTP Probing"]},
+        {"title": "SQL Injection Testing", "role": "exploiter", "priority": "high",
+         "tools": ["sqlmap"], "deps": ["Directory Fuzzing"]},
+        {"title": "XSS Testing", "role": "exploiter", "priority": "medium",
+         "tools": ["dalfox"], "deps": ["Directory Fuzzing"]},
     ],
     "network_assessment": [
-        {"name": "Network discovery", "priority": "critical", "mode": "parallel",
-         "tools": ["nmap", "masscan"], "time": 600},
-        {"name": "Service enumeration", "priority": "high", "mode": "sequential",
-         "tools": ["nmap", "enum4linux"], "time": 300},
-        {"name": "Vulnerability scanning", "priority": "critical", "mode": "parallel",
-         "tools": ["nuclei", "nmap"], "time": 600},
-        {"name": "Credential testing", "priority": "high", "mode": "sequential",
-         "tools": ["hydra", "crackmapexec"], "time": 300},
-    ],
-    "code_audit": [
-        {"name": "SAST scanning", "priority": "critical", "mode": "parallel",
-         "tools": ["semgrep", "bandit"], "time": 300},
-        {"name": "Secret detection", "priority": "high", "mode": "parallel",
-         "tools": ["trufflehog", "gitleaks"], "time": 120},
-        {"name": "Dependency audit", "priority": "high", "mode": "parallel",
-         "tools": ["trivy", "grype"], "time": 120},
-        {"name": "Manual code review", "priority": "medium", "mode": "sequential",
-         "tools": [], "time": 600},
+        {"title": "Network Discovery", "role": "recon", "priority": "high",
+         "tools": ["nmap", "masscan"], "deps": []},
+        {"title": "Service Enumeration", "role": "scanner", "priority": "high",
+         "tools": ["nmap"], "deps": ["Network Discovery"]},
+        {"title": "Vulnerability Scanning", "role": "scanner", "priority": "high",
+         "tools": ["nmap", "nuclei"], "deps": ["Service Enumeration"]},
+        {"title": "Exploitation", "role": "exploiter", "priority": "critical",
+         "tools": ["metasploit"], "deps": ["Vulnerability Scanning"]},
     ],
 }
 
 
 class TaskDecomposer:
-    """Decomposes high-level tasks into subtask graphs.
+    """Decomposes goals into sub-tasks with dependencies.
 
-    Produces executable task graphs with dependency
-    tracking, parallel execution support, and
-    budget-aware decomposition.
+    Creates a directed acyclic graph of tasks,
+    identifies parallelism opportunities, and
+    supports dynamic re-planning.
     """
 
-    def __init__(self, max_depth: int = 3) -> None:
-        self._graphs: dict[str, TaskGraph] = {}
+    def __init__(self) -> None:
+        self._tasks: dict[str, SubTask] = {}
         self._counter = 0
-        self._max_depth = max_depth
         self._log = logger.bind(component="task_decomposer")
 
-    def decompose(
+    def decompose_from_template(
         self,
-        task_name: str,
-        template: str = "full_assessment",
-        total_token_budget: int = 500_000,
-        total_time_budget: float = 3600,
-    ) -> TaskGraph:
-        """Decompose a high-level task into a graph."""
-        self._counter += 1
-
-        # Create root task
-        root = Task(
-            task_id=f"task-{self._counter}",
-            name=task_name,
-            status=TaskStatus.PENDING,
-            priority=TaskPriority.CRITICAL,
-            token_budget=total_token_budget,
-            time_budget_s=total_time_budget,
-            depth=0,
-            max_depth=self._max_depth,
-        )
-
-        graph = TaskGraph(
-            graph_id=f"graph-{self._counter}",
-            root_task=root.task_id,
-        )
-        graph.tasks[root.task_id] = root
-
-        # Apply template
-        subtask_templates = TASK_TEMPLATES.get(template, TASK_TEMPLATES["full_assessment"])
-        num_subtasks = len(subtask_templates)
-        token_per_subtask = total_token_budget // max(1, num_subtasks)
-        time_per_subtask = total_time_budget / max(1, num_subtasks)
-
-        prev_sequential: str = ""
-        for tmpl in subtask_templates:
-            self._counter += 1
-            subtask = Task(
-                task_id=f"task-{self._counter}",
-                name=tmpl["name"],
-                priority=TaskPriority(tmpl.get("priority", "medium")),
-                execution_mode=ExecutionMode(tmpl.get("mode", "sequential")),
-                parent_task=root.task_id,
-                tools=tmpl.get("tools", []),
-                token_budget=token_per_subtask,
-                time_budget_s=tmpl.get("time", time_per_subtask),
-                depth=1,
-                max_depth=self._max_depth,
-            )
-
-            # Sequential tasks depend on previous
-            if subtask.execution_mode == ExecutionMode.SEQUENTIAL and prev_sequential:
-                subtask.dependencies.append(prev_sequential)
-
-            if subtask.execution_mode == ExecutionMode.SEQUENTIAL:
-                prev_sequential = subtask.task_id
-
-            graph.tasks[subtask.task_id] = subtask
-            root.subtasks.append(subtask.task_id)
-
-        graph.total_tasks = len(graph.tasks)
-        self._graphs[graph.graph_id] = graph
-
-        return graph
-
-    def get_ready_tasks(self, graph_id: str) -> list[Task]:
-        """Get tasks that are ready to execute."""
-        graph = self._graphs.get(graph_id)
-        if not graph:
+        template_name: str,
+        parent_id: str = "",
+    ) -> list[SubTask]:
+        """Decompose a goal using a predefined template."""
+        template = TASK_TEMPLATES.get(template_name, [])
+        if not template:
             return []
 
-        ready = []
-        for task in graph.tasks.values():
-            if task.status != TaskStatus.PENDING:
-                continue
+        # Create tasks
+        tasks: list[SubTask] = []
+        title_to_id: dict[str, str] = {}
 
-            deps_met = all(
-                graph.tasks.get(dep_id, Task()).status == TaskStatus.COMPLETED
-                for dep_id in task.dependencies
+        for tmpl in template:
+            self._counter += 1
+            task = SubTask(
+                task_id=f"task-{self._counter}",
+                parent_id=parent_id,
+                title=tmpl["title"],
+                priority=TaskPriority(tmpl.get("priority", "medium")),
+                agent_role=tmpl.get("role", ""),
+                tool_hints=tmpl.get("tools", []),
             )
-            if deps_met:
-                task.status = TaskStatus.READY
-                ready.append(task)
+            self._tasks[task.task_id] = task
+            tasks.append(task)
+            title_to_id[task.title] = task.task_id
 
-        return ready
+        # Resolve dependencies
+        for i, tmpl in enumerate(template):
+            task = tasks[i]
+            for dep_title in tmpl.get("deps", []):
+                dep_id = title_to_id.get(dep_title)
+                if dep_id:
+                    task.dependencies.append(dep_id)
+
+        # Update readiness
+        self._update_readiness()
+        return tasks
+
+    def add_task(
+        self,
+        title: str,
+        description: str = "",
+        parent_id: str = "",
+        priority: TaskPriority = TaskPriority.MEDIUM,
+        agent_role: str = "",
+        tool_hints: list[str] | None = None,
+        dependencies: list[str] | None = None,
+        estimated_tokens: int = 5000,
+        estimated_duration_s: float = 60.0,
+    ) -> SubTask:
+        """Add a custom task."""
+        self._counter += 1
+        task = SubTask(
+            task_id=f"task-{self._counter}",
+            parent_id=parent_id,
+            title=title,
+            description=description,
+            priority=priority,
+            agent_role=agent_role,
+            tool_hints=tool_hints or [],
+            dependencies=dependencies or [],
+            estimated_tokens=estimated_tokens,
+            estimated_duration_s=estimated_duration_s,
+        )
+        self._tasks[task.task_id] = task
+        self._update_readiness()
+        return task
+
+    def start_task(self, task_id: str, agent_id: str = "") -> bool:
+        """Mark a task as started."""
+        task = self._tasks.get(task_id)
+        if not task or task.status != TaskStatus.READY:
+            return False
+
+        task.status = TaskStatus.IN_PROGRESS
+        task.assigned_agent = agent_id
+        task.started_at = time.time()
+        return True
 
     def complete_task(
         self,
-        graph_id: str,
         task_id: str,
         result: str = "",
-        success: bool = True,
-    ) -> None:
+        findings_count: int = 0,
+        tokens_used: int = 0,
+    ) -> bool:
         """Mark a task as completed."""
-        graph = self._graphs.get(graph_id)
-        if not graph:
-            return
-
-        task = graph.tasks.get(task_id)
+        task = self._tasks.get(task_id)
         if not task:
-            return
+            return False
 
-        task.status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
-        task.completed_at = time.time()
+        task.status = TaskStatus.COMPLETED
         task.result = result
+        task.findings_count = findings_count
+        task.actual_tokens = tokens_used
+        task.completed_at = time.time()
+        task.actual_duration_s = task.completed_at - task.started_at
 
-        if success:
-            graph.completed_tasks += 1
+        self._update_readiness()
+        return True
 
-    def re_decompose(
-        self,
-        graph_id: str,
-        task_id: str,
-    ) -> list[Task]:
-        """Re-decompose a failed task into smaller subtasks."""
-        graph = self._graphs.get(graph_id)
-        if not graph:
-            return []
-
-        task = graph.tasks.get(task_id)
+    def fail_task(self, task_id: str, error: str = "") -> bool:
+        """Mark a task as failed."""
+        task = self._tasks.get(task_id)
         if not task:
+            return False
+
+        task.status = TaskStatus.FAILED
+        task.error = error
+        task.completed_at = time.time()
+
+        self._update_readiness()
+        return True
+
+    def get_ready_tasks(self) -> list[SubTask]:
+        """Get tasks ready for execution."""
+        return [t for t in self._tasks.values() if t.status == TaskStatus.READY]
+
+    def get_parallel_groups(self) -> list[list[SubTask]]:
+        """Identify groups of tasks that can run in parallel."""
+        ready = self.get_ready_tasks()
+        if not ready:
+            return []
+        return [ready]  # All ready tasks can run in parallel
+
+    def replan_after_failure(self, failed_task_id: str) -> list[SubTask]:
+        """Re-plan after a task failure."""
+        failed = self._tasks.get(failed_task_id)
+        if not failed:
             return []
 
-        if task.depth >= task.max_depth:
-            return []
+        # Skip dependent tasks
+        affected: list[SubTask] = []
+        for task in self._tasks.values():
+            if failed_task_id in task.dependencies:
+                if task.status in (TaskStatus.PENDING, TaskStatus.READY):
+                    task.status = TaskStatus.SKIPPED
+                    affected.append(task)
 
-        # Split budget
-        sub_budget = task.token_budget // 2
-        sub_time = task.time_budget_s / 2
+        return affected
 
-        new_tasks = []
-        for i in range(2):
-            self._counter += 1
-            subtask = Task(
-                task_id=f"task-{self._counter}",
-                name=f"{task.name} (retry {i + 1})",
-                parent_task=task_id,
-                tools=task.tools,
-                token_budget=sub_budget,
-                time_budget_s=sub_time,
-                depth=task.depth + 1,
-                max_depth=task.max_depth,
-            )
-            graph.tasks[subtask.task_id] = subtask
-            task.subtasks.append(subtask.task_id)
-            new_tasks.append(subtask)
-            graph.total_tasks += 1
+    def build_task_prompt(self, max_tasks: int = 10) -> str:
+        """Build task context for LLM."""
+        lines = ["## Task Decomposition\n"]
 
-        return new_tasks
+        status_counts: dict[str, int] = {}
+        for t in self._tasks.values():
+            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
 
-    def build_graph_prompt(self, graph_id: str) -> str:
-        """Build a prompt describing the task graph."""
-        graph = self._graphs.get(graph_id)
-        if not graph:
-            return ""
+        lines.append(f"Tasks: {len(self._tasks)} | " + " ".join(
+            f"{k}={v}" for k, v in status_counts.items()
+        ))
 
-        lines = [f"## Task Graph ({graph.progress * 100:.0f}% complete)\n"]
+        ready = self.get_ready_tasks()
+        if ready:
+            lines.append(f"\nReady to execute ({len(ready)}):")
+            for t in ready[:max_tasks]:
+                tools = ",".join(t.tool_hints[:3]) if t.tool_hints else "none"
+                lines.append(
+                    f"  [{t.priority.value[0].upper()}] {t.title[:25]} "
+                    f"(role={t.agent_role}, tools={tools})"
+                )
 
-        for task in sorted(graph.tasks.values(), key=lambda t: t.depth):
-            indent = "  " * task.depth
-            status_icon = {"completed": "+", "failed": "!", "running": ">", "pending": "-", "ready": "*"}.get(task.status.value, "?")
-            lines.append(f"{indent}[{status_icon}] {task.name} ({task.priority.value})")
+        in_progress = [t for t in self._tasks.values() if t.status == TaskStatus.IN_PROGRESS]
+        if in_progress:
+            lines.append(f"\nIn progress ({len(in_progress)}):")
+            for t in in_progress[:5]:
+                elapsed = time.time() - t.started_at if t.started_at else 0
+                lines.append(f"  {t.title[:25]} ({elapsed:.0f}s)")
 
         return "\n".join(lines)
 
+    def _update_readiness(self) -> None:
+        """Update task readiness based on dependency status."""
+        for task in self._tasks.values():
+            if task.status != TaskStatus.PENDING:
+                continue
+
+            if not task.dependencies:
+                task.status = TaskStatus.READY
+                continue
+
+            all_deps_met = True
+            any_dep_failed = False
+            for dep_id in task.dependencies:
+                dep = self._tasks.get(dep_id)
+                if not dep or dep.status != TaskStatus.COMPLETED:
+                    all_deps_met = False
+                if dep and dep.status in (TaskStatus.FAILED, TaskStatus.SKIPPED):
+                    any_dep_failed = True
+
+            if any_dep_failed:
+                task.status = TaskStatus.BLOCKED
+            elif all_deps_met:
+                task.status = TaskStatus.READY
+
     def get_stats(self) -> dict[str, Any]:
-        total_tasks = sum(g.total_tasks for g in self._graphs.values())
-        completed = sum(g.completed_tasks for g in self._graphs.values())
+        status_counts: dict[str, int] = {}
+        for t in self._tasks.values():
+            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
 
         return {
-            "graphs": len(self._graphs),
-            "total_tasks": total_tasks,
-            "completed": completed,
-            "progress": round(completed / max(1, total_tasks) * 100, 1),
+            "total_tasks": len(self._tasks),
+            "by_status": status_counts,
+            "ready": len(self.get_ready_tasks()),
+            "total_findings": sum(t.findings_count for t in self._tasks.values()),
         }
