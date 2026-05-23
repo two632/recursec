@@ -1,379 +1,349 @@
-"""Context manager — manages context propagation across recursion levels.
+"""Context manager — manages LLM context windows across agent hierarchy.
 
-Handles:
-- Context inheritance (parent → child agents)
-- Context windowing (fitting relevant context into LLM context windows)
-- Context prioritization (most relevant information first)
-- Context compression (summarizing long contexts)
-- Context isolation (preventing context leakage between tasks)
-- Shared context (findings, knowledge) vs private context (tool outputs)
-- Context versioning and diff tracking
+Implements:
+1. Context window allocation per agent
+2. Context compression when approaching limits
+3. Priority-based content selection
+4. Hierarchical context inheritance (parent → child)
+5. Context summarization for long conversations
+6. Token counting and budget tracking
+7. Sliding window with importance scoring
+8. Context snapshot and restore
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from enum import Enum
+from typing import Any
 
 import structlog
-
-if TYPE_CHECKING:
-    from recursec.llm.router import ModelRouter
 
 logger = structlog.get_logger()
 
 
+class ContentPriority(str, Enum):
+    CRITICAL = "critical"       # System prompt, current task — never evict
+    HIGH = "high"               # Recent tool outputs, findings
+    MEDIUM = "medium"           # Earlier observations, context
+    LOW = "low"                 # Background info, history
+    EPHEMERAL = "ephemeral"     # Can be dropped anytime
+
+
 @dataclass
 class ContextEntry:
-    """A single entry in the agent's context."""
-    key: str
-    content: str
-    source: str = ""  # agent_id that produced this
-    entry_type: str = "general"  # general, finding, tool_output, plan, summary
-    priority: float = 0.5  # 0.0 = low, 1.0 = high
-    token_estimate: int = 0
+    """A single entry in the context window."""
+    entry_id: str = ""
+    content: str = ""
+    role: str = "system"          # system, user, assistant, tool
+    priority: ContentPriority = ContentPriority.MEDIUM
+    token_count: int = 0
+    source: str = ""              # Which agent/tool produced this
     timestamp: float = field(default_factory=time.time)
-    depth: int = 0  # Recursion depth at which this was created
-    is_shared: bool = True  # Can be inherited by child agents
-    is_compressed: bool = False
-    version: int = 1
-    metadata: dict[str, Any] = field(default_factory=dict)
+    access_count: int = 0
+    is_summary: bool = False      # Was this summarized from longer content?
 
-    def __post_init__(self) -> None:
-        if not self.token_estimate:
-            self.token_estimate = len(self.content) // 4  # Rough estimate
+    @property
+    def importance_score(self) -> float:
+        """Dynamic importance based on priority, recency, and access."""
+        priority_weights = {
+            ContentPriority.CRITICAL: 10.0,
+            ContentPriority.HIGH: 5.0,
+            ContentPriority.MEDIUM: 2.0,
+            ContentPriority.LOW: 1.0,
+            ContentPriority.EPHEMERAL: 0.5,
+        }
+        base = priority_weights.get(self.priority, 1.0)
+
+        # Recency boost (decays over 10 minutes)
+        age = time.time() - self.timestamp
+        recency = max(0.1, 1.0 - age / 600.0)
+
+        # Access boost
+        access_boost = min(2.0, 1.0 + self.access_count * 0.1)
+
+        return base * recency * access_boost
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "key": self.key, "content": self.content[:200],
-            "source": self.source, "type": self.entry_type,
-            "priority": self.priority, "tokens": self.token_estimate,
-            "depth": self.depth, "shared": self.is_shared,
+            "id": self.entry_id,
+            "role": self.role,
+            "priority": self.priority.value,
+            "tokens": self.token_count,
+            "importance": round(self.importance_score, 2),
+            "source": self.source[:20],
         }
 
 
 @dataclass
 class ContextWindow:
-    """A windowed view of context that fits within a token budget."""
+    """A managed context window."""
+    window_id: str = ""
+    agent_id: str = ""
+    max_tokens: int = 4096
     entries: list[ContextEntry] = field(default_factory=list)
     total_tokens: int = 0
-    max_tokens: int = 4096
-    truncated_count: int = 0
+    eviction_count: int = 0
+    compression_count: int = 0
 
-    def to_text(self) -> str:
-        """Convert to text for LLM consumption."""
-        parts = []
-        for entry in self.entries:
-            if entry.entry_type == "finding":
-                parts.append(f"[FINDING] {entry.content}")
-            elif entry.entry_type == "tool_output":
-                parts.append(f"[TOOL:{entry.source}] {entry.content}")
-            elif entry.entry_type == "plan":
-                parts.append(f"[PLAN] {entry.content}")
-            elif entry.entry_type == "summary":
-                parts.append(f"[SUMMARY] {entry.content}")
-            else:
-                parts.append(entry.content)
-        return "\n\n".join(parts)
+    @property
+    def remaining_tokens(self) -> int:
+        return max(0, self.max_tokens - self.total_tokens)
 
-    def to_messages(self) -> list[dict[str, str]]:
-        """Convert to chat message format."""
-        messages = []
-        for entry in self.entries:
-            role = "system" if entry.entry_type in ("plan", "summary") else "user"
-            messages.append({"role": role, "content": entry.content})
-        return messages
+    @property
+    def utilization(self) -> float:
+        if self.max_tokens == 0:
+            return 0.0
+        return self.total_tokens / self.max_tokens
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.window_id,
+            "agent": self.agent_id[:20],
+            "tokens": self.total_tokens,
+            "max": self.max_tokens,
+            "entries": len(self.entries),
+            "util_pct": round(self.utilization * 100, 1),
+        }
 
 
 class ContextManager:
-    """Manages context for agents across recursion levels.
+    """Manages LLM context windows across the agent hierarchy.
 
-    The context manager is responsible for:
-    1. Storing and organizing context entries
-    2. Building context windows that fit within token budgets
-    3. Propagating relevant context to child agents
-    4. Compressing context when it exceeds limits
-    5. Tracking context changes between iterations
+    Handles token budgeting, priority-based eviction,
+    compression, and hierarchical context inheritance.
     """
 
-    PRIORITY_BOOST = {
-        "finding": 0.3,       # Findings get priority boost
-        "plan": 0.2,          # Plans are important
-        "summary": 0.15,      # Summaries are useful
-        "tool_output": 0.0,   # Tool outputs are baseline
-        "general": -0.1,      # General context is lower priority
-    }
+    def __init__(self, default_max_tokens: int = 4096) -> None:
+        self._windows: dict[str, ContextWindow] = {}
+        self._window_counter = 0
+        self._entry_counter = 0
+        self._default_max = default_max_tokens
+        self._log = logger.bind(component="context_manager")
 
-    def __init__(
+    def create_window(
         self,
         agent_id: str,
-        max_context_tokens: int = 8192,
-        model_router: ModelRouter | None = None,
-    ) -> None:
-        self.agent_id = agent_id
-        self._max_tokens = max_context_tokens
-        self._router = model_router
-        self._entries: dict[str, ContextEntry] = {}
-        self._shared_entries: dict[str, ContextEntry] = {}  # Inherited from parent
-        self._compressed_summaries: list[str] = []
-        self._total_tokens = 0
-        self._log = logger.bind(agent=agent_id, component="context_mgr")
+        max_tokens: int = 0,
+    ) -> ContextWindow:
+        """Create a context window for an agent."""
+        self._window_counter += 1
+        window = ContextWindow(
+            window_id=f"ctx-{self._window_counter}",
+            agent_id=agent_id,
+            max_tokens=max_tokens or self._default_max,
+        )
+        self._windows[window.window_id] = window
+        return window
 
     def add(
         self,
-        key: str,
+        window_id: str,
         content: str,
-        entry_type: str = "general",
-        priority: float = 0.5,
+        role: str = "system",
+        priority: ContentPriority = ContentPriority.MEDIUM,
         source: str = "",
-        depth: int = 0,
-        is_shared: bool = True,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        """Add a context entry."""
-        entry = ContextEntry(
-            key=key, content=content,
-            source=source or self.agent_id,
-            entry_type=entry_type,
-            priority=priority + self.PRIORITY_BOOST.get(entry_type, 0),
-            depth=depth, is_shared=is_shared,
-            metadata=metadata or {},
-        )
+    ) -> ContextEntry | None:
+        """Add content to a context window."""
+        window = self._windows.get(window_id)
+        if not window:
+            return None
 
-        # Update or add
-        old = self._entries.get(key)
-        if old:
-            self._total_tokens -= old.token_estimate
-            entry.version = old.version + 1
+        token_count = self._estimate_tokens(content)
 
-        self._entries[key] = entry
-        self._total_tokens += entry.token_estimate
-
-    def add_finding(self, finding: dict[str, Any]) -> None:
-        """Add a finding to context."""
-        key = f"finding_{finding.get('id', hashlib.md5(json.dumps(finding, sort_keys=True).encode()).hexdigest()[:8])}"
-        severity = finding.get("severity", "info")
-        priority_map = {"critical": 1.0, "high": 0.8, "medium": 0.6, "low": 0.4, "info": 0.2}
-        self.add(
-            key=key,
-            content=json.dumps(finding),
-            entry_type="finding",
-            priority=priority_map.get(severity, 0.5),
-        )
-
-    def add_tool_output(self, tool_name: str, output: str, is_shared: bool = False) -> None:
-        """Add tool output to context."""
-        key = f"tool_{tool_name}_{int(time.time())}"
-        self.add(
-            key=key,
-            content=output[:2000],
-            entry_type="tool_output",
-            source=tool_name,
-            priority=0.4,
-            is_shared=is_shared,
-        )
-
-    def add_plan(self, plan_text: str) -> None:
-        """Add the current plan to context."""
-        self.add(
-            key="current_plan",
-            content=plan_text,
-            entry_type="plan",
-            priority=0.8,
-        )
-
-    def remove(self, key: str) -> None:
-        """Remove a context entry."""
-        entry = self._entries.pop(key, None)
-        if entry:
-            self._total_tokens -= entry.token_estimate
-
-    def get_window(
-        self,
-        max_tokens: int | None = None,
-        entry_types: list[str] | None = None,
-        min_priority: float = 0.0,
-        include_shared: bool = True,
-    ) -> ContextWindow:
-        """Build a context window that fits within the token budget.
-
-        Entries are selected by priority, with higher-priority entries
-        included first until the token budget is exhausted.
-        """
-        budget = max_tokens or self._max_tokens
-        window = ContextWindow(max_tokens=budget)
-
-        # Collect all candidate entries
-        candidates: list[ContextEntry] = []
-        for entry in self._entries.values():
-            if entry_types and entry.entry_type not in entry_types:
-                continue
-            if entry.priority < min_priority:
-                continue
-            candidates.append(entry)
-
-        if include_shared:
-            for entry in self._shared_entries.values():
-                if entry_types and entry.entry_type not in entry_types:
-                    continue
-                candidates.append(entry)
-
-        # Sort by priority (highest first), then by recency
-        candidates.sort(key=lambda e: (-e.priority, -e.timestamp))
-
-        # Fill window
-        for entry in candidates:
-            if window.total_tokens + entry.token_estimate <= budget:
-                window.entries.append(entry)
-                window.total_tokens += entry.token_estimate
-            else:
-                window.truncated_count += 1
-
-        return window
-
-    def get_for_child(self, child_depth: int) -> dict[str, ContextEntry]:
-        """Get context entries to propagate to a child agent."""
-        child_context: dict[str, ContextEntry] = {}
-
-        for key, entry in self._entries.items():
-            if not entry.is_shared:
-                continue
-            # Reduce priority for older entries at deeper levels
-            adjusted_priority = entry.priority * (0.9 ** (child_depth - entry.depth))
-            child_entry = ContextEntry(
-                key=key, content=entry.content,
-                source=entry.source, entry_type=entry.entry_type,
-                priority=adjusted_priority, depth=entry.depth,
-                is_shared=True, metadata=entry.metadata,
-            )
-            child_context[key] = child_entry
-
-        return child_context
-
-    def inherit_from_parent(self, parent_context: dict[str, ContextEntry]) -> None:
-        """Inherit context from a parent agent."""
-        self._shared_entries.update(parent_context)
-
-    async def compress(self) -> None:
-        """Compress context by summarizing long entries."""
-        if not self._router or self._total_tokens <= self._max_tokens:
-            return
-
-        # Find entries that can be compressed
-        compressible = sorted(
-            [e for e in self._entries.values() if not e.is_compressed and e.token_estimate > 500],
-            key=lambda e: e.priority,
-        )
-
-        for entry in compressible:
-            if self._total_tokens <= self._max_tokens * 0.8:
+        # Check if we need to make room
+        while window.total_tokens + token_count > window.max_tokens:
+            if not self._evict_lowest(window):
                 break
 
-            try:
-                summary = await self._summarize(entry.content)
-                old_tokens = entry.token_estimate
-                entry.content = summary
-                entry.token_estimate = len(summary) // 4
-                entry.is_compressed = True
-                entry.version += 1
-                self._total_tokens -= (old_tokens - entry.token_estimate)
-                self._compressed_summaries.append(f"Compressed {entry.key}: saved {old_tokens - entry.token_estimate} tokens")
-            except Exception as e:
-                self._log.warning("compression_error", key=entry.key, error=str(e))
+        # Still too big? Truncate
+        if window.total_tokens + token_count > window.max_tokens:
+            available = window.remaining_tokens
+            if available < 50:
+                return None
+            content = content[:available * 4]  # ~4 chars per token
+            token_count = self._estimate_tokens(content)
 
-    async def _summarize(self, text: str) -> str:
-        """Summarize text using LLM."""
-        if not self._router:
-            # Fallback: simple truncation
-            return text[:500] + "..." if len(text) > 500 else text
-
-        prompt = f"Summarize this security assessment data concisely, preserving all critical findings and technical details:\n\n{text[:4000]}"
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="general",
-            temperature=0.1,
-            max_tokens=512,
+        self._entry_counter += 1
+        entry = ContextEntry(
+            entry_id=f"ce-{self._entry_counter}",
+            content=content,
+            role=role,
+            priority=priority,
+            token_count=token_count,
+            source=source,
         )
-        return response
 
-    def get_stats(self) -> dict[str, Any]:
-        """Get context statistics."""
-        by_type: dict[str, int] = defaultdict(int)
-        for entry in self._entries.values():
-            by_type[entry.entry_type] += 1
+        window.entries.append(entry)
+        window.total_tokens += token_count
+
+        return entry
+
+    def get_context(
+        self,
+        window_id: str,
+        max_tokens: int = 0,
+    ) -> list[dict[str, str]]:
+        """Get the context as a list of messages."""
+        window = self._windows.get(window_id)
+        if not window:
+            return []
+
+        entries = window.entries
+        if max_tokens > 0:
+            # Take highest-importance entries that fit
+            sorted_entries = sorted(entries, key=lambda e: e.importance_score, reverse=True)
+            selected = []
+            used = 0
+            for entry in sorted_entries:
+                if used + entry.token_count <= max_tokens:
+                    selected.append(entry)
+                    used += entry.token_count
+                    entry.access_count += 1
+
+            # Re-sort by timestamp for correct ordering
+            selected.sort(key=lambda e: e.timestamp)
+            entries = selected
+
+        return [{"role": e.role, "content": e.content} for e in entries]
+
+    def compress(self, window_id: str) -> int:
+        """Compress the context by summarizing old entries."""
+        window = self._windows.get(window_id)
+        if not window:
+            return 0
+
+        # Find low-priority entries that can be compressed
+        compressible = [
+            e for e in window.entries
+            if e.priority in (ContentPriority.LOW, ContentPriority.EPHEMERAL)
+            and not e.is_summary and e.token_count > 50
+        ]
+
+        tokens_saved = 0
+        for entry in compressible:
+            # Simple compression: truncate to ~25% of original
+            original_tokens = entry.token_count
+            compressed_len = len(entry.content) // 4
+            entry.content = entry.content[:compressed_len] + "..."
+            entry.token_count = self._estimate_tokens(entry.content)
+            entry.is_summary = True
+
+            saved = original_tokens - entry.token_count
+            tokens_saved += saved
+            window.total_tokens -= saved
+
+        window.compression_count += 1
+        return tokens_saved
+
+    def inherit(
+        self,
+        parent_window_id: str,
+        child_window_id: str,
+        max_inherit_tokens: int = 1024,
+    ) -> int:
+        """Inherit context from parent to child window."""
+        parent = self._windows.get(parent_window_id)
+        child = self._windows.get(child_window_id)
+        if not parent or not child:
+            return 0
+
+        # Get highest-priority entries from parent
+        sorted_entries = sorted(
+            parent.entries,
+            key=lambda e: e.importance_score,
+            reverse=True,
+        )
+
+        inherited = 0
+        for entry in sorted_entries:
+            if inherited + entry.token_count > max_inherit_tokens:
+                continue
+
+            self.add(
+                child_window_id,
+                content=entry.content,
+                role=entry.role,
+                priority=entry.priority,
+                source=f"inherited:{entry.source}",
+            )
+            inherited += entry.token_count
+
+        return inherited
+
+    def _evict_lowest(self, window: ContextWindow) -> bool:
+        """Evict the lowest-importance entry."""
+        if not window.entries:
+            return False
+
+        # Never evict CRITICAL entries
+        evictable = [
+            (i, e) for i, e in enumerate(window.entries)
+            if e.priority != ContentPriority.CRITICAL
+        ]
+
+        if not evictable:
+            return False
+
+        # Find lowest importance
+        min_idx, min_entry = min(evictable, key=lambda x: x[1].importance_score)
+        window.entries.pop(min_idx)
+        window.total_tokens -= min_entry.token_count
+        window.eviction_count += 1
+        return True
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Estimate token count (~4 chars per token)."""
+        return max(1, len(text) // 4)
+
+    def snapshot(self, window_id: str) -> dict[str, Any]:
+        """Snapshot a context window for later restore."""
+        window = self._windows.get(window_id)
+        if not window:
+            return {}
+
         return {
-            "total_entries": len(self._entries),
-            "shared_entries": len(self._shared_entries),
-            "total_tokens": self._total_tokens,
-            "max_tokens": self._max_tokens,
-            "utilization": round(self._total_tokens / self._max_tokens * 100, 1) if self._max_tokens else 0,
-            "by_type": dict(by_type),
-            "compressions": len(self._compressed_summaries),
+            "window_id": window.window_id,
+            "agent_id": window.agent_id,
+            "max_tokens": window.max_tokens,
+            "entries": [
+                {
+                    "content": e.content,
+                    "role": e.role,
+                    "priority": e.priority.value,
+                    "source": e.source,
+                    "tokens": e.token_count,
+                }
+                for e in window.entries
+            ],
         }
 
-    def clear(self) -> None:
-        """Clear all context."""
-        self._entries.clear()
-        self._total_tokens = 0
+    def restore(self, snapshot: dict[str, Any]) -> str:
+        """Restore a context window from a snapshot."""
+        window = self.create_window(
+            agent_id=snapshot.get("agent_id", ""),
+            max_tokens=snapshot.get("max_tokens", self._default_max),
+        )
 
+        for entry_data in snapshot.get("entries", []):
+            self.add(
+                window.window_id,
+                content=entry_data.get("content", ""),
+                role=entry_data.get("role", "system"),
+                priority=ContentPriority(entry_data.get("priority", "medium")),
+                source=entry_data.get("source", "restored"),
+            )
 
-class ContextPool:
-    """Shared context pool across multiple agents.
-
-    Allows agents to share findings, knowledge, and discoveries
-    without direct message passing. Implements a publish-subscribe
-    model where agents can subscribe to specific context types.
-    """
-
-    def __init__(self) -> None:
-        self._pool: dict[str, ContextEntry] = {}
-        self._subscribers: dict[str, set[str]] = defaultdict(set)  # entry_type → agent_ids
-        self._notify_callbacks: dict[str, list[Any]] = defaultdict(list)
-
-    def publish(self, entry: ContextEntry) -> None:
-        """Publish a context entry to the pool."""
-        self._pool[entry.key] = entry
-
-        # Notify subscribers
-        for agent_id in self._subscribers.get(entry.entry_type, set()):
-            for callback in self._notify_callbacks.get(agent_id, []):
-                try:
-                    callback(entry)
-                except Exception:
-                    pass
-
-    def subscribe(self, agent_id: str, entry_type: str) -> None:
-        """Subscribe to context entries of a specific type."""
-        self._subscribers[entry_type].add(agent_id)
-
-    def get_entries(
-        self,
-        entry_type: str = "",
-        min_priority: float = 0.0,
-        limit: int = 50,
-    ) -> list[ContextEntry]:
-        """Get entries from the pool."""
-        entries = list(self._pool.values())
-        if entry_type:
-            entries = [e for e in entries if e.entry_type == entry_type]
-        entries = [e for e in entries if e.priority >= min_priority]
-        entries.sort(key=lambda e: (-e.priority, -e.timestamp))
-        return entries[:limit]
-
-    def get_findings(self) -> list[ContextEntry]:
-        """Get all findings from the pool."""
-        return self.get_entries(entry_type="finding")
+        return window.window_id
 
     def get_stats(self) -> dict[str, Any]:
-        by_type: dict[str, int] = defaultdict(int)
-        for entry in self._pool.values():
-            by_type[entry.entry_type] += 1
+        total_tokens = sum(w.total_tokens for w in self._windows.values())
+        total_evictions = sum(w.eviction_count for w in self._windows.values())
         return {
-            "total_entries": len(self._pool),
-            "by_type": dict(by_type),
-            "subscribers": {t: len(s) for t, s in self._subscribers.items()},
+            "windows": len(self._windows),
+            "total_tokens": total_tokens,
+            "total_entries": self._entry_counter,
+            "total_evictions": total_evictions,
         }
