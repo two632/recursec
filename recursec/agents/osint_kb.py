@@ -1,11 +1,11 @@
-"""OSINT (Open Source Intelligence) knowledge base.
+"""OSINT knowledge base.
 
 Deep knowledge about OSINT techniques:
-1. Passive reconnaissance
-2. Social media intelligence
-3. Domain/IP intelligence
-4. Code and credential leaks
-5. Dark web monitoring patterns
+1. Domain and infrastructure reconnaissance
+2. People and organization research
+3. Social media intelligence
+4. Code and leak analysis
+5. Dark web intelligence
 """
 
 from __future__ import annotations
@@ -20,10 +20,11 @@ logger = structlog.get_logger()
 
 @dataclass
 class OSINTPattern:
-    """An OSINT collection pattern."""
+    """An OSINT pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
+    severity: str = "medium"
     description: str = ""
     detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
@@ -38,179 +39,190 @@ class OSINTPattern:
 
 OSINT_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "osint-001", "name": "Domain and Infrastructure Intelligence",
-        "category": "infrastructure",
-        "desc": "Mapping target infrastructure passively.",
+        "id": "osint-001", "name": "Domain Reconnaissance",
+        "category": "domain", "severity": "medium",
+        "desc": "Domain and infrastructure enumeration.",
         "detection": (
-            "DOMAIN INTELLIGENCE:\n"
+            "DOMAIN RECONNAISSANCE:\n"
             "DNS ENUMERATION:\n"
-            "  # Zone transfer attempt\n"
-            "  dig axfr @<nameserver> <domain>\n"
             "  # Subdomain enumeration\n"
-            "  subfinder -d <domain> -all\n"
-            "  amass enum -passive -d <domain>\n"
-            "  # Certificate transparency\n"
-            "  curl 'https://crt.sh/?q=%25.<domain>&output=json'\n"
+            "  subfinder -d target.com -all -o subs.txt\n"
+            "  amass enum -d target.com -o amass.txt\n"
+            "  assetfinder target.com\n"
             "  # DNS records\n"
-            "  dig ANY <domain>\n"
-            "  dig TXT <domain>  # SPF, DKIM, DMARC\n"
-            "  # Reverse DNS\n"
-            "  dig -x <ip>\n"
-            "IP INTELLIGENCE:\n"
-            "  # ASN lookup\n"
-            "  whois -h whois.cymru.com \" -v <ip>\"\n"
-            "  # IP range from ASN\n"
-            "  whois -h whois.radb.net '!gAS<asn>'\n"
-            "  # Shodan (if available)\n"
-            "  shodan host <ip>\n"
-            "  shodan search 'org:\"Target Org\"'\n"
-            "TECHNOLOGY DETECTION:\n"
-            "  # HTTP headers analysis\n"
-            "  curl -sI https://<target> | grep -i 'server\\|x-powered\\|x-aspnet'\n"
-            "  # Wappalyzer/WhatWeb\n"
-            "  whatweb <target>\n"
-            "  # JavaScript libraries\n"
-            "  Check /robots.txt, /sitemap.xml, /.well-known/"
-        ),
-        "tools": ["subfinder", "amass", "dig", "whois", "whatweb"],
-    },
-    {
-        "id": "osint-002", "name": "Credential and Secret Leaks",
-        "category": "leaks",
-        "desc": "Finding leaked credentials and secrets.",
-        "detection": (
-            "CREDENTIAL LEAK DISCOVERY:\n"
-            "CODE REPOSITORIES:\n"
-            "  # GitHub/GitLab search\n"
-            "  Search: 'org:target password' or 'org:target api_key'\n"
-            "  Dorks:\n"
-            "    - filename:.env DB_PASSWORD\n"
-            "    - filename:wp-config.php\n"
-            "    - filename:id_rsa\n"
-            "    - filename:.npmrc _authToken\n"
-            "    - filename:docker-compose.yml\n"
-            "  Tools:\n"
-            "    trufflehog git https://github.com/org/repo\n"
-            "    gitleaks detect --source <repo>\n"
-            "    gitrob (automated GitHub scanner)\n"
-            "PASTE SITES:\n"
-            "  - Pastebin, Ghostbin, PrivateBin monitoring\n"
-            "  - Search for domain, emails, IP ranges\n"
-            "  - Automated monitoring with paste-alert tools\n"
-            "BREACH DATABASES:\n"
-            "  - Check if corporate emails appear in breaches\n"
-            "  - Tool: h8mail -t target@company.com\n"
-            "  - Check dehashed, leakpeek, snusbase\n"
-            "  - Password reuse across services\n"
-            "CLOUD STORAGE:\n"
-            "  - S3 bucket enumeration (company name variations)\n"
-            "  - Azure blob storage\n"
-            "  - GCS buckets\n"
-            "  - Tool: cloud_enum -k <company_name>"
-        ),
-        "tools": ["trufflehog", "gitleaks", "h8mail"],
-    },
-    {
-        "id": "osint-003", "name": "Social Engineering Intelligence",
-        "category": "social",
-        "desc": "Gathering social intelligence for assessments.",
-        "detection": (
-            "SOCIAL ENGINEERING INTELLIGENCE:\n"
-            "EMPLOYEE ENUMERATION:\n"
-            "  - LinkedIn company page → employees list\n"
-            "  - Email pattern discovery (first.last@company.com)\n"
-            "  - Tool: linkedin2username\n"
-            "  - theHarvester -d <domain> -b linkedin\n"
-            "  - Verify emails: emailfinder, hunter.io\n"
-            "SOCIAL MEDIA:\n"
-            "  - Twitter/X: Search company mentions, employee posts\n"
-            "  - Look for: tech stack mentions, internal tools\n"
-            "  - Job postings reveal technology and infrastructure\n"
-            "  - Conference talks by employees (reveal architecture)\n"
-            "EMAIL INFRASTRUCTURE:\n"
-            "  # MX records\n"
-            "  dig MX <domain>\n"
-            "  # SPF record (shows email infrastructure)\n"
-            "  dig TXT <domain> | grep spf\n"
-            "  # DMARC record\n"
-            "  dig TXT _dmarc.<domain>\n"
-            "  # Email validation\n"
-            "  smtp-user-enum -M VRFY -u <user> -t <mailserver>\n"
-            "DOCUMENT METADATA:\n"
-            "  - Download public PDFs, DOCs from target website\n"
-            "  - Extract metadata with exiftool:\n"
-            "    exiftool <document> → author, software, OS, dates\n"
-            "  - FOCA: Automated metadata extraction"
-        ),
-        "tools": ["theharvester", "exiftool", "linkedin2username"],
-    },
-    {
-        "id": "osint-004", "name": "Web Archive and Historical Data",
-        "category": "historical",
-        "desc": "Using historical data for intelligence gathering.",
-        "detection": (
-            "HISTORICAL INTELLIGENCE:\n"
-            "WEB ARCHIVES:\n"
-            "  - Wayback Machine: web.archive.org/web/*/<target>\n"
-            "  - Find old pages, removed content, config files\n"
-            "  - Tool: waybackurls <domain>\n"
-            "  - Tool: gau <domain> (GetAllUrls)\n"
-            "  - Look for: old admin panels, API endpoints, js files\n"
-            "HISTORICAL DNS:\n"
-            "  - SecurityTrails: Past DNS records\n"
-            "  - Old IP addresses may still be active\n"
-            "  - Track infrastructure changes over time\n"
-            "  - Find origin IP behind CDN/WAF\n"
-            "GOOGLE DORKS:\n"
-            "  - site:target.com filetype:pdf\n"
-            "  - site:target.com inurl:admin\n"
-            "  - site:target.com intitle:\"index of\"\n"
-            "  - site:target.com ext:sql | ext:bak | ext:log\n"
-            "  - site:target.com inurl:login\n"
-            "  - \"target.com\" password | secret | credentials\n"
-            "  - cache:target.com/sensitive-page\n"
-            "JAVASCRIPT ANALYSIS:\n"
-            "  - Download all JS files from target\n"
-            "  - Search for: API keys, endpoints, debug info\n"
-            "  - Tool: LinkFinder, SecretFinder\n"
-            "  - Beautify and analyze with JSNice/Prettier"
-        ),
-        "tools": ["waybackurls", "gau", "linkfinder"],
-    },
-    {
-        "id": "osint-005", "name": "Network and Physical Intelligence",
-        "category": "network_phys",
-        "desc": "Network mapping and physical site intelligence.",
-        "detection": (
-            "NETWORK INTELLIGENCE:\n"
-            "ASN AND NETWORK BLOCKS:\n"
-            "  # Find all IP ranges owned by organization\n"
-            "  whois -h whois.radb.net '!gAS<asn>'\n"
-            "  # BGP routing information\n"
-            "  bgp.he.net lookup for ASN\n"
-            "  # IPv4/IPv6 ranges\n"
-            "  Scan all owned ranges for services\n"
+            "  dig target.com ANY +noall +answer\n"
+            "  dig target.com MX +short\n"
+            "  dig target.com TXT +short\n"
+            "  dig target.com NS +short\n"
+            "  # Zone transfer attempt\n"
+            "  dig axfr target.com @ns1.target.com\n"
+            "WHOIS:\n"
+            "  whois target.com\n"
+            "  # Registrant info, dates, nameservers\n"
+            "  # Reverse WHOIS by email/org\n"
             "CERTIFICATE TRANSPARENCY:\n"
-            "  # All certificates issued for domain\n"
-            "  crt.sh → wildcard and specific subdomain certs\n"
-            "  certspotter.com → certificate monitoring\n"
-            "  # Reveals: internal hostnames, service names\n"
+            "  # crt.sh query\n"
+            "  curl 'https://crt.sh/?q=%.target.com&output=json' | jq '.[].name_value'\n"
+            "  # Censys certificate search\n"
+            "INFRASTRUCTURE:\n"
+            "  # Shodan\n"
+            "  shodan search hostname:target.com\n"
+            "  # Censys\n"
+            "  censys search target.com\n"
+            "  # IP history\n"
+            "  # SecurityTrails, ViewDNS, PassiveTotal\n"
+            "TOOLS:\n"
+            "  subfinder, amass, assetfinder  # Subdomain enum\n"
+            "  httpx  # HTTP probing\n"
+            "  dnsx  # DNS resolution"
+        ),
+        "tools": ["subfinder", "amass", "httpx", "dnsx"],
+    },
+    {
+        "id": "osint-002", "name": "People and Organization",
+        "category": "people", "severity": "medium",
+        "desc": "People and organization research techniques.",
+        "detection": (
+            "PEOPLE AND ORGANIZATION OSINT:\n"
+            "EMAIL ENUMERATION:\n"
+            "  # theHarvester\n"
+            "  theHarvester -d target.com -b all\n"
+            "  # Email format discovery\n"
+            "  # Common: first.last@, f.last@, first@\n"
+            "  # Verify with SMTP VRFY or RCPT TO\n"
+            "LINKEDIN:\n"
+            "  - Employee enumeration\n"
+            "  - Technology stack from job postings\n"
+            "  - Organizational structure\n"
+            "  - Key personnel identification\n"
+            "CREDENTIAL LEAKS:\n"
+            "  # Check breach databases\n"
+            "  # Have I Been Pwned API\n"
+            "  # DeHashed, IntelX, LeakCheck\n"
+            "  # Credential stuffing lists\n"
+            "GOOGLE DORKS:\n"
+            "  site:target.com filetype:pdf\n"
+            "  site:target.com inurl:admin\n"
+            "  site:target.com intitle:\"index of\"\n"
+            "  site:target.com ext:sql | ext:db | ext:bak\n"
+            "  site:target.com intext:password\n"
+            "  \"target.com\" filetype:env\n"
+            "GITHUB:\n"
+            "  # Search for secrets in repos\n"
+            "  trufflehog github --org=target-org\n"
+            "  gitleaks detect --source .\n"
+            "  # Search: org:target password OR secret OR api_key"
+        ),
+        "tools": ["theHarvester", "trufflehog", "gitleaks"],
+    },
+    {
+        "id": "osint-003", "name": "Web Application Recon",
+        "category": "webapp", "severity": "medium",
+        "desc": "Web application reconnaissance techniques.",
+        "detection": (
+            "WEB APPLICATION RECON:\n"
+            "TECHNOLOGY FINGERPRINTING:\n"
+            "  # Wappalyzer / WhatWeb\n"
+            "  whatweb target.com\n"
+            "  # Response headers\n"
+            "  curl -sI https://target.com | grep -i 'server\\|x-powered\\|x-aspnet'\n"
+            "  # HTML source analysis\n"
+            "  # JavaScript library detection\n"
+            "DIRECTORY/FILE DISCOVERY:\n"
+            "  ffuf -u https://target.com/FUZZ -w wordlist.txt -mc 200,301,302\n"
+            "  gobuster dir -u https://target.com -w wordlist.txt\n"
+            "  # Interesting files\n"
+            "  /robots.txt, /sitemap.xml, /.git/HEAD\n"
+            "  /.env, /wp-config.php.bak, /web.config\n"
+            "  /api, /swagger.json, /graphql\n"
+            "WAYBACK MACHINE:\n"
+            "  # Historical snapshots\n"
+            "  waybackurls target.com | sort -u\n"
+            "  gau target.com  # GetAllUrls\n"
+            "  # Find old endpoints, removed pages\n"
+            "  # JavaScript file analysis for endpoints\n"
+            "JAVASCRIPT ANALYSIS:\n"
+            "  # Extract URLs from JS files\n"
+            "  # Find API endpoints, secrets\n"
+            "  # LinkFinder, JSParser\n"
+            "  katana -u https://target.com -jc  # JS crawling"
+        ),
+        "tools": ["ffuf", "gobuster", "katana", "whatweb"],
+    },
+    {
+        "id": "osint-004", "name": "Network Infrastructure",
+        "category": "network", "severity": "medium",
+        "desc": "Network infrastructure intelligence.",
+        "detection": (
+            "NETWORK INFRASTRUCTURE OSINT:\n"
+            "ASN/BGP:\n"
+            "  # Find ASN\n"
+            "  whois -h whois.cymru.com \" -v <ip>\"\n"
+            "  # Find IP ranges for ASN\n"
+            "  whois -h whois.radb.net -- '-i origin AS12345'\n"
+            "  # BGP Looking Glass\n"
+            "PORT SCANNING:\n"
+            "  # Fast discovery\n"
+            "  masscan -p0-65535 <target> --rate=10000\n"
+            "  # Service detection\n"
+            "  nmap -sV -sC -p<ports> <target>\n"
+            "  # UDP scan\n"
+            "  nmap -sU --top-ports 100 <target>\n"
             "CDN/WAF DETECTION:\n"
             "  # Detect CDN\n"
-            "  Check DNS CNAME records\n"
-            "  Check HTTP headers (cf-ray for Cloudflare)\n"
-            "  # Find origin IP\n"
-            "  Historical DNS records\n"
-            "  Direct IP scanning of ASN ranges\n"
-            "  Censys.io search for certificate\n"
-            "  Outbound connections from target (SSRF)\n"
-            "PHYSICAL LOCATION:\n"
-            "  - IP geolocation (maxmind, ipinfo.io)\n"
-            "  - Office locations from LinkedIn, Google Maps\n"
-            "  - WiFi network names (wardriving/wigle.net)\n"
-            "  - Satellite imagery for physical security assessment"
+            "  # Cloudflare: cf-ray header\n"
+            "  # AWS CloudFront: x-amz-cf-id header\n"
+            "  # Akamai: x-akamai-* headers\n"
+            "  # Bypass: Find origin IP behind CDN\n"
+            "  # Check DNS history, certificate SAN\n"
+            "  # SecurityTrails, Censys for historical IPs\n"
+            "CLOUD ENUMERATION:\n"
+            "  # AWS S3 buckets\n"
+            "  aws s3 ls s3://target-name --no-sign-request\n"
+            "  # Azure blobs\n"
+            "  # target.blob.core.windows.net\n"
+            "  # GCP storage\n"
+            "  # storage.googleapis.com/target-name"
         ),
-        "tools": ["whois", "nmap", "censys"],
+        "tools": ["nmap", "masscan"],
+    },
+    {
+        "id": "osint-005", "name": "Leaked Credentials",
+        "category": "leaks", "severity": "critical",
+        "desc": "Credential and data leak intelligence.",
+        "detection": (
+            "LEAKED CREDENTIALS OSINT:\n"
+            "BREACH DATABASES:\n"
+            "  - Have I Been Pwned (HIBP)\n"
+            "  - DeHashed (paid, comprehensive)\n"
+            "  - IntelX (intelligence search)\n"
+            "  - LeakCheck\n"
+            "  - Snusbase\n"
+            "CODE REPOSITORIES:\n"
+            "  # GitHub/GitLab secret scanning\n"
+            "  trufflehog github --org=target\n"
+            "  gitleaks detect --source .\n"
+            "  # Common secrets:\n"
+            "  - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY\n"
+            "  - GITHUB_TOKEN, npm_token\n"
+            "  - Database connection strings\n"
+            "  - Private keys (RSA, SSH)\n"
+            "  - .env files committed\n"
+            "PASTE SITES:\n"
+            "  - Pastebin, GitHub Gists\n"
+            "  - Ghostbin, 0bin\n"
+            "  - Search: \"target.com\" + \"password\"\n"
+            "DOCKER IMAGES:\n"
+            "  # Secrets in Docker layers\n"
+            "  dive <image>  # Explore layers\n"
+            "  # Check for .env, config files in layers\n"
+            "TOOLS:\n"
+            "  trufflehog  # Secret scanning\n"
+            "  gitleaks  # Git secret detection\n"
+            "  h8mail  # Email breach hunting\n"
+            "  porch-pirate  # Postman workspace leaks"
+        ),
+        "tools": ["trufflehog", "gitleaks", "h8mail"],
     },
 ]
 
@@ -218,7 +230,7 @@ OSINT_PATTERNS: list[dict[str, Any]] = [
 class OSINTKB:
     """OSINT knowledge base.
 
-    Provides open source intelligence patterns
+    Provides OSINT techniques and patterns
     injected into agent prompts.
     """
 
@@ -234,6 +246,7 @@ class OSINTKB:
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
+                severity=data.get("severity", "medium"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
@@ -253,7 +266,7 @@ class OSINTKB:
         max_patterns: int = 4,
     ) -> str:
         """Build OSINT prompt."""
-        lines = ["## OSINT Collection Patterns\n"]
+        lines = ["## OSINT Techniques\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
