@@ -1,11 +1,11 @@
 """Cloud security knowledge base.
 
-Deep knowledge about cloud infrastructure vulnerabilities:
-1. AWS-specific attack patterns
-2. Azure attack surfaces
-3. GCP misconfigurations
-4. Cloud-native vulnerabilities (K8s, containers)
-5. IAM and identity attacks
+Deep knowledge about cloud-specific attacks:
+1. AWS misconfiguration exploitation
+2. Azure AD attacks
+3. GCP privilege escalation
+4. Kubernetes security
+5. Serverless security
 """
 
 from __future__ import annotations
@@ -23,184 +23,195 @@ class CloudPattern:
     """A cloud security pattern."""
     pattern_id: str = ""
     name: str = ""
-    provider: str = ""
+    platform: str = ""
     severity: str = "high"
     description: str = ""
     detection_strategy: str = ""
-    services: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.pattern_id,
             "name": self.name[:25],
-            "provider": self.provider[:10],
+            "platform": self.platform[:10],
         }
 
 
 CLOUD_PATTERNS: list[dict[str, Any]] = [
     {
         "id": "cloud-001", "name": "AWS S3 Bucket Misconfiguration",
-        "provider": "aws", "severity": "critical",
-        "desc": "Publicly accessible S3 buckets leaking sensitive data.",
+        "platform": "aws", "severity": "critical",
+        "desc": "Exposed S3 buckets and misconfigurations.",
         "detection": (
-            "AWS S3 BUCKET MISCONFIGURATION:\n"
-            "DISCOVERY:\n"
-            "  - Enumerate bucket names from DNS, source code, APIs\n"
-            "  - Common patterns: <company>-backup, <company>-data, <company>-logs\n"
-            "  - Check: aws s3 ls s3://<bucket> --no-sign-request\n"
-            "  - Test: curl https://<bucket>.s3.amazonaws.com/\n"
-            "PUBLIC ACCESS CHECKS:\n"
-            "  - ACL: aws s3api get-bucket-acl --bucket <name>\n"
-            "  - Policy: aws s3api get-bucket-policy --bucket <name>\n"
-            "  - Public access block: aws s3api get-public-access-block --bucket <name>\n"
-            "  - Look for: AllUsers, AuthenticatedUsers grants\n"
-            "COMMON DATA LEAKS:\n"
-            "  - Database backups (.sql, .bak, .dump)\n"
-            "  - Configuration files (.env, config.json)\n"
-            "  - Source code (.zip, .tar.gz, .git)\n"
-            "  - Credentials (access keys, private keys)\n"
-            "  - Log files with PII or tokens\n"
-            "TESTING TOOLS:\n"
-            "  - S3Scanner: Scan for open S3 buckets\n"
-            "  - bucket_finder: Enumerate S3 buckets\n"
-            "  - aws s3 sync: Download bucket contents\n"
-            "  - nuclei -t cloud/ -target <domain>"
+            "AWS S3 MISCONFIGURATION:\n"
+            "ENUMERATION:\n"
+            "  # Brute force bucket names\n"
+            "  aws s3 ls s3://<bucket-name> --no-sign-request\n"
+            "  # Tools:\n"
+            "  bucket-finder <wordlist>  # Find buckets by name\n"
+            "  s3scanner scan --bucket <name>  # Check permissions\n"
+            "  flaws.cloud method: <target>.s3.amazonaws.com\n"
+            "PERMISSION CHECKS:\n"
+            "  Public read:\n"
+            "    curl https://<bucket>.s3.amazonaws.com/\n"
+            "    → ListBucketResult = readable\n"
+            "  Public write:\n"
+            "    aws s3 cp test.txt s3://<bucket>/test.txt --no-sign-request\n"
+            "  ACL check:\n"
+            "    aws s3api get-bucket-acl --bucket <name> --no-sign-request\n"
+            "  Policy check:\n"
+            "    aws s3api get-bucket-policy --bucket <name>\n"
+            "COMMON MISCONFIGS:\n"
+            "  - Public read on sensitive data (backups, configs, DB dumps)\n"
+            "  - Public write allowing file upload (deface, malware hosting)\n"
+            "  - Overly permissive bucket policies\n"
+            "  - Missing encryption (server-side)\n"
+            "  - Missing access logging\n"
+            "  - Versioning disabled (no recovery from deletion)"
         ),
-        "services": ["s3"],
-        "tools": ["aws-cli", "nuclei", "s3scanner"],
+        "tools": ["aws-cli", "s3scanner", "bucket-finder"],
     },
     {
         "id": "cloud-002", "name": "AWS IAM Privilege Escalation",
-        "provider": "aws", "severity": "critical",
-        "desc": "Escalating AWS IAM privileges through policy misconfigurations.",
+        "platform": "aws", "severity": "critical",
+        "desc": "Escalating privileges through IAM misconfigurations.",
         "detection": (
             "AWS IAM PRIVILEGE ESCALATION:\n"
-            "COMMON ESCALATION PATHS:\n"
-            "  1. iam:CreatePolicyVersion → Create new policy version with admin access\n"
-            "  2. iam:SetDefaultPolicyVersion → Activate hidden permissive version\n"
-            "  3. iam:CreateAccessKey → Create keys for more privileged user\n"
-            "  4. iam:AttachUserPolicy → Attach AdministratorAccess to self\n"
-            "  5. iam:PutUserPolicy → Inline admin policy on self\n"
-            "  6. iam:PassRole + lambda:CreateFunction → Create Lambda with admin role\n"
-            "  7. iam:PassRole + ec2:RunInstances → Launch EC2 with admin role\n"
-            "  8. sts:AssumeRole → Assume cross-account admin role\n"
-            "  9. glue:CreateDevEndpoint + iam:PassRole → Glue with admin role\n"
-            "  10. lambda:UpdateFunctionCode → Inject code into existing Lambda\n"
-            "DETECTION:\n"
-            "  - Enumerate policies: aws iam list-attached-user-policies --user-name <name>\n"
-            "  - Check inline: aws iam list-user-policies --user-name <name>\n"
-            "  - Analyze with: PACU, Prowler, ScoutSuite\n"
-            "  - Map: pmapper (Principal Mapper)\n"
-            "AUTOMATED TOOLS:\n"
-            "  - PACU: AWS exploitation framework\n"
-            "  - Prowler: AWS security assessment\n"
-            "  - ScoutSuite: Multi-cloud assessment\n"
-            "  - CloudSploit: Cloud configuration scanner"
+            "ENUMERATION:\n"
+            "  # Who am I?\n"
+            "  aws sts get-caller-identity\n"
+            "  # What can I do?\n"
+            "  aws iam list-attached-user-policies --user-name <user>\n"
+            "  aws iam list-user-policies --user-name <user>\n"
+            "  # Automated enumeration:\n"
+            "  enumerate-iam --access-key <key> --secret-key <secret>\n"
+            "  pacu (AWS exploitation framework)\n"
+            "ESCALATION PATHS:\n"
+            "  iam:CreatePolicyVersion:\n"
+            "    - Create new policy version with admin permissions\n"
+            "    - Set as default version\n"
+            "  iam:AttachUserPolicy:\n"
+            "    - Attach AdministratorAccess to self\n"
+            "  iam:CreateLoginProfile:\n"
+            "    - Create console password for any user\n"
+            "  iam:PassRole + lambda:CreateFunction:\n"
+            "    - Create Lambda with admin role\n"
+            "    - Execute Lambda to perform admin actions\n"
+            "  sts:AssumeRole:\n"
+            "    - Assume higher-privileged role\n"
+            "    - Check trust policies for over-permissive conditions\n"
+            "TOOLS:\n"
+            "  pacu: AWS post-exploitation framework\n"
+            "  cloudsplaining: IAM policy analysis\n"
+            "  ScoutSuite: Multi-cloud security audit"
         ),
-        "services": ["iam", "lambda", "ec2"],
-        "tools": ["pacu", "prowler", "scoutsuite"],
+        "tools": ["pacu", "enumerate-iam", "scoutsuite"],
     },
     {
-        "id": "cloud-003", "name": "Kubernetes Misconfigurations",
-        "provider": "multi", "severity": "critical",
-        "desc": "Kubernetes cluster security issues.",
+        "id": "cloud-003", "name": "Kubernetes Security Issues",
+        "platform": "k8s", "severity": "critical",
+        "desc": "Kubernetes cluster misconfigurations and attacks.",
         "detection": (
             "KUBERNETES SECURITY:\n"
-            "API SERVER EXPOSURE:\n"
-            "  - Anonymous auth: curl -k https://<api-server>:6443/api/v1/namespaces\n"
-            "  - Insecure port (8080): curl http://<api-server>:8080/api/v1/pods\n"
-            "  - Dashboard: https://<node>:30000 (NodePort)\n"
-            "RBAC ISSUES:\n"
-            "  - Overly permissive ClusterRoleBindings\n"
-            "  - Default ServiceAccount with elevated privileges\n"
-            "  - kubectl auth can-i --list --as=system:serviceaccount:default:default\n"
+            "UNAUTHENTICATED ACCESS:\n"
+            "  # Check for exposed API server\n"
+            "  curl -k https://<k8s-api>:6443/api\n"
+            "  curl -k https://<k8s-api>:6443/api/v1/namespaces\n"
+            "  # Check kubelet (10250)\n"
+            "  curl -k https://<node>:10250/pods\n"
+            "  curl -k https://<node>:10250/run/<ns>/<pod>/<container>\n"
+            "  # Check etcd (2379)\n"
+            "  curl https://<node>:2379/v2/keys?recursive=true\n"
+            "RBAC MISCONFIGS:\n"
+            "  - cluster-admin binding to default service account\n"
+            "  - Wildcard permissions in roles\n"
+            "  - Check: kubectl auth can-i --list\n"
+            "  - Tool: rbac-police, kubeaudit\n"
             "CONTAINER ESCAPE:\n"
-            "  - Privileged containers: securityContext.privileged=true\n"
-            "  - Host PID/Network: hostPID=true, hostNetwork=true\n"
-            "  - Mounted host paths: /var/run/docker.sock\n"
-            "  - SYS_ADMIN capability\n"
-            "SECRET EXPOSURE:\n"
-            "  - Secrets as environment variables (visible in /proc)\n"
-            "  - Unencrypted etcd storage\n"
-            "  - kubectl get secrets -A -o yaml\n"
-            "NETWORK POLICIES:\n"
-            "  - Missing NetworkPolicies (default allow-all)\n"
-            "  - Pod-to-pod communication unrestricted\n"
-            "TOOLS:\n"
-            "  - kube-hunter: K8s penetration testing\n"
-            "  - kubeaudit: K8s manifest auditing\n"
-            "  - trivy k8s: K8s misconfiguration scanning\n"
-            "  - kubectl-who-can: RBAC analysis"
+            "  Privileged containers:\n"
+            "    - Mount host filesystem: nsenter --target 1 --mount -- /bin/bash\n"
+            "  Host PID namespace:\n"
+            "    - See host processes, ptrace attack\n"
+            "  Host network:\n"
+            "    - Access node services, metadata API\n"
+            "  Service account token:\n"
+            "    /var/run/secrets/kubernetes.io/serviceaccount/token\n"
+            "    → Use to access API server\n"
+            "METADATA API:\n"
+            "  curl http://169.254.169.254/latest/meta-data/iam/security-credentials/"
         ),
-        "services": ["kubernetes"],
-        "tools": ["kube-hunter", "kubeaudit", "trivy"],
+        "tools": ["kubeaudit", "kube-bench", "trivy"],
     },
     {
-        "id": "cloud-004", "name": "Azure AD and Identity Attacks",
-        "provider": "azure", "severity": "critical",
-        "desc": "Azure Active Directory attack patterns.",
+        "id": "cloud-004", "name": "Azure AD Attack Paths",
+        "platform": "azure", "severity": "critical",
+        "desc": "Azure Active Directory exploitation.",
         "detection": (
             "AZURE AD ATTACKS:\n"
             "ENUMERATION:\n"
-            "  - Tenant discovery: https://login.microsoftonline.com/<domain>/.well-known/openid-configuration\n"
-            "  - User enumeration: timing differences on login page\n"
-            "  - AADInternals: Invoke-AADIntReconAsOutsider\n"
-            "PASSWORD SPRAY:\n"
-            "  - Low and slow: 1 password per user per hour\n"
-            "  - Avoid lockout: stay under threshold (typically 10)\n"
-            "  - Tools: MSOLSpray, o365spray\n"
-            "  - Common passwords: Season+Year (Spring2024), Company+123\n"
-            "TOKEN ABUSE:\n"
-            "  - Refresh token theft → persistent access\n"
-            "  - Access token reuse across apps\n"
-            "  - ROADtools: Azure AD exploration\n"
-            "  - TokenTactics: Token manipulation\n"
-            "PRIVILEGE ESCALATION:\n"
-            "  - Global Admin via compromised service principal\n"
-            "  - Managed Identity abuse from compromised VM\n"
-            "  - Key Vault access from compromised identity\n"
-            "  - Application consent phishing\n"
-            "CONDITIONAL ACCESS BYPASS:\n"
-            "  - Device compliance spoofing\n"
-            "  - Location-based bypass via VPN\n"
-            "  - Legacy auth protocols (IMAP, SMTP)"
+            "  # Tenant enumeration\n"
+            "  https://login.microsoftonline.com/<domain>/.well-known/openid-configuration\n"
+            "  # User enumeration\n"
+            "  POST https://login.microsoftonline.com/common/GetCredentialType\n"
+            "  # Graph API (if token available)\n"
+            "  az ad user list --query '[].{UPN:userPrincipalName}'\n"
+            "ATTACKS:\n"
+            "  Password Spray:\n"
+            "    - Use common passwords against all users\n"
+            "    - Respect lockout threshold (typically 10 attempts)\n"
+            "    - Tool: MSOLSpray, o365spray\n"
+            "  Token Theft:\n"
+            "    - Steal access tokens from az CLI cache\n"
+            "    - ~/.azure/accessTokens.json\n"
+            "    - FOCI: Family of Client IDs (token reuse)\n"
+            "  Application Consent:\n"
+            "    - Illicit consent grant attack\n"
+            "    - Create malicious app requesting permissions\n"
+            "  PRT (Primary Refresh Token):\n"
+            "    - Device-bound token for SSO\n"
+            "    - Extract with mimikatz or ROADtools\n"
+            "TOOLS:\n"
+            "  ROADtools: Azure AD enumeration/exploitation\n"
+            "  AzureHound: BloodHound for Azure\n"
+            "  TokenTactics: Token manipulation"
         ),
-        "services": ["azure_ad", "key_vault"],
-        "tools": ["roadtools", "msolspray", "aad-internals"],
+        "tools": ["roadtools", "azurehound", "msolspray"],
     },
     {
-        "id": "cloud-005", "name": "Serverless Function Attacks",
-        "provider": "multi", "severity": "high",
-        "desc": "Serverless (Lambda/Functions/Cloud Functions) vulnerabilities.",
+        "id": "cloud-005", "name": "Serverless Security Issues",
+        "platform": "serverless", "severity": "high",
+        "desc": "Serverless function vulnerabilities.",
         "detection": (
             "SERVERLESS SECURITY:\n"
-            "EVENT INJECTION:\n"
-            "  - Inject payloads via event sources (S3, API Gateway, SNS)\n"
-            "  - SQL injection through Lambda → RDS\n"
-            "  - Command injection in runtime.exec() or subprocess\n"
-            "  - SSRF via function → internal APIs\n"
-            "ENVIRONMENT VARIABLES:\n"
-            "  - Secrets in env vars visible to function code\n"
-            "  - aws lambda get-function-configuration --function-name <name>\n"
-            "  - Environment variable exfiltration on compromise\n"
-            "IAM OVER-PRIVILEGE:\n"
-            "  - Function with wildcard (*) permissions\n"
-            "  - Cross-account role assumption\n"
-            "  - Resource-based policy exploitation\n"
-            "RUNTIME ATTACKS:\n"
-            "  - /tmp directory persistence between warm invocations\n"
-            "  - Cold start timing side channels\n"
-            "  - Layer poisoning (compromised shared layers)\n"
-            "  - Dependency confusion in function packages\n"
-            "DETECTION:\n"
-            "  - Review function configurations and env vars\n"
-            "  - Check IAM roles attached to functions\n"
-            "  - Test event sources for injection\n"
-            "  - Monitor with CloudTrail/CloudWatch"
+            "AWS LAMBDA:\n"
+            "  Event Injection:\n"
+            "    - User input flows directly into Lambda event\n"
+            "    - SQL injection via event parameters\n"
+            "    - Command injection via event data\n"
+            "    - Path traversal in S3 trigger key names\n"
+            "  Environment Variables:\n"
+            "    - Secrets stored in plaintext env vars\n"
+            "    - aws lambda get-function --function-name <func>\n"
+            "    - Leaked in error messages/logs\n"
+            "  Permissions:\n"
+            "    - Overly permissive IAM role\n"
+            "    - Resource:* in policy (no least privilege)\n"
+            "    - Cross-function privilege escalation\n"
+            "  Cold Start:\n"
+            "    - /tmp persists between invocations\n"
+            "    - Previous execution data accessible\n"
+            "API GATEWAY:\n"
+            "  - Missing authentication on endpoints\n"
+            "  - Broken function-level authorization\n"
+            "  - Debug mode left enabled\n"
+            "  - Custom domain misconfiguration\n"
+            "  - WAF bypass via direct Lambda URL\n"
+            "TESTING:\n"
+            "  - Enumerate functions: aws lambda list-functions\n"
+            "  - Check permissions: aws lambda get-policy\n"
+            "  - Test event injection with crafted payloads"
         ),
-        "services": ["lambda", "api_gateway"],
-        "tools": ["pacu", "prowler", "nuclei"],
+        "tools": ["aws-cli", "pacu", "serverless-spy"],
     },
 ]
 
@@ -208,8 +219,8 @@ CLOUD_PATTERNS: list[dict[str, Any]] = [
 class CloudSecurityKB:
     """Cloud security knowledge base.
 
-    Provides cloud-specific attack patterns
-    injected into agent prompts.
+    Provides cloud attack patterns injected
+    into agent prompts.
     """
 
     def __init__(self) -> None:
@@ -223,46 +234,45 @@ class CloudSecurityKB:
             pattern = CloudPattern(
                 pattern_id=data["id"],
                 name=data["name"],
-                provider=data.get("provider", ""),
+                platform=data.get("platform", ""),
                 severity=data.get("severity", "high"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
-                services=data.get("services", []),
                 tools=data.get("tools", []),
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_provider(self, provider: str) -> list[CloudPattern]:
-        """Get patterns by cloud provider."""
+    def get_by_platform(self, platform: str) -> list[CloudPattern]:
+        """Get patterns by cloud platform."""
         return [
             p for p in self._patterns.values()
-            if p.provider.lower() == provider.lower() or p.provider == "multi"
+            if p.platform.lower() == platform.lower()
         ]
 
     def build_cloud_prompt(
         self,
-        provider: str = "",
+        platforms: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
         """Build cloud security prompt."""
         lines = ["## Cloud Security Patterns\n"]
         count = 0
         for pattern in self._patterns.values():
-            if provider and pattern.provider not in (provider, "multi"):
+            if platforms and pattern.platform.lower() not in [p.lower() for p in platforms]:
                 continue
             if count >= max_patterns:
                 break
-            lines.append(f"### {pattern.name} [{pattern.provider.upper()}]")
+            lines.append(f"### {pattern.name} [{pattern.platform.upper()}]")
             lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        prov_counts: dict[str, int] = {}
+        plat_counts: dict[str, int] = {}
         for p in self._patterns.values():
-            prov_counts[p.provider] = prov_counts.get(p.provider, 0) + 1
+            plat_counts[p.platform] = plat_counts.get(p.platform, 0) + 1
         return {
             "patterns": len(self._patterns),
-            "by_provider": prov_counts,
+            "by_platform": plat_counts,
         }
