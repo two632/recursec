@@ -1,19 +1,19 @@
-"""Task DAG planner — directed acyclic graph for task decomposition.
+"""Task DAG — directed acyclic graph for task decomposition.
 
 Implements:
-1. Task node creation with dependencies
+1. DAG-based task dependency modeling
 2. Topological ordering for execution
-3. Parallel task scheduling
-4. Dependency resolution
-5. Budget propagation through task tree
-6. Task status tracking
-7. Critical path analysis
+3. Parallel task identification
+4. Budget allocation per task
+5. Critical path analysis
+6. Task merging for deduplication
+7. Dynamic task insertion during execution
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -25,12 +25,12 @@ logger = structlog.get_logger()
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
-    READY = "ready"           # All dependencies met
+    READY = "ready"       # All dependencies met
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
-    BLOCKED = "blocked"       # Dependency failed
+    BLOCKED = "blocked"   # Dependency failed
 
 
 class TaskPriority(str, Enum):
@@ -46,64 +46,139 @@ class TaskNode:
     task_id: str = ""
     name: str = ""
     description: str = ""
-    agent_role: str = ""
-    tool: str = ""
-    priority: TaskPriority = TaskPriority.MEDIUM
     status: TaskStatus = TaskStatus.PENDING
+    priority: TaskPriority = TaskPriority.MEDIUM
+    agent_role: str = ""          # Which agent type handles this
+    tool_name: str = ""           # Primary tool if applicable
+    token_budget: int = 10000
+    time_budget_s: float = 600.0
     dependencies: list[str] = field(default_factory=list)
     dependents: list[str] = field(default_factory=list)
-    token_budget: int = 0
-    time_budget_s: float = 0.0
     tokens_used: int = 0
-    duration_s: float = 0.0
     result: str = ""
-    findings: int = 0
+    created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
-    retries: int = 0
-    max_retries: int = 2
 
     @property
-    def is_terminal(self) -> bool:
-        return self.status in (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.SKIPPED,
-        )
+    def duration_s(self) -> float:
+        if self.started_at and self.completed_at:
+            return self.completed_at - self.started_at
+        return 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.task_id[:10],
-            "name": self.name[:20],
+            "name": self.name[:25],
             "status": self.status.value,
+            "priority": self.priority.value,
             "deps": len(self.dependencies),
-            "findings": self.findings,
         }
 
 
 @dataclass
-class DAGExecutionPlan:
-    """Execution plan from the DAG."""
-    levels: list[list[str]] = field(default_factory=list)
+class ExecutionPlan:
+    """A plan derived from the DAG."""
+    phases: list[list[str]] = field(default_factory=list)
     critical_path: list[str] = field(default_factory=list)
-    total_tasks: int = 0
-    parallelizable: int = 0
+    estimated_tokens: int = 0
+    estimated_time_s: float = 0.0
+    parallelism: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "levels": len(self.levels),
-            "tasks": self.total_tasks,
-            "parallelizable": self.parallelizable,
-            "critical_path": len(self.critical_path),
+            "phases": len(self.phases),
+            "critical_path_len": len(self.critical_path),
+            "est_tokens": self.estimated_tokens,
+            "est_time": round(self.estimated_time_s, 1),
+            "parallelism": self.parallelism,
         }
 
 
-class TaskDAG:
-    """Directed acyclic graph for task planning.
+# ── Task templates ───────────────────────────────────────────
 
-    Decomposes assessment objectives into
-    tasks with dependencies, computes execution
-    order, and identifies parallel opportunities.
+TASK_TEMPLATES: dict[str, dict[str, Any]] = {
+    "subdomain_enum": {
+        "name": "Subdomain Enumeration",
+        "agent_role": "recon",
+        "tool_name": "subfinder",
+        "token_budget": 5000,
+        "time_budget_s": 300,
+        "priority": "high",
+    },
+    "port_scan": {
+        "name": "Port Scanning",
+        "agent_role": "scanner",
+        "tool_name": "nmap",
+        "token_budget": 8000,
+        "time_budget_s": 600,
+        "priority": "high",
+    },
+    "web_scan": {
+        "name": "Web Vulnerability Scan",
+        "agent_role": "scanner",
+        "tool_name": "nuclei",
+        "token_budget": 15000,
+        "time_budget_s": 900,
+        "priority": "high",
+    },
+    "sqli_test": {
+        "name": "SQL Injection Testing",
+        "agent_role": "exploiter",
+        "tool_name": "sqlmap",
+        "token_budget": 10000,
+        "time_budget_s": 600,
+        "priority": "critical",
+    },
+    "dir_bruteforce": {
+        "name": "Directory Bruteforce",
+        "agent_role": "scanner",
+        "tool_name": "ffuf",
+        "token_budget": 5000,
+        "time_budget_s": 300,
+        "priority": "medium",
+    },
+    "ssl_check": {
+        "name": "SSL/TLS Check",
+        "agent_role": "scanner",
+        "tool_name": "testssl",
+        "token_budget": 3000,
+        "time_budget_s": 120,
+        "priority": "medium",
+    },
+    "code_audit": {
+        "name": "Source Code Audit",
+        "agent_role": "code_auditor",
+        "tool_name": "semgrep",
+        "token_budget": 20000,
+        "time_budget_s": 1200,
+        "priority": "high",
+    },
+    "analysis": {
+        "name": "Finding Analysis",
+        "agent_role": "analyst",
+        "tool_name": "",
+        "token_budget": 15000,
+        "time_budget_s": 600,
+        "priority": "high",
+    },
+    "validation": {
+        "name": "Finding Validation",
+        "agent_role": "validator",
+        "tool_name": "",
+        "token_budget": 10000,
+        "time_budget_s": 300,
+        "priority": "medium",
+    },
+}
+
+
+class TaskDAG:
+    """Manages a DAG of assessment tasks.
+
+    Models task dependencies, provides
+    topological ordering, identifies parallel
+    execution opportunities, and tracks execution.
     """
 
     def __init__(self) -> None:
@@ -116,11 +191,11 @@ class TaskDAG:
         name: str,
         description: str = "",
         agent_role: str = "",
-        tool: str = "",
+        tool_name: str = "",
+        token_budget: int = 10000,
+        time_budget_s: float = 600.0,
         priority: TaskPriority = TaskPriority.MEDIUM,
         dependencies: list[str] | None = None,
-        token_budget: int = 0,
-        time_budget_s: float = 0.0,
     ) -> TaskNode:
         """Add a task to the DAG."""
         self._counter += 1
@@ -129,222 +204,236 @@ class TaskDAG:
             name=name,
             description=description,
             agent_role=agent_role,
-            tool=tool,
-            priority=priority,
-            dependencies=dependencies or [],
+            tool_name=tool_name,
             token_budget=token_budget,
             time_budget_s=time_budget_s,
+            priority=priority,
+            dependencies=dependencies or [],
         )
-        self._tasks[task.task_id] = task
 
-        # Register as dependent on each dependency
+        # Register as dependent in dependency tasks
         for dep_id in task.dependencies:
             dep = self._tasks.get(dep_id)
             if dep:
                 dep.dependents.append(task.task_id)
 
+        self._tasks[task.task_id] = task
+        self._update_readiness()
         return task
 
-    def mark_ready(self, task_id: str) -> bool:
-        """Check and mark task as ready if all deps are complete."""
-        task = self._tasks.get(task_id)
-        if not task or task.status != TaskStatus.PENDING:
-            return False
+    def add_from_template(
+        self,
+        template_name: str,
+        description: str = "",
+        dependencies: list[str] | None = None,
+    ) -> TaskNode | None:
+        """Add a task from a template."""
+        tmpl = TASK_TEMPLATES.get(template_name)
+        if not tmpl:
+            return None
 
-        for dep_id in task.dependencies:
-            dep = self._tasks.get(dep_id)
-            if not dep or dep.status != TaskStatus.COMPLETED:
-                return False
+        try:
+            priority = TaskPriority(tmpl.get("priority", "medium"))
+        except ValueError:
+            priority = TaskPriority.MEDIUM
 
-        task.status = TaskStatus.READY
-        return True
+        return self.add_task(
+            name=tmpl["name"],
+            description=description,
+            agent_role=tmpl.get("agent_role", ""),
+            tool_name=tmpl.get("tool_name", ""),
+            token_budget=tmpl.get("token_budget", 10000),
+            time_budget_s=tmpl.get("time_budget_s", 600),
+            priority=priority,
+            dependencies=dependencies,
+        )
 
     def start_task(self, task_id: str) -> bool:
         """Mark task as running."""
         task = self._tasks.get(task_id)
-        if not task or task.status not in (TaskStatus.READY, TaskStatus.PENDING):
+        if not task or task.status != TaskStatus.READY:
             return False
-
         task.status = TaskStatus.RUNNING
         task.started_at = time.time()
         return True
 
-    def complete_task(
-        self,
-        task_id: str,
-        result: str = "",
-        findings: int = 0,
-        tokens_used: int = 0,
-    ) -> list[str]:
-        """Complete a task and return newly ready tasks."""
+    def complete_task(self, task_id: str, result: str = "") -> bool:
+        """Mark task as completed."""
         task = self._tasks.get(task_id)
-        if not task:
-            return []
-
+        if not task or task.status != TaskStatus.RUNNING:
+            return False
         task.status = TaskStatus.COMPLETED
         task.completed_at = time.time()
-        task.duration_s = task.completed_at - task.started_at
         task.result = result
-        task.findings = findings
-        task.tokens_used = tokens_used
+        self._update_readiness()
+        return True
 
-        # Check which dependents are now ready
-        newly_ready = []
-        for dep_id in task.dependents:
-            if self.mark_ready(dep_id):
-                newly_ready.append(dep_id)
-
-        return newly_ready
-
-    def fail_task(self, task_id: str, reason: str = "") -> list[str]:
-        """Fail a task and cascade to dependents."""
+    def fail_task(self, task_id: str, error: str = "") -> bool:
+        """Mark task as failed and block dependents."""
         task = self._tasks.get(task_id)
         if not task:
-            return []
-
-        # Check for retries
-        if task.retries < task.max_retries:
-            task.retries += 1
-            task.status = TaskStatus.READY
-            return [task_id]
-
+            return False
         task.status = TaskStatus.FAILED
-        task.result = reason
+        task.completed_at = time.time()
+        task.result = error
 
-        # Cascade failure to dependents
-        blocked = []
+        # Block all dependents
         for dep_id in task.dependents:
             dep = self._tasks.get(dep_id)
             if dep and dep.status == TaskStatus.PENDING:
                 dep.status = TaskStatus.BLOCKED
-                blocked.append(dep_id)
 
-        return blocked
+        return True
 
     def get_ready_tasks(self) -> list[TaskNode]:
-        """Get all tasks that are ready to execute."""
-        ready = []
-        for task in self._tasks.values():
-            if task.status == TaskStatus.READY:
-                ready.append(task)
-            elif task.status == TaskStatus.PENDING:
-                self.mark_ready(task.task_id)
-                if task.status == TaskStatus.READY:
-                    ready.append(task)
+        """Get tasks ready for execution."""
+        return [
+            t for t in self._tasks.values()
+            if t.status == TaskStatus.READY
+        ]
 
-        # Sort by priority
-        priority_order = {
-            TaskPriority.CRITICAL: 0,
-            TaskPriority.HIGH: 1,
-            TaskPriority.MEDIUM: 2,
-            TaskPriority.LOW: 3,
-        }
-        ready.sort(key=lambda t: priority_order.get(t.priority, 2))
-        return ready
+    def get_parallel_groups(self) -> list[list[str]]:
+        """Get groups of tasks that can run in parallel."""
+        order = self._topological_sort()
+        if not order:
+            return []
 
-    def topological_sort(self) -> list[list[str]]:
-        """Compute topological ordering (level-based)."""
-        in_degree: dict[str, int] = {}
-        for task_id, task in self._tasks.items():
-            in_degree[task_id] = len(task.dependencies)
+        # Group by depth level
+        depth: dict[str, int] = {}
+        for task_id in order:
+            task = self._tasks[task_id]
+            if not task.dependencies:
+                depth[task_id] = 0
+            else:
+                depth[task_id] = max(
+                    depth.get(d, 0) for d in task.dependencies
+                ) + 1
 
-        levels: list[list[str]] = []
-        remaining = set(self._tasks.keys())
+        # Group by depth
+        groups: dict[int, list[str]] = {}
+        for task_id, d in depth.items():
+            groups.setdefault(d, []).append(task_id)
 
-        while remaining:
-            # Find all tasks with no remaining dependencies
-            level = [
-                tid for tid in remaining
-                if in_degree.get(tid, 0) == 0
-            ]
-
-            if not level:
-                break  # Cycle detected
-
-            levels.append(level)
-
-            for tid in level:
-                remaining.discard(tid)
-                task = self._tasks.get(tid)
-                if task:
-                    for dep_id in task.dependents:
-                        if dep_id in in_degree:
-                            in_degree[dep_id] -= 1
-
-        return levels
+        return [groups[d] for d in sorted(groups.keys())]
 
     def get_critical_path(self) -> list[str]:
-        """Find the critical path (longest dependency chain)."""
-        dist: dict[str, int] = {}
+        """Find the critical path (longest path)."""
+        order = self._topological_sort()
+        if not order:
+            return []
+
+        dist: dict[str, float] = {}
         pred: dict[str, str] = {}
 
-        for task_id in self._tasks:
-            dist[task_id] = 0
-            pred[task_id] = ""
+        for task_id in order:
+            task = self._tasks[task_id]
+            dist[task_id] = task.time_budget_s
 
-        levels = self.topological_sort()
-        for level in levels:
-            for task_id in level:
-                task = self._tasks.get(task_id)
-                if task:
-                    for dep_id in task.dependents:
-                        if dist.get(dep_id, 0) < dist.get(task_id, 0) + 1:
-                            dist[dep_id] = dist.get(task_id, 0) + 1
-                            pred[dep_id] = task_id
+            for dep_id in task.dependencies:
+                new_dist = dist.get(dep_id, 0) + task.time_budget_s
+                if new_dist > dist[task_id]:
+                    dist[task_id] = new_dist
+                    pred[task_id] = dep_id
 
         if not dist:
             return []
 
-        # Find the endpoint of the longest path
-        end_id = max(dist, key=lambda x: dist[x])
-        path = [end_id]
-        current = end_id
-        while pred.get(current, ""):
-            current = pred[current]
-            path.append(current)
+        # Trace back from longest
+        end_id = max(dist, key=lambda k: dist[k])
+        path: list[str] = [end_id]
+        while end_id in pred:
+            end_id = pred[end_id]
+            path.insert(0, end_id)
 
-        path.reverse()
         return path
 
-    def build_execution_plan(self) -> DAGExecutionPlan:
-        """Build a full execution plan."""
-        levels = self.topological_sort()
+    def build_plan(self) -> ExecutionPlan:
+        """Build an execution plan from the DAG."""
+        phases = self.get_parallel_groups()
         critical = self.get_critical_path()
-        parallelizable = sum(len(level) - 1 for level in levels if len(level) > 1)
 
-        return DAGExecutionPlan(
-            levels=levels,
+        total_tokens = sum(t.token_budget for t in self._tasks.values())
+        total_time = sum(t.time_budget_s for t in self._tasks.values())
+        max_parallel = max((len(p) for p in phases), default=0)
+
+        return ExecutionPlan(
+            phases=phases,
             critical_path=critical,
-            total_tasks=len(self._tasks),
-            parallelizable=parallelizable,
+            estimated_tokens=total_tokens,
+            estimated_time_s=total_time,
+            parallelism=max_parallel,
         )
 
-    def build_dag_prompt(self) -> str:
-        """Build DAG visualization for LLM context."""
+    def build_dag_prompt(self, max_tasks: int = 15) -> str:
+        """Build DAG context for LLM."""
         lines = ["## Task DAG\n"]
-        plan = self.build_execution_plan()
 
-        lines.append(f"Tasks: {plan.total_tasks}, "
-                      f"Levels: {len(plan.levels)}, "
-                      f"Parallelizable: {plan.parallelizable}")
+        # Show tasks by status
+        for status in [TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.PENDING]:
+            tasks = [t for t in self._tasks.values() if t.status == status]
+            if not tasks:
+                continue
+            lines.append(f"\n{status.value.upper()}:")
+            for t in tasks[:max_tasks]:
+                deps_str = ""
+                if t.dependencies:
+                    deps_str = f" (after: {', '.join(d[:8] for d in t.dependencies)})"
+                lines.append(f"  {t.task_id[:8]}: {t.name}{deps_str}")
 
-        for idx, level in enumerate(plan.levels):
-            task_names = []
-            for tid in level:
-                task = self._tasks.get(tid)
-                if task:
-                    task_names.append(f"{task.name} [{task.status.value}]")
-            lines.append(f"Level {idx}: {', '.join(task_names)}")
+        # Plan summary
+        plan = self.build_plan()
+        lines.append(f"\nPhases: {len(plan.phases)}, Max parallel: {plan.parallelism}")
 
         return "\n".join(lines)
 
-    def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
+    def _topological_sort(self) -> list[str]:
+        """Kahn's algorithm for topological sort."""
+        in_degree: dict[str, int] = {
+            t_id: len(t.dependencies)
+            for t_id, t in self._tasks.items()
+        }
+        queue: deque[str] = deque(
+            t_id for t_id, d in in_degree.items() if d == 0
+        )
+        order: list[str] = []
+
+        while queue:
+            task_id = queue.popleft()
+            order.append(task_id)
+            task = self._tasks[task_id]
+            for dep_id in task.dependents:
+                in_degree[dep_id] -= 1
+                if in_degree[dep_id] == 0:
+                    queue.append(dep_id)
+
+        if len(order) != len(self._tasks):
+            self._log.error("cycle_detected", order=len(order), total=len(self._tasks))
+            return []
+
+        return order
+
+    def _update_readiness(self) -> None:
+        """Update task readiness based on dependencies."""
         for task in self._tasks.values():
-            status_counts[task.status.value] += 1
+            if task.status != TaskStatus.PENDING:
+                continue
+            if not task.dependencies:
+                task.status = TaskStatus.READY
+                continue
+            all_complete = all(
+                self._tasks.get(d, TaskNode()).status == TaskStatus.COMPLETED
+                for d in task.dependencies
+            )
+            if all_complete:
+                task.status = TaskStatus.READY
+
+    def get_stats(self) -> dict[str, Any]:
+        status_counts: dict[str, int] = {}
+        for t in self._tasks.values():
+            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
 
         return {
             "total_tasks": len(self._tasks),
-            "by_status": dict(status_counts),
-            "total_findings": sum(t.findings for t in self._tasks.values()),
+            "by_status": status_counts,
+            "total_budget": sum(t.token_budget for t in self._tasks.values()),
         }
