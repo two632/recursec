@@ -1,20 +1,18 @@
-"""Agent state machine — formal state management for agent lifecycle.
+"""Agent state machine — manages complex agent lifecycle states.
 
 Implements:
-1. Hierarchical state machine (nested states)
-2. State transition validation
-3. Guard conditions on transitions
-4. Entry/exit actions per state
-5. State history tracking
-6. Timeout-based transitions
-7. Event-driven state changes
-8. Parallel state regions
+1. Finite state machine for agent execution
+2. State transitions with guards
+3. Event-driven state changes
+4. Timeout-based auto-transitions
+5. State history for debugging
+6. Parallel state tracking for multi-agent
+7. Error recovery state handling
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -25,259 +23,272 @@ logger = structlog.get_logger()
 
 
 class AgentState(str, Enum):
-    # Top-level states
-    IDLE = "idle"
     INITIALIZING = "initializing"
+    IDLE = "idle"
     PLANNING = "planning"
-    EXECUTING = "executing"
-    ANALYZING = "analyzing"
-    WAITING = "waiting"
-    ERROR = "error"
-    COMPLETE = "complete"
+    EXECUTING_TOOL = "executing_tool"
+    REASONING = "reasoning"
+    WAITING_LLM = "waiting_llm"
+    ANALYZING_OUTPUT = "analyzing_output"
+    REPORTING = "reporting"
+    SPAWNING_CHILD = "spawning_child"
+    WAITING_CHILD = "waiting_child"
+    DEBATING = "debating"
+    CHECKPOINTING = "checkpointing"
+    ERROR_RECOVERY = "error_recovery"
     PAUSED = "paused"
-
-    # Planning sub-states
-    PLAN_STRATEGY_SELECT = "plan_strategy_select"
-    PLAN_TOOL_SELECT = "plan_tool_select"
-    PLAN_MODEL_SELECT = "plan_model_select"
-    PLAN_TASK_DECOMPOSE = "plan_task_decompose"
-
-    # Executing sub-states
-    EXEC_TOOL_RUN = "exec_tool_run"
-    EXEC_LLM_QUERY = "exec_llm_query"
-    EXEC_SPAWN_CHILD = "exec_spawn_child"
-    EXEC_VALIDATE = "exec_validate"
-
-    # Analyzing sub-states
-    ANALYZE_PARSE = "analyze_parse"
-    ANALYZE_CORRELATE = "analyze_correlate"
-    ANALYZE_REASON = "analyze_reason"
-    ANALYZE_DECIDE = "analyze_decide"
+    TERMINATED = "terminated"
+    COMPLETED = "completed"
 
 
 class StateEvent(str, Enum):
     START = "start"
-    PLAN_COMPLETE = "plan_complete"
-    TOOL_STARTED = "tool_started"
-    TOOL_COMPLETE = "tool_complete"
+    PLAN_READY = "plan_ready"
+    TOOL_SELECTED = "tool_selected"
+    TOOL_COMPLETED = "tool_completed"
+    TOOL_FAILED = "tool_failed"
+    TOOL_TIMEOUT = "tool_timeout"
     LLM_RESPONSE = "llm_response"
-    FINDING_NEW = "finding_new"
-    ERROR_OCCURRED = "error_occurred"
-    TIMEOUT = "timeout"
-    STAGNATION = "stagnation"
-    PHASE_ADVANCE = "phase_advance"
-    CHILD_COMPLETE = "child_complete"
-    PAUSE_REQUESTED = "pause_requested"
-    RESUME_REQUESTED = "resume_requested"
-    STOP_REQUESTED = "stop_requested"
-    RETRY = "retry"
+    LLM_ERROR = "llm_error"
+    ANALYSIS_DONE = "analysis_done"
+    FINDING_FOUND = "finding_found"
+    CHILD_SPAWNED = "child_spawned"
+    CHILD_COMPLETED = "child_completed"
+    CHILD_FAILED = "child_failed"
+    DEBATE_STARTED = "debate_started"
+    DEBATE_RESOLVED = "debate_resolved"
+    CHECKPOINT_DONE = "checkpoint_done"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CONVERGENCE_REACHED = "convergence_reached"
+    ERROR = "error"
+    RECOVER = "recover"
+    PAUSE = "pause"
+    RESUME = "resume"
+    TERMINATE = "terminate"
 
 
 @dataclass
 class StateTransition:
-    """A state transition rule."""
-    from_state: AgentState
-    to_state: AgentState
-    event: StateEvent
-    guard: str = ""            # Description of guard condition
-    priority: int = 0
+    """A transition from one state to another."""
+    from_state: AgentState = AgentState.IDLE
+    event: StateEvent = StateEvent.START
+    to_state: AgentState = AgentState.IDLE
+    guard: str = ""           # Condition name
+    action: str = ""          # Action to perform
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "from": self.from_state.value,
+            "event": self.event.value,
+            "to": self.to_state.value,
+        }
+
+
+@dataclass
+class StateHistoryEntry:
+    """An entry in the state history."""
+    from_state: AgentState = AgentState.IDLE
+    to_state: AgentState = AgentState.IDLE
+    event: StateEvent = StateEvent.START
+    timestamp: float = field(default_factory=time.time)
+    context: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "from": self.from_state.value,
             "to": self.to_state.value,
             "event": self.event.value,
-            "guard": self.guard[:30],
         }
 
 
 @dataclass
-class StateHistoryEntry:
-    """Record of a state change."""
-    from_state: str = ""
-    to_state: str = ""
-    event: str = ""
-    timestamp: float = field(default_factory=time.time)
-    duration_in_state_s: float = 0.0
+class AgentSM:
+    """State machine for a single agent."""
+    agent_id: str = ""
+    current_state: AgentState = AgentState.INITIALIZING
+    history: list[StateHistoryEntry] = field(default_factory=list)
+    error_count: int = 0
+    max_errors: int = 3
+    created_at: float = field(default_factory=time.time)
+    last_transition: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "from": self.from_state[:20],
-            "to": self.to_state[:20],
-            "event": self.event[:20],
-            "duration": round(self.duration_in_state_s, 2),
+            "agent": self.agent_id[:10],
+            "state": self.current_state.value,
+            "transitions": len(self.history),
+            "errors": self.error_count,
         }
 
 
-# ── Transition Table ──────────────────────────────────────────
+# ── Transition table ──────────────────────────────────────────
 
-TRANSITIONS: list[dict[str, Any]] = [
-    # From IDLE
-    {"from": "idle", "to": "initializing", "event": "start"},
+TRANSITIONS: list[StateTransition] = [
+    # Initialization
+    StateTransition(AgentState.INITIALIZING, StateEvent.START, AgentState.PLANNING, action="load_context"),
 
-    # From INITIALIZING
-    {"from": "initializing", "to": "planning", "event": "plan_complete"},
-    {"from": "initializing", "to": "error", "event": "error_occurred"},
+    # Planning
+    StateTransition(AgentState.PLANNING, StateEvent.PLAN_READY, AgentState.REASONING, action="start_reasoning"),
+    StateTransition(AgentState.PLANNING, StateEvent.ERROR, AgentState.ERROR_RECOVERY),
 
-    # From PLANNING
-    {"from": "planning", "to": "plan_strategy_select", "event": "start"},
-    {"from": "plan_strategy_select", "to": "plan_tool_select", "event": "plan_complete"},
-    {"from": "plan_tool_select", "to": "plan_model_select", "event": "plan_complete"},
-    {"from": "plan_model_select", "to": "plan_task_decompose", "event": "plan_complete"},
-    {"from": "plan_task_decompose", "to": "executing", "event": "plan_complete"},
-    {"from": "planning", "to": "executing", "event": "plan_complete"},
-    {"from": "planning", "to": "error", "event": "error_occurred"},
+    # Reasoning (LLM query)
+    StateTransition(AgentState.REASONING, StateEvent.TOOL_SELECTED, AgentState.EXECUTING_TOOL, action="execute_tool"),
+    StateTransition(AgentState.REASONING, StateEvent.CHILD_SPAWNED, AgentState.SPAWNING_CHILD),
+    StateTransition(AgentState.REASONING, StateEvent.DEBATE_STARTED, AgentState.DEBATING),
+    StateTransition(AgentState.REASONING, StateEvent.ANALYSIS_DONE, AgentState.REPORTING),
+    StateTransition(AgentState.REASONING, StateEvent.LLM_ERROR, AgentState.ERROR_RECOVERY),
+    StateTransition(AgentState.REASONING, StateEvent.BUDGET_EXHAUSTED, AgentState.REPORTING),
+    StateTransition(AgentState.REASONING, StateEvent.CONVERGENCE_REACHED, AgentState.REPORTING),
 
-    # From EXECUTING
-    {"from": "executing", "to": "exec_tool_run", "event": "tool_started"},
-    {"from": "executing", "to": "exec_llm_query", "event": "start"},
-    {"from": "executing", "to": "exec_spawn_child", "event": "start"},
-    {"from": "exec_tool_run", "to": "analyzing", "event": "tool_complete"},
-    {"from": "exec_llm_query", "to": "analyzing", "event": "llm_response"},
-    {"from": "exec_spawn_child", "to": "waiting", "event": "start"},
-    {"from": "exec_validate", "to": "analyzing", "event": "plan_complete"},
-    {"from": "executing", "to": "error", "event": "error_occurred"},
-    {"from": "executing", "to": "waiting", "event": "timeout"},
+    # Tool execution
+    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.TOOL_COMPLETED, AgentState.ANALYZING_OUTPUT, action="parse_output"),
+    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.TOOL_FAILED, AgentState.REASONING, action="report_failure"),
+    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.TOOL_TIMEOUT, AgentState.REASONING, action="report_timeout"),
 
-    # From ANALYZING
-    {"from": "analyzing", "to": "analyze_parse", "event": "start"},
-    {"from": "analyze_parse", "to": "analyze_correlate", "event": "plan_complete"},
-    {"from": "analyze_correlate", "to": "analyze_reason", "event": "plan_complete"},
-    {"from": "analyze_reason", "to": "analyze_decide", "event": "plan_complete"},
-    {"from": "analyze_decide", "to": "planning", "event": "plan_complete", "guard": "more_work_needed"},
-    {"from": "analyze_decide", "to": "complete", "event": "stop_requested"},
-    {"from": "analyzing", "to": "planning", "event": "plan_complete"},
-    {"from": "analyzing", "to": "executing", "event": "finding_new"},
-    {"from": "analyzing", "to": "error", "event": "error_occurred"},
+    # Output analysis
+    StateTransition(AgentState.ANALYZING_OUTPUT, StateEvent.FINDING_FOUND, AgentState.REASONING, action="record_finding"),
+    StateTransition(AgentState.ANALYZING_OUTPUT, StateEvent.ANALYSIS_DONE, AgentState.REASONING),
 
-    # From WAITING
-    {"from": "waiting", "to": "analyzing", "event": "child_complete"},
-    {"from": "waiting", "to": "executing", "event": "timeout"},
-    {"from": "waiting", "to": "error", "event": "error_occurred"},
+    # Child agent management
+    StateTransition(AgentState.SPAWNING_CHILD, StateEvent.CHILD_SPAWNED, AgentState.WAITING_CHILD),
+    StateTransition(AgentState.WAITING_CHILD, StateEvent.CHILD_COMPLETED, AgentState.REASONING, action="aggregate_child"),
+    StateTransition(AgentState.WAITING_CHILD, StateEvent.CHILD_FAILED, AgentState.REASONING, action="handle_child_failure"),
 
-    # From ERROR
-    {"from": "error", "to": "planning", "event": "retry"},
-    {"from": "error", "to": "complete", "event": "stop_requested"},
+    # Debate
+    StateTransition(AgentState.DEBATING, StateEvent.DEBATE_RESOLVED, AgentState.REASONING, action="apply_verdict"),
 
-    # From PAUSED
-    {"from": "paused", "to": "executing", "event": "resume_requested"},
-    {"from": "paused", "to": "complete", "event": "stop_requested"},
+    # Reporting
+    StateTransition(AgentState.REPORTING, StateEvent.CHECKPOINT_DONE, AgentState.COMPLETED),
 
-    # Universal transitions
-    {"from": "executing", "to": "paused", "event": "pause_requested"},
-    {"from": "planning", "to": "paused", "event": "pause_requested"},
-    {"from": "analyzing", "to": "paused", "event": "pause_requested"},
+    # Error recovery
+    StateTransition(AgentState.ERROR_RECOVERY, StateEvent.RECOVER, AgentState.REASONING),
+    StateTransition(AgentState.ERROR_RECOVERY, StateEvent.TERMINATE, AgentState.TERMINATED),
 
-    # Phase advances
-    {"from": "analyzing", "to": "planning", "event": "phase_advance"},
-    {"from": "executing", "to": "planning", "event": "phase_advance"},
+    # Pause/Resume
+    StateTransition(AgentState.REASONING, StateEvent.PAUSE, AgentState.PAUSED),
+    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.PAUSE, AgentState.PAUSED),
+    StateTransition(AgentState.PAUSED, StateEvent.RESUME, AgentState.REASONING),
 
-    # Stagnation
-    {"from": "executing", "to": "planning", "event": "stagnation"},
-    {"from": "analyzing", "to": "planning", "event": "stagnation"},
+    # Global terminate
+    StateTransition(AgentState.REASONING, StateEvent.TERMINATE, AgentState.TERMINATED),
+    StateTransition(AgentState.EXECUTING_TOOL, StateEvent.TERMINATE, AgentState.TERMINATED),
+    StateTransition(AgentState.WAITING_CHILD, StateEvent.TERMINATE, AgentState.TERMINATED),
 ]
 
 
 class AgentStateMachine:
-    """Formal state machine for agent lifecycle management.
+    """Manages state machines for multiple agents.
 
-    Manages state transitions, validates events, tracks history,
-    and enforces transition rules.
+    Each agent has its own state machine tracking
+    its lifecycle through planning, execution,
+    analysis, and reporting phases.
     """
 
-    def __init__(self, initial_state: AgentState = AgentState.IDLE) -> None:
-        self._current_state = initial_state
-        self._previous_state: AgentState | None = None
-        self._state_enter_time = time.time()
-        self._transitions: list[StateTransition] = []
-        self._history: list[StateHistoryEntry] = []
-        self._state_durations: dict[str, float] = defaultdict(float)
-        self._transition_counts: dict[str, int] = defaultdict(int)
+    def __init__(self) -> None:
+        self._agents: dict[str, AgentSM] = {}
+        self._transition_table: dict[tuple[str, str], StateTransition] = {}
         self._log = logger.bind(component="agent_state_machine")
+        self._build_transition_table()
 
-        self._load_transitions()
-
-    def _load_transitions(self) -> None:
-        """Load transition rules."""
+    def _build_transition_table(self) -> None:
+        """Build lookup table for transitions."""
         for t in TRANSITIONS:
-            self._transitions.append(StateTransition(
-                from_state=AgentState(t["from"]),
-                to_state=AgentState(t["to"]),
-                event=StateEvent(t["event"]),
-                guard=t.get("guard", ""),
-            ))
+            key = (t.from_state.value, t.event.value)
+            self._transition_table[key] = t
 
-    @property
-    def current_state(self) -> AgentState:
-        return self._current_state
+    def create_agent(self, agent_id: str) -> AgentSM:
+        """Create a new agent state machine."""
+        sm = AgentSM(agent_id=agent_id)
+        self._agents[agent_id] = sm
+        return sm
 
-    @property
-    def time_in_state_s(self) -> float:
-        return time.time() - self._state_enter_time
-
-    def can_transition(self, event: StateEvent) -> bool:
-        """Check if a transition is valid for the current state."""
-        for t in self._transitions:
-            if t.from_state == self._current_state and t.event == event:
-                return True
-        return False
-
-    def transition(self, event: StateEvent) -> AgentState | None:
+    def transition(
+        self,
+        agent_id: str,
+        event: StateEvent,
+        context: str = "",
+    ) -> AgentState | None:
         """Attempt a state transition."""
-        valid = [
-            t for t in self._transitions
-            if t.from_state == self._current_state and t.event == event
-        ]
-
-        if not valid:
+        sm = self._agents.get(agent_id)
+        if not sm:
             return None
 
-        # Use highest priority transition
-        transition = max(valid, key=lambda t: t.priority)
+        key = (sm.current_state.value, event.value)
+        trans = self._transition_table.get(key)
+
+        if not trans:
+            self._log.warning(
+                "invalid_transition",
+                agent=agent_id[:10],
+                state=sm.current_state.value,
+                event=event.value,
+            )
+            return None
 
         # Record history
-        now = time.time()
-        duration = now - self._state_enter_time
+        entry = StateHistoryEntry(
+            from_state=sm.current_state,
+            to_state=trans.to_state,
+            event=event,
+            context=context,
+        )
+        sm.history.append(entry)
 
-        self._history.append(StateHistoryEntry(
-            from_state=self._current_state.value,
-            to_state=transition.to_state.value,
+        # Track errors
+        if event in (StateEvent.ERROR, StateEvent.TOOL_FAILED, StateEvent.LLM_ERROR):
+            sm.error_count += 1
+            if sm.error_count >= sm.max_errors:
+                sm.current_state = AgentState.TERMINATED
+                return AgentState.TERMINATED
+
+        old_state = sm.current_state
+        sm.current_state = trans.to_state
+        sm.last_transition = time.time()
+
+        self._log.debug(
+            "state_transition",
+            agent=agent_id[:10],
+            old=old_state.value,
+            new=trans.to_state.value,
             event=event.value,
-            timestamp=now,
-            duration_in_state_s=duration,
-        ))
+        )
 
-        # Update durations
-        self._state_durations[self._current_state.value] += duration
-        self._transition_counts[f"{self._current_state.value}->{transition.to_state.value}"] += 1
+        return trans.to_state
 
-        # Transition
-        self._previous_state = self._current_state
-        self._current_state = transition.to_state
-        self._state_enter_time = now
+    def get_state(self, agent_id: str) -> AgentState | None:
+        """Get current state of an agent."""
+        sm = self._agents.get(agent_id)
+        return sm.current_state if sm else None
 
-        return self._current_state
+    def get_active_agents(self) -> list[AgentSM]:
+        """Get all active (non-terminal) agents."""
+        terminal = {AgentState.COMPLETED, AgentState.TERMINATED}
+        return [
+            sm for sm in self._agents.values()
+            if sm.current_state not in terminal
+        ]
 
-    def get_valid_events(self) -> list[StateEvent]:
-        """Get events that are valid in the current state."""
-        events = set()
-        for t in self._transitions:
-            if t.from_state == self._current_state:
-                events.add(t.event)
-        return sorted(events, key=lambda e: e.value)
-
-    def get_history(self, last_n: int = 10) -> list[dict[str, Any]]:
-        """Get recent state history."""
-        return [h.to_dict() for h in self._history[-last_n:]]
+    def get_stalled_agents(
+        self,
+        stall_threshold_s: float = 300.0,
+    ) -> list[AgentSM]:
+        """Get agents that haven't transitioned recently."""
+        now = time.time()
+        return [
+            sm for sm in self._agents.values()
+            if sm.current_state not in (AgentState.COMPLETED, AgentState.TERMINATED)
+            and (now - sm.last_transition) > stall_threshold_s
+        ]
 
     def get_stats(self) -> dict[str, Any]:
+        state_counts: dict[str, int] = {}
+        for sm in self._agents.values():
+            state_counts[sm.current_state.value] = state_counts.get(
+                sm.current_state.value, 0,
+            ) + 1
+
         return {
-            "current": self._current_state.value,
-            "previous": self._previous_state.value if self._previous_state else None,
-            "time_in_state": round(self.time_in_state_s, 1),
-            "transitions": len(self._history),
-            "state_durations": {
-                k: round(v, 1) for k, v in self._state_durations.items()
-            },
-            "valid_events": [e.value for e in self.get_valid_events()],
+            "total_agents": len(self._agents),
+            "by_state": state_counts,
+            "total_transitions": sum(len(sm.history) for sm in self._agents.values()),
         }
