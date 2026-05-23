@@ -1,11 +1,11 @@
 """API security knowledge base.
 
 Deep knowledge about API vulnerabilities:
-1. REST API security patterns
-2. GraphQL security issues
-3. gRPC attack vectors
-4. WebSocket security
-5. OAuth/JWT attacks
+1. REST API testing methodology
+2. GraphQL exploitation
+3. gRPC/Protobuf attacks
+4. API authentication bypass
+5. Rate limiting and abuse
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ class APIPattern:
     """An API security pattern."""
     pattern_id: str = ""
     name: str = ""
-    api_type: str = ""
+    category: str = ""
     severity: str = "high"
     description: str = ""
     detection_strategy: str = ""
@@ -33,175 +33,180 @@ class APIPattern:
         return {
             "id": self.pattern_id,
             "name": self.name[:25],
-            "type": self.api_type[:10],
+            "category": self.category[:12],
         }
 
 
 API_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "api-001", "name": "GraphQL Introspection and Injection",
-        "api_type": "graphql", "severity": "high",
-        "desc": "GraphQL-specific attack patterns.",
+        "id": "api-001", "name": "REST API Vulnerability Testing",
+        "category": "rest", "severity": "high",
+        "desc": "Comprehensive REST API security testing.",
         "detection": (
-            "GRAPHQL SECURITY:\n"
+            "REST API TESTING:\n"
+            "ENDPOINT DISCOVERY:\n"
+            "  # Swagger/OpenAPI discovery\n"
+            "  ffuf -u https://<target>/FUZZ -w api-endpoints.txt\n"
+            "  # Common paths:\n"
+            "  /api/v1/ /api/v2/ /swagger/ /swagger.json\n"
+            "  /openapi.json /api-docs /graphql /graphiql\n"
+            "  /.well-known/ /actuator /health /metrics\n"
+            "AUTHENTICATION TESTING:\n"
+            "  - Test endpoints without auth token\n"
+            "  - Test with expired token\n"
+            "  - Test with token from different user\n"
+            "  - Test with modified JWT claims\n"
+            "  - Test with API key from different scope\n"
+            "IDOR/BOLA:\n"
+            "  - Change numeric IDs: /api/users/1 → /api/users/2\n"
+            "  - Change UUIDs: Try sequential or predictable patterns\n"
+            "  - Test with different object types in same endpoint\n"
+            "  - Check batch endpoints: /api/users?ids=1,2,3\n"
+            "MASS ASSIGNMENT:\n"
+            "  - Add extra fields: {\"name\": \"x\", \"role\": \"admin\"}\n"
+            "  - Add fields from API docs that aren't in UI\n"
+            "  - Test PATCH with restricted fields\n"
+            "RATE LIMITING:\n"
+            "  - Test with rapid requests (no rate limit = DoS risk)\n"
+            "  - Test from different IPs/headers\n"
+            "  - Check X-Forwarded-For bypass"
+        ),
+        "tools": ["ffuf", "burp", "postman"],
+    },
+    {
+        "id": "api-002", "name": "GraphQL Exploitation",
+        "category": "graphql", "severity": "high",
+        "desc": "Exploiting GraphQL endpoints.",
+        "detection": (
+            "GRAPHQL EXPLOITATION:\n"
             "INTROSPECTION:\n"
-            "  - Query: { __schema { types { name fields { name } } } }\n"
-            "  - Full introspection: { __schema { queryType { name } mutationType { name } "
-            "types { name kind fields { name args { name type { name } } } } } }\n"
-            "  - Tools: graphql-voyager (visualization), InQL (Burp extension)\n"
-            "  - Check: POST /graphql with introspection query\n"
+            "  # Full schema dump\n"
+            "  {__schema{types{name,fields{name,args{name,type{name}}}}}}\n"
+            "  # Tools\n"
+            "  graphql-cop -t https://<target>/graphql\n"
+            "  clairvoyance -o schema.json https://<target>/graphql\n"
+            "  InQL (Burp extension)\n"
             "INJECTION:\n"
-            "  - SQL injection in arguments: { user(id: \"1' OR 1=1--\") { name } }\n"
-            "  - NoSQL injection: { user(filter: \"{\\\"$gt\\\": \\\"\\\"}\") { name } }\n"
-            "  - Nested query DoS (batching): [{query: q1}, {query: q2}, ...]\n"
+            "  # SQL injection through arguments\n"
+            "  query { user(id: \"1' OR '1'='1\") { name, email }}\n"
+            "  # NoSQL injection\n"
+            "  query { user(filter: {\"$gt\": \"\"}) { name }}\n"
+            "BATCHING ATTACKS:\n"
+            "  # Send multiple queries in one request\n"
+            "  [{\"query\": \"q1\"}, {\"query\": \"q2\"}, ...]\n"
+            "  # Bypass rate limiting by batching\n"
+            "  # Brute force via aliased queries\n"
+            "  query { a1: login(user:\"a\",pass:\"1\") a2: login(user:\"a\",pass:\"2\") }\n"
+            "DENIAL OF SERVICE:\n"
+            "  # Deeply nested queries\n"
+            "  query { user { friends { friends { friends { ... } } } } }\n"
+            "  # Alias-based DoS\n"
+            "  # Fragment-based circular queries\n"
             "AUTHORIZATION:\n"
-            "  - Query depth attacks: deeply nested relationships\n"
-            "  - Field-level authorization bypass\n"
-            "  - Mutation authorization: test if mutations work without auth\n"
-            "  - Subscription eavesdropping\n"
-            "INFORMATION DISCLOSURE:\n"
-            "  - Verbose error messages with stack traces\n"
-            "  - Debug/development mode enabled\n"
-            "  - Suggestions in errors revealing field names\n"
-            "TESTING:\n"
-            "  1. Test for introspection (should be disabled in production)\n"
-            "  2. Map all queries, mutations, subscriptions\n"
-            "  3. Test authorization on each field/type\n"
-            "  4. Test input validation on all arguments\n"
-            "  5. Test query complexity limits (DoS)"
+            "  - Access mutations without proper roles\n"
+            "  - Query fields that should be restricted\n"
+            "  - Test subscription endpoints for data leaks"
         ),
-        "tools": ["graphql-voyager", "inql", "burp"],
+        "tools": ["graphql-cop", "clairvoyance", "burp"],
     },
     {
-        "id": "api-002", "name": "REST API Mass Assignment",
-        "api_type": "rest", "severity": "high",
-        "desc": "Mass assignment / parameter pollution in REST APIs.",
+        "id": "api-003", "name": "gRPC/Protobuf Attacks",
+        "category": "grpc", "severity": "high",
+        "desc": "Attacking gRPC and Protocol Buffer endpoints.",
         "detection": (
-            "REST API MASS ASSIGNMENT:\n"
-            "DETECTION:\n"
-            "  - Find API endpoints that accept JSON objects\n"
-            "  - Add extra fields not in the UI: {\"name\": \"test\", \"role\": \"admin\"}\n"
-            "  - Common fields to try:\n"
-            "    {\"is_admin\": true}\n"
-            "    {\"role\": \"admin\"}\n"
-            "    {\"verified\": true}\n"
-            "    {\"active\": true}\n"
-            "    {\"balance\": 99999}\n"
-            "    {\"plan\": \"enterprise\"}\n"
-            "    {\"discount\": 100}\n"
-            "TESTING METHODOLOGY:\n"
-            "  1. Capture normal request with all expected fields\n"
-            "  2. Study API documentation or response format for additional fields\n"
-            "  3. Add extra fields from response into request\n"
-            "  4. Check if server accepted the extra fields\n"
-            "  5. Test PUT, PATCH, and POST endpoints\n"
-            "PARAMETER POLLUTION:\n"
-            "  - Duplicate params: ?id=1&id=2 (server-dependent behavior)\n"
-            "  - Array injection: ?id[]=1&id[]=2\n"
-            "  - JSON in query: ?filter={\"role\":\"admin\"}\n"
-            "  - Nested objects: user[role]=admin\n"
-            "COMMON VULNERABLE FRAMEWORKS:\n"
-            "  - Ruby on Rails: Strong Parameters bypass\n"
-            "  - Django: ModelSerializer accepting all fields\n"
-            "  - Express: body-parser accepting nested objects"
+            "gRPC/PROTOBUF ATTACKS:\n"
+            "DISCOVERY:\n"
+            "  # Detect gRPC services\n"
+            "  nmap -p 50051 --script=http-grpc <target>\n"
+            "  # Server reflection (if enabled)\n"
+            "  grpcurl -plaintext <host>:<port> list\n"
+            "  grpcurl -plaintext <host>:<port> describe <service>\n"
+            "  # If no reflection:\n"
+            "  # Intercept .proto files from mobile apps/web\n"
+            "  # Decompile from binary\n"
+            "ENUMERATION:\n"
+            "  # List all services\n"
+            "  grpcurl -plaintext <host>:<port> list\n"
+            "  # Describe service methods\n"
+            "  grpcurl -plaintext <host>:<port> describe <Service>\n"
+            "  # Call method\n"
+            "  grpcurl -plaintext -d '{\"id\": 1}' <host>:<port> <Service>/<Method>\n"
+            "ATTACKS:\n"
+            "  - Missing authentication on methods\n"
+            "  - IDOR through request parameters\n"
+            "  - Protobuf deserialization issues\n"
+            "  - Type confusion (send wrong type)\n"
+            "  - Integer overflow in protobuf fields\n"
+            "  - Large message DoS (no size limits)\n"
+            "  - Stream abuse (bidirectional streaming)\n"
+            "  - Metadata injection (HTTP/2 headers)"
         ),
-        "tools": ["burp", "ffuf", "curl"],
+        "tools": ["grpcurl", "nmap", "protobuf-inspector"],
     },
     {
-        "id": "api-003", "name": "WebSocket Security",
-        "api_type": "websocket", "severity": "high",
-        "desc": "WebSocket protocol security issues.",
+        "id": "api-004", "name": "WebSocket Security",
+        "category": "websocket", "severity": "high",
+        "desc": "Testing WebSocket connections for vulnerabilities.",
         "detection": (
             "WEBSOCKET SECURITY:\n"
-            "DISCOVERY:\n"
-            "  - Look for ws:// or wss:// URLs in JavaScript\n"
+            "DETECTION:\n"
+            "  - Look for ws:// or wss:// in source code\n"
             "  - Check for Upgrade: websocket headers\n"
-            "  - Common paths: /ws, /socket, /socket.io, /realtime\n"
+            "  - Monitor network tab for WS connections\n"
+            "  - Common endpoints: /ws /socket /socket.io /hub\n"
             "CROSS-SITE WEBSOCKET HIJACKING:\n"
-            "  - WebSocket doesn't follow same-origin policy by default\n"
-            "  - Test: Open WebSocket from different origin\n"
-            "  - If server doesn't check Origin header → hijackable\n"
-            "  - Exploit: Create malicious page that connects to victim's WS\n"
+            "  - Check if Origin header is validated\n"
+            "  - If not → can connect from attacker's domain\n"
+            "  - Test: Connect from different origin\n"
+            "  - Exploit: Read messages, send commands\n"
             "INJECTION:\n"
-            "  - Send malicious payloads via WebSocket messages\n"
-            "  - XSS if messages are rendered in DOM\n"
-            "  - SQL injection if messages query database\n"
-            "  - Command injection if messages trigger system commands\n"
-            "AUTHENTICATION:\n"
-            "  - Check if WS requires authentication\n"
-            "  - Token handling: Is token validated per message or only on connect?\n"
-            "  - Session fixation: Can you replay old WS session?\n"
-            "RATE LIMITING:\n"
-            "  - Most WS implementations lack rate limiting\n"
-            "  - Flood testing: Send many messages rapidly\n"
-            "  - Resource exhaustion: Send very large messages"
+            "  - Send SQL injection via WS messages\n"
+            "  - Send XSS payloads through WS\n"
+            "  - Send command injection via WS\n"
+            "  - Test message format manipulation\n"
+            "AUTHORIZATION:\n"
+            "  - Connect without authentication\n"
+            "  - Subscribe to channels of other users\n"
+            "  - Send admin-level commands as regular user\n"
+            "  - Test reconnection with stale tokens\n"
+            "DENIAL OF SERVICE:\n"
+            "  - Rapidly open many connections\n"
+            "  - Send very large messages\n"
+            "  - Send malformed frames"
         ),
-        "tools": ["burp", "wssip", "curl"],
+        "tools": ["burp", "wscat", "autobahn-testsuite"],
     },
     {
-        "id": "api-004", "name": "OAuth 2.0 Vulnerabilities",
-        "api_type": "oauth", "severity": "critical",
-        "desc": "OAuth 2.0 implementation vulnerabilities.",
+        "id": "api-005", "name": "OAuth/OIDC Exploitation",
+        "category": "oauth", "severity": "critical",
+        "desc": "Exploiting OAuth 2.0 and OpenID Connect flaws.",
         "detection": (
-            "OAUTH 2.0 ATTACKS:\n"
-            "REDIRECT URI MANIPULATION:\n"
-            "  - Open redirect: redirect_uri=https://evil.com\n"
-            "  - Subdomain takeover: redirect_uri=https://sub.legitimate.com\n"
-            "  - Path traversal: redirect_uri=https://legitimate.com/../evil\n"
-            "  - Fragment injection: redirect_uri=https://legitimate.com#evil\n"
-            "CSRF ATTACKS:\n"
-            "  - Missing state parameter → CSRF in OAuth flow\n"
-            "  - Predictable state values\n"
-            "  - State parameter not bound to session\n"
+            "OAUTH/OIDC EXPLOITATION:\n"
+            "AUTHORIZATION CODE FLOW:\n"
+            "  - Missing state parameter → CSRF\n"
+            "  - Redirect URI manipulation:\n"
+            "    redirect_uri=https://attacker.com\n"
+            "    redirect_uri=https://legitimate.com@attacker.com\n"
+            "    redirect_uri=https://legitimate.com/..%2F..%2Fattacker.com\n"
+            "  - Authorization code replay (no PKCE)\n"
+            "  - Code injection via redirect_uri path\n"
             "TOKEN ATTACKS:\n"
-            "  - Authorization code reuse (should be single-use)\n"
             "  - Token leakage via Referer header\n"
-            "  - Implicit flow token in URL fragment\n"
-            "  - Client secret exposure in JavaScript\n"
-            "SCOPE MANIPULATION:\n"
-            "  - Request elevated scope: scope=admin\n"
-            "  - Scope upgrade after initial grant\n"
-            "  - Missing scope validation on resource server\n"
-            "TESTING:\n"
-            "  1. Map complete OAuth flow (authorization, token, resource)\n"
-            "  2. Test redirect_uri validation\n"
-            "  3. Test state parameter implementation\n"
-            "  4. Test authorization code for single-use\n"
-            "  5. Test scope enforcement"
+            "  - Token in URL fragment → leaked to JS\n"
+            "  - Token scope escalation\n"
+            "  - Refresh token rotation not enforced\n"
+            "  - Token stored in localStorage (XSS risk)\n"
+            "IMPLICIT FLOW ATTACKS:\n"
+            "  - Access token in URL → history, logs, Referer\n"
+            "  - Token substitution (use token from attacker app)\n"
+            "  - Confused deputy (mix up client IDs)\n"
+            "OIDC SPECIFIC:\n"
+            "  - ID token validation bypass\n"
+            "  - Nonce reuse → replay attack\n"
+            "  - Issuer validation missing\n"
+            "  - User info endpoint IDOR"
         ),
-        "tools": ["burp", "oauth-tools", "curl"],
-    },
-    {
-        "id": "api-005", "name": "API Rate Limiting and DoS",
-        "api_type": "rest", "severity": "medium",
-        "desc": "API rate limiting bypass and denial of service.",
-        "detection": (
-            "API RATE LIMITING AND DoS:\n"
-            "ENUMERATION:\n"
-            "  - Check response headers: X-RateLimit-Limit, X-RateLimit-Remaining\n"
-            "  - Retry-After header\n"
-            "  - 429 Too Many Requests status code\n"
-            "BYPASS TECHNIQUES:\n"
-            "  - IP rotation headers: X-Forwarded-For, X-Real-IP\n"
-            "  - HTTP method variation: GET vs POST vs OPTIONS\n"
-            "  - Endpoint variation: /api/v1/users vs /api/v1/users/\n"
-            "  - User-Agent rotation\n"
-            "  - API key rotation (if multiple available)\n"
-            "  - Distributed requests from multiple IPs\n"
-            "RESOURCE EXHAUSTION:\n"
-            "  - Large payload: Send very large JSON body\n"
-            "  - Regex DoS (ReDoS): Craft input that triggers exponential regex\n"
-            "  - Pagination abuse: ?page=1&limit=1000000\n"
-            "  - Search abuse: Complex search queries\n"
-            "  - File upload: Very large file or many concurrent uploads\n"
-            "  - GraphQL complexity: Deeply nested queries\n"
-            "TESTING:\n"
-            "  1. Identify rate-limited endpoints\n"
-            "  2. Measure rate limit thresholds\n"
-            "  3. Test bypass techniques\n"
-            "  4. Test resource exhaustion vectors"
-        ),
-        "tools": ["ffuf", "nuclei", "curl"],
+        "tools": ["burp", "oauth-tester"],
     },
 ]
 
@@ -209,7 +214,7 @@ API_PATTERNS: list[dict[str, Any]] = [
 class APISecurityKB:
     """API security knowledge base.
 
-    Provides API-specific attack patterns
+    Provides API vulnerability patterns
     injected into agent prompts.
     """
 
@@ -224,7 +229,7 @@ class APISecurityKB:
             pattern = APIPattern(
                 pattern_id=data["id"],
                 name=data["name"],
-                api_type=data.get("api_type", ""),
+                category=data.get("category", ""),
                 severity=data.get("severity", "high"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
@@ -232,37 +237,37 @@ class APISecurityKB:
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_type(self, api_type: str) -> list[APIPattern]:
-        """Get patterns by API type."""
+    def get_by_category(self, category: str) -> list[APIPattern]:
+        """Get patterns by category."""
         return [
             p for p in self._patterns.values()
-            if p.api_type.lower() == api_type.lower()
+            if p.category.lower() == category.lower()
         ]
 
     def build_api_prompt(
         self,
-        api_types: list[str] | None = None,
+        categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
         """Build API security prompt."""
         lines = ["## API Security Patterns\n"]
         count = 0
         for pattern in self._patterns.values():
-            if api_types and pattern.api_type.lower() not in [t.lower() for t in api_types]:
+            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
                 continue
             if count >= max_patterns:
                 break
-            lines.append(f"### {pattern.name} [{pattern.api_type.upper()}]")
+            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
             lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        type_counts: dict[str, int] = {}
+        cat_counts: dict[str, int] = {}
         for p in self._patterns.values():
-            type_counts[p.api_type] = type_counts.get(p.api_type, 0) + 1
+            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
         return {
             "patterns": len(self._patterns),
-            "by_type": type_counts,
+            "by_category": cat_counts,
         }
