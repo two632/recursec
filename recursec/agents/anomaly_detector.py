@@ -1,14 +1,14 @@
-"""Anomaly detector — identifies unusual patterns in findings and behavior.
+"""Anomaly detector — behavioral analysis for vulnerability discovery.
 
 Implements:
-1. Statistical anomaly detection (z-score, IQR)
-2. Behavioral anomaly detection (agent behavior shifts)
-3. Finding anomaly detection (unusual vulnerability patterns)
-4. Temporal anomaly detection (timing irregularities)
-5. Network anomaly detection (unusual traffic patterns)
-6. Baseline learning from normal behavior
-7. Anomaly classification and severity
-8. Alert generation for detected anomalies
+1. Response time anomaly detection
+2. Response size anomaly detection
+3. Status code pattern analysis
+4. Content difference analysis
+5. Parameter behavior profiling
+6. Baseline establishment
+7. Statistical outlier detection (Z-score, IQR)
+8. Time-series anomaly detection
 """
 
 from __future__ import annotations
@@ -26,32 +26,67 @@ logger = structlog.get_logger()
 
 
 class AnomalyType(str, Enum):
-    STATISTICAL = "statistical"
-    BEHAVIORAL = "behavioral"
-    TEMPORAL = "temporal"
-    FINDING = "finding"
-    NETWORK = "network"
+    RESPONSE_TIME = "response_time"
+    RESPONSE_SIZE = "response_size"
+    STATUS_CODE = "status_code"
+    CONTENT_DIFF = "content_diff"
+    BEHAVIOR_CHANGE = "behavior_change"
+    ERROR_SPIKE = "error_spike"
 
 
 class AnomalySeverity(str, Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
+    LOW = "low"              # Minor deviation
+    MEDIUM = "medium"        # Notable deviation
+    HIGH = "high"            # Significant anomaly
+    CRITICAL = "critical"    # Extreme outlier
 
 
 @dataclass
-class DataPoint:
-    """A data point for anomaly detection."""
-    name: str = ""
-    value: float = 0.0
+class Observation:
+    """A single observation data point."""
+    endpoint: str = ""
+    method: str = "GET"
+    status_code: int = 200
+    response_time_ms: float = 0.0
+    response_size: int = 0
+    content_hash: str = ""
+    parameters: dict[str, str] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "name": self.name[:20],
-            "value": round(self.value, 3),
+            "endpoint": self.endpoint[:30],
+            "status": self.status_code,
+            "time_ms": round(self.response_time_ms, 1),
+            "size": self.response_size,
+        }
+
+
+@dataclass
+class Baseline:
+    """Statistical baseline for an endpoint."""
+    endpoint: str = ""
+    sample_count: int = 0
+    avg_response_time_ms: float = 0.0
+    std_response_time_ms: float = 0.0
+    avg_response_size: float = 0.0
+    std_response_size: float = 0.0
+    common_status_codes: dict[int, int] = field(default_factory=dict)
+    content_hashes: set[str] = field(default_factory=set)
+    min_time: float = float("inf")
+    max_time: float = 0.0
+    min_size: float = float("inf")
+    max_size: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "endpoint": self.endpoint[:30],
+            "samples": self.sample_count,
+            "avg_time": round(self.avg_response_time_ms, 1),
+            "std_time": round(self.std_response_time_ms, 1),
+            "avg_size": round(self.avg_response_size, 0),
+            "status_codes": dict(self.common_status_codes),
         }
 
 
@@ -59,278 +94,240 @@ class DataPoint:
 class Anomaly:
     """A detected anomaly."""
     anomaly_id: str = ""
-    anomaly_type: AnomalyType = AnomalyType.STATISTICAL
+    anomaly_type: AnomalyType = AnomalyType.RESPONSE_TIME
     severity: AnomalySeverity = AnomalySeverity.MEDIUM
+    endpoint: str = ""
     description: str = ""
-    metric_name: str = ""
-    observed_value: float = 0.0
-    expected_range: tuple[float, float] = (0.0, 0.0)
-    deviation_score: float = 0.0
+    expected_value: float = 0.0
+    actual_value: float = 0.0
+    z_score: float = 0.0
+    observation: Observation | None = None
     timestamp: float = field(default_factory=time.time)
 
+    @property
+    def deviation_ratio(self) -> float:
+        if self.expected_value == 0:
+            return 0.0
+        return abs(self.actual_value - self.expected_value) / self.expected_value
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.anomaly_id,
+            "id": self.anomaly_id[:10],
             "type": self.anomaly_type.value,
             "severity": self.severity.value,
-            "desc": self.description[:40],
-            "metric": self.metric_name[:20],
-            "observed": round(self.observed_value, 3),
-            "deviation": round(self.deviation_score, 2),
-        }
-
-
-@dataclass
-class Baseline:
-    """A statistical baseline for a metric."""
-    name: str = ""
-    values: list[float] = field(default_factory=list)
-    mean: float = 0.0
-    std_dev: float = 0.0
-    q1: float = 0.0
-    q3: float = 0.0
-    min_val: float = 0.0
-    max_val: float = 0.0
-    last_updated: float = 0.0
-
-    @property
-    def iqr(self) -> float:
-        return self.q3 - self.q1
-
-    @property
-    def lower_fence(self) -> float:
-        return self.q1 - 1.5 * self.iqr
-
-    @property
-    def upper_fence(self) -> float:
-        return self.q3 + 1.5 * self.iqr
-
-    def z_score(self, value: float) -> float:
-        if self.std_dev == 0:
-            return 0.0
-        return (value - self.mean) / self.std_dev
-
-    def is_outlier_iqr(self, value: float) -> bool:
-        return value < self.lower_fence or value > self.upper_fence
-
-    def update(self) -> None:
-        """Recompute statistics from values."""
-        if not self.values:
-            return
-
-        n = len(self.values)
-        self.mean = sum(self.values) / n
-
-        variance = sum((v - self.mean) ** 2 for v in self.values) / max(1, n - 1)
-        self.std_dev = math.sqrt(variance)
-
-        sorted_vals = sorted(self.values)
-        self.min_val = sorted_vals[0]
-        self.max_val = sorted_vals[-1]
-        self.q1 = sorted_vals[max(0, n // 4)]
-        self.q3 = sorted_vals[min(n - 1, 3 * n // 4)]
-        self.last_updated = time.time()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name[:20],
-            "mean": round(self.mean, 3),
-            "std": round(self.std_dev, 3),
-            "iqr": round(self.iqr, 3),
-            "samples": len(self.values),
+            "endpoint": self.endpoint[:25],
+            "expected": round(self.expected_value, 1),
+            "actual": round(self.actual_value, 1),
+            "z_score": round(self.z_score, 2),
         }
 
 
 class AnomalyDetector:
-    """Identifies unusual patterns in findings and behavior.
+    """Behavioral anomaly detection for vulnerability discovery.
 
-    Learns baselines from normal behavior and flags
-    deviations using statistical and heuristic methods.
+    Establishes baselines for endpoint behavior and detects
+    deviations that may indicate vulnerabilities:
+    - Slow responses → potential injection
+    - Size changes → content injection/information disclosure
+    - Error spikes → input validation issues
+    - Content differences → dynamic behavior
     """
 
     def __init__(
         self,
-        z_threshold: float = 2.5,
-        min_baseline_samples: int = 10,
-        max_baseline_samples: int = 200,
+        z_threshold: float = 3.0,
+        min_samples: int = 5,
     ) -> None:
         self._baselines: dict[str, Baseline] = {}
+        self._observations: dict[str, list[Observation]] = defaultdict(list)
         self._anomalies: list[Anomaly] = []
-        self._anomaly_counter = 0
+        self._counter = 0
         self._z_threshold = z_threshold
-        self._min_baseline = min_baseline_samples
-        self._max_baseline = max_baseline_samples
+        self._min_samples = min_samples
         self._log = logger.bind(component="anomaly_detector")
 
-    def observe(self, name: str, value: float) -> Anomaly | None:
-        """Observe a data point and check for anomalies."""
-        baseline = self._get_or_create_baseline(name)
+    def observe(self, observation: Observation) -> list[Anomaly]:
+        """Record an observation and check for anomalies."""
+        endpoint = observation.endpoint
+        self._observations[endpoint].append(observation)
 
-        baseline.values.append(value)
-        if len(baseline.values) > self._max_baseline:
-            baseline.values = baseline.values[-self._max_baseline:]
-        baseline.update()
+        # Update baseline
+        self._update_baseline(endpoint, observation)
 
-        # Need enough data for detection
-        if len(baseline.values) < self._min_baseline:
-            return None
+        # Check for anomalies
+        anomalies = []
+        baseline = self._baselines.get(endpoint)
+        if baseline and baseline.sample_count >= self._min_samples:
+            anomalies = self._check_anomalies(observation, baseline)
+            self._anomalies.extend(anomalies)
 
-        # Z-score detection
-        z = baseline.z_score(value)
-        if abs(z) > self._z_threshold:
-            return self._create_anomaly(
-                anomaly_type=AnomalyType.STATISTICAL,
-                description=f"{name} z-score={z:.2f} exceeds threshold",
-                metric_name=name,
-                observed_value=value,
-                expected_range=(baseline.mean - 2 * baseline.std_dev,
-                                baseline.mean + 2 * baseline.std_dev),
-                deviation_score=abs(z),
-            )
+        return anomalies
 
-        # IQR detection
-        if baseline.is_outlier_iqr(value):
-            return self._create_anomaly(
-                anomaly_type=AnomalyType.STATISTICAL,
-                description=f"{name} outside IQR fences",
-                metric_name=name,
-                observed_value=value,
-                expected_range=(baseline.lower_fence, baseline.upper_fence),
-                deviation_score=abs(z),
-            )
+    def _update_baseline(self, endpoint: str, obs: Observation) -> None:
+        """Update baseline statistics with Welford's online algorithm."""
+        if endpoint not in self._baselines:
+            self._baselines[endpoint] = Baseline(endpoint=endpoint)
 
-        return None
+        bl = self._baselines[endpoint]
+        bl.sample_count += 1
+        n = bl.sample_count
 
-    def detect_temporal_anomaly(
+        # Welford's for response time
+        delta = obs.response_time_ms - bl.avg_response_time_ms
+        bl.avg_response_time_ms += delta / n
+        delta2 = obs.response_time_ms - bl.avg_response_time_ms
+        if n > 1:
+            variance = ((n - 2) / (n - 1)) * (bl.std_response_time_ms ** 2) + (delta * delta2) / n
+            bl.std_response_time_ms = math.sqrt(max(0, variance))
+
+        # Welford's for response size
+        delta_s = obs.response_size - bl.avg_response_size
+        bl.avg_response_size += delta_s / n
+        delta2_s = obs.response_size - bl.avg_response_size
+        if n > 1:
+            variance_s = ((n - 2) / (n - 1)) * (bl.std_response_size ** 2) + (delta_s * delta2_s) / n
+            bl.std_response_size = math.sqrt(max(0, variance_s))
+
+        # Min/max
+        bl.min_time = min(bl.min_time, obs.response_time_ms)
+        bl.max_time = max(bl.max_time, obs.response_time_ms)
+        bl.min_size = min(bl.min_size, obs.response_size)
+        bl.max_size = max(bl.max_size, obs.response_size)
+
+        # Status codes
+        bl.common_status_codes[obs.status_code] = bl.common_status_codes.get(obs.status_code, 0) + 1
+
+        # Content hashes
+        if obs.content_hash:
+            bl.content_hashes.add(obs.content_hash)
+
+    def _check_anomalies(
         self,
-        name: str,
-        timestamps: list[float],
-    ) -> Anomaly | None:
-        """Detect timing anomalies (irregular intervals)."""
-        if len(timestamps) < 3:
-            return None
+        obs: Observation,
+        baseline: Baseline,
+    ) -> list[Anomaly]:
+        """Check observation against baseline for anomalies."""
+        anomalies = []
 
-        intervals = [
-            timestamps[i + 1] - timestamps[i]
-            for i in range(len(timestamps) - 1)
-        ]
+        # Response time anomaly
+        if baseline.std_response_time_ms > 0:
+            z_time = (obs.response_time_ms - baseline.avg_response_time_ms) / baseline.std_response_time_ms
+            if abs(z_time) > self._z_threshold:
+                self._counter += 1
+                severity = self._z_to_severity(abs(z_time))
+                anomalies.append(Anomaly(
+                    anomaly_id=f"anom-{self._counter}",
+                    anomaly_type=AnomalyType.RESPONSE_TIME,
+                    severity=severity,
+                    endpoint=obs.endpoint,
+                    description=f"Response time {obs.response_time_ms:.0f}ms vs baseline {baseline.avg_response_time_ms:.0f}ms",
+                    expected_value=baseline.avg_response_time_ms,
+                    actual_value=obs.response_time_ms,
+                    z_score=z_time,
+                    observation=obs,
+                ))
 
-        if not intervals:
-            return None
+        # Response size anomaly
+        if baseline.std_response_size > 0:
+            z_size = (obs.response_size - baseline.avg_response_size) / baseline.std_response_size
+            if abs(z_size) > self._z_threshold:
+                self._counter += 1
+                severity = self._z_to_severity(abs(z_size))
+                anomalies.append(Anomaly(
+                    anomaly_id=f"anom-{self._counter}",
+                    anomaly_type=AnomalyType.RESPONSE_SIZE,
+                    severity=severity,
+                    endpoint=obs.endpoint,
+                    description=f"Response size {obs.response_size}B vs baseline {baseline.avg_response_size:.0f}B",
+                    expected_value=baseline.avg_response_size,
+                    actual_value=obs.response_size,
+                    z_score=z_size,
+                    observation=obs,
+                ))
 
-        mean_interval = sum(intervals) / len(intervals)
-        if mean_interval == 0:
-            return None
+        # Status code anomaly
+        total_codes = sum(baseline.common_status_codes.values())
+        code_freq = baseline.common_status_codes.get(obs.status_code, 0) / max(1, total_codes)
+        if code_freq < 0.05 and baseline.sample_count >= 10:
+            self._counter += 1
+            anomalies.append(Anomaly(
+                anomaly_id=f"anom-{self._counter}",
+                anomaly_type=AnomalyType.STATUS_CODE,
+                severity=AnomalySeverity.MEDIUM,
+                endpoint=obs.endpoint,
+                description=f"Unusual status code {obs.status_code} (seen {code_freq:.0%} of the time)",
+                expected_value=200,
+                actual_value=obs.status_code,
+                observation=obs,
+            ))
 
-        latest_interval = intervals[-1]
-        ratio = latest_interval / mean_interval
+        # Content difference
+        if obs.content_hash and obs.content_hash not in baseline.content_hashes:
+            self._counter += 1
+            anomalies.append(Anomaly(
+                anomaly_id=f"anom-{self._counter}",
+                anomaly_type=AnomalyType.CONTENT_DIFF,
+                severity=AnomalySeverity.LOW,
+                endpoint=obs.endpoint,
+                description="Response content differs from all previous responses",
+                observation=obs,
+            ))
 
-        # More than 3x or less than 0.3x normal interval
-        if ratio > 3.0 or ratio < 0.3:
-            return self._create_anomaly(
-                anomaly_type=AnomalyType.TEMPORAL,
-                description=f"{name} interval {ratio:.1f}x normal",
-                metric_name=name,
-                observed_value=latest_interval,
-                expected_range=(mean_interval * 0.5, mean_interval * 2.0),
-                deviation_score=abs(ratio - 1.0),
-            )
+        # Error detection
+        if obs.error and obs.status_code >= 500:
+            self._counter += 1
+            anomalies.append(Anomaly(
+                anomaly_id=f"anom-{self._counter}",
+                anomaly_type=AnomalyType.ERROR_SPIKE,
+                severity=AnomalySeverity.HIGH,
+                endpoint=obs.endpoint,
+                description=f"Server error: {obs.error[:50]}",
+                observation=obs,
+            ))
 
-        return None
+        return anomalies
 
-    def detect_behavioral_anomaly(
+    def _z_to_severity(self, z: float) -> AnomalySeverity:
+        """Convert Z-score to severity."""
+        if z > 6:
+            return AnomalySeverity.CRITICAL
+        if z > 4:
+            return AnomalySeverity.HIGH
+        if z > 3:
+            return AnomalySeverity.MEDIUM
+        return AnomalySeverity.LOW
+
+    def get_baseline(self, endpoint: str) -> Baseline | None:
+        """Get baseline for an endpoint."""
+        return self._baselines.get(endpoint)
+
+    def get_anomalies(
         self,
-        agent_id: str,
-        action_distribution: dict[str, int],
-        baseline_distribution: dict[str, int],
-    ) -> Anomaly | None:
-        """Detect behavioral shift in agent action patterns."""
-        all_actions = set(action_distribution) | set(baseline_distribution)
-        if not all_actions:
-            return None
-
-        total_current = sum(action_distribution.values())
-        total_baseline = sum(baseline_distribution.values())
-
-        if total_current == 0 or total_baseline == 0:
-            return None
-
-        # Chi-squared-like divergence
-        divergence = 0.0
-        for action in all_actions:
-            p_current = action_distribution.get(action, 0) / total_current
-            p_baseline = baseline_distribution.get(action, 0) / total_baseline
-            if p_baseline > 0:
-                divergence += abs(p_current - p_baseline) / p_baseline
-
-        if divergence > 1.0:  # Significant behavioral shift
-            return self._create_anomaly(
-                anomaly_type=AnomalyType.BEHAVIORAL,
-                description=f"Agent {agent_id} behavior shift (divergence={divergence:.2f})",
-                metric_name=f"behavior:{agent_id}",
-                observed_value=divergence,
-                expected_range=(0.0, 1.0),
-                deviation_score=divergence,
-            )
-
-        return None
-
-    def _create_anomaly(
-        self,
-        anomaly_type: AnomalyType,
-        description: str,
-        metric_name: str,
-        observed_value: float,
-        expected_range: tuple[float, float],
-        deviation_score: float,
-    ) -> Anomaly:
-        """Create and store an anomaly."""
-        self._anomaly_counter += 1
-
-        # Determine severity from deviation
-        if deviation_score > 5.0:
-            severity = AnomalySeverity.CRITICAL
-        elif deviation_score > 3.0:
-            severity = AnomalySeverity.HIGH
-        elif deviation_score > 2.0:
-            severity = AnomalySeverity.MEDIUM
-        else:
-            severity = AnomalySeverity.LOW
-
-        anomaly = Anomaly(
-            anomaly_id=f"anom-{self._anomaly_counter}",
-            anomaly_type=anomaly_type,
-            severity=severity,
-            description=description,
-            metric_name=metric_name,
-            observed_value=observed_value,
-            expected_range=expected_range,
-            deviation_score=deviation_score,
-        )
-
-        self._anomalies.append(anomaly)
-        if len(self._anomalies) > 500:
-            self._anomalies = self._anomalies[-500:]
-
-        return anomaly
-
-    def _get_or_create_baseline(self, name: str) -> Baseline:
-        if name not in self._baselines:
-            self._baselines[name] = Baseline(name=name)
-        return self._baselines[name]
-
-    def get_recent_anomalies(self, limit: int = 10) -> list[dict[str, Any]]:
-        return [a.to_dict() for a in self._anomalies[-limit:]]
-
-    def get_baselines(self) -> list[dict[str, Any]]:
-        return [b.to_dict() for b in self._baselines.values()]
+        endpoint: str = "",
+        anomaly_type: AnomalyType | None = None,
+        severity: AnomalySeverity | None = None,
+    ) -> list[Anomaly]:
+        """Get detected anomalies with optional filtering."""
+        results = self._anomalies
+        if endpoint:
+            results = [a for a in results if a.endpoint == endpoint]
+        if anomaly_type:
+            results = [a for a in results if a.anomaly_type == anomaly_type]
+        if severity:
+            results = [a for a in results if a.severity == severity]
+        return results
 
     def get_stats(self) -> dict[str, Any]:
-        sev_counts: dict[str, int] = defaultdict(int)
+        type_counts: dict[str, int] = defaultdict(int)
+        severity_counts: dict[str, int] = defaultdict(int)
         for a in self._anomalies:
-            sev_counts[a.severity.value] += 1
+            type_counts[a.anomaly_type.value] += 1
+            severity_counts[a.severity.value] += 1
+
         return {
             "baselines": len(self._baselines),
+            "total_observations": sum(len(obs) for obs in self._observations.values()),
             "anomalies": len(self._anomalies),
-            "by_severity": dict(sev_counts),
+            "by_type": dict(type_counts),
+            "by_severity": dict(severity_counts),
         }
