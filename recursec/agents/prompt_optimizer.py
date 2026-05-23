@@ -1,24 +1,21 @@
-"""Prompt optimization engine — learns which prompts work best.
+"""Prompt optimizer — learns and optimizes prompt structures for better LLM responses.
 
-Tracks prompt performance and iteratively improves them:
-1. A/B testing of prompt variants
-2. Performance tracking per prompt template
-3. Dynamic variable injection optimization
-4. Model-specific prompt formatting
-5. Temperature and parameter tuning
-6. Few-shot example selection
-7. Prompt compression for token efficiency
-8. Chain-of-thought vs. direct prompting selection
+Implements:
+1. Prompt variant generation
+2. A/B testing of prompts
+3. Prompt performance tracking
+4. Automatic prompt selection
+5. Few-shot example curation
+6. System prompt tuning
+7. Temperature/parameter optimization
+8. Prompt chain optimization
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
+import random
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -28,350 +25,248 @@ logger = structlog.get_logger()
 
 @dataclass
 class PromptVariant:
-    """A variant of a prompt template for A/B testing."""
+    """A variant of a prompt for testing."""
     variant_id: str = ""
     template: str = ""
-    variables: list[str] = field(default_factory=list)
-    model_preference: str = ""
-    temperature: float = 0.2
-    max_tokens: int = 1024
-    system_message: str = ""
+    system_prompt: str = ""
+    temperature: float = 0.7
+    max_tokens: int = 2048
     few_shot_examples: list[dict[str, str]] = field(default_factory=list)
-
-    # Performance tracking
-    times_used: int = 0
-    total_quality: float = 0.0
-    avg_quality: float = 0.0
-    avg_latency_ms: float = 0.0
-    avg_tokens_used: int = 0
-    success_rate: float = 0.5
+    uses: int = 0
+    total_reward: float = 0.0
+    avg_reward: float = 0.0
+    avg_latency_s: float = 0.0
+    avg_output_quality: float = 0.5
+    created_at: float = field(default_factory=time.time)
 
     @property
-    def confidence(self) -> float:
-        """Confidence in quality estimate based on sample size."""
-        return min(1.0, self.times_used / 20)
-
-    @property
-    def ucb_score(self) -> float:
-        """Upper confidence bound for variant selection."""
-        if self.times_used == 0:
-            return float("inf")
-        exploitation = self.avg_quality
-        exploration = (2 * (1 + self.times_used) / self.times_used) ** 0.5
-        return exploitation + 0.5 * exploration
+    def score(self) -> float:
+        if self.uses == 0:
+            return 0.5  # Prior
+        return self.avg_reward * 0.6 + self.avg_output_quality * 0.4
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.variant_id,
-            "template_preview": self.template[:100],
-            "times_used": self.times_used,
-            "avg_quality": round(self.avg_quality, 3),
-            "success_rate": round(self.success_rate, 3),
-            "avg_latency_ms": round(self.avg_latency_ms, 1),
-            "confidence": round(self.confidence, 2),
+            "template": self.template[:40],
+            "temp": self.temperature,
+            "uses": self.uses,
+            "score": round(self.score, 3),
+            "avg_reward": round(self.avg_reward, 3),
+            "quality": round(self.avg_output_quality, 3),
         }
 
 
 @dataclass
 class PromptExperiment:
-    """An A/B test experiment for prompt optimization."""
+    """An A/B test experiment."""
     experiment_id: str = ""
     name: str = ""
     task_type: str = ""
-    variants: list[PromptVariant] = field(default_factory=list)
-    winner: str = ""            # variant_id of winner
-    min_samples: int = 10       # Min samples before declaring winner
-    created_at: float = field(default_factory=time.time)
-    completed: bool = False
+    variants: list[str] = field(default_factory=list)  # variant IDs
+    winner_id: str = ""
+    min_samples: int = 10
+    started_at: float = field(default_factory=time.time)
+    concluded_at: float = 0.0
+
+    @property
+    def is_concluded(self) -> bool:
+        return self.concluded_at > 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.experiment_id,
-            "name": self.name,
-            "task_type": self.task_type,
+            "name": self.name[:40],
+            "task": self.task_type[:20],
             "variants": len(self.variants),
-            "winner": self.winner,
-            "completed": self.completed,
+            "concluded": self.is_concluded,
+            "winner": self.winner_id[:15],
         }
 
 
-@dataclass
-class FewShotExample:
-    """A few-shot example for prompt injection."""
-    example_id: str = ""
-    task_type: str = ""
-    input_text: str = ""
-    output_text: str = ""
-    quality_score: float = 0.5
-    times_used: int = 0
-    avg_outcome: float = 0.5
+# ── Prompt Templates ──────────────────────────────────────────
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.example_id,
-            "type": self.task_type,
-            "quality": round(self.quality_score, 2),
-            "used": self.times_used,
-            "input_preview": self.input_text[:50],
-        }
+BASE_SYSTEM_PROMPTS: dict[str, list[str]] = {
+    "security_analysis": [
+        "You are an expert security analyst. Analyze the following data and identify potential vulnerabilities, their severity, and recommended mitigations.",
+        "As a senior penetration tester, examine the provided information. Focus on critical and high-severity findings. Be precise and evidence-based.",
+        "You are a vulnerability researcher. Given the following security scan results, provide a structured analysis with risk ratings and exploitation potential.",
+    ],
+    "recon": [
+        "You are a reconnaissance specialist. Plan the next steps for information gathering on the target. Prioritize by expected value of information.",
+        "As an attack surface analyst, examine the target information and identify additional areas to investigate. Focus on high-value assets.",
+    ],
+    "planning": [
+        "You are a security assessment planner. Create a comprehensive test plan based on the current findings. Include tool selection, ordering, and expected outcomes.",
+        "As a senior security architect, design the optimal testing strategy. Consider stealth, thoroughness, and time constraints.",
+    ],
+    "validation": [
+        "You are a security finding validator. Verify whether the reported vulnerability is a true positive. Request additional evidence if needed.",
+        "As a QA security analyst, cross-reference the finding against known patterns. Assess confidence level and suggest confirmation steps.",
+    ],
+}
 
 
 class PromptOptimizer:
-    """Learns which prompts work best through experimentation.
+    """Learns and optimizes prompt structures for better LLM responses.
 
-    Tracks performance of prompt variants, runs A/B tests,
-    and continuously improves prompt quality.
+    Uses A/B testing and reward tracking to find
+    the most effective prompts for each task type.
     """
 
-    def __init__(self, storage_dir: str = "data/prompt_optimization") -> None:
-        self._storage_dir = Path(storage_dir)
-        self._storage_dir.mkdir(parents=True, exist_ok=True)
-
+    def __init__(self) -> None:
+        self._variants: dict[str, PromptVariant] = {}
         self._experiments: dict[str, PromptExperiment] = {}
-        self._active_variants: dict[str, list[PromptVariant]] = defaultdict(list)
-        self._few_shot_library: dict[str, list[FewShotExample]] = defaultdict(list)
-        self._performance_history: list[dict[str, Any]] = []
-
+        self._task_best: dict[str, str] = {}  # task_type -> best variant_id
+        self._variant_counter = 0
+        self._experiment_counter = 0
         self._log = logger.bind(component="prompt_optimizer")
-        self._load()
 
-    def register_variants(
+        self._initialize_defaults()
+
+    def _initialize_defaults(self) -> None:
+        """Create default prompt variants from templates."""
+        for task_type, prompts in BASE_SYSTEM_PROMPTS.items():
+            for i, prompt in enumerate(prompts):
+                self._variant_counter += 1
+                variant = PromptVariant(
+                    variant_id=f"pv-{self._variant_counter}",
+                    template=f"{task_type}_v{i+1}",
+                    system_prompt=prompt,
+                    temperature=0.7 - i * 0.1,  # Vary temperature
+                )
+                self._variants[variant.variant_id] = variant
+
+    def select_prompt(
         self,
         task_type: str,
-        variants: list[PromptVariant],
-        experiment_name: str = "",
-    ) -> str:
-        """Register prompt variants for A/B testing."""
-        exp_id = hashlib.md5(f"{task_type}:{time.time()}".encode()).hexdigest()[:10]
-        experiment = PromptExperiment(
-            experiment_id=exp_id,
-            name=experiment_name or f"{task_type}_experiment",
-            task_type=task_type,
-            variants=variants,
-        )
-        self._experiments[exp_id] = experiment
-        self._active_variants[task_type].extend(variants)
-        return exp_id
+    ) -> PromptVariant | None:
+        """Select the best prompt for a task type."""
+        # If we have a known best, use it most of the time
+        best_id = self._task_best.get(task_type)
+        if best_id and random.random() > 0.1:  # 90% exploit
+            return self._variants.get(best_id)
 
-    def select_variant(self, task_type: str) -> PromptVariant | None:
-        """Select the best prompt variant for a task type using UCB."""
-        variants = self._active_variants.get(task_type, [])
-        if not variants:
+        # Otherwise explore
+        candidates = [
+            v for v in self._variants.values()
+            if task_type in v.template
+        ]
+
+        if not candidates:
             return None
 
-        # Use UCB to balance exploration/exploitation
-        return max(variants, key=lambda v: v.ucb_score)
+        # UCB1-like selection
+        return max(candidates, key=lambda v: v.score)
 
-    def record_result(
+    def create_variant(
+        self,
+        template: str,
+        system_prompt: str,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        few_shot_examples: list[dict[str, str]] | None = None,
+    ) -> PromptVariant:
+        """Create a new prompt variant."""
+        self._variant_counter += 1
+        variant = PromptVariant(
+            variant_id=f"pv-{self._variant_counter}",
+            template=template,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            few_shot_examples=few_shot_examples or [],
+        )
+        self._variants[variant.variant_id] = variant
+        return variant
+
+    def record_outcome(
         self,
         variant_id: str,
-        quality: float,
-        latency_ms: float = 0,
-        tokens_used: int = 0,
-        success: bool = True,
+        reward: float,
+        output_quality: float = 0.5,
+        latency_s: float = 0.0,
     ) -> None:
-        """Record the result of using a prompt variant."""
-        for variants in self._active_variants.values():
-            for variant in variants:
-                if variant.variant_id == variant_id:
-                    variant.times_used += 1
-                    variant.total_quality += quality
-                    variant.avg_quality = variant.total_quality / variant.times_used
-
-                    if latency_ms > 0:
-                        n = variant.times_used
-                        variant.avg_latency_ms = (
-                            variant.avg_latency_ms * (n - 1) + latency_ms
-                        ) / n
-
-                    if tokens_used > 0:
-                        variant.avg_tokens_used = (
-                            (variant.avg_tokens_used * (variant.times_used - 1) + tokens_used)
-                            // variant.times_used
-                        )
-
-                    total = variant.times_used
-                    successes = variant.success_rate * (total - 1) + (1.0 if success else 0.0)
-                    variant.success_rate = successes / total
-
-                    self._performance_history.append({
-                        "variant": variant_id,
-                        "quality": quality,
-                        "success": success,
-                        "timestamp": time.time(),
-                    })
-                    break
-
-        # Check if any experiments can be resolved
-        self._check_experiments()
-
-    def get_best_variant(self, task_type: str) -> PromptVariant | None:
-        """Get the best performing variant for a task type."""
-        variants = self._active_variants.get(task_type, [])
-        if not variants:
-            return None
-
-        # Only consider variants with enough samples
-        confident = [v for v in variants if v.times_used >= 5]
-        if not confident:
-            return variants[0]  # Not enough data, return first
-
-        return max(confident, key=lambda v: v.avg_quality)
-
-    # ── Few-Shot Example Management ──────────────────────
-
-    def add_few_shot(
-        self,
-        task_type: str,
-        input_text: str,
-        output_text: str,
-        quality_score: float = 0.5,
-    ) -> str:
-        """Add a few-shot example to the library."""
-        example_id = hashlib.md5(
-            f"{task_type}:{input_text[:50]}".encode()
-        ).hexdigest()[:10]
-
-        example = FewShotExample(
-            example_id=example_id,
-            task_type=task_type,
-            input_text=input_text,
-            output_text=output_text,
-            quality_score=quality_score,
-        )
-
-        self._few_shot_library[task_type].append(example)
-        return example_id
-
-    def get_few_shots(
-        self,
-        task_type: str,
-        max_examples: int = 3,
-    ) -> list[FewShotExample]:
-        """Get the best few-shot examples for a task type."""
-        examples = self._few_shot_library.get(task_type, [])
-        if not examples:
-            return []
-
-        # Sort by quality, prefer less-used examples for diversity
-        scored = []
-        for ex in examples:
-            usage_penalty = min(1.0, ex.times_used * 0.1)
-            score = ex.quality_score * (1 - usage_penalty * 0.3)
-            scored.append((ex, score))
-
-        scored.sort(key=lambda x: -x[1])
-        selected = [ex for ex, _ in scored[:max_examples]]
-
-        for ex in selected:
-            ex.times_used += 1
-
-        return selected
-
-    # ── Prompt Compression ───────────────────────────────
-
-    def compress_prompt(self, text: str, target_tokens: int) -> str:
-        """Compress a prompt to fit within a token budget."""
-        current_tokens = len(text.split()) * 2  # Rough estimate
-
-        if current_tokens <= target_tokens:
-            return text
-
-        # Strategy 1: Remove redundant whitespace
-        lines = text.split("\n")
-        lines = [line.strip() for line in lines if line.strip()]
-        text = "\n".join(lines)
-
-        # Strategy 2: Truncate verbose sections
-        if len(text.split()) * 2 > target_tokens:
-            max_chars = target_tokens * 3
-            text = text[:max_chars] + "\n[... truncated for token budget]"
-
-        return text
-
-    # ── Persistence ──────────────────────────────────────
-
-    def save(self) -> None:
-        """Persist optimization state."""
-        try:
-            data = {
-                "variants": {
-                    task_type: [
-                        {
-                            "id": v.variant_id,
-                            "template": v.template[:500],
-                            "times_used": v.times_used,
-                            "avg_quality": v.avg_quality,
-                            "success_rate": v.success_rate,
-                        }
-                        for v in variants
-                    ]
-                    for task_type, variants in self._active_variants.items()
-                },
-                "few_shots": {
-                    task_type: [e.to_dict() for e in examples[:20]]
-                    for task_type, examples in self._few_shot_library.items()
-                },
-            }
-            path = self._storage_dir / "optimizer_state.json"
-            path.write_text(json.dumps(data))
-        except OSError as e:
-            self._log.warning("save_failed", error=str(e))
-
-    def _load(self) -> None:
-        """Load persisted state."""
-        path = self._storage_dir / "optimizer_state.json"
-        if not path.exists():
+        """Record the outcome of using a prompt variant."""
+        variant = self._variants.get(variant_id)
+        if not variant:
             return
-        try:
-            data = json.loads(path.read_text())
-            # Restore variant stats
-            for task_type, variants_data in data.get("variants", {}).items():
-                for v_data in variants_data:
-                    variant = PromptVariant(
-                        variant_id=v_data.get("id", ""),
-                        template=v_data.get("template", ""),
-                        times_used=v_data.get("times_used", 0),
-                        avg_quality=v_data.get("avg_quality", 0),
-                        success_rate=v_data.get("success_rate", 0.5),
-                    )
-                    if variant.times_used > 0:
-                        variant.total_quality = variant.avg_quality * variant.times_used
-                    self._active_variants[task_type].append(variant)
-        except (json.JSONDecodeError, OSError):
-            pass
 
-    def _check_experiments(self) -> None:
-        """Check if any experiments have enough data to declare a winner."""
-        for exp in self._experiments.values():
-            if exp.completed:
-                continue
+        variant.uses += 1
+        variant.total_reward += reward
 
-            all_ready = all(
-                v.times_used >= exp.min_samples for v in exp.variants
-            )
-            if not all_ready:
-                continue
+        # Running averages
+        n = variant.uses
+        variant.avg_reward += (reward - variant.avg_reward) / n
+        variant.avg_output_quality += (output_quality - variant.avg_output_quality) / n
+        if latency_s > 0:
+            variant.avg_latency_s += (latency_s - variant.avg_latency_s) / n
 
-            # Declare winner
-            best = max(exp.variants, key=lambda v: v.avg_quality)
-            exp.winner = best.variant_id
-            exp.completed = True
+        # Check if this variant is now the best for its task type
+        task_type = variant.template.rsplit("_", 1)[0]
+        current_best_id = self._task_best.get(task_type)
+        if current_best_id:
+            current_best = self._variants.get(current_best_id)
+            if current_best and variant.score > current_best.score and variant.uses >= 5:
+                self._task_best[task_type] = variant_id
+        elif variant.uses >= 5:
+            self._task_best[task_type] = variant_id
 
-            self._log.info(
-                "experiment_complete",
-                experiment=exp.experiment_id,
-                winner=best.variant_id,
-                quality=round(best.avg_quality, 3),
-            )
+    def create_experiment(
+        self,
+        name: str,
+        task_type: str,
+        variant_ids: list[str],
+        min_samples: int = 10,
+    ) -> PromptExperiment:
+        """Create an A/B test experiment."""
+        self._experiment_counter += 1
+        experiment = PromptExperiment(
+            experiment_id=f"exp-{self._experiment_counter}",
+            name=name,
+            task_type=task_type,
+            variants=variant_ids,
+            min_samples=min_samples,
+        )
+        self._experiments[experiment.experiment_id] = experiment
+        return experiment
+
+    def check_experiment(self, experiment_id: str) -> PromptExperiment | None:
+        """Check if an experiment can be concluded."""
+        experiment = self._experiments.get(experiment_id)
+        if not experiment or experiment.is_concluded:
+            return experiment
+
+        variants = [
+            self._variants.get(vid)
+            for vid in experiment.variants
+        ]
+        variants = [v for v in variants if v is not None]
+
+        # All variants need minimum samples
+        if all(v.uses >= experiment.min_samples for v in variants):
+            winner = max(variants, key=lambda v: v.score)
+            experiment.winner_id = winner.variant_id
+            experiment.concluded_at = time.time()
+            self._task_best[experiment.task_type] = winner.variant_id
+
+        return experiment
+
+    def get_best_prompts(self) -> dict[str, dict[str, Any]]:
+        """Get the best prompt for each task type."""
+        result = {}
+        for task_type, variant_id in self._task_best.items():
+            variant = self._variants.get(variant_id)
+            if variant:
+                result[task_type] = variant.to_dict()
+        return result
 
     def get_stats(self) -> dict[str, Any]:
-        total_variants = sum(len(v) for v in self._active_variants.values())
+        total_uses = sum(v.uses for v in self._variants.values())
         return {
+            "variants": len(self._variants),
             "experiments": len(self._experiments),
-            "completed_experiments": sum(1 for e in self._experiments.values() if e.completed),
-            "total_variants": total_variants,
-            "task_types": list(self._active_variants.keys()),
-            "few_shot_examples": sum(len(v) for v in self._few_shot_library.values()),
-            "performance_records": len(self._performance_history),
+            "concluded": sum(1 for e in self._experiments.values() if e.is_concluded),
+            "total_uses": total_uses,
+            "known_best": len(self._task_best),
         }
