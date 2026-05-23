@@ -1,20 +1,17 @@
-"""Prompt compiler — builds optimal prompts for LLM agents.
+"""Prompt compiler — assembles dynamic prompts for LLMs.
 
 Implements:
-1. Dynamic system prompt construction
-2. Knowledge base injection into prompts
-3. Context window management
-4. Token budget allocation
-5. Tool documentation injection
-6. Finding context injection
-7. Prompt templating and composition
-8. Model-specific prompt formatting
+1. System prompt construction per model
+2. Context injection from knowledge bases
+3. Token-budget-aware truncation
+4. Model-specific format templates
+5. Dynamic few-shot example selection
+6. Role-specific prompt assembly
+7. Tool documentation injection
 """
 
 from __future__ import annotations
 
-import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -24,37 +21,33 @@ import structlog
 logger = structlog.get_logger()
 
 
+class PromptFormat(str, Enum):
+    CHATML = "chatml"           # <|im_start|> format
+    LLAMA = "llama"             # [INST] format
+    MISTRAL = "mistral"         # [INST] format (Mistral variant)
+    PHI = "phi"                 # <|system|> format
+    DEEPSEEK = "deepseek"       # DeepSeek format
+    PLAIN = "plain"             # No special tokens
+
+
 class PromptSection(str, Enum):
     SYSTEM = "system"
     ROLE = "role"
-    GOAL = "goal"
     CONTEXT = "context"
     KNOWLEDGE = "knowledge"
     TOOLS = "tools"
-    FINDINGS = "findings"
+    TASK = "task"
     CONSTRAINTS = "constraints"
     EXAMPLES = "examples"
     HISTORY = "history"
-    OUTPUT_FORMAT = "output_format"
-
-
-class ModelFormat(str, Enum):
-    CHATML = "chatml"
-    LLAMA = "llama"
-    MISTRAL = "mistral"
-    ALPACA = "alpaca"
-    VICUNA = "vicuna"
-    PHI = "phi"
-    DEEPSEEK = "deepseek"
-    GENERIC = "generic"
 
 
 @dataclass
 class PromptBlock:
-    """A block of content in a prompt."""
-    section: PromptSection = PromptSection.CONTEXT
+    """A block of content for prompt assembly."""
+    section: PromptSection = PromptSection.SYSTEM
     content: str = ""
-    priority: int = 5            # 1-10, higher = more important
+    priority: int = 0       # Higher = more important
     token_estimate: int = 0
     required: bool = False
 
@@ -69,266 +62,195 @@ class PromptBlock:
 
 @dataclass
 class CompiledPrompt:
-    """A compiled prompt ready for LLM submission."""
-    model: str = ""
+    """A fully compiled prompt."""
     system_prompt: str = ""
     user_prompt: str = ""
+    format_used: PromptFormat = PromptFormat.CHATML
     total_tokens_estimate: int = 0
     sections_included: list[str] = field(default_factory=list)
     sections_dropped: list[str] = field(default_factory=list)
-    compiled_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model[:15],
-            "tokens": self.total_tokens_estimate,
+            "format": self.format_used.value,
+            "tokens_est": self.total_tokens_estimate,
             "included": len(self.sections_included),
             "dropped": len(self.sections_dropped),
         }
 
 
-# ── Model format templates ───────────────────────────────────
+# ── Model format mappings ────────────────────────────────────
 
-FORMAT_TEMPLATES: dict[str, dict[str, str]] = {
-    "chatml": {
-        "system_prefix": "<|im_start|>system\n",
-        "system_suffix": "<|im_end|>\n",
-        "user_prefix": "<|im_start|>user\n",
-        "user_suffix": "<|im_end|>\n",
-        "assistant_prefix": "<|im_start|>assistant\n",
-        "assistant_suffix": "<|im_end|>\n",
-    },
-    "llama": {
-        "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
-        "system_suffix": "<|eot_id|>\n",
-        "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
-        "user_suffix": "<|eot_id|>\n",
-        "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
-        "assistant_suffix": "<|eot_id|>\n",
-    },
-    "mistral": {
-        "system_prefix": "[INST] ",
-        "system_suffix": " [/INST]\n",
-        "user_prefix": "[INST] ",
-        "user_suffix": " [/INST]\n",
-        "assistant_prefix": "",
-        "assistant_suffix": "</s>\n",
-    },
-    "phi": {
-        "system_prefix": "<|system|>\n",
-        "system_suffix": "<|end|>\n",
-        "user_prefix": "<|user|>\n",
-        "user_suffix": "<|end|>\n",
-        "assistant_prefix": "<|assistant|>\n",
-        "assistant_suffix": "<|end|>\n",
-    },
-    "deepseek": {
-        "system_prefix": "<|begin▁of▁sentence|>",
-        "system_suffix": "\n",
-        "user_prefix": "User: ",
-        "user_suffix": "\n",
-        "assistant_prefix": "Assistant: ",
-        "assistant_suffix": "\n",
-    },
-    "generic": {
-        "system_prefix": "### System:\n",
-        "system_suffix": "\n",
-        "user_prefix": "### User:\n",
-        "user_suffix": "\n",
-        "assistant_prefix": "### Assistant:\n",
-        "assistant_suffix": "\n",
-    },
+MODEL_FORMATS: dict[str, PromptFormat] = {
+    "whiterabbitneo-7b": PromptFormat.CHATML,
+    "qwen-coder-14b": PromptFormat.CHATML,
+    "qwen-coder-7b": PromptFormat.CHATML,
+    "deepseek-r1-7b": PromptFormat.DEEPSEEK,
+    "deepseek-math-7b": PromptFormat.DEEPSEEK,
+    "hermes-14b": PromptFormat.CHATML,
+    "llama-3.1-8b": PromptFormat.LLAMA,
+    "dolphin-8b": PromptFormat.CHATML,
+    "mistral-7b": PromptFormat.MISTRAL,
+    "codellama-13b": PromptFormat.LLAMA,
+    "codellama-7b": PromptFormat.LLAMA,
+    "yi-9b-200k": PromptFormat.CHATML,
+    "phi-3.5-mini": PromptFormat.PHI,
+    "nomic-embed": PromptFormat.PLAIN,
+    "llama-guard-3": PromptFormat.LLAMA,
+    "functiongemma": PromptFormat.PLAIN,
 }
 
-# ── Model→Format mapping ─────────────────────────────────────
 
-MODEL_FORMATS: dict[str, str] = {
-    "whiterabbitneo-7b": "chatml",
-    "qwen-coder-14b": "chatml",
-    "qwen-coder-7b": "chatml",
-    "deepseek-r1-7b": "deepseek",
-    "deepseek-math-7b": "deepseek",
-    "hermes-14b": "chatml",
-    "llama-3.1-8b": "llama",
-    "dolphin-8b": "chatml",
-    "mistral-7b": "mistral",
-    "codellama-13b": "llama",
-    "codellama-7b": "llama",
-    "yi-9b-200k": "chatml",
-    "phi-3.5-mini": "phi",
-    "llama-guard-3": "llama",
-    "functiongemma": "generic",
-    "nomic-embed": "generic",
+# ── Base system prompts ──────────────────────────────────────
+
+ROLE_SYSTEM_PROMPTS: dict[str, str] = {
+    "coordinator": (
+        "You are RecurSec Coordinator, an autonomous security assessment orchestrator. "
+        "Your role is to decompose targets into subtasks, assign work to specialized agents, "
+        "and synthesize findings. You reason about attack surfaces, prioritize testing paths, "
+        "and make strategic decisions about tool and technique selection."
+    ),
+    "recon": (
+        "You are RecurSec Recon Agent, specializing in target reconnaissance. "
+        "Map the complete attack surface: subdomains, ports, services, technologies, "
+        "and entry points. Be thorough and systematic."
+    ),
+    "scanner": (
+        "You are RecurSec Scanner Agent, specializing in vulnerability discovery. "
+        "Run comprehensive scans, interpret results, correlate findings, "
+        "and identify both known CVEs and novel vulnerabilities."
+    ),
+    "exploiter": (
+        "You are RecurSec Exploit Agent, specializing in vulnerability exploitation. "
+        "Develop and execute exploit chains with minimal impact. "
+        "Document reproduction steps and assess real-world impact."
+    ),
+    "validator": (
+        "You are RecurSec Validator Agent, specializing in finding verification. "
+        "Cross-check all findings using alternative tools and methods. "
+        "Eliminate false positives and confirm true vulnerabilities."
+    ),
+    "code_auditor": (
+        "You are RecurSec Code Auditor, specializing in source code security analysis. "
+        "Identify vulnerabilities through static analysis, taint tracking, "
+        "and pattern matching across multiple languages."
+    ),
+    "planner": (
+        "You are RecurSec Planner Agent, specializing in strategic planning. "
+        "Analyze targets, generate hypotheses, plan attack chains, "
+        "and optimize testing coverage."
+    ),
+}
+
+
+# ── Tool documentation snippets ──────────────────────────────
+
+TOOL_DOCS: dict[str, str] = {
+    "nmap": "nmap: Network scanner. Usage: nmap [flags] <target>. Key flags: -sV (version), -sC (scripts), -p- (all ports), -O (OS), --script=<name>",
+    "nuclei": "nuclei: Template-based vuln scanner. Usage: nuclei -u <url> -t <templates>. Key: -severity critical,high -json -silent",
+    "sqlmap": "sqlmap: SQL injection tool. Usage: sqlmap -u <url> --batch --level=5 --risk=3. Key: --dbs --tables --dump --os-shell",
+    "ffuf": "ffuf: Web fuzzer. Usage: ffuf -u <url>/FUZZ -w <wordlist>. Key: -mc 200,301,302 -fc 404 -fs <size>",
+    "subfinder": "subfinder: Subdomain discovery. Usage: subfinder -d <domain> -silent. Key: -all -recursive",
+    "httpx": "httpx: HTTP probe. Usage: httpx -l <urls> -status-code -title -tech-detect. Key: -json -silent",
+    "hydra": "hydra: Brute forcer. Usage: hydra -l <user> -P <wordlist> <target> <service>. Key: -t 4 -vV",
+    "semgrep": "semgrep: SAST scanner. Usage: semgrep scan --config=auto <path>. Key: --severity=ERROR --json",
+    "trivy": "trivy: Container/dependency scanner. Usage: trivy image <image> or trivy fs <path>. Key: --severity CRITICAL,HIGH",
+    "testssl": "testssl: SSL/TLS checker. Usage: testssl.sh <target>. Key: --json --severity HIGH",
+    "gobuster": "gobuster: Directory buster. Usage: gobuster dir -u <url> -w <wordlist>. Key: -t 50 -x php,html",
+    "dalfox": "dalfox: XSS scanner. Usage: dalfox url <target>. Key: --blind <callback> --mining-dict",
+    "masscan": "masscan: Fast port scanner. Usage: masscan <target> -p0-65535 --rate=10000. Key: --banners -oJ",
+    "amass": "amass: Attack surface mapper. Usage: amass enum -d <domain>. Key: -passive -active -brute",
+    "nikto": "nikto: Web server scanner. Usage: nikto -h <target>. Key: -Tuning x -Format json",
+    "wpscan": "wpscan: WordPress scanner. Usage: wpscan --url <target>. Key: --enumerate vp,vt,u --plugins-detection aggressive",
+    "trufflehog": "trufflehog: Secret scanner. Usage: trufflehog git <repo-url>. Key: --json --only-verified",
+    "gitleaks": "gitleaks: Git secret scanner. Usage: gitleaks detect --source=<path>. Key: --report-format json",
 }
 
 
 class PromptCompiler:
-    """Builds optimal prompts for LLM agents.
+    """Assembles dynamic prompts for LLM queries.
 
-    Manages prompt construction with:
-    - Knowledge base injection
-    - Context window fitting
-    - Model-specific formatting
-    - Priority-based section dropping
+    Constructs system and user prompts with
+    knowledge injection, tool docs, and
+    model-specific formatting.
     """
 
-    def __init__(self, default_max_tokens: int = 4096) -> None:
-        self._default_max_tokens = default_max_tokens
+    def __init__(self, max_tokens: int = 4096) -> None:
+        self._max_tokens = max_tokens
         self._log = logger.bind(component="prompt_compiler")
-        self._compile_count = 0
 
     def compile(
         self,
-        blocks: list[PromptBlock],
-        model: str = "",
-        max_tokens: int = 0,
-    ) -> CompiledPrompt:
-        """Compile prompt blocks into a formatted prompt."""
-        max_tokens = max_tokens or self._default_max_tokens
-        self._compile_count += 1
-
-        # Estimate tokens for each block (rough: 4 chars per token)
-        for block in blocks:
-            if block.token_estimate == 0:
-                block.token_estimate = len(block.content) // 4
-
-        # Sort by priority (required first, then by priority desc)
-        sorted_blocks = sorted(
-            blocks,
-            key=lambda b: (not b.required, -b.priority),
-        )
-
-        # Fit blocks within token budget
-        included: list[PromptBlock] = []
-        dropped: list[PromptBlock] = []
-        remaining_tokens = max_tokens
-
-        for block in sorted_blocks:
-            if block.token_estimate <= remaining_tokens:
-                included.append(block)
-                remaining_tokens -= block.token_estimate
-            elif block.required:
-                # Truncate required blocks to fit
-                available_chars = remaining_tokens * 4
-                block.content = block.content[:available_chars]
-                block.token_estimate = remaining_tokens
-                included.append(block)
-                remaining_tokens = 0
-            else:
-                dropped.append(block)
-
-        # Group by section
-        section_content: dict[PromptSection, list[str]] = defaultdict(list)
-        for block in included:
-            section_content[block.section].append(block.content)
-
-        # Build system prompt
-        system_parts = []
-        for section in [PromptSection.SYSTEM, PromptSection.ROLE,
-                        PromptSection.CONSTRAINTS, PromptSection.TOOLS,
-                        PromptSection.OUTPUT_FORMAT]:
-            if section in section_content:
-                system_parts.extend(section_content[section])
-
-        # Build user prompt
-        user_parts = []
-        for section in [PromptSection.GOAL, PromptSection.CONTEXT,
-                        PromptSection.KNOWLEDGE, PromptSection.FINDINGS,
-                        PromptSection.EXAMPLES, PromptSection.HISTORY]:
-            if section in section_content:
-                user_parts.extend(section_content[section])
-
-        # Apply model format
-        system_prompt = "\n\n".join(system_parts)
-        user_prompt = "\n\n".join(user_parts)
-
-        if model:
-            fmt_name = MODEL_FORMATS.get(model, "generic")
-            fmt = FORMAT_TEMPLATES.get(fmt_name, FORMAT_TEMPLATES["generic"])
-            system_prompt = fmt["system_prefix"] + system_prompt + fmt["system_suffix"]
-            user_prompt = fmt["user_prefix"] + user_prompt + fmt["user_suffix"]
-
-        return CompiledPrompt(
-            model=model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            total_tokens_estimate=max_tokens - remaining_tokens,
-            sections_included=[b.section.value for b in included],
-            sections_dropped=[b.section.value for b in dropped],
-        )
-
-    def build_security_prompt(
-        self,
         role: str,
-        goal: str,
-        target: str,
-        tools: list[str],
-        findings: list[dict[str, Any]] | None = None,
-        knowledge: str = "",
+        task: str,
+        model_id: str = "",
+        knowledge_sections: list[str] | None = None,
+        tool_names: list[str] | None = None,
+        context: str = "",
+        constraints: str = "",
+        examples: list[str] | None = None,
         history: str = "",
-        model: str = "",
-        max_tokens: int = 0,
     ) -> CompiledPrompt:
-        """Build a complete security assessment prompt."""
-        blocks = [
-            PromptBlock(
-                section=PromptSection.SYSTEM,
-                content="You are a security assessment agent. Follow instructions precisely. Output structured findings.",
-                priority=10,
-                required=True,
-            ),
-            PromptBlock(
-                section=PromptSection.ROLE,
-                content=f"Role: {role}",
-                priority=9,
-                required=True,
-            ),
-            PromptBlock(
-                section=PromptSection.GOAL,
-                content=f"Goal: {goal}\nTarget: {target}",
-                priority=9,
-                required=True,
-            ),
-            PromptBlock(
-                section=PromptSection.CONSTRAINTS,
-                content=(
-                    "Constraints:\n"
-                    "- Only test authorized targets\n"
-                    "- Minimize destructive actions\n"
-                    "- Validate findings before reporting\n"
-                    "- Use structured JSON output for findings"
-                ),
-                priority=8,
-                required=True,
-            ),
-        ]
+        """Compile a full prompt from components."""
+        fmt = MODEL_FORMATS.get(model_id, PromptFormat.CHATML)
 
-        # Tools
-        if tools:
-            tool_doc = "Available tools:\n" + "\n".join(f"- {t}" for t in tools)
+        blocks: list[PromptBlock] = []
+
+        # System/role prompt (required)
+        system = ROLE_SYSTEM_PROMPTS.get(role, ROLE_SYSTEM_PROMPTS.get("coordinator", ""))
+        blocks.append(PromptBlock(
+            section=PromptSection.SYSTEM,
+            content=system,
+            priority=100,
+            token_estimate=self._estimate_tokens(system),
+            required=True,
+        ))
+
+        # Context
+        if context:
             blocks.append(PromptBlock(
-                section=PromptSection.TOOLS,
-                content=tool_doc,
-                priority=7,
+                section=PromptSection.CONTEXT,
+                content=context,
+                priority=80,
+                token_estimate=self._estimate_tokens(context),
             ))
 
-        # Knowledge injection
-        if knowledge:
+        # Knowledge sections
+        for kb_text in (knowledge_sections or []):
             blocks.append(PromptBlock(
                 section=PromptSection.KNOWLEDGE,
-                content=knowledge,
-                priority=6,
+                content=kb_text,
+                priority=60,
+                token_estimate=self._estimate_tokens(kb_text),
             ))
 
-        # Existing findings
-        if findings:
-            finding_text = "Current findings:\n"
-            for f in findings[:10]:
-                finding_text += f"- [{f.get('severity', 'unknown')}] {f.get('title', '')}\n"
+        # Tool documentation
+        if tool_names:
+            tool_text = self._build_tool_docs(tool_names)
             blocks.append(PromptBlock(
-                section=PromptSection.FINDINGS,
-                content=finding_text,
-                priority=5,
+                section=PromptSection.TOOLS,
+                content=tool_text,
+                priority=70,
+                token_estimate=self._estimate_tokens(tool_text),
+            ))
+
+        # Constraints
+        if constraints:
+            blocks.append(PromptBlock(
+                section=PromptSection.CONSTRAINTS,
+                content=constraints,
+                priority=90,
+                token_estimate=self._estimate_tokens(constraints),
+                required=True,
+            ))
+
+        # Examples
+        for example in (examples or []):
+            blocks.append(PromptBlock(
+                section=PromptSection.EXAMPLES,
+                content=example,
+                priority=40,
+                token_estimate=self._estimate_tokens(example),
             ))
 
         # History
@@ -336,103 +258,112 @@ class PromptCompiler:
             blocks.append(PromptBlock(
                 section=PromptSection.HISTORY,
                 content=history,
-                priority=3,
+                priority=50,
+                token_estimate=self._estimate_tokens(history),
             ))
 
-        # Output format
+        # Task (required)
         blocks.append(PromptBlock(
-            section=PromptSection.OUTPUT_FORMAT,
-            content=(
-                "Output format:\n"
-                "1. ANALYSIS: Brief analysis of current state\n"
-                "2. NEXT_ACTION: What tool/command to run next\n"
-                "3. RATIONALE: Why this action\n"
-                "4. FINDINGS: Any new findings in JSON"
-            ),
-            priority=8,
+            section=PromptSection.TASK,
+            content=task,
+            priority=95,
+            token_estimate=self._estimate_tokens(task),
+            required=True,
         ))
 
-        return self.compile(blocks, model=model, max_tokens=max_tokens)
+        # Budget-aware assembly
+        return self._assemble(blocks, fmt)
 
-    def build_reasoning_prompt(
+    def _assemble(
         self,
-        question: str,
-        evidence: list[str],
-        model: str = "",
-        max_tokens: int = 0,
+        blocks: list[PromptBlock],
+        fmt: PromptFormat,
     ) -> CompiledPrompt:
-        """Build a reasoning/chain-of-thought prompt."""
-        blocks = [
-            PromptBlock(
-                section=PromptSection.SYSTEM,
-                content=(
-                    "You are a security reasoning engine. Think step by step.\n"
-                    "For each step:\n"
-                    "1. State what you observe\n"
-                    "2. Form a hypothesis\n"
-                    "3. Consider evidence for and against\n"
-                    "4. Draw a conclusion with confidence level"
-                ),
-                priority=10,
-                required=True,
-            ),
-            PromptBlock(
-                section=PromptSection.GOAL,
-                content=f"Question: {question}",
-                priority=9,
-                required=True,
-            ),
-        ]
+        """Assemble blocks into a compiled prompt within budget."""
+        # Sort by priority (highest first)
+        sorted_blocks = sorted(blocks, key=lambda b: b.priority, reverse=True)
 
-        if evidence:
-            ev_text = "Evidence:\n" + "\n".join(f"- {e}" for e in evidence)
-            blocks.append(PromptBlock(
-                section=PromptSection.CONTEXT,
-                content=ev_text,
-                priority=7,
-            ))
+        included: list[PromptBlock] = []
+        dropped: list[PromptBlock] = []
+        total_tokens = 0
 
-        return self.compile(blocks, model=model, max_tokens=max_tokens)
+        for block in sorted_blocks:
+            if total_tokens + block.token_estimate <= self._max_tokens or block.required:
+                included.append(block)
+                total_tokens += block.token_estimate
+            else:
+                dropped.append(block)
 
-    def build_validation_prompt(
+        # Build system prompt from system/role/knowledge/constraints/tools
+        system_parts = []
+        user_parts = []
+
+        for block in sorted(included, key=lambda b: b.priority, reverse=True):
+            if block.section in (PromptSection.SYSTEM, PromptSection.ROLE, PromptSection.CONSTRAINTS):
+                system_parts.append(block.content)
+            elif block.section in (PromptSection.KNOWLEDGE, PromptSection.TOOLS):
+                system_parts.append(block.content)
+            else:
+                user_parts.append(block.content)
+
+        system_prompt = "\n\n".join(system_parts)
+        user_prompt = "\n\n".join(user_parts)
+
+        return CompiledPrompt(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            format_used=fmt,
+            total_tokens_estimate=total_tokens,
+            sections_included=[b.section.value for b in included],
+            sections_dropped=[b.section.value for b in dropped],
+        )
+
+    def _build_tool_docs(self, tool_names: list[str]) -> str:
+        """Build tool documentation section."""
+        lines = ["## Available Tools\n"]
+        for name in tool_names:
+            doc = TOOL_DOCS.get(name)
+            if doc:
+                lines.append(f"- {doc}")
+        return "\n".join(lines)
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count (rough: ~4 chars per token)."""
+        return len(text) // 4
+
+    def format_for_model(
         self,
-        finding: dict[str, Any],
-        model: str = "",
-        max_tokens: int = 0,
-    ) -> CompiledPrompt:
-        """Build a finding validation prompt."""
-        blocks = [
-            PromptBlock(
-                section=PromptSection.SYSTEM,
-                content=(
-                    "You are a security finding validator. Your job is to:\n"
-                    "1. Assess if the finding is a true positive or false positive\n"
-                    "2. Suggest verification steps\n"
-                    "3. Rate confidence (0.0 to 1.0)\n"
-                    "4. Suggest remediation if confirmed"
-                ),
-                priority=10,
-                required=True,
-            ),
-            PromptBlock(
-                section=PromptSection.GOAL,
-                content=(
-                    f"Finding to validate:\n"
-                    f"Title: {finding.get('title', '')}\n"
-                    f"Severity: {finding.get('severity', '')}\n"
-                    f"Description: {finding.get('description', '')}\n"
-                    f"Evidence: {finding.get('evidence', '')}"
-                ),
-                priority=9,
-                required=True,
-            ),
-        ]
+        system: str,
+        user: str,
+        model_id: str = "",
+    ) -> str:
+        """Format prompt for specific model."""
+        fmt = MODEL_FORMATS.get(model_id, PromptFormat.CHATML)
 
-        return self.compile(blocks, model=model, max_tokens=max_tokens)
-
-    def get_stats(self) -> dict[str, Any]:
-        return {
-            "compiles": self._compile_count,
-            "supported_formats": list(FORMAT_TEMPLATES.keys()),
-            "model_mappings": len(MODEL_FORMATS),
-        }
+        if fmt == PromptFormat.CHATML:
+            return (
+                f"<|im_start|>system\n{system}<|im_end|>\n"
+                f"<|im_start|>user\n{user}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+        elif fmt == PromptFormat.LLAMA:
+            return (
+                f"<s>[INST] <<SYS>>\n{system}\n<</SYS>>\n\n"
+                f"{user} [/INST]"
+            )
+        elif fmt == PromptFormat.MISTRAL:
+            return f"[INST] {system}\n\n{user} [/INST]"
+        elif fmt == PromptFormat.PHI:
+            return (
+                f"<|system|>\n{system}<|end|>\n"
+                f"<|user|>\n{user}<|end|>\n"
+                f"<|assistant|>\n"
+            )
+        elif fmt == PromptFormat.DEEPSEEK:
+            return (
+                f"<|begin▁of▁sentence|>{system}\n"
+                f"User: {user}\n"
+                f"Assistant:"
+            )
+        else:
+            return f"{system}\n\n{user}"
