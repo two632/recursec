@@ -1,23 +1,25 @@
-"""Session manager — manages assessment session lifecycle.
+"""Session manager — assessment session lifecycle.
 
 Implements:
-1. Session creation and configuration
-2. Session state persistence
-3. Session resume from checkpoint
-4. Session metrics tracking
-5. Multi-session management
-6. Session export and import
-7. Session comparison
-8. Session cleanup
+1. Session creation and tracking
+2. Session state machine
+3. Findings aggregation
+4. Session export (JSON/JSONL)
+5. Session comparison
+6. Session templates
+7. Session metrics
+8. Multi-target session management
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -25,129 +27,156 @@ import structlog
 logger = structlog.get_logger()
 
 
+class SessionState(str, Enum):
+    CREATED = "created"
+    INITIALIZING = "initializing"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETING = "completing"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class FindingSeverity(str, Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
+
+
 @dataclass
-class SessionConfig:
-    """Configuration for a session."""
+class Finding:
+    """A security finding."""
+    finding_id: str = ""
+    title: str = ""
+    severity: FindingSeverity = FindingSeverity.INFO
+    category: str = ""
+    description: str = ""
+    evidence: str = ""
+    remediation: str = ""
     target: str = ""
-    target_type: str = "web_app"
-    stealth_mode: bool = False
-    validate_findings: bool = True
-    deep_mode: bool = False
-    max_time_s: float = 3600.0
-    token_budget: int = 5_000_000
-    max_agents: int = 20
-    custom_config: dict[str, Any] = field(default_factory=dict)
+    tool: str = ""
+    model: str = ""
+    confidence: float = 0.8
+    confirmed: bool = False
+    cwe: str = ""
+    cvss: float = 0.0
+    timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "target": self.target[:40], "type": self.target_type,
-            "stealth": self.stealth_mode,
-            "validate": self.validate_findings,
-            "deep": self.deep_mode,
-            "max_time_s": self.max_time_s,
-            "budget": self.token_budget,
+            "id": self.finding_id[:10],
+            "title": self.title[:40],
+            "severity": self.severity.value,
+            "category": self.category[:15],
+            "confidence": round(self.confidence, 2),
+            "confirmed": self.confirmed,
+            "cwe": self.cwe[:10],
+            "cvss": self.cvss,
         }
 
 
 @dataclass
-class SessionMetrics:
-    """Metrics for a session."""
-    findings_total: int = 0
-    findings_critical: int = 0
-    findings_high: int = 0
-    findings_medium: int = 0
-    findings_low: int = 0
-    tools_run: int = 0
-    agents_spawned: int = 0
-    tokens_used: int = 0
-    models_used: set[str] = field(default_factory=set)
-    errors: int = 0
+class SessionTarget:
+    """A target within a session."""
+    target: str = ""
+    target_type: str = ""        # ip, domain, url, cidr
+    findings_count: int = 0
+    tools_used: list[str] = field(default_factory=list)
+    scan_start: float = 0.0
+    scan_end: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "findings": self.findings_total,
-            "critical": self.findings_critical,
-            "high": self.findings_high,
-            "medium": self.findings_medium,
-            "low": self.findings_low,
-            "tools": self.tools_run,
-            "agents": self.agents_spawned,
-            "tokens": self.tokens_used,
-            "models": len(self.models_used),
-            "errors": self.errors,
+            "target": self.target[:30],
+            "type": self.target_type[:8],
+            "findings": self.findings_count,
+            "tools": len(self.tools_used),
         }
 
 
 @dataclass
 class Session:
-    """An assessment session."""
+    """A security assessment session."""
     session_id: str = ""
-    config: SessionConfig = field(default_factory=SessionConfig)
-    status: str = "created"        # created, running, paused, completed, failed
-    metrics: SessionMetrics = field(default_factory=SessionMetrics)
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    phase: str = ""                # Current phase
-    checkpoint: dict[str, Any] = field(default_factory=dict)
+    name: str = ""
+    state: SessionState = SessionState.CREATED
+    targets: list[SessionTarget] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
+    goal: str = ""
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
-    tags: list[str] = field(default_factory=list)
+    total_tokens: int = 0
+    total_tool_calls: int = 0
+    total_llm_calls: int = 0
+    agents_spawned: int = 0
+    config: dict[str, Any] = field(default_factory=dict)
 
     @property
     def duration_s(self) -> float:
-        if self.completed_at and self.started_at:
+        if self.started_at > 0 and self.completed_at > 0:
             return self.completed_at - self.started_at
-        if self.started_at:
+        if self.started_at > 0:
             return time.time() - self.started_at
         return 0.0
 
+    @property
+    def finding_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for f in self.findings:
+            counts[f.severity.value] += 1
+        return dict(counts)
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.session_id,
-            "target": self.config.target[:40],
-            "status": self.status,
-            "phase": self.phase[:20],
-            "findings": self.metrics.findings_total,
-            "duration_s": round(self.duration_s, 0),
+            "id": self.session_id[:12],
+            "state": self.state.value,
+            "targets": len(self.targets),
+            "findings": len(self.findings),
+            "by_severity": self.finding_counts,
+            "duration_s": round(self.duration_s, 1),
+            "tokens": self.total_tokens,
+            "tool_calls": self.total_tool_calls,
+            "agents": self.agents_spawned,
         }
 
 
 class SessionManager:
-    """Manages assessment session lifecycle.
+    """Manages security assessment sessions.
 
-    Creates, tracks, persists, and resumes
-    security assessment sessions.
+    Tracks session lifecycle, aggregates findings,
+    and provides session export capabilities.
     """
 
-    def __init__(self, data_dir: str = "data/sessions") -> None:
-        self._data_dir = Path(data_dir)
-        self._data_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, data_dir: str = "") -> None:
         self._sessions: dict[str, Session] = {}
-        self._session_counter = 0
-        self._active_session: str = ""
+        self._counter = 0
+        self._data_dir = data_dir or os.path.expanduser("~/.recursec/sessions")
         self._log = logger.bind(component="session_manager")
 
     def create(
         self,
-        target: str,
-        target_type: str = "web_app",
-        config: SessionConfig | None = None,
-        tags: list[str] | None = None,
+        targets: list[str],
+        goal: str = "",
+        name: str = "",
+        config: dict[str, Any] | None = None,
     ) -> Session:
         """Create a new session."""
-        self._session_counter += 1
-        session_id = f"session-{self._session_counter}"
+        self._counter += 1
+        ts = int(time.time())
 
-        if config is None:
-            config = SessionConfig(target=target, target_type=target_type)
-        else:
-            config.target = target
-            config.target_type = target_type
+        target_hash = hashlib.md5(",".join(targets).encode()).hexdigest()[:6]
+        session_id = f"sess-{ts}-{target_hash}"
 
         session = Session(
             session_id=session_id,
-            config=config,
-            tags=tags or [],
+            name=name or f"Assessment {self._counter}",
+            goal=goal,
+            targets=[SessionTarget(target=t) for t in targets],
+            config=config or {},
         )
 
         self._sessions[session_id] = session
@@ -159,196 +188,180 @@ class SessionManager:
         if not session:
             return False
 
-        session.status = "running"
+        session.state = SessionState.RUNNING
         session.started_at = time.time()
-        self._active_session = session_id
         return True
 
     def pause(self, session_id: str) -> bool:
         """Pause a session."""
         session = self._sessions.get(session_id)
-        if not session or session.status != "running":
+        if not session or session.state != SessionState.RUNNING:
             return False
-
-        session.status = "paused"
-        self._save_checkpoint(session)
+        session.state = SessionState.PAUSED
         return True
 
     def resume(self, session_id: str) -> bool:
         """Resume a paused session."""
         session = self._sessions.get(session_id)
-        if not session or session.status != "paused":
+        if not session or session.state != SessionState.PAUSED:
             return False
-
-        session.status = "running"
-        self._active_session = session_id
+        session.state = SessionState.RUNNING
         return True
 
     def complete(self, session_id: str) -> bool:
-        """Complete a session."""
+        """Mark a session as complete."""
         session = self._sessions.get(session_id)
         if not session:
             return False
-
-        session.status = "completed"
+        session.state = SessionState.COMPLETE
         session.completed_at = time.time()
-        self._save_session(session)
-
-        if self._active_session == session_id:
-            self._active_session = ""
-
         return True
 
-    def fail(self, session_id: str, error: str = "") -> bool:
+    def fail(self, session_id: str, reason: str = "") -> bool:
         """Mark a session as failed."""
         session = self._sessions.get(session_id)
         if not session:
             return False
-
-        session.status = "failed"
+        session.state = SessionState.FAILED
         session.completed_at = time.time()
-        session.checkpoint["error"] = error
-        self._save_session(session)
         return True
 
     def add_finding(
         self,
         session_id: str,
-        finding: dict[str, Any],
-    ) -> None:
+        title: str,
+        severity: FindingSeverity,
+        category: str = "",
+        description: str = "",
+        evidence: str = "",
+        remediation: str = "",
+        target: str = "",
+        tool: str = "",
+        model: str = "",
+        confidence: float = 0.8,
+        confirmed: bool = False,
+        cwe: str = "",
+        cvss: float = 0.0,
+    ) -> Finding | None:
         """Add a finding to a session."""
         session = self._sessions.get(session_id)
         if not session:
-            return
+            return None
+
+        self._counter += 1
+        finding = Finding(
+            finding_id=f"find-{self._counter}",
+            title=title,
+            severity=severity,
+            category=category,
+            description=description,
+            evidence=evidence,
+            remediation=remediation,
+            target=target,
+            tool=tool,
+            model=model,
+            confidence=confidence,
+            confirmed=confirmed,
+            cwe=cwe,
+            cvss=cvss,
+        )
 
         session.findings.append(finding)
-        session.metrics.findings_total += 1
 
-        severity = finding.get("severity", "info")
-        if severity == "critical":
-            session.metrics.findings_critical += 1
-        elif severity == "high":
-            session.metrics.findings_high += 1
-        elif severity == "medium":
-            session.metrics.findings_medium += 1
-        elif severity == "low":
-            session.metrics.findings_low += 1
+        # Update target findings count
+        for st in session.targets:
+            if st.target == target:
+                st.findings_count += 1
+                break
 
-    def record_tool_run(
+        return finding
+
+    def update_metrics(
         self,
         session_id: str,
-        tool: str = "",
         tokens: int = 0,
-        model: str = "",
+        tool_calls: int = 0,
+        llm_calls: int = 0,
+        agents: int = 0,
     ) -> None:
-        """Record a tool run in the session."""
+        """Update session metrics."""
         session = self._sessions.get(session_id)
         if not session:
             return
+        session.total_tokens += tokens
+        session.total_tool_calls += tool_calls
+        session.total_llm_calls += llm_calls
+        session.agents_spawned += agents
 
-        session.metrics.tools_run += 1
-        session.metrics.tokens_used += tokens
-        if model:
-            session.metrics.models_used.add(model)
-
-    def set_phase(self, session_id: str, phase: str) -> None:
-        """Set the current phase of a session."""
+    def export_json(self, session_id: str) -> str:
+        """Export session as JSON."""
         session = self._sessions.get(session_id)
-        if session:
-            session.phase = phase
+        if not session:
+            return "{}"
 
-    def get_active(self) -> Session | None:
-        """Get the currently active session."""
-        if self._active_session:
-            return self._sessions.get(self._active_session)
-        return None
-
-    def _save_checkpoint(self, session: Session) -> None:
-        """Save a session checkpoint."""
-        session.checkpoint = {
-            "phase": session.phase,
-            "findings_count": session.metrics.findings_total,
-            "timestamp": time.time(),
+        data = {
+            "session": session.to_dict(),
+            "targets": [t.to_dict() for t in session.targets],
+            "findings": [f.to_dict() for f in session.findings],
+            "goal": session.goal,
+            "config": session.config,
         }
-        self._save_session(session)
+        return json.dumps(data, indent=2)
 
-    def _save_session(self, session: Session) -> None:
-        """Save session to disk."""
-        try:
-            path = self._data_dir / f"{session.session_id}.json"
-            data = {
-                "id": session.session_id,
-                "config": session.config.to_dict(),
-                "status": session.status,
-                "metrics": session.metrics.to_dict(),
-                "findings_count": len(session.findings),
-                "phase": session.phase,
-                "checkpoint": session.checkpoint,
-                "created_at": session.created_at,
-                "started_at": session.started_at,
-                "completed_at": session.completed_at,
-                "tags": session.tags,
-            }
-            path.write_text(json.dumps(data, indent=2, default=str))
-        except OSError:
-            pass
+    def export_findings_jsonl(self, session_id: str) -> str:
+        """Export findings as JSONL (one JSON per line)."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return ""
 
-    def load_session(self, session_id: str) -> Session | None:
-        """Load a session from disk."""
-        path = self._data_dir / f"{session_id}.json"
-        if not path.exists():
-            return None
+        lines = []
+        for f in session.findings:
+            lines.append(json.dumps(f.to_dict()))
+        return "\n".join(lines)
 
-        try:
-            data = json.loads(path.read_text())
-            session = Session(
-                session_id=data["id"],
-                status=data.get("status", "completed"),
-                phase=data.get("phase", ""),
-                checkpoint=data.get("checkpoint", {}),
-                created_at=data.get("created_at", 0),
-                started_at=data.get("started_at", 0),
-                completed_at=data.get("completed_at", 0),
-                tags=data.get("tags", []),
-            )
-            self._sessions[session_id] = session
-            return session
-        except (json.JSONDecodeError, OSError, KeyError):
-            return None
-
-    def compare(
+    def compare_sessions(
         self,
-        session_id_1: str,
-        session_id_2: str,
+        session_id_a: str,
+        session_id_b: str,
     ) -> dict[str, Any]:
         """Compare two sessions."""
-        s1 = self._sessions.get(session_id_1)
-        s2 = self._sessions.get(session_id_2)
+        a = self._sessions.get(session_id_a)
+        b = self._sessions.get(session_id_b)
+        if not a or not b:
+            return {"error": "Session not found"}
 
-        if not s1 or not s2:
-            return {"error": "session_not_found"}
+        a_titles = {f.title for f in a.findings}
+        b_titles = {f.title for f in b.findings}
 
         return {
-            "session_1": s1.to_dict(),
-            "session_2": s2.to_dict(),
-            "findings_diff": s1.metrics.findings_total - s2.metrics.findings_total,
-            "critical_diff": s1.metrics.findings_critical - s2.metrics.findings_critical,
-            "duration_diff": round(s1.duration_s - s2.duration_s, 0),
-            "token_diff": s1.metrics.tokens_used - s2.metrics.tokens_used,
+            "session_a": session_id_a,
+            "session_b": session_id_b,
+            "findings_a": len(a.findings),
+            "findings_b": len(b.findings),
+            "common": len(a_titles & b_titles),
+            "only_a": len(a_titles - b_titles),
+            "only_b": len(b_titles - a_titles),
+            "new_in_b": list(b_titles - a_titles)[:10],
+            "resolved_in_b": list(a_titles - b_titles)[:10],
         }
 
-    def list_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
-        return [s.to_dict() for s in list(self._sessions.values())[-limit:]]
+    def get_session(self, session_id: str) -> Session | None:
+        """Get a session by ID."""
+        return self._sessions.get(session_id)
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        """List all sessions."""
+        return [s.to_dict() for s in self._sessions.values()]
 
     def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
-        for session in self._sessions.values():
-            status_counts[session.status] += 1
+        state_counts: dict[str, int] = defaultdict(int)
+        total_findings = 0
+        for s in self._sessions.values():
+            state_counts[s.state.value] += 1
+            total_findings += len(s.findings)
 
         return {
-            "total": len(self._sessions),
-            "active": self._active_session or "none",
-            "status": dict(status_counts),
+            "sessions": len(self._sessions),
+            "total_findings": total_findings,
+            "by_state": dict(state_counts),
         }
-
-
