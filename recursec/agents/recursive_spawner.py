@@ -1,19 +1,18 @@
-"""Recursive agent spawner — dynamic agent hierarchy management.
+"""Recursive agent spawner — depth-bounded agent hierarchy.
 
 Implements:
-1. Dynamic agent instantiation with role/goal/tools
-2. Budget decay (70% per depth level)
-3. Bounded recursion (max depth 5)
-4. Agent pool with reuse
-5. Result aggregation from child agents
-6. Inter-agent message passing
-7. Convergence-based early termination
+1. Recursive agent creation (parent → child → grandchild)
+2. Depth limits (configurable max recursion depth)
+3. Budget propagation (parent shares budget with children)
+4. Result aggregation (children → parent)
+5. Agent lineage tracking
+6. Spawn strategy selection
+7. Spawn context for LLM
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -22,426 +21,358 @@ import structlog
 
 logger = structlog.get_logger()
 
-BUDGET_DECAY_FACTOR = 0.70
-MAX_RECURSION_DEPTH = 5
-DEFAULT_TOKEN_BUDGET = 50000
-DEFAULT_TIME_BUDGET_S = 300.0
+
+class SpawnReason(str, Enum):
+    DECOMPOSE = "decompose"            # Task needs sub-agents
+    SPECIALIZE = "specialize"          # Need specialist agent
+    PARALLEL = "parallel"              # Parallel exploration
+    VALIDATE = "validate"              # Cross-validation
+    EXPLORE = "explore"                # Explore alternative approach
+    DEEPEN = "deepen"                  # Go deeper on finding
 
 
 class AgentRole(str, Enum):
     COORDINATOR = "coordinator"
     RECON = "recon"
-    SCANNER = "scanner"
-    EXPLOITER = "exploiter"
+    VULN_SCAN = "vuln_scan"
+    WEB_AUDIT = "web_audit"
+    CODE_AUDIT = "code_audit"
+    EXPLOIT = "exploit"
     VALIDATOR = "validator"
-    CODE_AUDITOR = "code_auditor"
-    PLANNER = "planner"
     REPORTER = "reporter"
-    OSINT = "osint"
-    CLOUD = "cloud"
-    MOBILE = "mobile"
-    IOT = "iot"
-    NETWORK = "network"
-    WEB = "web"
-    API = "api"
-    FUZZER = "fuzzer"
+    PLANNER = "planner"
 
 
-class AgentState(str, Enum):
-    IDLE = "idle"
-    INITIALIZING = "initializing"
+class SpawnStatus(str, Enum):
+    PENDING = "pending"
     RUNNING = "running"
-    WAITING_CHILDREN = "waiting_children"
-    AGGREGATING = "aggregating"
     COMPLETED = "completed"
     FAILED = "failed"
-    TERMINATED = "terminated"
-
-
-@dataclass
-class AgentContext:
-    """Context inherited from parent agent."""
-    target: str = ""
-    scope: list[str] = field(default_factory=list)
-    knowledge: list[str] = field(default_factory=list)
-    findings_so_far: list[dict[str, Any]] = field(default_factory=list)
-    parent_observations: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "target": self.target[:20],
-            "scope_items": len(self.scope),
-            "knowledge_items": len(self.knowledge),
-            "findings": len(self.findings_so_far),
-        }
-
-
-@dataclass
-class AgentBudget:
-    """Resource budget for an agent."""
-    token_budget: int = DEFAULT_TOKEN_BUDGET
-    tokens_used: int = 0
-    time_budget_s: float = DEFAULT_TIME_BUDGET_S
-    time_used_s: float = 0.0
-    tool_call_limit: int = 50
-    tool_calls_made: int = 0
-    llm_query_limit: int = 20
-    llm_queries_made: int = 0
-    child_budget_limit: int = 5
-
-    @property
-    def tokens_remaining(self) -> int:
-        return max(0, self.token_budget - self.tokens_used)
-
-    @property
-    def time_remaining_s(self) -> float:
-        return max(0.0, self.time_budget_s - self.time_used_s)
-
-    @property
-    def tool_calls_remaining(self) -> int:
-        return max(0, self.tool_call_limit - self.tool_calls_made)
-
-    @property
-    def budget_utilization(self) -> float:
-        if self.token_budget == 0:
-            return 0.0
-        return self.tokens_used / self.token_budget
-
-    @property
-    def is_exhausted(self) -> bool:
-        return (
-            self.tokens_remaining <= 0
-            or self.time_remaining_s <= 0
-            or self.tool_calls_remaining <= 0
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tokens": f"{self.tokens_used}/{self.token_budget}",
-            "time_s": f"{self.time_used_s:.0f}/{self.time_budget_s:.0f}",
-            "tools": f"{self.tool_calls_made}/{self.tool_call_limit}",
-            "utilization": f"{self.budget_utilization:.0%}",
-        }
+    CANCELLED = "cancelled"
 
 
 @dataclass
 class SpawnedAgent:
-    """A spawned agent instance."""
+    """A spawned child agent."""
     agent_id: str = ""
-    role: AgentRole = AgentRole.SCANNER
-    goal: str = ""
-    model_id: str = ""
-    state: AgentState = AgentState.IDLE
-    depth: int = 0
     parent_id: str = ""
-    children_ids: list[str] = field(default_factory=list)
-    context: AgentContext = field(default_factory=AgentContext)
-    budget: AgentBudget = field(default_factory=AgentBudget)
-    tools: list[str] = field(default_factory=list)
+    role: AgentRole = AgentRole.COORDINATOR
+    depth: int = 0
+    reason: SpawnReason = SpawnReason.DECOMPOSE
+    status: SpawnStatus = SpawnStatus.PENDING
+    task: str = ""
+    model_id: str = ""
+    token_budget: int = 0
+    tokens_used: int = 0
     findings: list[dict[str, Any]] = field(default_factory=list)
-    result: str = ""
-    started_at: float = field(default_factory=time.time)
+    children: list[str] = field(default_factory=list)    # Child agent IDs
+    result: dict[str, Any] = field(default_factory=dict)
+    started_at: float = 0.0
     completed_at: float = 0.0
+    created_at: float = field(default_factory=time.time)
 
     @property
-    def duration_s(self) -> float:
-        if self.completed_at > 0:
+    def runtime_s(self) -> float:
+        if self.completed_at:
             return self.completed_at - self.started_at
-        return time.time() - self.started_at
+        if self.started_at:
+            return time.time() - self.started_at
+        return 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.agent_id[:10],
-            "role": self.role.value,
+            "parent": self.parent_id[:10] if self.parent_id else "root",
+            "role": self.role.value[:8],
             "depth": self.depth,
-            "state": self.state.value,
-            "children": len(self.children_ids),
+            "status": self.status.value[:6],
             "findings": len(self.findings),
+            "children": len(self.children),
         }
 
 
-@dataclass
-class AggregatedResult:
-    """Aggregated results from child agents."""
-    parent_id: str = ""
-    children_results: list[dict[str, Any]] = field(default_factory=list)
-    merged_findings: list[dict[str, Any]] = field(default_factory=list)
-    total_tokens: int = 0
-    total_duration_s: float = 0.0
-    success_rate: float = 0.0
+# ── Default spawn strategies per role ────────────────────────
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "children": len(self.children_results),
-            "findings": len(self.merged_findings),
-            "tokens": self.total_tokens,
-            "success_rate": round(self.success_rate, 2),
-        }
-
-
-# ── Role-to-model mapping ────────────────────────────────────
-
-ROLE_MODEL_MAP: dict[str, str] = {
-    "coordinator": "hermes-14b",
-    "recon": "mistral-7b",
-    "scanner": "whiterabbitneo-7b",
-    "exploiter": "whiterabbitneo-7b",
-    "validator": "deepseek-r1-7b",
-    "code_auditor": "qwen-coder-14b",
-    "planner": "deepseek-r1-7b",
-    "reporter": "llama-3.1-8b",
-    "osint": "dolphin-8b",
-    "cloud": "hermes-14b",
-    "mobile": "whiterabbitneo-7b",
-    "iot": "whiterabbitneo-7b",
-    "network": "whiterabbitneo-7b",
-    "web": "whiterabbitneo-7b",
-    "api": "qwen-coder-7b",
-    "fuzzer": "phi-3.5-mini",
+SPAWN_STRATEGIES: dict[str, list[dict[str, Any]]] = {
+    "full_assessment": [
+        {"role": "recon", "reason": "decompose", "task": "Enumerate attack surface"},
+        {"role": "vuln_scan", "reason": "decompose", "task": "Scan for vulnerabilities"},
+        {"role": "web_audit", "reason": "specialize", "task": "Deep web application audit"},
+        {"role": "code_audit", "reason": "specialize", "task": "Source code review"},
+        {"role": "exploit", "reason": "decompose", "task": "Validate and exploit findings"},
+        {"role": "reporter", "reason": "decompose", "task": "Generate assessment report"},
+    ],
+    "web_assessment": [
+        {"role": "recon", "reason": "decompose", "task": "Web recon and crawling"},
+        {"role": "web_audit", "reason": "specialize", "task": "OWASP testing"},
+        {"role": "vuln_scan", "reason": "parallel", "task": "Automated scanning"},
+        {"role": "validator", "reason": "validate", "task": "Validate findings"},
+    ],
+    "network_assessment": [
+        {"role": "recon", "reason": "decompose", "task": "Network enumeration"},
+        {"role": "vuln_scan", "reason": "decompose", "task": "Port and service scanning"},
+        {"role": "exploit", "reason": "specialize", "task": "Exploit network services"},
+    ],
+    "validation": [
+        {"role": "validator", "reason": "validate", "task": "Cross-validate finding"},
+        {"role": "exploit", "reason": "deepen", "task": "Attempt exploitation"},
+    ],
 }
 
-ROLE_TOOLS: dict[str, list[str]] = {
-    "recon": ["subfinder", "amass", "httpx", "dig", "whois"],
-    "scanner": ["nmap", "nuclei", "nikto", "testssl"],
-    "exploiter": ["sqlmap", "curl", "nuclei"],
-    "validator": ["curl", "nuclei"],
-    "code_auditor": ["semgrep", "bandit", "trufflehog"],
-    "osint": ["subfinder", "waybackurls", "gau"],
-    "cloud": ["nuclei", "curl", "trivy"],
-    "network": ["nmap", "masscan", "enum4linux"],
-    "web": ["nuclei", "ffuf", "sqlmap", "dalfox"],
-    "api": ["ffuf", "nuclei", "curl", "arjun"],
-    "fuzzer": ["ffuf", "nuclei"],
+# Model assignments per role
+ROLE_MODEL_PREFERENCE: dict[AgentRole, list[str]] = {
+    AgentRole.COORDINATOR: ["Hermes-4-14B", "DeepSeek-R1"],
+    AgentRole.RECON: ["Mistral-7B", "Llama-3.1-8B"],
+    AgentRole.VULN_SCAN: ["WhiteRabbitNeo-7B", "Qwen2.5-Coder-7B"],
+    AgentRole.WEB_AUDIT: ["WhiteRabbitNeo-7B", "Qwen2.5-Coder-14B"],
+    AgentRole.CODE_AUDIT: ["Qwen2.5-Coder-14B", "CodeLlama-13B"],
+    AgentRole.EXPLOIT: ["WhiteRabbitNeo-7B", "Dolphin-2.9"],
+    AgentRole.VALIDATOR: ["DeepSeek-R1", "Hermes-4-14B"],
+    AgentRole.REPORTER: ["Mistral-7B", "Llama-3.1-8B"],
+    AgentRole.PLANNER: ["DeepSeek-R1", "Yi-9B-200K"],
 }
 
 
 class RecursiveSpawner:
-    """Manages recursive agent spawning and lifecycle.
+    """Manages recursive agent spawning with depth limits.
 
-    Handles dynamic creation of child agents with
-    budget decay, bounded depth, result aggregation,
-    and convergence monitoring.
+    Parent agents spawn children, children spawn grandchildren,
+    up to a configurable max depth. Budgets are propagated
+    down and results aggregated up.
     """
 
     def __init__(
         self,
-        max_depth: int = MAX_RECURSION_DEPTH,
-        budget_decay: float = BUDGET_DECAY_FACTOR,
+        max_depth: int = 4,
+        max_children: int = 8,
+        default_budget: int = 50000,
     ) -> None:
         self._agents: dict[str, SpawnedAgent] = {}
-        self._counter = 0
         self._max_depth = max_depth
-        self._budget_decay = budget_decay
+        self._max_children = max_children
+        self._default_budget = default_budget
+        self._counter = 0
         self._log = logger.bind(component="recursive_spawner")
 
     def spawn(
         self,
+        parent_id: str,
         role: AgentRole,
-        goal: str,
-        parent_id: str = "",
-        context: AgentContext | None = None,
-        token_budget: int = DEFAULT_TOKEN_BUDGET,
-        time_budget_s: float = DEFAULT_TIME_BUDGET_S,
+        task: str,
+        reason: SpawnReason = SpawnReason.DECOMPOSE,
         model_id: str = "",
-        tools: list[str] | None = None,
+        token_budget: int = 0,
     ) -> SpawnedAgent | None:
-        """Spawn a new agent."""
-        parent = self._agents.get(parent_id) if parent_id else None
-        depth = (parent.depth + 1) if parent else 0
+        """Spawn a child agent."""
+        parent = self._agents.get(parent_id)
+        parent_depth = parent.depth if parent else -1
 
-        if depth > self._max_depth:
-            self._log.warn("max_depth_exceeded", depth=depth)
+        # Check depth limit
+        if parent_depth + 1 >= self._max_depth:
+            self._log.warning(
+                "max_depth_reached",
+                parent=parent_id,
+                depth=parent_depth + 1,
+            )
             return None
 
-        # Apply budget decay for child agents
-        if parent:
-            token_budget = int(parent.budget.tokens_remaining * self._budget_decay)
-            time_budget_s = parent.budget.time_remaining_s * self._budget_decay
+        # Check children limit
+        if parent and len(parent.children) >= self._max_children:
+            self._log.warning(
+                "max_children_reached",
+                parent=parent_id,
+                children=len(parent.children),
+            )
+            return None
 
-            if parent.budget.is_exhausted:
-                self._log.warn("parent_budget_exhausted", parent_id=parent_id)
-                return None
+        # Determine model
+        if not model_id:
+            prefs = ROLE_MODEL_PREFERENCE.get(role, [])
+            model_id = prefs[0] if prefs else "Mistral-7B"
+
+        # Determine budget
+        if not token_budget:
+            if parent:
+                remaining = parent.token_budget - parent.tokens_used
+                token_budget = remaining // (self._max_children - len(parent.children))
+            else:
+                token_budget = self._default_budget
 
         self._counter += 1
         agent = SpawnedAgent(
             agent_id=f"agent-{self._counter}",
-            role=role,
-            goal=goal,
-            model_id=model_id or ROLE_MODEL_MAP.get(role.value, "mistral-7b"),
-            state=AgentState.INITIALIZING,
-            depth=depth,
             parent_id=parent_id,
-            context=context or AgentContext(),
-            budget=AgentBudget(
-                token_budget=token_budget,
-                time_budget_s=time_budget_s,
-                tool_call_limit=max(5, 50 - depth * 10),
-                llm_query_limit=max(3, 20 - depth * 4),
-                child_budget_limit=max(1, 5 - depth),
-            ),
-            tools=tools or ROLE_TOOLS.get(role.value, []),
+            role=role,
+            depth=parent_depth + 1,
+            reason=reason,
+            task=task,
+            model_id=model_id,
+            token_budget=token_budget,
         )
 
         self._agents[agent.agent_id] = agent
-
         if parent:
-            parent.children_ids.append(agent.agent_id)
+            parent.children.append(agent.agent_id)
 
         return agent
 
-    def start_agent(self, agent_id: str) -> bool:
-        """Transition agent to running state."""
-        agent = self._agents.get(agent_id)
-        if not agent or agent.state != AgentState.INITIALIZING:
-            return False
+    def spawn_strategy(
+        self,
+        parent_id: str,
+        strategy_name: str,
+    ) -> list[SpawnedAgent]:
+        """Spawn agents according to a named strategy."""
+        strategy = SPAWN_STRATEGIES.get(strategy_name, [])
+        spawned: list[SpawnedAgent] = []
 
-        agent.state = AgentState.RUNNING
+        for spec in strategy:
+            try:
+                role = AgentRole(spec["role"])
+                reason = SpawnReason(spec["reason"])
+            except ValueError:
+                continue
+
+            agent = self.spawn(
+                parent_id=parent_id,
+                role=role,
+                task=spec.get("task", ""),
+                reason=reason,
+            )
+            if agent:
+                spawned.append(agent)
+
+        return spawned
+
+    def start_agent(self, agent_id: str) -> bool:
+        """Mark agent as running."""
+        agent = self._agents.get(agent_id)
+        if not agent or agent.status != SpawnStatus.PENDING:
+            return False
+        agent.status = SpawnStatus.RUNNING
         agent.started_at = time.time()
         return True
-
-    def record_tool_call(
-        self,
-        agent_id: str,
-        tokens_used: int = 0,
-        duration_s: float = 0.0,
-    ) -> bool:
-        """Record a tool call for budget tracking."""
-        agent = self._agents.get(agent_id)
-        if not agent:
-            return False
-
-        agent.budget.tool_calls_made += 1
-        agent.budget.tokens_used += tokens_used
-        agent.budget.time_used_s += duration_s
-        return not agent.budget.is_exhausted
-
-    def record_llm_query(
-        self,
-        agent_id: str,
-        tokens_used: int = 0,
-    ) -> bool:
-        """Record an LLM query for budget tracking."""
-        agent = self._agents.get(agent_id)
-        if not agent:
-            return False
-
-        agent.budget.llm_queries_made += 1
-        agent.budget.tokens_used += tokens_used
-        return not agent.budget.is_exhausted
-
-    def add_finding(
-        self,
-        agent_id: str,
-        finding: dict[str, Any],
-    ) -> None:
-        """Add a finding to an agent."""
-        agent = self._agents.get(agent_id)
-        if agent:
-            agent.findings.append(finding)
 
     def complete_agent(
         self,
         agent_id: str,
-        result: str = "",
-    ) -> AggregatedResult | None:
-        """Complete an agent and aggregate child results."""
+        findings: list[dict[str, Any]] | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> bool:
+        """Mark agent as completed with results."""
         agent = self._agents.get(agent_id)
         if not agent:
-            return None
-
-        agent.state = AgentState.AGGREGATING
+            return False
+        agent.status = SpawnStatus.COMPLETED
         agent.completed_at = time.time()
-        agent.result = result
+        agent.findings = findings or []
+        agent.result = result or {}
+        return True
 
-        # Aggregate child results
-        aggregated = AggregatedResult(parent_id=agent_id)
-        all_findings = list(agent.findings)
-        completed_children = 0
+    def fail_agent(self, agent_id: str, reason: str = "") -> bool:
+        """Mark agent as failed."""
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return False
+        agent.status = SpawnStatus.FAILED
+        agent.completed_at = time.time()
+        agent.result = {"error": reason}
+        return True
 
-        for child_id in agent.children_ids:
+    def aggregate_results(self, parent_id: str) -> dict[str, Any]:
+        """Aggregate results from all children of a parent."""
+        parent = self._agents.get(parent_id)
+        if not parent:
+            return {}
+
+        all_findings: list[dict[str, Any]] = []
+        child_results: list[dict[str, Any]] = []
+        completed = 0
+        failed = 0
+
+        for child_id in parent.children:
             child = self._agents.get(child_id)
             if not child:
                 continue
+            if child.status == SpawnStatus.COMPLETED:
+                completed += 1
+                all_findings.extend(child.findings)
+                child_results.append({
+                    "agent": child.agent_id,
+                    "role": child.role.value,
+                    "findings": len(child.findings),
+                    "runtime": child.runtime_s,
+                })
+            elif child.status == SpawnStatus.FAILED:
+                failed += 1
 
-            aggregated.children_results.append(child.to_dict())
-            aggregated.total_tokens += child.budget.tokens_used
-            aggregated.total_duration_s += child.duration_s
+        return {
+            "children": len(parent.children),
+            "completed": completed,
+            "failed": failed,
+            "total_findings": len(all_findings),
+            "findings": all_findings,
+            "child_results": child_results,
+        }
 
-            all_findings.extend(child.findings)
+    def get_lineage(self, agent_id: str) -> list[str]:
+        """Get full lineage (root → ... → agent)."""
+        lineage: list[str] = []
+        current = agent_id
+        while current:
+            lineage.insert(0, current)
+            agent = self._agents.get(current)
+            if not agent or not agent.parent_id:
+                break
+            current = agent.parent_id
+        return lineage
 
-            if child.state == AgentState.COMPLETED:
-                completed_children += 1
-
-        aggregated.merged_findings = all_findings
-        aggregated.total_tokens += agent.budget.tokens_used
-
-        if agent.children_ids:
-            aggregated.success_rate = completed_children / len(agent.children_ids)
-
-        agent.state = AgentState.COMPLETED
-        return aggregated
-
-    def fail_agent(self, agent_id: str, reason: str = "") -> None:
-        """Mark agent as failed."""
-        agent = self._agents.get(agent_id)
-        if agent:
-            agent.state = AgentState.FAILED
-            agent.result = reason
-            agent.completed_at = time.time()
-
-    def get_agent(self, agent_id: str) -> SpawnedAgent | None:
-        """Get an agent by ID."""
-        return self._agents.get(agent_id)
-
-    def get_agent_tree(self, root_id: str) -> dict[str, Any]:
-        """Get the full agent tree from a root."""
-        agent = self._agents.get(root_id)
-        if not agent:
-            return {}
-
-        tree = agent.to_dict()
-        tree["children"] = []
-
-        for child_id in agent.children_ids:
-            child_tree = self.get_agent_tree(child_id)
-            if child_tree:
-                tree["children"].append(child_tree)
-
-        return tree
-
-    def build_spawner_prompt(self, agent_id: str = "") -> str:
+    def build_spawn_prompt(self, agent_id: str = "") -> str:
         """Build spawner context for LLM."""
         lines = ["## Agent Hierarchy\n"]
 
-        if agent_id:
-            agent = self._agents.get(agent_id)
-            if agent:
-                lines.append(f"Current: {agent.role.value} (depth {agent.depth})")
-                lines.append(f"Budget: {agent.budget.to_dict()}")
-                lines.append(f"Children: {len(agent.children_ids)}")
+        lines.append(
+            f"Active agents: {len(self._agents)} | "
+            f"Max depth: {self._max_depth} | "
+            f"Max children: {self._max_children}"
+        )
 
-        active = [a for a in self._agents.values() if a.state == AgentState.RUNNING]
-        if active:
-            lines.append(f"\nActive agents: {len(active)}")
-            for agent in active[:5]:
-                lines.append(f"  - {agent.role.value} @ depth {agent.depth}: {agent.goal[:40]}")
+        # Status summary
+        status_counts: dict[str, int] = {}
+        for a in self._agents.values():
+            status_counts[a.status.value] = status_counts.get(a.status.value, 0) + 1
+        lines.append("Status: " + " ".join(f"{k}={v}" for k, v in status_counts.items()))
+
+        # If specific agent, show its context
+        if agent_id and agent_id in self._agents:
+            agent = self._agents[agent_id]
+            lineage = self.get_lineage(agent_id)
+            lines.append(f"\nAgent: {agent_id[:10]} (depth={agent.depth})")
+            lines.append(f"Role: {agent.role.value} | Model: {agent.model_id[:15]}")
+            lines.append(f"Budget: {agent.tokens_used}/{agent.token_budget} tokens")
+            lines.append(f"Lineage: {' → '.join(a[:8] for a in lineage)}")
+
+            if agent.children:
+                lines.append(f"Children ({len(agent.children)}):")
+                for cid in agent.children[:5]:
+                    child = self._agents.get(cid)
+                    if child:
+                        lines.append(
+                            f"  {cid[:8]} [{child.role.value[:6]}] "
+                            f"{child.status.value} ({len(child.findings)} findings)"
+                        )
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        state_counts: dict[str, int] = defaultdict(int)
-        role_counts: dict[str, int] = defaultdict(int)
-        for agent in self._agents.values():
-            state_counts[agent.state.value] += 1
-            role_counts[agent.role.value] += 1
+        role_counts: dict[str, int] = {}
+        for a in self._agents.values():
+            role_counts[a.role.value] = role_counts.get(a.role.value, 0) + 1
 
-        total_findings = sum(len(a.findings) for a in self._agents.values())
         max_depth = max((a.depth for a in self._agents.values()), default=0)
 
         return {
             "total_agents": len(self._agents),
-            "max_depth": max_depth,
-            "total_findings": total_findings,
-            "by_state": dict(state_counts),
-            "by_role": dict(role_counts),
+            "max_depth_used": max_depth,
+            "by_role": role_counts,
+            "total_findings": sum(len(a.findings) for a in self._agents.values()),
         }
