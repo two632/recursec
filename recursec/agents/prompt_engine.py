@@ -1,460 +1,361 @@
-"""Advanced prompt engineering engine for RecurSec agents.
+"""Prompt engineering engine — dynamic prompt construction and optimization.
 
-Provides:
-- Chain-of-thought templates for security reasoning
-- Few-shot examples for vulnerability classification
-- Tool selection prompts
-- Output schema enforcement
-- Context window management
-- Prompt compression for long contexts
-- Dynamic prompt assembly from templates
+Implements:
+1. Role-based prompt templates for each agent type
+2. Dynamic system prompt construction
+3. Few-shot example injection
+4. Context-aware prompt adaptation
+5. Prompt compression for token efficiency
+6. Output format enforcement (JSON, structured)
+7. Chain-of-thought prompt strategies
+8. Prompt caching and reuse
+9. Model-specific prompt formatting
+10. Safety guardrail injection
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+import structlog
+
+logger = structlog.get_logger()
+
+
+class PromptRole(str, Enum):
+    RECON = "recon"
+    VULN_SCANNER = "vuln_scanner"
+    EXPLOIT_DEV = "exploit_dev"
+    CODE_AUDITOR = "code_auditor"
+    NETWORK_ANALYST = "network_analyst"
+    WEB_TESTER = "web_tester"
+    OSINT = "osint"
+    FORENSICS = "forensics"
+    PLANNER = "planner"
+    VALIDATOR = "validator"
+    REPORTER = "reporter"
+    COORDINATOR = "coordinator"
+
+
+class OutputFormat(str, Enum):
+    JSON = "json"
+    TEXT = "text"
+    MARKDOWN = "markdown"
+    STRUCTURED = "structured"
+
+
+class PromptStrategy(str, Enum):
+    DIRECT = "direct"                   # Simple instruction
+    CHAIN_OF_THOUGHT = "chain_of_thought"  # Step-by-step reasoning
+    FEW_SHOT = "few_shot"               # Examples provided
+    TREE_OF_THOUGHT = "tree_of_thought" # Multiple reasoning paths
+    REACT = "react"                     # Reasoning + Acting
+    EXPERT_PANEL = "expert_panel"       # Multiple perspectives
 
 
 @dataclass
-class PromptContext:
-    """Context for building a prompt."""
-    target: str = ""
-    target_type: str = "host"
-    objective: str = ""
-    findings_so_far: list[dict[str, Any]] | None = None
-    available_tools: list[str] | None = None
-    model_capabilities: str = ""
-    max_tokens: int = 4096
-    recursion_depth: int = 0
-    parent_context: str = ""
-    knowledge_snippets: list[str] | None = None
+class PromptTemplate:
+    """A reusable prompt template."""
+    name: str = ""
+    role: PromptRole = PromptRole.COORDINATOR
+    system_prompt: str = ""
+    user_template: str = ""
+    output_format: OutputFormat = OutputFormat.JSON
+    strategy: PromptStrategy = PromptStrategy.DIRECT
+    few_shot_examples: list[dict[str, str]] = field(default_factory=list)
+    max_tokens: int = 1024
+    temperature: float = 0.3
+    stop_sequences: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name, "role": self.role.value,
+            "format": self.output_format.value,
+            "strategy": self.strategy.value,
+            "examples": len(self.few_shot_examples),
+        }
 
 
-# ── Chain-of-Thought Templates ─────────────────────────────
+@dataclass
+class ConstructedPrompt:
+    """A fully constructed prompt ready for LLM."""
+    system: str = ""
+    messages: list[dict[str, str]] = field(default_factory=list)
+    max_tokens: int = 1024
+    temperature: float = 0.3
+    stop_sequences: list[str] = field(default_factory=list)
+    estimated_tokens: int = 0
 
-RECON_COT = """## Reconnaissance Analysis
-
-I need to discover the attack surface for {target}.
-
-**Step 1: Identify Target Type**
-Target: {target}
-Type: {target_type}
-
-**Step 2: Select Discovery Methods**
-Based on the target type, I should:
-{recon_methods}
-
-**Step 3: Analyze Results**
-From the scan results, I will identify:
-- Open ports and services
-- Operating system / versions
-- Potential entry points
-- Misconfigurations
-- Network topology
-
-**Step 4: Prioritize Findings**
-I'll rank findings by:
-1. Directly exploitable services (critical)
-2. Misconfigured services (high)
-3. Outdated software with known CVEs (high)
-4. Information disclosure (medium)
-5. Default configurations (low)
-
-**Step 5: Plan Next Actions**
-Based on findings, delegate to:
-- VulnScan for confirmed services
-- WebScan for any web services found
-- OSINT for additional intelligence
-"""
-
-VULN_ANALYSIS_COT = """## Vulnerability Analysis
-
-Analyzing vulnerability scan results for {target}.
-
-**Step 1: Categorize Findings**
-Group by:
-- Remote Code Execution (RCE) — CRITICAL
-- Authentication Bypass — CRITICAL
-- SQL Injection — HIGH/CRITICAL
-- Cross-Site Scripting (XSS) — MEDIUM/HIGH
-- Information Disclosure — LOW/MEDIUM
-- Denial of Service — MEDIUM
-
-**Step 2: Cross-Reference CVEs**
-For each finding:
-- Look up CVE ID in local NVD database
-- Check CVSS score
-- Verify affected version matches target
-- Check if exploit is publicly available
-
-**Step 3: Validate (Anti-Hallucination)**
-For each potential vulnerability:
-- Was it detected by the actual tool output? (not hallucinated)
-- Does the service version match the vulnerable version?
-- Is there confirming evidence from multiple tools?
-- Could this be a false positive?
-
-**Step 4: Risk Assessment**
-Calculate risk = Severity × Exploitability × Impact
-- Consider network position (internet-facing vs internal)
-- Consider data sensitivity
-- Consider existing mitigations
-
-**Step 5: Recommend Actions**
-{action_recommendations}
-"""
-
-EXPLOIT_PLANNING_COT = """## Exploitation Planning
-
-Planning exploitation for: {finding_title}
-Target: {target}
-Vulnerability: {vuln_type}
-
-**Step 1: Verify Exploitability**
-Before attempting exploitation:
-- Confirm vulnerability version match
-- Check for mitigating controls (WAF, IPS, ASLR)
-- Verify network accessibility
-- Assess collateral damage risk
-
-**Step 2: Select Exploit Strategy**
-Available approaches:
-{exploit_strategies}
-
-**Step 3: Prepare Payload**
-Payload requirements:
-- Must match target architecture ({architecture})
-- Must evade known defenses
-- Should minimize detection footprint
-- Must have reliable cleanup mechanism
-
-**Step 4: Execute with Safety**
-Execution checklist:
-[ ] Verify target is in scope
-[ ] Confirm authorization level
-[ ] Set up monitoring for anomalies
-[ ] Prepare rollback procedure
-[ ] Execute exploit
-[ ] Capture evidence
-[ ] Clean up artifacts
-
-**Step 5: Post-Exploitation Assessment**
-If successful:
-- Document exact reproduction steps
-- Assess actual impact (data access, privilege level)
-- Check for lateral movement opportunities
-- Report with CVSS score and evidence
-"""
-
-CODE_AUDIT_COT = """## Code Audit Analysis
-
-Analyzing code at: {target}
-
-**Step 1: Identify Technology Stack**
-- Language(s): {languages}
-- Framework(s): {frameworks}
-- Dependencies: Check for known vulnerable packages
-
-**Step 2: Priority Checks**
-1. Input validation (injection points)
-2. Authentication/authorization logic
-3. Cryptographic implementations
-4. Session management
-5. File operations (path traversal)
-6. Deserialization
-7. Command execution
-8. SQL queries (parameterized?)
-9. Output encoding (XSS prevention)
-10. Secret management (hardcoded credentials?)
-
-**Step 3: SAST Results Analysis**
-Review findings from:
-- semgrep rules (custom + community)
-- bandit (Python-specific)
-- Language-specific linters
-Eliminate known false positives.
-
-**Step 4: Risk Contextualization**
-For each finding:
-- Is the vulnerable code reachable from user input?
-- What's the data flow from source to sink?
-- Are there sanitization functions in between?
-- What's the worst-case impact?
-
-**Step 5: Remediation Guidance**
-{remediation_guidance}
-"""
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "messages": len(self.messages),
+            "tokens_est": self.estimated_tokens,
+        }
 
 
-# ── Few-Shot Examples ──────────────────────────────────────
+# ── System Prompts ────────────────────────────────────────────
 
-FEW_SHOT_VULN_CLASSIFICATION = """
-Example 1:
-Tool Output: "nmap port 22 open, OpenSSH 7.6p1"
-Classification: LOW — OpenSSH 7.6 has CVE-2018-15473 (username enumeration) but no RCE.
-Confidence: 0.7
+SYSTEM_PROMPTS: dict[str, str] = {
+    "recon": """You are a reconnaissance specialist in a security assessment team.
+Your role is to gather information about targets: subdomains, open ports, services,
+technologies, and any publicly available information. Be thorough and systematic.
+Report findings in structured JSON format. Flag anything unusual or high-risk.""",
 
-Example 2:
-Tool Output: "nuclei detected CVE-2021-44228 (Log4Shell) on port 8080"
-Classification: CRITICAL — Remote Code Execution via JNDI injection, CVSS 10.0.
-Confidence: 0.95
+    "vuln_scanner": """You are a vulnerability analysis specialist. You analyze tool outputs
+from scanners (nmap, nuclei, nikto) and identify real vulnerabilities. Distinguish between
+true positives and false positives. Rate severity using CVSS methodology. Provide evidence
+for each finding. Be precise — false positives waste resources.""",
 
-Example 3:
-Tool Output: "nikto found /admin accessible without authentication"
-Classification: HIGH — Administrative interface exposed, potential full system compromise.
-Confidence: 0.85
+    "exploit_dev": """You are an exploitation specialist. You develop and execute safe proof-of-concept
+exploits to demonstrate vulnerability impact. Always work within authorized scope.
+Use the minimum force necessary to prove exploitability. Document every step.""",
 
-Example 4:
-Tool Output: "sqlmap confirmed SQL injection on parameter 'id'"
-Classification: CRITICAL — Confirmed SQL injection enables data extraction and potentially RCE.
-Confidence: 0.95
+    "code_auditor": """You are a code security auditor. You review source code for vulnerabilities:
+injection flaws, authentication issues, authorization bypasses, crypto weaknesses,
+insecure deserialization, and more. Map findings to CWE IDs. Provide line numbers
+and remediation guidance.""",
 
-Example 5:
-Tool Output: "X-Powered-By header present: Express"
-Classification: INFO — Information disclosure, no direct security impact.
-Confidence: 0.9
-"""
+    "network_analyst": """You are a network security analyst. You analyze network configurations,
+protocols, traffic patterns, and firewall rules. Identify misconfigurations, weak protocols,
+and potential attack paths. Map findings to network topology.""",
 
-FEW_SHOT_TOOL_SELECTION = """
-Scenario 1: "Scan target 192.168.1.1 for open ports"
-Tools: nmap (quick SYN scan), masscan (if full range needed)
-Reasoning: Start with nmap -sS for reliable service detection.
+    "web_tester": """You are a web application security tester. You test for OWASP Top 10
+vulnerabilities: injection, broken auth, sensitive data exposure, XXE, broken access control,
+security misconfiguration, XSS, insecure deserialization, known vulnerable components,
+and insufficient logging.""",
 
-Scenario 2: "Test web application at https://target.com for vulnerabilities"
-Tools: nuclei (template scan), nikto (server misconfig), sqlmap (if params found), ffuf (dir discovery)
-Reasoning: nuclei covers broadest vulnerability set, nikto adds server-specific checks.
+    "osint": """You are an OSINT (Open Source Intelligence) specialist. You gather publicly
+available information about targets: email addresses, employee names, technology stacks,
+leaked credentials, social media presence, and corporate relationships.""",
 
-Scenario 3: "Audit the GitHub repository at /path/to/code"
-Tools: semgrep (SAST), trufflehog (secrets), trivy (dependency vulns), bandit (if Python)
-Reasoning: Multi-layer analysis catches different vulnerability classes.
+    "forensics": """You are a digital forensics analyst. You analyze system artifacts, logs,
+and evidence to understand security incidents. Follow evidence preservation best practices.
+Document chain of custody. Identify indicators of compromise.""",
 
-Scenario 4: "Crack this NTLM hash: aad3b435b51404eeaad3b435b51404ee"
-Tools: hashcat (GPU), john (CPU fallback)
-Reasoning: NTLM mode 1000 in hashcat, use rockyou wordlist first.
-"""
+    "planner": """You are a security assessment planner. You create comprehensive assessment
+plans with phases, milestones, and resource allocation. Prioritize actions based on risk
+and available time. Adapt plans based on findings.""",
 
+    "validator": """You are a finding validator. You independently verify vulnerability findings
+using different tools and techniques. Cross-reference findings with known vulnerability
+databases. Challenge assumptions and look for false positives. Be skeptical — only confirm
+findings with strong evidence.""",
 
-# ── Output Schema Templates ───────────────────────────────
+    "reporter": """You are a security report writer. You create clear, actionable reports
+for technical and executive audiences. Prioritize findings by risk. Include remediation
+recommendations with estimated effort.""",
 
-STRUCTURED_FINDING_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "title": {"type": "string", "description": "Short descriptive title"},
-        "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
-        "cvss_score": {"type": "number", "minimum": 0, "maximum": 10},
-        "cve_id": {"type": "string", "description": "CVE identifier if applicable"},
-        "description": {"type": "string", "description": "Detailed description"},
-        "evidence": {"type": "array", "items": {"type": "string"}},
-        "affected_component": {"type": "string"},
-        "remediation": {"type": "string"},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "false_positive_risk": {"type": "string", "enum": ["low", "medium", "high"]},
-    },
-    "required": ["title", "severity", "description", "confidence"],
+    "coordinator": """You are the security assessment coordinator. You manage the team of
+specialist agents, allocate resources, resolve conflicts, and ensure comprehensive coverage.
+Track progress and adapt strategy based on findings.""",
 }
 
-TOOL_SELECTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "tool": {"type": "string", "description": "Tool name to execute"},
-        "arguments": {"type": "object", "description": "Tool-specific arguments"},
-        "reasoning": {"type": "string", "description": "Why this tool was selected"},
-        "expected_output": {"type": "string", "description": "What to look for in output"},
-        "timeout_s": {"type": "integer", "default": 300},
-        "follow_up_tools": {"type": "array", "items": {"type": "string"}},
+
+# ── Few-Shot Examples ─────────────────────────────────────────
+
+FEW_SHOT_VULN_ANALYSIS: list[dict[str, str]] = [
+    {
+        "user": "Analyze this nmap output:\nPORT STATE SERVICE VERSION\n22/tcp open ssh OpenSSH 7.4\n80/tcp open http Apache 2.4.6\n443/tcp open ssl/http Apache 2.4.6\n3306/tcp open mysql MySQL 5.7.38",
+        "assistant": '{"findings": [{"port": 22, "service": "ssh", "version": "OpenSSH 7.4", "risk": "medium", "note": "OpenSSH 7.4 has known vulnerabilities (CVE-2017-15906). Upgrade recommended."}, {"port": 3306, "service": "mysql", "risk": "high", "note": "MySQL exposed to network. Should be firewalled to localhost only."}], "recommendations": ["Upgrade OpenSSH to latest", "Restrict MySQL to 127.0.0.1", "Check Apache mod_security"]}',
     },
-    "required": ["tool", "arguments", "reasoning"],
+    {
+        "user": "Is this XSS finding valid?\nURL: https://example.com/search?q=<script>alert(1)</script>\nResponse contains: <script>alert(1)</script>",
+        "assistant": '{"valid": true, "confidence": 0.9, "type": "reflected_xss", "severity": "medium", "evidence": "User input reflected unescaped in response body", "cwe": "CWE-79", "remediation": "Implement output encoding. Use Content-Security-Policy header."}',
+    },
+]
+
+FEW_SHOT_RECON: list[dict[str, str]] = [
+    {
+        "user": "What can you determine about this target from the headers?\nServer: nginx/1.18.0\nX-Powered-By: PHP/7.4.3\nSet-Cookie: PHPSESSID=abc123; path=/\nX-Frame-Options: DENY",
+        "assistant": '{"tech_stack": {"server": "nginx 1.18.0", "language": "PHP 7.4.3", "session": "PHP native sessions"}, "security_headers": {"x_frame_options": "present", "csp": "missing", "hsts": "missing"}, "findings": [{"item": "PHP version exposed", "risk": "low", "note": "Remove X-Powered-By header"}, {"item": "Missing HSTS", "risk": "medium"}, {"item": "Missing CSP", "risk": "medium"}]}',
+    },
+]
+
+
+# ── Output Format Templates ──────────────────────────────────
+
+OUTPUT_FORMATS = {
+    "json": "\n\nRespond ONLY with valid JSON. No markdown, no explanation, just JSON.",
+    "structured": "\n\nRespond with structured data:\n- Use bullet points for lists\n- Use headers for sections\n- Include severity ratings",
+    "markdown": "\n\nRespond in Markdown format with headers, lists, and code blocks as needed.",
+    "text": "",
 }
 
-TASK_DECOMPOSITION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "subtasks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "description": {"type": "string"},
-                    "agent_role": {"type": "string"},
-                    "priority": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "dependencies": {"type": "array", "items": {"type": "string"}},
-                    "tools_needed": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["description", "agent_role", "priority"],
-            },
-        },
-    },
-    "required": ["subtasks"],
-}
+
+# ── Safety Guardrails ────────────────────────────────────────
+
+SAFETY_SUFFIX = """
+
+SAFETY RULES:
+- Only operate within authorized scope
+- Do not access or modify data outside the assessment
+- Use the least-destructive technique to demonstrate impact
+- Stop immediately if you detect you're affecting production systems
+- Report any accidental findings outside scope immediately"""
 
 
 class PromptEngine:
-    """Builds and manages prompts for RecurSec agents."""
+    """Dynamic prompt construction and optimization.
+
+    Builds context-aware, role-specific prompts with
+    few-shot examples, safety guardrails, and format
+    enforcement.
+    """
 
     def __init__(self) -> None:
-        self._templates: dict[str, str] = {
-            "recon_cot": RECON_COT,
-            "vuln_analysis_cot": VULN_ANALYSIS_COT,
-            "exploit_planning_cot": EXPLOIT_PLANNING_COT,
-            "code_audit_cot": CODE_AUDIT_COT,
-        }
+        self._templates: dict[str, PromptTemplate] = {}
+        self._cache: dict[str, ConstructedPrompt] = {}
+        self._log = logger.bind(component="prompt_engine")
 
-    def build_recon_prompt(self, ctx: PromptContext) -> str:
-        """Build a complete recon prompt with CoT."""
-        methods = self._select_recon_methods(ctx.target_type)
-        cot = self._templates["recon_cot"].format(
-            target=ctx.target,
-            target_type=ctx.target_type,
-            recon_methods=methods,
-        )
+        self._init_templates()
 
-        return self._assemble_prompt(
-            system="You are a reconnaissance specialist. Discover the complete attack surface.",
-            cot=cot,
-            tools=ctx.available_tools,
-            output_schema=TOOL_SELECTION_SCHEMA,
-            max_tokens=ctx.max_tokens,
-        )
+    def _init_templates(self) -> None:
+        """Initialize built-in prompt templates."""
+        for role_name, system_prompt in SYSTEM_PROMPTS.items():
+            try:
+                role = PromptRole(role_name)
+            except ValueError:
+                continue
 
-    def build_vuln_analysis_prompt(
-        self, ctx: PromptContext, scan_results: str = ""
-    ) -> str:
-        """Build vulnerability analysis prompt."""
-        cot = self._templates["vuln_analysis_cot"].format(
-            target=ctx.target,
-            action_recommendations="Prioritize remediations by risk score.",
-        )
+            template = PromptTemplate(
+                name=role_name,
+                role=role,
+                system_prompt=system_prompt,
+                output_format=OutputFormat.JSON,
+                strategy=PromptStrategy.CHAIN_OF_THOUGHT,
+            )
 
-        return self._assemble_prompt(
-            system="You are a vulnerability analyst. Classify and prioritize findings accurately.",
-            cot=cot,
-            few_shot=FEW_SHOT_VULN_CLASSIFICATION,
-            context=scan_results,
-            output_schema=STRUCTURED_FINDING_SCHEMA,
-            max_tokens=ctx.max_tokens,
-        )
+            # Add few-shot examples for specific roles
+            if role_name == "vuln_scanner":
+                template.few_shot_examples = FEW_SHOT_VULN_ANALYSIS
+            elif role_name == "recon":
+                template.few_shot_examples = FEW_SHOT_RECON
 
-    def build_exploit_prompt(
+            self._templates[role_name] = template
+
+    def construct(
         self,
-        ctx: PromptContext,
-        finding_title: str = "",
-        vuln_type: str = "",
-    ) -> str:
-        """Build exploitation planning prompt."""
-        cot = self._templates["exploit_planning_cot"].format(
-            finding_title=finding_title,
-            target=ctx.target,
-            vuln_type=vuln_type,
-            exploit_strategies="1. Direct exploit\n2. Chained exploitation\n3. Social engineering",
-            architecture="x86_64",
-        )
-
-        return self._assemble_prompt(
-            system="You are an exploitation specialist. Plan and execute verified exploits safely.",
-            cot=cot,
-            tools=ctx.available_tools,
-            max_tokens=ctx.max_tokens,
-        )
-
-    def build_code_audit_prompt(
-        self, ctx: PromptContext, languages: str = "", frameworks: str = ""
-    ) -> str:
-        """Build code audit prompt."""
-        cot = self._templates["code_audit_cot"].format(
-            target=ctx.target,
-            languages=languages or "auto-detected",
-            frameworks=frameworks or "auto-detected",
-            remediation_guidance="Provide specific code fixes with examples.",
-        )
-
-        return self._assemble_prompt(
-            system="You are a code security auditor. Find vulnerabilities in source code.",
-            cot=cot,
-            few_shot=FEW_SHOT_VULN_CLASSIFICATION,
-            output_schema=STRUCTURED_FINDING_SCHEMA,
-            max_tokens=ctx.max_tokens,
-        )
-
-    def build_task_decomposition_prompt(self, ctx: PromptContext) -> str:
-        """Build task decomposition prompt for the orchestrator."""
-        return self._assemble_prompt(
-            system="You are the orchestrator. Decompose this objective into specialized sub-tasks.",
-            context=f"Objective: {ctx.objective}\nTarget: {ctx.target}\nType: {ctx.target_type}",
-            output_schema=TASK_DECOMPOSITION_SCHEMA,
-            few_shot=FEW_SHOT_TOOL_SELECTION,
-            max_tokens=ctx.max_tokens,
-        )
-
-    def build_validation_prompt(
-        self,
-        finding: dict[str, Any],
-        tool_outputs: list[str] | None = None,
-    ) -> str:
-        """Build finding validation prompt (anti-hallucination)."""
-        context = f"Finding to validate:\n{json.dumps(finding, indent=2)}"
-        if tool_outputs:
-            context += "\n\nRaw tool outputs:\n" + "\n---\n".join(tool_outputs[:3])
-
-        return self._assemble_prompt(
-            system="""You are a finding validator. Your job is to determine if a security finding is:
-1. VALID — confirmed by tool output evidence
-2. FALSE POSITIVE — tool output doesn't actually confirm this
-3. NEEDS VERIFICATION — inconclusive, requires additional testing
-
-Be skeptical. Only mark as VALID if there is clear evidence in the tool output.
-Common false positives: generic server headers, version-only detections without exploit confirmation,
-informational findings classified as vulnerabilities.""",
-            context=context,
-            max_tokens=1024,
-        )
-
-    def _assemble_prompt(
-        self,
-        system: str = "",
-        cot: str = "",
-        few_shot: str = "",
+        role: str,
+        user_message: str,
         context: str = "",
-        tools: list[str] | None = None,
-        output_schema: dict[str, Any] | None = None,
-        max_tokens: int = 4096,
-    ) -> str:
-        """Assemble a complete prompt from components."""
-        parts = []
+        target: str = "",
+        output_format: OutputFormat = OutputFormat.JSON,
+        strategy: PromptStrategy = PromptStrategy.CHAIN_OF_THOUGHT,
+        include_safety: bool = True,
+        model_name: str = "",
+    ) -> ConstructedPrompt:
+        """Construct a complete prompt."""
+        template = self._templates.get(role)
+        system = template.system_prompt if template else SYSTEM_PROMPTS.get("coordinator", "")
 
-        if system:
-            parts.append(f"[SYSTEM]\n{system}")
-
-        if few_shot:
-            parts.append(f"\n[EXAMPLES]\n{few_shot}")
-
-        if cot:
-            parts.append(f"\n[REASONING]\n{cot}")
-
+        # Add context
         if context:
-            # Truncate context if too long
-            max_context = max_tokens * 3  # Rough char estimate
-            if len(context) > max_context:
-                context = context[:max_context] + "\n... [truncated]"
-            parts.append(f"\n[CONTEXT]\n{context}")
+            system += f"\n\nCurrent context:\n{context[:500]}"
 
-        if tools:
-            parts.append("\n[AVAILABLE TOOLS]\n" + ", ".join(tools))
+        # Add target info
+        if target:
+            system += f"\n\nTarget: {target}"
 
-        if output_schema:
-            parts.append(f"\n[OUTPUT FORMAT]\nRespond with valid JSON matching this schema:\n{json.dumps(output_schema, indent=2)}")
+        # Strategy-specific additions
+        if strategy == PromptStrategy.CHAIN_OF_THOUGHT:
+            system += "\n\nThink step-by-step. Show your reasoning before your conclusion."
+        elif strategy == PromptStrategy.REACT:
+            system += "\n\nUse the ReAct pattern: Thought → Action → Observation → Thought → ..."
+        elif strategy == PromptStrategy.TREE_OF_THOUGHT:
+            system += "\n\nConsider multiple approaches. Evaluate each before choosing the best."
 
-        return "\n".join(parts)
+        # Output format
+        system += OUTPUT_FORMATS.get(output_format.value, "")
 
-    def _select_recon_methods(self, target_type: str) -> str:
-        """Select appropriate recon methods based on target type."""
-        methods: dict[str, str] = {
-            "host": "1. Port scan (nmap/masscan)\n2. Service enumeration\n3. OS fingerprinting\n4. Banner grabbing",
-            "url": "1. Technology fingerprinting\n2. Directory discovery\n3. Parameter enumeration\n4. Subdomain discovery\n5. WAF detection",
-            "network_range": "1. Host discovery (ARP/ICMP)\n2. Top-port scan all live hosts\n3. Service enumeration on open ports\n4. Network topology mapping",
-            "code_repo": "1. Technology stack identification\n2. Dependency listing\n3. Secret scanning\n4. Framework detection",
-            "api": "1. Endpoint discovery\n2. Authentication testing\n3. Parameter fuzzing\n4. Rate limit testing\n5. Schema validation",
-            "domain": "1. DNS enumeration\n2. Subdomain discovery\n3. Certificate transparency\n4. WHOIS lookup\n5. Email harvesting",
+        # Safety
+        if include_safety:
+            system += SAFETY_SUFFIX
+
+        # Model-specific formatting
+        system = self._format_for_model(system, model_name)
+
+        # Build messages
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+
+        # Few-shot examples
+        if template and template.few_shot_examples:
+            for example in template.few_shot_examples[:3]:
+                messages.append({"role": "user", "content": example["user"]})
+                messages.append({"role": "assistant", "content": example["assistant"]})
+
+        # User message
+        messages.append({"role": "user", "content": user_message})
+
+        # Estimate tokens
+        total_chars = sum(len(m["content"]) for m in messages)
+        est_tokens = total_chars // 4
+
+        return ConstructedPrompt(
+            system=system,
+            messages=messages,
+            max_tokens=template.max_tokens if template else 1024,
+            temperature=template.temperature if template else 0.3,
+            estimated_tokens=est_tokens,
+        )
+
+    def _format_for_model(self, system: str, model_name: str) -> str:
+        """Apply model-specific formatting."""
+        model_lower = model_name.lower()
+
+        if "llama" in model_lower:
+            pass  # Llama uses standard chat format
+        elif "qwen" in model_lower:
+            pass  # Qwen uses standard chat format
+        elif "deepseek" in model_lower:
+            # DeepSeek benefits from explicit step numbering
+            if "step-by-step" not in system.lower():
+                system += "\n\nPlease reason carefully, step by step."
+        elif "dolphin" in model_lower:
+            # Dolphin is uncensored — can be more direct
+            system = system.replace(SAFETY_SUFFIX, "")
+        elif "phi" in model_lower:
+            # Phi is small — keep prompts concise
+            lines = system.split("\n")
+            system = "\n".join(line for line in lines if line.strip())
+
+        return system
+
+    def add_template(self, template: PromptTemplate) -> None:
+        self._templates[template.name] = template
+
+    def get_template(self, name: str) -> PromptTemplate | None:
+        return self._templates.get(name)
+
+    def list_templates(self) -> list[str]:
+        return list(self._templates.keys())
+
+    def compress_prompt(self, text: str, max_tokens: int = 2000) -> str:
+        """Compress a prompt to fit within token limits."""
+        est_tokens = len(text) // 4
+
+        if est_tokens <= max_tokens:
+            return text
+
+        # Strategy 1: Remove empty lines
+        lines = [line for line in text.split("\n") if line.strip()]
+        text = "\n".join(lines)
+
+        est_tokens = len(text) // 4
+        if est_tokens <= max_tokens:
+            return text
+
+        # Strategy 2: Truncate from the middle
+        target_chars = max_tokens * 4
+        if len(text) > target_chars:
+            half = target_chars // 2
+            text = text[:half] + "\n...[truncated]...\n" + text[-half:]
+
+        return text
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "templates": len(self._templates),
+            "roles": [r.value for r in PromptRole],
         }
-        return methods.get(target_type, methods["host"])
