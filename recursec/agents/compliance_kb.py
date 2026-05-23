@@ -1,11 +1,11 @@
-"""Compliance and audit knowledge base.
+"""Compliance and regulatory knowledge base.
 
-Deep knowledge about security compliance:
-1. PCI DSS requirements
-2. HIPAA technical safeguards
+Deep knowledge about security compliance frameworks:
+1. PCI DSS compliance testing
+2. HIPAA security assessment
 3. SOC 2 controls
-4. NIST cybersecurity framework
-5. GDPR technical requirements
+4. GDPR technical requirements
+5. NIST CSF mapping
 """
 
 from __future__ import annotations
@@ -20,204 +20,215 @@ logger = structlog.get_logger()
 
 @dataclass
 class CompliancePattern:
-    """A compliance requirement pattern."""
+    """A compliance pattern."""
     pattern_id: str = ""
     name: str = ""
-    framework: str = ""
     category: str = ""
+    severity: str = "high"
     description: str = ""
-    test_procedures: str = ""
+    detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.pattern_id,
             "name": self.name[:25],
-            "framework": self.framework[:10],
+            "category": self.category[:12],
         }
 
 
 COMPLIANCE_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "comp-001", "name": "PCI DSS Network Security",
-        "framework": "PCI_DSS", "category": "network",
-        "desc": "PCI DSS requirements for network security.",
-        "procedures": (
-            "PCI DSS NETWORK SECURITY:\n"
-            "REQ 1: Install and maintain network security controls\n"
-            "  TESTS:\n"
-            "  - Verify firewall between DMZ and internal network\n"
-            "  - Check firewall rules deny all by default\n"
-            "  - Verify no direct public access to cardholder data env\n"
-            "  - Review firewall/router configurations\n"
-            "  nmap -sS -p- <cardholder_env>  # Check open ports\n"
-            "  nmap --script firewall-bypass <target>\n"
-            "REQ 2: Secure system configurations\n"
-            "  TESTS:\n"
-            "  - Check no default passwords on systems\n"
-            "  - Verify unnecessary services disabled\n"
-            "  - Review system hardening standards\n"
-            "  nmap -sV --script default <target>  # Service versions\n"
-            "  # Check default credentials\n"
-            "  hydra -L defaults.txt -P defaults.txt <target> ssh\n"
-            "REQ 4: Encrypt cardholder data in transit\n"
-            "  TESTS:\n"
-            "  - Verify TLS 1.2+ on all external connections\n"
-            "  - Check for weak ciphers\n"
-            "  testssl.sh <target>  # Full TLS analysis\n"
-            "  nmap --script ssl-enum-ciphers <target>"
+        "id": "comp-001", "name": "PCI DSS Testing",
+        "category": "pci", "severity": "high",
+        "desc": "PCI DSS compliance security testing.",
+        "detection": (
+            "PCI DSS COMPLIANCE TESTING:\n"
+            "REQUIREMENT 1: Network Security Controls\n"
+            "  - Firewall rules review\n"
+            "  - Network segmentation testing\n"
+            "  - CDE boundary verification\n"
+            "  - DMZ configuration check\n"
+            "REQUIREMENT 2: Secure Configurations\n"
+            "  - Default credential check\n"
+            "  - Unnecessary service removal\n"
+            "  - Encryption standards (TLS 1.2+)\n"
+            "  - System hardening benchmarks (CIS)\n"
+            "REQUIREMENT 3: Stored Account Data\n"
+            "  - PAN storage discovery\n"
+            "  - Encryption verification (AES-256)\n"
+            "  - Key management review\n"
+            "  - Data retention policies\n"
+            "REQUIREMENT 6: Secure Software\n"
+            "  - OWASP Top 10 testing\n"
+            "  - Secure SDLC review\n"
+            "  - Public-facing web app scanning\n"
+            "  - WAF deployment check\n"
+            "REQUIREMENT 11: Regular Testing\n"
+            "  - Quarterly ASV scans\n"
+            "  - Annual penetration testing\n"
+            "  - Internal vulnerability scans\n"
+            "  - Wireless scanning\n"
+            "  - IDS/IPS monitoring\n"
+            "  - File integrity monitoring\n"
+            "TOOLS:\n"
+            "  Nessus, Qualys, nmap, nuclei"
         ),
-        "tools": ["nmap", "testssl", "hydra"],
+        "tools": ["nessus", "qualys"],
     },
     {
-        "id": "comp-002", "name": "HIPAA Technical Safeguards",
-        "framework": "HIPAA", "category": "healthcare",
-        "desc": "HIPAA technical safeguard requirements.",
-        "procedures": (
-            "HIPAA TECHNICAL SAFEGUARDS:\n"
-            "ACCESS CONTROL (164.312(a)):\n"
-            "  - Unique user identification\n"
-            "  - Emergency access procedures\n"
-            "  - Automatic logoff\n"
-            "  - Encryption and decryption of ePHI\n"
-            "  TESTS:\n"
-            "  - Verify unique user IDs for all users\n"
-            "  - Check session timeout settings\n"
-            "  - Test encryption of data at rest\n"
-            "  - Verify role-based access controls\n"
-            "AUDIT CONTROLS (164.312(b)):\n"
-            "  - Hardware, software, procedural logging\n"
-            "  - Record and examine system activity\n"
-            "  TESTS:\n"
-            "  - Verify logging enabled on all systems\n"
-            "  - Check log retention (minimum 6 years)\n"
-            "  - Review log monitoring processes\n"
-            "TRANSMISSION SECURITY (164.312(e)):\n"
-            "  - Integrity controls\n"
-            "  - Encryption of ePHI in transit\n"
-            "  TESTS:\n"
-            "  testssl.sh <target>  # Verify TLS\n"
-            "  - Check all ePHI transmissions encrypted\n"
-            "  - Verify VPN for remote access"
+        "id": "comp-002", "name": "HIPAA Security",
+        "category": "hipaa", "severity": "high",
+        "desc": "HIPAA security assessment.",
+        "detection": (
+            "HIPAA SECURITY ASSESSMENT:\n"
+            "ADMINISTRATIVE (§164.308):\n"
+            "  - Risk analysis conducted\n"
+            "  - Risk management plan\n"
+            "  - Workforce training\n"
+            "  - Information access management\n"
+            "  - Security incident procedures\n"
+            "PHYSICAL (§164.310):\n"
+            "  - Facility access controls\n"
+            "  - Workstation security\n"
+            "  - Device and media controls\n"
+            "  - Disposal procedures\n"
+            "TECHNICAL (§164.312):\n"
+            "  - Access control (unique user ID, auto-logoff)\n"
+            "  - Audit controls (logging, monitoring)\n"
+            "  - Integrity controls (hashing, checksums)\n"
+            "  - Transmission security (encryption in transit)\n"
+            "  - Authentication mechanisms\n"
+            "PHI DATA:\n"
+            "  - PHI at rest encryption\n"
+            "  - PHI in transit encryption (TLS 1.2+)\n"
+            "  - Access logging for PHI access\n"
+            "  - Minimum necessary principle\n"
+            "  - Business associate agreements\n"
+            "TESTING:\n"
+            "  - Network segmentation of PHI systems\n"
+            "  - PHI data discovery (DLP scanning)\n"
+            "  - Access control testing\n"
+            "  - Encryption verification"
         ),
-        "tools": ["testssl", "nmap"],
+        "tools": [],
     },
     {
-        "id": "comp-003", "name": "NIST Cybersecurity Framework",
-        "framework": "NIST_CSF", "category": "general",
-        "desc": "NIST CSF assessment areas.",
-        "procedures": (
-            "NIST CYBERSECURITY FRAMEWORK:\n"
-            "IDENTIFY (ID):\n"
-            "  - Asset management (ID.AM)\n"
-            "  - Business environment (ID.BE)\n"
-            "  - Risk assessment (ID.RA)\n"
-            "  TESTS:\n"
-            "  - Verify asset inventory completeness\n"
-            "  nmap -sn <network>/24  # Discover unknown devices\n"
-            "  - Review risk assessment documentation\n"
-            "PROTECT (PR):\n"
-            "  - Access control (PR.AC)\n"
-            "  - Awareness and training (PR.AT)\n"
-            "  - Data security (PR.DS)\n"
-            "  TESTS:\n"
-            "  - Verify MFA on all critical systems\n"
-            "  - Check patch management process\n"
-            "  - Test backup and recovery\n"
-            "DETECT (DE):\n"
-            "  - Anomalies and events (DE.AE)\n"
-            "  - Continuous monitoring (DE.CM)\n"
-            "  TESTS:\n"
-            "  - Verify IDS/IPS deployment\n"
-            "  - Check SIEM coverage\n"
-            "  - Test alerting with simulated attacks\n"
-            "RESPOND (RS):\n"
-            "  - Response planning (RS.RP)\n"
-            "  - Communications (RS.CO)\n"
-            "  - Analysis (RS.AN)\n"
-            "RECOVER (RC):\n"
-            "  - Recovery planning (RC.RP)\n"
-            "  - Verify RTO/RPO compliance"
-        ),
-        "tools": ["nmap", "nuclei"],
-    },
-    {
-        "id": "comp-004", "name": "SOC 2 Trust Services",
-        "framework": "SOC2", "category": "cloud",
-        "desc": "SOC 2 trust service criteria testing.",
-        "procedures": (
-            "SOC 2 TRUST SERVICES:\n"
+        "id": "comp-003", "name": "SOC 2 Controls",
+        "category": "soc2", "severity": "medium",
+        "desc": "SOC 2 Trust Services Criteria.",
+        "detection": (
+            "SOC 2 CONTROLS:\n"
             "SECURITY (CC):\n"
-            "  CC6.1: Logical and physical access controls\n"
-            "  TESTS:\n"
-            "  - Verify access reviews performed quarterly\n"
-            "  - Check least privilege enforcement\n"
-            "  - Test account provisioning/deprovisioning\n"
-            "  - Verify MFA on all admin accounts\n"
-            "  CC6.6: Restriction of network traffic\n"
-            "  TESTS:\n"
-            "  - Verify firewall rules\n"
-            "  - Check network segmentation\n"
-            "  - Test egress filtering\n"
-            "  nmap -sS <target>  # Verify exposed ports\n"
-            "  CC7.2: Monitoring of system components\n"
-            "  TESTS:\n"
-            "  - Verify logging coverage\n"
-            "  - Check SIEM alerts configured\n"
+            "  CC6.1: Access controls (RBAC, MFA)\n"
+            "  CC6.2: Authentication mechanisms\n"
+            "  CC6.3: Authorization management\n"
+            "  CC6.6: External threat protection\n"
+            "  CC6.7: Network security monitoring\n"
+            "  CC6.8: Unauthorized access prevention\n"
             "AVAILABILITY (A):\n"
-            "  A1.1: Processing capacity\n"
-            "  - Verify auto-scaling configured\n"
-            "  - Test failover mechanisms\n"
-            "  - Check SLA compliance\n"
+            "  A1.1: Capacity planning\n"
+            "  A1.2: Environmental safeguards\n"
+            "  A1.3: Recovery procedures\n"
             "CONFIDENTIALITY (C):\n"
-            "  C1.1: Confidential information protection\n"
-            "  - Verify encryption at rest and in transit\n"
-            "  - Check data classification\n"
-            "  - Test DLP controls"
+            "  C1.1: Data classification\n"
+            "  C1.2: Confidential data protection\n"
+            "PROCESSING INTEGRITY (PI):\n"
+            "  PI1.1: Processing accuracy\n"
+            "  PI1.2: Input/output validation\n"
+            "TESTING:\n"
+            "  - Evidence collection automation\n"
+            "  - Control effectiveness testing\n"
+            "  - Gap analysis against criteria\n"
+            "  - Continuous monitoring setup\n"
+            "  - Policy and procedure review\n"
+            "TOOLS:\n"
+            "  Vanta, Drata, Secureframe (compliance automation)"
         ),
-        "tools": ["nmap", "nuclei", "testssl"],
+        "tools": [],
     },
     {
-        "id": "comp-005", "name": "GDPR Technical Controls",
-        "framework": "GDPR", "category": "privacy",
-        "desc": "GDPR technical requirement testing.",
-        "procedures": (
-            "GDPR TECHNICAL CONTROLS:\n"
-            "ART 25: Data protection by design\n"
-            "  TESTS:\n"
-            "  - Verify data minimization in applications\n"
-            "  - Check privacy settings default to most protective\n"
-            "  - Test pseudonymization/anonymization\n"
-            "  - Review data retention automation\n"
-            "ART 32: Security of processing\n"
-            "  TESTS:\n"
-            "  - Verify encryption of personal data\n"
-            "  testssl.sh <target>  # TLS assessment\n"
-            "  - Check access controls on personal data stores\n"
-            "  - Verify regular security testing\n"
-            "  nuclei -u <target> -t cves/  # Vulnerability scan\n"
-            "ART 33: Data breach notification\n"
-            "  TESTS:\n"
-            "  - Verify breach detection capability\n"
-            "  - Check notification process (<72 hours)\n"
-            "  - Test incident response plan\n"
-            "ART 17: Right to erasure\n"
-            "  TESTS:\n"
-            "  - Verify data deletion mechanisms\n"
-            "  - Check deletion from backups\n"
-            "  - Test API for data deletion requests\n"
-            "ART 20: Data portability\n"
-            "  TESTS:\n"
-            "  - Verify data export in machine-readable format\n"
-            "  - Test API for data export"
+        "id": "comp-004", "name": "GDPR Technical",
+        "category": "gdpr", "severity": "high",
+        "desc": "GDPR technical security requirements.",
+        "detection": (
+            "GDPR TECHNICAL REQUIREMENTS:\n"
+            "ARTICLE 32 (Security of Processing):\n"
+            "  - Encryption of personal data\n"
+            "  - Confidentiality, integrity, availability\n"
+            "  - Resilience of processing systems\n"
+            "  - Ability to restore data\n"
+            "  - Regular testing of security\n"
+            "DATA PROTECTION:\n"
+            "  - Data at rest encryption (AES-256)\n"
+            "  - Data in transit encryption (TLS 1.2+)\n"
+            "  - Pseudonymization/anonymization\n"
+            "  - Data minimization\n"
+            "  - Storage limitation\n"
+            "ACCESS CONTROL:\n"
+            "  - Role-based access (RBAC)\n"
+            "  - Multi-factor authentication\n"
+            "  - Privileged access management\n"
+            "  - Access reviews\n"
+            "BREACH NOTIFICATION (Art. 33/34):\n"
+            "  - 72-hour notification to authority\n"
+            "  - Breach detection capabilities\n"
+            "  - Incident response procedures\n"
+            "  - Data subject notification\n"
+            "DATA SUBJECT RIGHTS:\n"
+            "  - Right to access (Art. 15)\n"
+            "  - Right to erasure (Art. 17)\n"
+            "  - Data portability (Art. 20)\n"
+            "  - Technical implementation of rights"
         ),
-        "tools": ["testssl", "nuclei", "nmap"],
+        "tools": [],
+    },
+    {
+        "id": "comp-005", "name": "NIST CSF Mapping",
+        "category": "nist", "severity": "medium",
+        "desc": "NIST Cybersecurity Framework mapping.",
+        "detection": (
+            "NIST CSF MAPPING:\n"
+            "IDENTIFY (ID):\n"
+            "  ID.AM: Asset management\n"
+            "  ID.BE: Business environment\n"
+            "  ID.GV: Governance\n"
+            "  ID.RA: Risk assessment\n"
+            "  ID.RM: Risk management strategy\n"
+            "PROTECT (PR):\n"
+            "  PR.AC: Access control\n"
+            "  PR.AT: Awareness training\n"
+            "  PR.DS: Data security\n"
+            "  PR.IP: Information protection\n"
+            "  PR.MA: Maintenance\n"
+            "  PR.PT: Protective technology\n"
+            "DETECT (DE):\n"
+            "  DE.AE: Anomalies and events\n"
+            "  DE.CM: Continuous monitoring\n"
+            "  DE.DP: Detection processes\n"
+            "RESPOND (RS):\n"
+            "  RS.RP: Response planning\n"
+            "  RS.CO: Communications\n"
+            "  RS.AN: Analysis\n"
+            "  RS.MI: Mitigation\n"
+            "  RS.IM: Improvements\n"
+            "RECOVER (RC):\n"
+            "  RC.RP: Recovery planning\n"
+            "  RC.IM: Improvements\n"
+            "  RC.CO: Communications\n"
+            "TESTING:\n"
+            "  - Map existing controls to CSF\n"
+            "  - Identify gaps per function\n"
+            "  - Prioritize by risk/impact\n"
+            "  - Implement maturity levels (1-4)"
+        ),
+        "tools": [],
     },
 ]
 
 
 class ComplianceKB:
-    """Compliance and audit knowledge base.
+    """Compliance knowledge base.
 
     Provides compliance framework patterns
     injected into agent prompts.
@@ -234,45 +245,45 @@ class ComplianceKB:
             pattern = CompliancePattern(
                 pattern_id=data["id"],
                 name=data["name"],
-                framework=data.get("framework", ""),
                 category=data.get("category", ""),
+                severity=data.get("severity", "high"),
                 description=data.get("desc", ""),
-                test_procedures=data.get("procedures", ""),
+                detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_framework(self, framework: str) -> list[CompliancePattern]:
-        """Get patterns by framework."""
+    def get_by_category(self, category: str) -> list[CompliancePattern]:
+        """Get patterns by category."""
         return [
             p for p in self._patterns.values()
-            if p.framework.lower() == framework.lower()
+            if p.category.lower() == category.lower()
         ]
 
     def build_compliance_prompt(
         self,
-        frameworks: list[str] | None = None,
-        max_patterns: int = 3,
+        categories: list[str] | None = None,
+        max_patterns: int = 4,
     ) -> str:
         """Build compliance prompt."""
-        lines = ["## Compliance Requirements\n"]
+        lines = ["## Compliance Frameworks\n"]
         count = 0
         for pattern in self._patterns.values():
-            if frameworks and pattern.framework.lower() not in [f.lower() for f in frameworks]:
+            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
                 continue
             if count >= max_patterns:
                 break
-            lines.append(f"### {pattern.name} [{pattern.framework}]")
-            lines.append(pattern.test_procedures)
+            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
+            lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        fw_counts: dict[str, int] = {}
+        cat_counts: dict[str, int] = {}
         for p in self._patterns.values():
-            fw_counts[p.framework] = fw_counts.get(p.framework, 0) + 1
+            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
         return {
             "patterns": len(self._patterns),
-            "by_framework": fw_counts,
+            "by_category": cat_counts,
         }
