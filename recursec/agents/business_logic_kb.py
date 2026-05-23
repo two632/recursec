@@ -1,11 +1,11 @@
 """Business logic vulnerability knowledge base.
 
-Deep knowledge about business logic flaws:
+Deep knowledge about business logic attacks:
 1. Authentication bypass patterns
-2. Authorization flaws (IDOR, BOLA, BFLA)
-3. Payment/transaction manipulation
-4. Workflow bypass attacks
-5. Rate limiting and abuse patterns
+2. Authorization flaws (IDOR, privilege escalation)
+3. Race condition exploitation
+4. Payment/transaction manipulation
+5. Workflow bypass attacks
 """
 
 from __future__ import annotations
@@ -39,170 +39,161 @@ class BusinessLogicPattern:
 
 BUSINESS_LOGIC_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "biz-001", "name": "IDOR / BOLA (Broken Object Level Auth)",
-        "category": "authorization", "severity": "critical",
-        "desc": "Accessing other users' objects by manipulating IDs.",
+        "id": "biz-001", "name": "IDOR (Insecure Direct Object Reference)",
+        "category": "authorization", "severity": "high",
+        "desc": "Accessing unauthorized objects by manipulating references.",
         "detection": (
-            "IDOR / BOLA DETECTION:\n"
+            "IDOR DETECTION:\n"
             "METHODOLOGY:\n"
-            "  1. Create 2+ test accounts (Account A and Account B)\n"
-            "  2. Perform actions as Account A, capture all API calls\n"
-            "  3. Identify endpoints with object references (IDs, UUIDs)\n"
-            "  4. Replay requests as Account B with Account A's object IDs\n"
-            "  5. Check if Account B can access Account A's objects\n"
-            "COMMON ID LOCATIONS:\n"
-            "  - URL path: /api/users/123/profile\n"
-            "  - Query parameter: /api/orders?id=456\n"
-            "  - Request body: {\"user_id\": 789}\n"
-            "  - Headers: X-User-Id: 123\n"
-            "  - GraphQL: query { user(id: 123) { ... } }\n"
-            "ID PATTERNS TO TEST:\n"
-            "  - Sequential integers: 1, 2, 3 (most vulnerable)\n"
-            "  - UUIDs: Try other known UUIDs from API responses\n"
-            "  - Encoded IDs: base64 decode, modify, re-encode\n"
-            "  - Composite keys: user_id + object_id combinations\n"
-            "ESCALATION:\n"
-            "  - Read access: View other users' data\n"
-            "  - Write access: Modify other users' data\n"
-            "  - Delete access: Remove other users' resources\n"
-            "  - Admin access: Access admin-only objects\n"
+            "  1. Create two accounts (User A, User B)\n"
+            "  2. Perform actions as User A, note all object IDs\n"
+            "  3. Try accessing User A's objects as User B\n"
+            "COMMON LOCATIONS:\n"
+            "  - /api/user/123/profile → change 123 to another ID\n"
+            "  - /api/orders/456 → access other users' orders\n"
+            "  - /api/documents/789 → download other users' files\n"
+            "  - /api/messages/inbox?user_id=123\n"
+            "ID TYPES:\n"
+            "  Sequential integers: 1, 2, 3 → easy to enumerate\n"
+            "  UUIDs: Harder but sometimes leaked in responses\n"
+            "  Encoded: Base64, hex → decode and modify\n"
+            "  Hashed: Sometimes predictable (MD5 of email)\n"
+            "TESTING:\n"
+            "  Horizontal IDOR: Same role, different user's data\n"
+            "  Vertical IDOR: Lower role accessing admin data\n"
+            "  Method-based: GET blocked but PUT/DELETE allowed\n"
+            "  Parameter pollution: ?id=1&id=2 (server-dependent)\n"
             "TOOLS:\n"
-            "  - Burp Suite Autorize extension\n"
-            "  - OWASP ZAP Access Control Testing\n"
-            "  - Custom scripts with 2 session tokens"
+            "  - Burp Autorize extension (automated IDOR checking)\n"
+            "  - Replace parameter values systematically\n"
+            "  - Check response differences (200 vs 403/404)"
         ),
-        "tools": ["burp", "ffuf", "curl"],
+        "tools": ["burp", "curl"],
     },
     {
-        "id": "biz-002", "name": "Payment and Transaction Manipulation",
+        "id": "biz-002", "name": "Race Condition Exploitation",
+        "category": "race_condition", "severity": "critical",
+        "desc": "Exploiting TOCTOU and parallel request processing.",
+        "detection": (
+            "RACE CONDITION ATTACKS:\n"
+            "TIME-OF-CHECK-TO-TIME-OF-USE (TOCTOU):\n"
+            "  - Application checks condition, then acts\n"
+            "  - Window between check and act is exploitable\n"
+            "  - Send identical requests simultaneously\n"
+            "COMMON TARGETS:\n"
+            "  Limit Bypass:\n"
+            "    - Coupon/promo code: Apply same code multiple times\n"
+            "    - Free trial: Create multiple simultaneous signups\n"
+            "    - Voting: Send multiple votes in parallel\n"
+            "  Financial:\n"
+            "    - Double withdrawal: Two transfers, balance checked once\n"
+            "    - Overdraft: Transfer more than balance in parallel\n"
+            "    - Gift card: Redeem same card in parallel requests\n"
+            "  Account:\n"
+            "    - Email change + password reset race\n"
+            "    - Invite accept race condition\n"
+            "TESTING:\n"
+            "  # Using Burp Turbo Intruder:\n"
+            "  # Send 10-20 identical requests at once\n"
+            "  # Check if action occurred more than once\n"
+            "  # Python (requests with threading):\n"
+            "  from concurrent.futures import ThreadPoolExecutor\n"
+            "  with ThreadPoolExecutor(max_workers=20) as pool:\n"
+            "      futures = [pool.submit(send_request) for _ in range(20)]\n"
+            "  # Check: Did 20 coupons apply? Did balance go negative?"
+        ),
+        "tools": ["burp", "turbo-intruder"],
+    },
+    {
+        "id": "biz-003", "name": "Payment and Transaction Manipulation",
         "category": "payment", "severity": "critical",
-        "desc": "Manipulating prices, quantities, and payment flows.",
+        "desc": "Manipulating payment flows and transaction logic.",
         "detection": (
             "PAYMENT MANIPULATION:\n"
             "PRICE MANIPULATION:\n"
-            "  - Intercept checkout request, modify price field\n"
-            "  - Change price to 0, negative, or very small value\n"
-            "  - Modify quantity to negative (refund generation)\n"
-            "  - Change currency code to weaker currency\n"
-            "  - Apply coupon/discount multiple times\n"
-            "CHECKOUT FLOW BYPASS:\n"
-            "  - Skip payment step (direct to order confirmation)\n"
-            "  - Replay successful payment token for different order\n"
-            "  - Race condition: place order during payment processing\n"
-            "  - Modify order after payment confirmation\n"
-            "COUPON/DISCOUNT ABUSE:\n"
-            "  - Apply same coupon multiple times\n"
-            "  - Stack incompatible discounts\n"
-            "  - Use expired coupons (check server-side validation)\n"
-            "  - Generate valid coupons (predictable patterns)\n"
-            "  - Apply staff/internal discounts\n"
-            "REFUND MANIPULATION:\n"
-            "  - Request refund for items not returned\n"
-            "  - Double-refund via race condition\n"
-            "  - Partial refund > original amount\n"
-            "TESTING APPROACH:\n"
-            "  1. Map entire payment flow with Burp\n"
-            "  2. Identify all modifiable parameters\n"
-            "  3. Test each parameter with boundary values\n"
-            "  4. Test flow bypass by skipping steps\n"
-            "  5. Test race conditions on financial operations"
+            "  - Modify price in request (client-side price)\n"
+            "  - Change quantity to negative → credit instead of charge\n"
+            "  - Change currency code (USD → weaker currency)\n"
+            "  - Apply excessive discount (100% or more)\n"
+            "  - Remove items from cart after discount applied\n"
+            "FLOW BYPASS:\n"
+            "  - Skip payment step (go directly to confirmation)\n"
+            "  - Reuse successful payment callback\n"
+            "  - Modify payment status in request\n"
+            "  - Cancel payment after confirmation but before fulfillment\n"
+            "  - Race condition on payment + order creation\n"
+            "TESTING:\n"
+            "  1. Map entire payment flow (add → cart → checkout → pay → confirm)\n"
+            "  2. Intercept each request with Burp\n"
+            "  3. Modify price, quantity, discounts\n"
+            "  4. Skip steps (jump from cart to confirmation)\n"
+            "  5. Test with negative values\n"
+            "  6. Test with zero-value transactions\n"
+            "  7. Test refund logic (refund more than paid)\n"
+            "  8. Test currency conversion edge cases"
         ),
-        "tools": ["burp", "curl", "ffuf"],
+        "tools": ["burp", "curl"],
     },
     {
-        "id": "biz-003", "name": "Authentication Bypass Patterns",
-        "category": "authentication", "severity": "critical",
-        "desc": "Bypassing authentication mechanisms.",
+        "id": "biz-004", "name": "Authentication Logic Flaws",
+        "category": "auth_logic", "severity": "critical",
+        "desc": "Bypassing authentication through logic errors.",
         "detection": (
-            "AUTHENTICATION BYPASS:\n"
-            "COMMON BYPASSES:\n"
-            "  - Default credentials (admin:admin, test:test)\n"
-            "  - SQL injection in login: ' OR 1=1-- -\n"
-            "  - Response manipulation: Change 'success: false' to 'success: true'\n"
-            "  - Token forging: JWT none algorithm, weak secret\n"
-            "  - Password reset flow manipulation\n"
-            "JWT ATTACKS:\n"
-            "  - Algorithm confusion: RS256 → HS256 with public key as secret\n"
-            "  - None algorithm: {\"alg\": \"none\"}\n"
-            "  - Weak secret: hashcat/john on JWT token\n"
-            "  - JWT kid injection: header manipulation\n"
-            "  - Expired token acceptance\n"
-            "  - Token not bound to user session\n"
+            "AUTHENTICATION LOGIC FLAWS:\n"
+            "MFA BYPASS:\n"
+            "  - Skip MFA step (go directly to authenticated page)\n"
+            "  - Reuse MFA code from previous session\n"
+            "  - Brute force short MFA codes (4-6 digits)\n"
+            "  - MFA code in response body or headers\n"
+            "  - Backup codes not rate limited\n"
+            "  - Change email before MFA → MFA for new email\n"
             "PASSWORD RESET:\n"
-            "  - Predictable reset tokens\n"
-            "  - Token reuse after password change\n"
-            "  - Host header injection for reset link\n"
-            "  - Rate limiting bypass on reset endpoint\n"
-            "  - Account takeover via email change → reset\n"
-            "2FA BYPASS:\n"
-            "  - Missing 2FA check on certain endpoints\n"
-            "  - Brute force 2FA code (4-6 digits)\n"
-            "  - Response manipulation to skip 2FA\n"
-            "  - Backup code guessing\n"
-            "  - Session fixation before 2FA"
+            "  - Token in URL (no expiry or long expiry)\n"
+            "  - Predictable reset tokens (timestamp-based)\n"
+            "  - Host header injection for token theft\n"
+            "  - Reset token reuse after password change\n"
+            "  - Password reset for arbitrary user via parameter tampering\n"
+            "SESSION:\n"
+            "  - Session fixation: Set session before login\n"
+            "  - Session not invalidated on password change\n"
+            "  - Session not invalidated on logout\n"
+            "  - Concurrent session limit bypass\n"
+            "OAUTH:\n"
+            "  - Missing state parameter (CSRF)\n"
+            "  - Open redirect in redirect_uri\n"
+            "  - Token leakage via Referer header\n"
+            "  - Account linking without verification"
         ),
-        "tools": ["burp", "hydra", "jwt_tool"],
-    },
-    {
-        "id": "biz-004", "name": "Rate Limiting and Abuse",
-        "category": "abuse", "severity": "high",
-        "desc": "Bypassing rate limits and abusing functionality.",
-        "detection": (
-            "RATE LIMITING BYPASS:\n"
-            "BYPASS TECHNIQUES:\n"
-            "  - IP rotation: X-Forwarded-For, X-Real-IP headers\n"
-            "  - Add headers: X-Forwarded-For: 127.0.0.1\n"
-            "  - Case variation: /api/login vs /API/LOGIN vs /Api/Login\n"
-            "  - Path variation: /api/login vs /api/./login vs /api/login/\n"
-            "  - HTTP method: POST vs PUT vs PATCH\n"
-            "  - Parameter pollution: id=1&id=2\n"
-            "  - Unicode normalization: admin vs ɑdmin\n"
-            "  - Adding null bytes: %00, %0d, %0a\n"
-            "TESTING METHODOLOGY:\n"
-            "  1. Identify rate-limited endpoints\n"
-            "  2. Determine limit (requests per time window)\n"
-            "  3. Test bypass techniques systematically\n"
-            "  4. Test distributed bypass (multiple source IPs)\n"
-            "  5. Test per-account vs per-IP limits\n"
-            "ABUSE PATTERNS:\n"
-            "  - Mass account creation (spam)\n"
-            "  - Credential stuffing\n"
-            "  - Resource exhaustion (large file upload)\n"
-            "  - Email bombing via notification triggers\n"
-            "  - SMS bombing via phone verification\n"
-            "  - API abuse for data scraping"
-        ),
-        "tools": ["ffuf", "curl", "hydra"],
+        "tools": ["burp", "curl", "nuclei"],
     },
     {
         "id": "biz-005", "name": "Workflow and State Manipulation",
         "category": "workflow", "severity": "high",
-        "desc": "Bypassing multi-step workflows and state transitions.",
+        "desc": "Manipulating application state machines and workflows.",
         "detection": (
             "WORKFLOW MANIPULATION:\n"
-            "STEP SKIPPING:\n"
-            "  - Directly access step 3 URL without completing steps 1-2\n"
-            "  - Modify step counter in request (step=1 → step=3)\n"
-            "  - Delete intermediate state tokens/cookies\n"
-            "  - Access completion endpoint directly\n"
-            "STATE MANIPULATION:\n"
-            "  - Modify state parameters: status=pending → status=approved\n"
-            "  - Change role during multi-step process\n"
-            "  - Access denied state resources via direct URL\n"
-            "  - Resubmit completed workflow (double execution)\n"
-            "COMMON VULNERABLE WORKFLOWS:\n"
-            "  1. Account registration: Skip email verification\n"
-            "  2. KYC verification: Bypass document upload\n"
-            "  3. Approval process: Self-approve requests\n"
-            "  4. Checkout: Skip payment step\n"
-            "  5. Password change: Skip old password verification\n"
-            "  6. File upload: Skip antivirus scan\n"
-            "TESTING:\n"
-            "  - Map all workflow steps with Burp\n"
-            "  - Identify state parameters and tokens\n"
-            "  - Test each step independently\n"
-            "  - Test backward navigation\n"
-            "  - Test concurrent workflow instances"
+            "STATE BYPASS:\n"
+            "  - Skip mandatory workflow steps\n"
+            "  - Example: Pending → Approved (skip Review)\n"
+            "  - Directly call API endpoint for later stage\n"
+            "  - Manipulate state parameter in request\n"
+            "PRIVILEGE ESCALATION:\n"
+            "  - Change role in request body (role='admin')\n"
+            "  - Modify JWT claims (role, permissions)\n"
+            "  - Access admin functionality via direct URL\n"
+            "  - Parameter manipulation on user creation (isAdmin=true)\n"
+            "APPROVAL BYPASS:\n"
+            "  - Self-approve own requests\n"
+            "  - Modify approver field in request\n"
+            "  - Race condition on approval check\n"
+            "  - Approve then immediately modify approved content\n"
+            "DATA VALIDATION:\n"
+            "  - Test boundary values (max/min/zero/negative)\n"
+            "  - Test field length limits\n"
+            "  - Test special characters in business fields\n"
+            "  - Test date/time manipulation (future dates, past dates)\n"
+            "  - Test with empty required fields\n"
+            "  - Test enum values not in expected set"
         ),
         "tools": ["burp", "curl"],
     },
@@ -247,7 +238,7 @@ class BusinessLogicKB:
         categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
-        """Build business logic attack prompt."""
+        """Build business logic prompt."""
         lines = ["## Business Logic Vulnerability Patterns\n"]
         count = 0
         for pattern in self._patterns.values():
@@ -255,7 +246,7 @@ class BusinessLogicKB:
                 continue
             if count >= max_patterns:
                 break
-            lines.append(f"### {pattern.name} [{pattern.severity.upper()}]")
+            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
             lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
