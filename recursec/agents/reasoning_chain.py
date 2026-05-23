@@ -1,407 +1,456 @@
-"""Reasoning chain — structured chain-of-thought for security analysis.
+"""Reasoning chain — builds explicit chains of reasoning for agent decisions.
 
-Implements multi-step reasoning with:
-1. Evidence collection and weighting
-2. Hypothesis formation
-3. Deductive and inductive reasoning steps
-4. Confidence propagation through chains
-5. Contradiction detection
-6. Reasoning with uncertainty
-7. Multi-chain aggregation
-8. Reasoning explanation generation
+Implements:
+1. Chain-of-thought tracking (each reasoning step recorded)
+2. Multi-step inference with evidence linking
+3. Hypothesis generation and testing
+4. Abductive reasoning (best explanation for observations)
+5. Deductive reasoning (implications from known facts)
+6. Analogical reasoning (similar targets had similar vulns)
+7. Reasoning confidence propagation
+8. Reasoning visualization for debug
 """
 
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import structlog
-
-if TYPE_CHECKING:
-    from recursec.llm.router import ModelRouter
 
 logger = structlog.get_logger()
 
 
 class ReasoningType(str, Enum):
-    DEDUCTIVE = "deductive"     # General rule → specific conclusion
-    INDUCTIVE = "inductive"     # Specific observations → general rule
-    ABDUCTIVE = "abductive"     # Observation → best explanation
-    ANALOGICAL = "analogical"   # Similar cases → inference
-    CAUSAL = "causal"           # Cause → effect reasoning
+    DEDUCTIVE = "deductive"        # If A then B; A is true; therefore B
+    INDUCTIVE = "inductive"        # Observed pattern suggests general rule
+    ABDUCTIVE = "abductive"        # Best explanation for observations
+    ANALOGICAL = "analogical"      # Similar to known case
+    CAUSAL = "causal"              # A caused B
+    TEMPORAL = "temporal"          # A happened before B; A may enable B
 
 
-class EvidenceStrength(str, Enum):
-    STRONG = "strong"           # Direct, verified evidence
-    MODERATE = "moderate"       # Indirect but reliable
-    WEAK = "weak"               # Circumstantial or unverified
-    CONTRADICTORY = "contradictory"
+class StepType(str, Enum):
+    OBSERVATION = "observation"
+    HYPOTHESIS = "hypothesis"
+    EVIDENCE = "evidence"
+    INFERENCE = "inference"
+    CONCLUSION = "conclusion"
+    COUNTERARGUMENT = "counterargument"
+    REVISION = "revision"
 
 
-@dataclass
-class Evidence:
-    """A piece of evidence for reasoning."""
-    evidence_id: str = ""
-    description: str = ""
-    source: str = ""            # Tool output, observation, prior finding
-    strength: EvidenceStrength = EvidenceStrength.MODERATE
-    confidence: float = 0.5
-    data: dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
-
-    @property
-    def weight(self) -> float:
-        strength_weights = {
-            EvidenceStrength.STRONG: 1.0,
-            EvidenceStrength.MODERATE: 0.6,
-            EvidenceStrength.WEAK: 0.3,
-            EvidenceStrength.CONTRADICTORY: -0.5,
-        }
-        return strength_weights.get(self.strength, 0.5) * self.confidence
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.evidence_id,
-            "description": self.description[:100],
-            "source": self.source,
-            "strength": self.strength.value,
-            "confidence": round(self.confidence, 2),
-            "weight": round(self.weight, 2),
-        }
+class HypothesisStatus(str, Enum):
+    PROPOSED = "proposed"
+    SUPPORTED = "supported"
+    REFUTED = "refuted"
+    UNCERTAIN = "uncertain"
 
 
 @dataclass
 class ReasoningStep:
     """A single step in a reasoning chain."""
     step_id: str = ""
-    step_number: int = 0
-    reasoning_type: ReasoningType = ReasoningType.DEDUCTIVE
-    premise: str = ""
-    inference: str = ""
-    conclusion: str = ""
-    evidence_ids: list[str] = field(default_factory=list)
+    step_type: StepType = StepType.OBSERVATION
+    content: str = ""
+    evidence: list[str] = field(default_factory=list)
     confidence: float = 0.5
-    contradictions: list[str] = field(default_factory=list)
+    source: str = ""               # Which tool/model produced this
+    depends_on: list[str] = field(default_factory=list)  # Previous step IDs
+    timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "step": self.step_number,
-            "type": self.reasoning_type.value,
-            "premise": self.premise[:100],
-            "conclusion": self.conclusion[:100],
+            "id": self.step_id,
+            "type": self.step_type.value,
+            "content": self.content[:60],
             "confidence": round(self.confidence, 2),
-            "contradictions": len(self.contradictions),
+            "depends": len(self.depends_on),
+        }
+
+
+@dataclass
+class Hypothesis:
+    """A hypothesis about a vulnerability or system behavior."""
+    hypothesis_id: str = ""
+    statement: str = ""
+    status: HypothesisStatus = HypothesisStatus.PROPOSED
+    supporting_evidence: list[str] = field(default_factory=list)
+    contradicting_evidence: list[str] = field(default_factory=list)
+    confidence: float = 0.5
+    tests_to_verify: list[str] = field(default_factory=list)
+
+    @property
+    def evidence_ratio(self) -> float:
+        total = len(self.supporting_evidence) + len(self.contradicting_evidence)
+        if total == 0:
+            return 0.5
+        return len(self.supporting_evidence) / total
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.hypothesis_id,
+            "statement": self.statement[:50],
+            "status": self.status.value,
+            "confidence": round(self.confidence, 2),
+            "support": len(self.supporting_evidence),
+            "contra": len(self.contradicting_evidence),
         }
 
 
 @dataclass
 class ReasoningChain:
-    """A complete chain of reasoning."""
+    """A complete chain of reasoning about a topic."""
     chain_id: str = ""
-    question: str = ""
+    topic: str = ""
+    reasoning_type: ReasoningType = ReasoningType.DEDUCTIVE
     steps: list[ReasoningStep] = field(default_factory=list)
-    evidence: list[Evidence] = field(default_factory=list)
-    final_conclusion: str = ""
+    hypotheses: list[Hypothesis] = field(default_factory=list)
+    conclusion: str = ""
     overall_confidence: float = 0.0
-    has_contradictions: bool = False
-    created_at: float = field(default_factory=time.time)
+    started_at: float = field(default_factory=time.time)
+    completed_at: float = 0.0
+
+    @property
+    def is_complete(self) -> bool:
+        return bool(self.conclusion)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.chain_id,
-            "question": self.question[:100],
+            "topic": self.topic[:30],
+            "type": self.reasoning_type.value,
             "steps": len(self.steps),
-            "evidence": len(self.evidence),
-            "conclusion": self.final_conclusion[:100],
+            "hypotheses": len(self.hypotheses),
             "confidence": round(self.overall_confidence, 2),
-            "contradictions": self.has_contradictions,
+            "complete": self.is_complete,
         }
 
 
-REASONING_PROMPT = """You are a security analyst performing structured reasoning.
+# ── Reasoning Templates ──────────────────────────────────────
 
-Question: {question}
+REASONING_TEMPLATES: dict[str, list[dict[str, Any]]] = {
+    "sqli_investigation": [
+        {"type": "observation", "template": "Input field at {location} reflects user input"},
+        {"type": "hypothesis", "template": "Input may be injected into SQL query"},
+        {"type": "evidence", "template": "Single quote causes error: {error_msg}"},
+        {"type": "inference", "template": "Error message reveals {db_type} database"},
+        {"type": "evidence", "template": "Union-based payload returned {extra_data}"},
+        {"type": "conclusion", "template": "Confirmed SQL injection: {vuln_type} in {param}"},
+    ],
+    "auth_bypass_investigation": [
+        {"type": "observation", "template": "Authentication endpoint at {location}"},
+        {"type": "hypothesis", "template": "Auth may have logical flaws"},
+        {"type": "evidence", "template": "Response differs for valid vs invalid users: {diff}"},
+        {"type": "inference", "template": "User enumeration possible via {indicator}"},
+        {"type": "evidence", "template": "Token lacks proper validation: {detail}"},
+        {"type": "conclusion", "template": "Auth bypass via {method}: {impact}"},
+    ],
+    "ssrf_investigation": [
+        {"type": "observation", "template": "URL parameter at {location} fetches remote resources"},
+        {"type": "hypothesis", "template": "Server-side request forgery may be possible"},
+        {"type": "evidence", "template": "Request to {internal_url} returned {response}"},
+        {"type": "inference", "template": "Internal service {service} is reachable"},
+        {"type": "evidence", "template": "Cloud metadata at {metadata_url} returned {data}"},
+        {"type": "conclusion", "template": "SSRF confirmed: access to {scope}"},
+    ],
+    "rce_investigation": [
+        {"type": "observation", "template": "Endpoint {location} processes user input as code/commands"},
+        {"type": "hypothesis", "template": "Remote code execution may be possible"},
+        {"type": "evidence", "template": "Time-based payload caused {delay}s delay"},
+        {"type": "inference", "template": "Command execution confirmed, OS: {os}"},
+        {"type": "evidence", "template": "OOB callback received from {target}"},
+        {"type": "conclusion", "template": "RCE confirmed via {method}, running as {user}"},
+    ],
+}
 
-Evidence:
-{evidence_text}
+# ── Analogical Reasoning Database ─────────────────────────────
 
-Perform step-by-step reasoning to answer the question.
-For each step, identify:
-1. The type of reasoning (deductive, inductive, abductive, analogical, causal)
-2. The premise (what we know)
-3. The inference (how we derive new knowledge)
-4. The conclusion (what we can conclude)
-5. Any contradictions or uncertainties
+ANALOGY_PATTERNS: list[dict[str, Any]] = [
+    {
+        "condition": {"tech": "wordpress", "finding": "outdated_plugin"},
+        "inference": "WordPress sites with outdated plugins frequently have RCE via plugin vulnerabilities",
+        "confidence": 0.7,
+    },
+    {
+        "condition": {"tech": "spring", "finding": "actuator_exposed"},
+        "inference": "Exposed Spring Actuator endpoints often lead to RCE via heapdump or env endpoints",
+        "confidence": 0.75,
+    },
+    {
+        "condition": {"tech": "nginx", "finding": "misconfig"},
+        "inference": "Nginx misconfigs commonly allow path traversal via off-by-slash or alias misuse",
+        "confidence": 0.65,
+    },
+    {
+        "condition": {"tech": "graphql", "finding": "introspection"},
+        "inference": "GraphQL with introspection enabled usually has authorization issues on mutations",
+        "confidence": 0.6,
+    },
+    {
+        "condition": {"tech": "jwt", "finding": "weak_secret"},
+        "inference": "JWT with weak secrets often accompanies other auth issues (no expiry, privilege escalation)",
+        "confidence": 0.7,
+    },
+    {
+        "condition": {"tech": "docker", "finding": "socket_exposed"},
+        "inference": "Exposed Docker socket allows container escape to host with root access",
+        "confidence": 0.9,
+    },
+    {
+        "condition": {"tech": "redis", "finding": "unauth"},
+        "inference": "Unauthenticated Redis can be leveraged for RCE via Lua scripting or master-slave replication",
+        "confidence": 0.85,
+    },
+    {
+        "condition": {"tech": "s3", "finding": "public"},
+        "inference": "Public S3 buckets frequently contain credentials, API keys, or customer data",
+        "confidence": 0.7,
+    },
+]
 
-Respond as JSON:
-{{
-  "steps": [
-    {{
-      "type": "deductive|inductive|abductive|analogical|causal",
-      "premise": "what we know",
-      "inference": "reasoning process",
-      "conclusion": "what we conclude",
-      "confidence": 0.X,
-      "contradictions": ["any contradictions"]
-    }}
-  ],
-  "final_conclusion": "overall conclusion",
-  "overall_confidence": 0.X
-}}"""
 
+class ReasoningChainEngine:
+    """Builds and manages explicit reasoning chains.
 
-class ReasoningEngine:
-    """Structured chain-of-thought reasoning for security analysis.
-
-    Builds evidence-based reasoning chains with confidence
-    propagation, contradiction detection, and multi-chain
-    aggregation.
+    Tracks chain-of-thought reasoning so the agent can
+    explain its decisions, test hypotheses, and build
+    confidence in findings through multi-step inference.
     """
 
-    def __init__(self, model_router: ModelRouter | None = None) -> None:
-        self._router = model_router
+    def __init__(self) -> None:
         self._chains: dict[str, ReasoningChain] = {}
-        self._evidence_store: dict[str, Evidence] = {}
         self._chain_counter = 0
-        self._evidence_counter = 0
         self._step_counter = 0
+        self._hypothesis_counter = 0
         self._log = logger.bind(component="reasoning_chain")
 
-    def add_evidence(
+    def start_chain(
         self,
-        description: str,
-        source: str,
-        strength: EvidenceStrength = EvidenceStrength.MODERATE,
-        confidence: float = 0.5,
-        data: dict[str, Any] | None = None,
-    ) -> str:
-        """Add evidence to the store."""
-        self._evidence_counter += 1
-        ev_id = f"ev-{self._evidence_counter}"
-
-        evidence = Evidence(
-            evidence_id=ev_id,
-            description=description,
-            source=source,
-            strength=strength,
-            confidence=confidence,
-            data=data or {},
-        )
-
-        self._evidence_store[ev_id] = evidence
-        return ev_id
-
-    async def reason(
-        self,
-        question: str,
-        evidence_ids: list[str] | None = None,
+        topic: str,
+        reasoning_type: ReasoningType = ReasoningType.DEDUCTIVE,
     ) -> ReasoningChain:
-        """Build a reasoning chain for a question."""
+        """Start a new reasoning chain."""
         self._chain_counter += 1
-        chain_id = f"chain-{self._chain_counter}"
-
         chain = ReasoningChain(
-            chain_id=chain_id,
-            question=question,
+            chain_id=f"chain-{self._chain_counter}",
+            topic=topic,
+            reasoning_type=reasoning_type,
         )
-
-        # Gather evidence
-        if evidence_ids:
-            chain.evidence = [
-                self._evidence_store[eid] for eid in evidence_ids
-                if eid in self._evidence_store
-            ]
-        else:
-            chain.evidence = list(self._evidence_store.values())[-10:]
-
-        # LLM reasoning
-        if self._router:
-            steps, conclusion, confidence = await self._llm_reason(question, chain.evidence)
-            chain.steps = steps
-            chain.final_conclusion = conclusion
-            chain.overall_confidence = confidence
-        else:
-            chain = self._heuristic_reason(chain)
-
-        # Check for contradictions
-        chain.has_contradictions = any(
-            step.contradictions for step in chain.steps
-        )
-
-        # Adjust confidence for contradictions
-        if chain.has_contradictions:
-            chain.overall_confidence *= 0.7
-
-        self._chains[chain_id] = chain
+        self._chains[chain.chain_id] = chain
         return chain
 
-    async def reason_about_finding(
+    def add_step(
         self,
-        finding: dict[str, Any],
-    ) -> ReasoningChain:
-        """Reason about whether a finding is valid."""
-        title = finding.get("title", "Unknown")
-        severity = finding.get("severity", "unknown")
-        evidence_text = finding.get("evidence", "")
-        tool = finding.get("tool", "")
+        chain_id: str,
+        step_type: StepType,
+        content: str,
+        evidence: list[str] | None = None,
+        confidence: float = 0.5,
+        source: str = "",
+        depends_on: list[str] | None = None,
+    ) -> ReasoningStep | None:
+        """Add a step to a reasoning chain."""
+        chain = self._chains.get(chain_id)
+        if not chain:
+            return None
 
-        question = (
-            f"Is this {severity} vulnerability finding valid? "
-            f"'{title}' found by {tool}. Evidence: {evidence_text[:200]}"
-        )
-
-        ev_id = self.add_evidence(
-            description=f"Finding: {title}",
-            source=tool,
-            strength=EvidenceStrength.MODERATE,
-            confidence=0.6,
-            data=finding,
-        )
-
-        return await self.reason(question, evidence_ids=[ev_id])
-
-    async def multi_chain_aggregate(
-        self,
-        question: str,
-        num_chains: int = 3,
-        evidence_ids: list[str] | None = None,
-    ) -> ReasoningChain:
-        """Run multiple reasoning chains and aggregate."""
-        chains = []
-        for _ in range(num_chains):
-            chain = await self.reason(question, evidence_ids)
-            chains.append(chain)
-
-        # Aggregate: take majority conclusion with averaged confidence
-        if not chains:
-            return ReasoningChain(question=question)
-
-        best = max(chains, key=lambda c: c.overall_confidence)
-
-        # Average confidence across chains
-        avg_confidence = sum(c.overall_confidence for c in chains) / len(chains)
-
-        result = ReasoningChain(
-            chain_id=best.chain_id + "-agg",
-            question=question,
-            steps=best.steps,
-            evidence=best.evidence,
-            final_conclusion=best.final_conclusion,
-            overall_confidence=avg_confidence,
-            has_contradictions=any(c.has_contradictions for c in chains),
-        )
-
-        return result
-
-    async def _llm_reason(
-        self,
-        question: str,
-        evidence: list[Evidence],
-    ) -> tuple[list[ReasoningStep], str, float]:
-        """Use LLM for reasoning."""
-        if not self._router:
-            return [], "", 0.0
-
-        evidence_text = "\n".join(
-            f"  [{e.strength.value}] {e.description} (source: {e.source}, confidence: {e.confidence:.2f})"
-            for e in evidence
-        ) or "  No evidence available."
-
-        prompt = REASONING_PROMPT.format(
-            question=question[:300],
-            evidence_text=evidence_text[:1000],
-        )
-
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="reasoning",
-            temperature=0.3,
-            max_tokens=1024,
-        )
-
-        return self._parse_reasoning(response, evidence)
-
-    def _heuristic_reason(self, chain: ReasoningChain) -> ReasoningChain:
-        """Heuristic reasoning without LLM."""
         self._step_counter += 1
         step = ReasoningStep(
             step_id=f"step-{self._step_counter}",
-            step_number=1,
-            reasoning_type=ReasoningType.INDUCTIVE,
-            premise="Evidence available: " + ", ".join(
-                e.description[:30] for e in chain.evidence[:3]
-            ),
-            inference="Based on available evidence weight",
-            conclusion="Assessment based on evidence strength",
+            step_type=step_type,
+            content=content,
+            evidence=evidence or [],
+            confidence=confidence,
+            source=source,
+            depends_on=depends_on or [],
         )
+        chain.steps.append(step)
 
-        # Confidence from evidence weights
-        if chain.evidence:
-            total_weight = sum(e.weight for e in chain.evidence)
-            step.confidence = min(1.0, max(0.0, total_weight / max(1, len(chain.evidence))))
-        else:
-            step.confidence = 0.3
+        # Update chain confidence (weighted by step type)
+        self._update_chain_confidence(chain)
 
-        chain.steps = [step]
-        chain.overall_confidence = step.confidence
-        chain.final_conclusion = step.conclusion
+        return step
 
+    def add_hypothesis(
+        self,
+        chain_id: str,
+        statement: str,
+        tests_to_verify: list[str] | None = None,
+    ) -> Hypothesis | None:
+        """Add a hypothesis to a chain."""
+        chain = self._chains.get(chain_id)
+        if not chain:
+            return None
+
+        self._hypothesis_counter += 1
+        hypothesis = Hypothesis(
+            hypothesis_id=f"hyp-{self._hypothesis_counter}",
+            statement=statement,
+            tests_to_verify=tests_to_verify or [],
+        )
+        chain.hypotheses.append(hypothesis)
+        return hypothesis
+
+    def update_hypothesis(
+        self,
+        chain_id: str,
+        hypothesis_id: str,
+        evidence: str,
+        supports: bool = True,
+    ) -> Hypothesis | None:
+        """Update a hypothesis with new evidence."""
+        chain = self._chains.get(chain_id)
+        if not chain:
+            return None
+
+        for hyp in chain.hypotheses:
+            if hyp.hypothesis_id == hypothesis_id:
+                if supports:
+                    hyp.supporting_evidence.append(evidence)
+                else:
+                    hyp.contradicting_evidence.append(evidence)
+
+                # Update status
+                ratio = hyp.evidence_ratio
+                if ratio >= 0.7:
+                    hyp.status = HypothesisStatus.SUPPORTED
+                    hyp.confidence = ratio
+                elif ratio <= 0.3:
+                    hyp.status = HypothesisStatus.REFUTED
+                    hyp.confidence = 1 - ratio
+                else:
+                    hyp.status = HypothesisStatus.UNCERTAIN
+                    hyp.confidence = 0.5
+
+                return hyp
+
+        return None
+
+    def conclude(
+        self,
+        chain_id: str,
+        conclusion: str,
+    ) -> ReasoningChain | None:
+        """Set the conclusion for a chain."""
+        chain = self._chains.get(chain_id)
+        if not chain:
+            return None
+
+        chain.conclusion = conclusion
+        chain.completed_at = time.time()
+        self._update_chain_confidence(chain)
         return chain
 
-    def _parse_reasoning(
+    def get_analogies(
         self,
-        response: str,
-        evidence: list[Evidence],
-    ) -> tuple[list[ReasoningStep], str, float]:
-        """Parse LLM reasoning response."""
-        import json as json_mod
+        tech: str,
+        finding: str,
+    ) -> list[dict[str, Any]]:
+        """Get analogical reasoning matches."""
+        matches = []
+        tech_lower = tech.lower()
+        finding_lower = finding.lower()
 
-        try:
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-            data = json_mod.loads(response.strip())
-        except (json_mod.JSONDecodeError, IndexError):
-            return [], response[:200], 0.4
+        for pattern in ANALOGY_PATTERNS:
+            cond = pattern["condition"]
+            if (cond["tech"] in tech_lower and
+                    cond["finding"] in finding_lower):
+                matches.append({
+                    "inference": pattern["inference"],
+                    "confidence": pattern["confidence"],
+                })
 
-        steps = []
-        ev_ids = [e.evidence_id for e in evidence]
+        return matches
 
-        for idx, s_data in enumerate(data.get("steps", [])[:10]):
-            self._step_counter += 1
-            type_str = s_data.get("type", "deductive")
-            try:
-                r_type = ReasoningType(type_str)
-            except ValueError:
-                r_type = ReasoningType.DEDUCTIVE
+    def get_template(self, template_name: str) -> list[dict[str, Any]]:
+        """Get a reasoning template."""
+        return REASONING_TEMPLATES.get(template_name, [])
 
-            steps.append(ReasoningStep(
-                step_id=f"step-{self._step_counter}",
-                step_number=idx + 1,
-                reasoning_type=r_type,
-                premise=s_data.get("premise", ""),
-                inference=s_data.get("inference", ""),
-                conclusion=s_data.get("conclusion", ""),
-                evidence_ids=ev_ids[:3],
-                confidence=s_data.get("confidence", 0.5),
-                contradictions=s_data.get("contradictions", []),
-            ))
+    def build_reasoning_prompt(self, chain_id: str) -> str:
+        """Build a prompt showing the reasoning chain for LLM continuation."""
+        chain = self._chains.get(chain_id)
+        if not chain:
+            return ""
 
-        conclusion = data.get("final_conclusion", "")
-        confidence = data.get("overall_confidence", 0.5)
+        lines = [
+            f"Reasoning chain: {chain.topic}",
+            f"Type: {chain.reasoning_type.value}\n",
+        ]
 
-        return steps, conclusion, confidence
+        for step in chain.steps:
+            prefix = {
+                StepType.OBSERVATION: "OBSERVED",
+                StepType.HYPOTHESIS: "HYPOTHESIS",
+                StepType.EVIDENCE: "EVIDENCE",
+                StepType.INFERENCE: "THEREFORE",
+                StepType.CONCLUSION: "CONCLUSION",
+                StepType.COUNTERARGUMENT: "BUT",
+                StepType.REVISION: "REVISED",
+            }.get(step.step_type, "STEP")
+            lines.append(
+                f"[{prefix}] (conf: {step.confidence:.1f}) {step.content}"
+            )
+
+        if chain.hypotheses:
+            lines.append("\nHypotheses:")
+            for hyp in chain.hypotheses:
+                lines.append(
+                    f"  [{hyp.status.value}] {hyp.statement} "
+                    f"(+{len(hyp.supporting_evidence)}/-{len(hyp.contradicting_evidence)})"
+                )
+
+        if not chain.conclusion:
+            lines.append(
+                "\nBased on the above reasoning, what is the logical next step or conclusion?"
+            )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _update_chain_confidence(chain: ReasoningChain) -> None:
+        """Update overall chain confidence."""
+        if not chain.steps:
+            chain.overall_confidence = 0.0
+            return
+
+        weights = {
+            StepType.EVIDENCE: 1.5,
+            StepType.INFERENCE: 1.2,
+            StepType.CONCLUSION: 1.0,
+            StepType.OBSERVATION: 0.8,
+            StepType.HYPOTHESIS: 0.5,
+            StepType.COUNTERARGUMENT: -0.5,
+            StepType.REVISION: 0.3,
+        }
+
+        total_weight = 0.0
+        weighted_conf = 0.0
+        for step in chain.steps:
+            w = weights.get(step.step_type, 0.5)
+            if w > 0:
+                weighted_conf += step.confidence * w
+                total_weight += abs(w)
+            else:
+                weighted_conf += (1 - step.confidence) * abs(w)
+                total_weight += abs(w)
+
+        chain.overall_confidence = weighted_conf / max(0.01, total_weight)
 
     def get_chain(self, chain_id: str) -> ReasoningChain | None:
         return self._chains.get(chain_id)
 
     def get_stats(self) -> dict[str, Any]:
+        type_counts: dict[str, int] = defaultdict(int)
+        for chain in self._chains.values():
+            type_counts[chain.reasoning_type.value] += 1
         return {
             "chains": len(self._chains),
-            "evidence": len(self._evidence_store),
+            "complete": sum(1 for c in self._chains.values() if c.is_complete),
             "steps": self._step_counter,
+            "hypotheses": self._hypothesis_counter,
+            "by_type": dict(type_counts),
         }
