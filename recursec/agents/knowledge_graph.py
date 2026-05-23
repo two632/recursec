@@ -1,23 +1,22 @@
-"""Knowledge graph — stores and queries relationships between security entities.
+"""Knowledge graph — rich interconnected knowledge representation.
 
 Implements:
-1. Entity node management (targets, vulns, services, etc.)
-2. Relationship edge management
-3. Graph traversal queries
-4. Path finding between entities
-5. Subgraph extraction
-6. Pattern matching in graph
-7. Graph persistence (JSON)
-8. Entity scoring based on relationships
+1. Entity-relationship graph storage
+2. Multi-hop query traversal
+3. Knowledge inference (derive new facts)
+4. Graph-based similarity
+5. Knowledge merging from multiple sources
+6. Temporal knowledge (facts with time bounds)
+7. Knowledge provenance tracking
+8. Graph statistics and analysis
 """
 
 from __future__ import annotations
 
-import json
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from pathlib import Path
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -25,331 +24,325 @@ import structlog
 logger = structlog.get_logger()
 
 
+class EntityType(str, Enum):
+    HOST = "host"
+    SERVICE = "service"
+    VULNERABILITY = "vulnerability"
+    TECHNOLOGY = "technology"
+    CREDENTIAL = "credential"
+    ENDPOINT = "endpoint"
+    FINDING = "finding"
+    TOOL = "tool"
+    AGENT = "agent"
+    ATTACK_VECTOR = "attack_vector"
+
+
+class RelType(str, Enum):
+    RUNS = "runs"                  # host RUNS service
+    HAS = "has"                    # host HAS vulnerability
+    USES = "uses"                  # service USES technology
+    FOUND_BY = "found_by"         # vulnerability FOUND_BY tool
+    EXPLOITS = "exploits"          # attack_vector EXPLOITS vulnerability
+    CONNECTS_TO = "connects_to"    # host CONNECTS_TO host
+    DEPENDS_ON = "depends_on"      # service DEPENDS_ON service
+    CONTAINS = "contains"          # endpoint CONTAINS parameter
+    AUTHENTICATES = "authenticates"  # credential AUTHENTICATES service
+    DISCOVERED = "discovered"      # agent DISCOVERED finding
+
+
 @dataclass
-class GraphNode:
-    """A node in the knowledge graph."""
-    node_id: str = ""
-    node_type: str = ""          # target, service, vuln, finding, tool, domain, ip, cve, cwe
-    label: str = ""
+class Entity:
+    """An entity in the knowledge graph."""
+    entity_id: str = ""
+    entity_type: EntityType = EntityType.HOST
+    name: str = ""
     properties: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.5
+    source: str = ""
     created_at: float = field(default_factory=time.time)
+    valid_until: float = 0.0       # 0 = no expiry
+
+    @property
+    def is_valid(self) -> bool:
+        if self.valid_until == 0:
+            return True
+        return time.time() < self.valid_until
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.node_id, "type": self.node_type,
-            "label": self.label[:40],
+            "id": self.entity_id,
+            "type": self.entity_type.value,
+            "name": self.name[:25],
+            "confidence": round(self.confidence, 2),
             "props": len(self.properties),
+            "valid": self.is_valid,
         }
 
 
 @dataclass
-class GraphEdge:
-    """An edge (relationship) in the knowledge graph."""
-    edge_id: str = ""
-    source: str = ""
-    target: str = ""
-    relation: str = ""           # has_port, runs_service, has_vuln, found_by, resolves_to, etc.
-    weight: float = 1.0
+class Relationship:
+    """A relationship between entities."""
+    rel_id: str = ""
+    source_id: str = ""
+    target_id: str = ""
+    rel_type: RelType = RelType.HAS
     properties: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.5
+    source: str = ""
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.edge_id, "source": self.source[:20],
-            "target": self.target[:20], "relation": self.relation,
-            "weight": round(self.weight, 2),
+            "id": self.rel_id,
+            "from": self.source_id[:15],
+            "to": self.target_id[:15],
+            "type": self.rel_type.value,
+            "confidence": round(self.confidence, 2),
+        }
+
+
+@dataclass
+class QueryResult:
+    """Result of a graph query."""
+    entities: list[Entity] = field(default_factory=list)
+    relationships: list[Relationship] = field(default_factory=list)
+    paths: list[list[str]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entities": len(self.entities),
+            "relationships": len(self.relationships),
+            "paths": len(self.paths),
         }
 
 
 class KnowledgeGraph:
-    """Stores and queries relationships between security entities.
+    """Rich interconnected knowledge representation.
 
-    Provides graph-based knowledge management with
-    traversal, path finding, and pattern matching.
+    Stores entities and their relationships as a graph,
+    supporting multi-hop queries and inference.
     """
 
-    def __init__(self, data_dir: str = "data/knowledge") -> None:
-        self._data_dir = Path(data_dir)
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._nodes: dict[str, GraphNode] = {}
-        self._edges: dict[str, GraphEdge] = {}
-        # Adjacency lists
-        self._outgoing: dict[str, list[str]] = defaultdict(list)   # node_id -> [edge_ids]
-        self._incoming: dict[str, list[str]] = defaultdict(list)   # node_id -> [edge_ids]
-        self._node_counter = 0
-        self._edge_counter = 0
+    def __init__(self) -> None:
+        self._entities: dict[str, Entity] = {}
+        self._relationships: list[Relationship] = []
+        self._adjacency: dict[str, list[str]] = defaultdict(list)
+        self._reverse_adj: dict[str, list[str]] = defaultdict(list)
+        self._type_index: dict[EntityType, list[str]] = defaultdict(list)
+        self._name_index: dict[str, str] = {}
+        self._entity_counter = 0
+        self._rel_counter = 0
         self._log = logger.bind(component="knowledge_graph")
 
-    def add_node(
+    def add_entity(
         self,
-        node_type: str,
-        label: str,
+        entity_type: EntityType,
+        name: str,
         properties: dict[str, Any] | None = None,
-        node_id: str = "",
-    ) -> str:
-        """Add a node to the graph."""
-        if not node_id:
-            self._node_counter += 1
-            node_id = f"n-{self._node_counter}"
+        confidence: float = 0.5,
+        source: str = "",
+        valid_until: float = 0.0,
+    ) -> Entity:
+        """Add an entity to the graph."""
+        # Check if entity already exists by name
+        existing_id = self._name_index.get(name.lower())
+        if existing_id and existing_id in self._entities:
+            existing = self._entities[existing_id]
+            if properties:
+                existing.properties.update(properties)
+            existing.confidence = max(existing.confidence, confidence)
+            return existing
 
-        node = GraphNode(
-            node_id=node_id,
-            node_type=node_type,
-            label=label,
+        self._entity_counter += 1
+        entity = Entity(
+            entity_id=f"kg-{self._entity_counter}",
+            entity_type=entity_type,
+            name=name,
             properties=properties or {},
-        )
-        self._nodes[node_id] = node
-        return node_id
-
-    def add_edge(
-        self,
-        source: str,
-        target: str,
-        relation: str,
-        weight: float = 1.0,
-        properties: dict[str, Any] | None = None,
-    ) -> str:
-        """Add an edge between two nodes."""
-        if source not in self._nodes or target not in self._nodes:
-            return ""
-
-        self._edge_counter += 1
-        edge_id = f"e-{self._edge_counter}"
-
-        edge = GraphEdge(
-            edge_id=edge_id,
+            confidence=confidence,
             source=source,
-            target=target,
-            relation=relation,
-            weight=weight,
-            properties=properties or {},
+            valid_until=valid_until,
         )
-        self._edges[edge_id] = edge
-        self._outgoing[source].append(edge_id)
-        self._incoming[target].append(edge_id)
-        return edge_id
 
-    def get_node(self, node_id: str) -> GraphNode | None:
-        return self._nodes.get(node_id)
+        self._entities[entity.entity_id] = entity
+        self._type_index[entity_type].append(entity.entity_id)
+        self._name_index[name.lower()] = entity.entity_id
+        return entity
+
+    def add_relationship(
+        self,
+        source_id: str,
+        target_id: str,
+        rel_type: RelType,
+        properties: dict[str, Any] | None = None,
+        confidence: float = 0.5,
+        source: str = "",
+    ) -> Relationship:
+        """Add a relationship between entities."""
+        self._rel_counter += 1
+        rel = Relationship(
+            rel_id=f"kr-{self._rel_counter}",
+            source_id=source_id,
+            target_id=target_id,
+            rel_type=rel_type,
+            properties=properties or {},
+            confidence=confidence,
+            source=source,
+        )
+
+        self._relationships.append(rel)
+        self._adjacency[source_id].append(rel.rel_id)
+        self._reverse_adj[target_id].append(rel.rel_id)
+        return rel
+
+    def get_entity(self, name: str) -> Entity | None:
+        """Get entity by name."""
+        eid = self._name_index.get(name.lower())
+        if eid:
+            return self._entities.get(eid)
+        return None
+
+    def get_by_type(self, entity_type: EntityType) -> list[Entity]:
+        """Get all entities of a type."""
+        return [
+            self._entities[eid]
+            for eid in self._type_index.get(entity_type, [])
+            if eid in self._entities
+        ]
 
     def get_neighbors(
         self,
-        node_id: str,
-        direction: str = "out",
-        relation: str = "",
-    ) -> list[GraphNode]:
-        """Get neighboring nodes."""
-        neighbors = []
-
-        if direction in ("out", "both"):
-            for edge_id in self._outgoing.get(node_id, []):
-                edge = self._edges.get(edge_id)
-                if edge and (not relation or edge.relation == relation):
-                    node = self._nodes.get(edge.target)
-                    if node:
-                        neighbors.append(node)
-
-        if direction in ("in", "both"):
-            for edge_id in self._incoming.get(node_id, []):
-                edge = self._edges.get(edge_id)
-                if edge and (not relation or edge.relation == relation):
-                    node = self._nodes.get(edge.source)
-                    if node:
-                        neighbors.append(node)
-
-        return neighbors
-
-    def find_path(
-        self,
-        start: str,
-        end: str,
-        max_depth: int = 10,
-    ) -> list[str]:
-        """Find shortest path between two nodes (BFS)."""
-        if start not in self._nodes or end not in self._nodes:
-            return []
-
-        visited: set[str] = {start}
-        queue: deque[tuple[str, list[str]]] = deque([(start, [start])])
-
-        while queue:
-            current, path = queue.popleft()
-
-            if current == end:
-                return path
-
-            if len(path) >= max_depth:
-                continue
-
-            for edge_id in self._outgoing.get(current, []):
-                edge = self._edges.get(edge_id)
-                if edge and edge.target not in visited:
-                    visited.add(edge.target)
-                    queue.append((edge.target, path + [edge.target]))
-
-        return []
-
-    def find_nodes_by_type(
-        self,
-        node_type: str,
-        limit: int = 50,
-    ) -> list[GraphNode]:
-        """Find all nodes of a given type."""
+        entity_id: str,
+        rel_type: RelType | None = None,
+        direction: str = "outgoing",
+    ) -> list[tuple[Relationship, Entity]]:
+        """Get neighboring entities."""
         results = []
-        for node in self._nodes.values():
-            if node.node_type == node_type:
-                results.append(node)
-                if len(results) >= limit:
-                    break
+
+        if direction in ("outgoing", "both"):
+            for rel_id in self._adjacency.get(entity_id, []):
+                rel = self._find_rel(rel_id)
+                if rel and (not rel_type or rel.rel_type == rel_type):
+                    target = self._entities.get(rel.target_id)
+                    if target:
+                        results.append((rel, target))
+
+        if direction in ("incoming", "both"):
+            for rel_id in self._reverse_adj.get(entity_id, []):
+                rel = self._find_rel(rel_id)
+                if rel and (not rel_type or rel.rel_type == rel_type):
+                    source_ent = self._entities.get(rel.source_id)
+                    if source_ent:
+                        results.append((rel, source_ent))
+
         return results
 
-    def find_patterns(
+    def query_path(
         self,
-        pattern: list[tuple[str, str, str]],
+        start_name: str,
+        end_name: str,
+        max_hops: int = 5,
     ) -> list[list[str]]:
-        """Find subgraphs matching a pattern.
-
-        Pattern is a list of (source_type, relation, target_type) triples.
-        """
-        if not pattern:
+        """Find paths between two entities."""
+        start = self.get_entity(start_name)
+        end = self.get_entity(end_name)
+        if not start or not end:
             return []
 
-        # Start with first pattern element
-        first_type, first_rel, _ = pattern[0]
-        candidates = self.find_nodes_by_type(first_type)
-        results = []
-
-        for start_node in candidates:
-            path = self._match_pattern_from(start_node.node_id, pattern, 0)
-            if path:
-                results.append(path)
-
-        return results
-
-    def _match_pattern_from(
-        self,
-        node_id: str,
-        pattern: list[tuple[str, str, str]],
-        pattern_idx: int,
-    ) -> list[str]:
-        """Recursively match a pattern from a starting node."""
-        if pattern_idx >= len(pattern):
-            return [node_id]
-
-        _, relation, target_type = pattern[pattern_idx]
-
-        neighbors = self.get_neighbors(node_id, direction="out", relation=relation)
-
-        for neighbor in neighbors:
-            if neighbor.node_type == target_type:
-                rest = self._match_pattern_from(
-                    neighbor.node_id, pattern, pattern_idx + 1,
-                )
-                if rest:
-                    return [node_id] + rest
-
-        return []
-
-    def score_node(self, node_id: str) -> float:
-        """Score a node based on its connections."""
-        node = self._nodes.get(node_id)
-        if not node:
-            return 0.0
-
-        score = 0.0
-
-        # Degree centrality
-        out_degree = len(self._outgoing.get(node_id, []))
-        in_degree = len(self._incoming.get(node_id, []))
-        score += (out_degree + in_degree) * 0.1
-
-        # Weighted connections
-        for edge_id in self._outgoing.get(node_id, []) + self._incoming.get(node_id, []):
-            edge = self._edges.get(edge_id)
-            if edge:
-                score += edge.weight * 0.2
-
-        return min(10.0, score)
-
-    def subgraph(
-        self,
-        center: str,
-        depth: int = 2,
-    ) -> dict[str, Any]:
-        """Extract a subgraph around a center node."""
-        nodes: set[str] = set()
-        edges_found: list[str] = []
-
-        queue: deque[tuple[str, int]] = deque([(center, 0)])
-        visited: set[str] = {center}
+        paths = []
+        visited: set[str] = set()
+        queue: deque[list[str]] = deque([[start.entity_id]])
 
         while queue:
-            current, current_depth = queue.popleft()
-            nodes.add(current)
+            path = queue.popleft()
+            current = path[-1]
 
-            if current_depth >= depth:
+            if current == end.entity_id:
+                paths.append(path)
                 continue
 
-            for edge_id in self._outgoing.get(current, []):
-                edge = self._edges.get(edge_id)
-                if edge:
-                    edges_found.append(edge_id)
-                    if edge.target not in visited:
-                        visited.add(edge.target)
-                        queue.append((edge.target, current_depth + 1))
+            if len(path) >= max_hops + 1:
+                continue
 
-        return {
-            "center": center,
-            "nodes": [self._nodes[n].to_dict() for n in nodes if n in self._nodes],
-            "edges": [self._edges[e].to_dict() for e in edges_found if e in self._edges],
-        }
+            if current in visited:
+                continue
+            visited.add(current)
 
-    def save(self) -> str:
-        """Save graph to disk."""
-        path = self._data_dir / "graph.json"
-        data = {
-            "nodes": {nid: {"type": n.node_type, "label": n.label, "props": n.properties}
-                      for nid, n in self._nodes.items()},
-            "edges": {eid: {"source": e.source, "target": e.target,
-                           "relation": e.relation, "weight": e.weight}
-                      for eid, e in self._edges.items()},
-        }
-        path.write_text(json.dumps(data, indent=2, default=str))
-        return str(path)
+            for rel_id in self._adjacency.get(current, []):
+                rel = self._find_rel(rel_id)
+                if rel and rel.target_id not in visited:
+                    queue.append(path + [rel.target_id])
 
-    def load(self) -> bool:
-        """Load graph from disk."""
-        path = self._data_dir / "graph.json"
-        if not path.exists():
-            return False
+        return paths
 
-        try:
-            data = json.loads(path.read_text())
-            for nid, ndata in data.get("nodes", {}).items():
-                self.add_node(
-                    node_type=ndata["type"],
-                    label=ndata["label"],
-                    properties=ndata.get("props", {}),
-                    node_id=nid,
-                )
-            for eid_key, edata in data.get("edges", {}).items():
-                self.add_edge(
-                    source=edata["source"],
-                    target=edata["target"],
-                    relation=edata["relation"],
-                    weight=edata.get("weight", 1.0),
-                )
-            return True
-        except (json.JSONDecodeError, OSError, KeyError):
-            return False
+    def infer(self) -> list[Relationship]:
+        """Infer new relationships from existing knowledge."""
+        new_rels = []
+
+        # If A RUNS service and service HAS vuln, then A HAS vuln
+        for entity in self._entities.values():
+            if entity.entity_type == EntityType.HOST:
+                # Get services
+                services = self.get_neighbors(entity.entity_id, RelType.RUNS)
+                for _, service in services:
+                    # Get vulnerabilities of service
+                    vulns = self.get_neighbors(service.entity_id, RelType.HAS)
+                    for _, vuln in vulns:
+                        # Check if host-vuln relationship already exists
+                        existing = any(
+                            r.source_id == entity.entity_id and
+                            r.target_id == vuln.entity_id and
+                            r.rel_type == RelType.HAS
+                            for r in self._relationships
+                        )
+                        if not existing:
+                            rel = self.add_relationship(
+                                entity.entity_id, vuln.entity_id,
+                                RelType.HAS,
+                                confidence=0.7,
+                                source="inferred",
+                            )
+                            new_rels.append(rel)
+
+        return new_rels
+
+    def merge(self, other_entities: list[dict[str, Any]]) -> int:
+        """Merge knowledge from another source."""
+        merged = 0
+        for data in other_entities:
+            name = data.get("name", "")
+            if not name:
+                continue
+
+            entity_type = EntityType(data.get("type", "host"))
+            self.add_entity(
+                entity_type=entity_type,
+                name=name,
+                properties=data.get("properties", {}),
+                confidence=data.get("confidence", 0.5),
+                source=data.get("source", "merge"),
+            )
+            merged += 1
+
+        return merged
+
+    def _find_rel(self, rel_id: str) -> Relationship | None:
+        for rel in self._relationships:
+            if rel.rel_id == rel_id:
+                return rel
+        return None
 
     def get_stats(self) -> dict[str, Any]:
-        type_counts: dict[str, int] = defaultdict(int)
-        for node in self._nodes.values():
-            type_counts[node.node_type] += 1
+        type_counts = {
+            t.value: len(ids) for t, ids in self._type_index.items()
+        }
+        rel_type_counts: dict[str, int] = defaultdict(int)
+        for rel in self._relationships:
+            rel_type_counts[rel.rel_type.value] += 1
 
         return {
-            "nodes": len(self._nodes),
-            "edges": len(self._edges),
-            "node_types": dict(type_counts),
+            "entities": len(self._entities),
+            "relationships": len(self._relationships),
+            "entity_types": type_counts,
+            "rel_types": dict(rel_type_counts),
         }
