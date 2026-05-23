@@ -1,19 +1,17 @@
-"""Convergence monitor — stagnation detection and recovery.
+"""Convergence monitor — detects when to stop or pivot.
 
 Implements:
-1. Finding rate tracking (findings per cycle)
-2. Stagnation detection (no new findings)
-3. Strategy diversity monitoring
-4. Coverage tracking (% of attack surface tested)
-5. Diminishing returns detection
-6. Automatic strategy switching
-7. Budget consumption tracking
-8. Convergence criteria evaluation
+1. Progress tracking metrics
+2. Diminishing returns detection
+3. Coverage estimation
+4. Stagnation detection
+5. Strategy pivot recommendations
+6. Time-based convergence
+7. Finding rate analysis
 """
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -26,237 +24,243 @@ logger = structlog.get_logger()
 
 class ConvergenceState(str, Enum):
     EXPLORING = "exploring"         # Active discovery
-    PRODUCTIVE = "productive"       # Finding vulnerabilities
-    PLATEAU = "plateau"             # Finding rate declining
-    STAGNANT = "stagnant"           # No new findings for N cycles
-    CONVERGED = "converged"         # Assessment is complete
-    DIVERGING = "diverging"         # Too many strategies, no focus
+    PROGRESSING = "progressing"     # Finding new things
+    PLATEAU = "plateau"             # Slowing down
+    DIMINISHING = "diminishing"     # Very slow progress
+    CONVERGED = "converged"         # No new progress
+    STAGNANT = "stagnant"          # Stuck
+
+
+class PivotReason(str, Enum):
+    DIMINISHING_RETURNS = "diminishing_returns"
+    COVERAGE_COMPLETE = "coverage_complete"
+    TIME_LIMIT = "time_limit"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    REPEATED_FAILURES = "repeated_failures"
+    NO_FINDINGS = "no_findings"
 
 
 @dataclass
-class CycleMetrics:
-    """Metrics for a single assessment cycle."""
-    cycle: int = 0
-    findings: int = 0
-    new_findings: int = 0
-    tools_used: int = 0
-    tokens_used: int = 0
-    duration_s: float = 0.0
-    strategy: str = ""
+class ProgressSnapshot:
+    """A point-in-time progress snapshot."""
     timestamp: float = field(default_factory=time.time)
+    findings_count: int = 0
+    tools_run: int = 0
+    tokens_used: int = 0
+    unique_vulns: int = 0
+    coverage_estimate: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "cycle": self.cycle,
-            "findings": self.findings,
-            "new": self.new_findings,
-            "tools": self.tools_used,
-            "tokens": self.tokens_used,
+            "findings": self.findings_count,
+            "tools": self.tools_run,
+            "coverage": round(self.coverage_estimate, 2),
         }
 
 
 @dataclass
-class ConvergenceReport:
-    """Report on convergence status."""
-    state: ConvergenceState = ConvergenceState.EXPLORING
-    finding_rate: float = 0.0          # Findings per cycle (moving average)
-    finding_rate_trend: float = 0.0    # Positive = increasing, negative = decreasing
-    cycles_since_finding: int = 0
-    total_findings: int = 0
-    total_cycles: int = 0
-    coverage_estimate: float = 0.0
-    budget_consumed: float = 0.0
-    recommendation: str = ""
-    timestamp: float = field(default_factory=time.time)
+class PivotRecommendation:
+    """A recommendation to change strategy."""
+    reason: PivotReason = PivotReason.DIMINISHING_RETURNS
+    current_phase: str = ""
+    recommended_phase: str = ""
+    explanation: str = ""
+    confidence: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "state": self.state.value,
-            "rate": round(self.finding_rate, 2),
-            "trend": round(self.finding_rate_trend, 3),
-            "stale_cycles": self.cycles_since_finding,
-            "findings": self.total_findings,
-            "cycles": self.total_cycles,
-            "coverage": round(self.coverage_estimate, 2),
-            "budget": round(self.budget_consumed, 2),
-            "recommendation": self.recommendation[:40],
+            "reason": self.reason.value,
+            "from": self.current_phase[:15],
+            "to": self.recommended_phase[:15],
+            "confidence": round(self.confidence, 2),
         }
 
 
 class ConvergenceMonitor:
-    """Monitors assessment convergence and detects stagnation.
+    """Monitors assessment progress and detects convergence.
 
-    Tracks finding rate over time and determines when
-    the assessment has reached diminishing returns or
-    needs strategy changes.
+    Tracks finding rate, coverage, and progress
+    to determine when to stop or pivot strategy.
     """
 
     def __init__(
         self,
-        stagnation_threshold: int = 5,
-        convergence_threshold: float = 0.05,
-        window_size: int = 10,
-        max_budget_tokens: int = 1000000,
+        window_size: int = 5,
+        diminishing_threshold: float = 0.1,
+        stagnation_minutes: float = 10.0,
     ) -> None:
-        self._metrics: list[CycleMetrics] = []
-        self._finding_hashes: set[str] = set()
-        self._stagnation_threshold = stagnation_threshold
-        self._convergence_threshold = convergence_threshold
+        self._snapshots: list[ProgressSnapshot] = []
         self._window_size = window_size
-        self._max_budget_tokens = max_budget_tokens
-        self._total_tokens = 0
-        self._cycles_since_finding = 0
-        self._strategies_tried: set[str] = set()
-        self._coverage_regions: dict[str, bool] = {}
+        self._diminishing_threshold = diminishing_threshold
+        self._stagnation_minutes = stagnation_minutes
+        self._state = ConvergenceState.EXPLORING
+        self._start_time = time.time()
         self._log = logger.bind(component="convergence_monitor")
 
-    def record_cycle(
+    def record_snapshot(
+        self,
+        findings_count: int,
+        tools_run: int = 0,
+        tokens_used: int = 0,
+        unique_vulns: int = 0,
+    ) -> ProgressSnapshot:
+        """Record a progress snapshot."""
+        coverage = self._estimate_coverage(findings_count, tools_run)
+
+        snapshot = ProgressSnapshot(
+            findings_count=findings_count,
+            tools_run=tools_run,
+            tokens_used=tokens_used,
+            unique_vulns=unique_vulns,
+            coverage_estimate=coverage,
+        )
+        self._snapshots.append(snapshot)
+
+        # Update state
+        self._update_state()
+
+        return snapshot
+
+    def _estimate_coverage(
         self,
         findings: int,
-        new_findings: int,
-        tools_used: int = 0,
-        tokens_used: int = 0,
-        duration_s: float = 0.0,
-        strategy: str = "",
-        finding_hashes: list[str] | None = None,
-    ) -> ConvergenceReport:
-        """Record a cycle and evaluate convergence."""
-        cycle_num = len(self._metrics) + 1
+        tools: int,
+    ) -> float:
+        """Estimate assessment coverage (0-1)."""
+        # Heuristic: coverage based on tool diversity and finding rate
+        tool_coverage = min(1.0, tools / 15)  # Assume 15 tools is full coverage
+        finding_signal = min(1.0, findings / 20)  # Assume 20 findings is thorough
 
-        metric = CycleMetrics(
-            cycle=cycle_num,
-            findings=findings,
-            new_findings=new_findings,
-            tools_used=tools_used,
-            tokens_used=tokens_used,
-            duration_s=duration_s,
-            strategy=strategy,
-        )
-        self._metrics.append(metric)
+        return tool_coverage * 0.6 + finding_signal * 0.4
 
-        self._total_tokens += tokens_used
-        if strategy:
-            self._strategies_tried.add(strategy)
+    def _update_state(self) -> None:
+        """Update convergence state based on recent snapshots."""
+        if len(self._snapshots) < 2:
+            self._state = ConvergenceState.EXPLORING
+            return
 
-        if finding_hashes:
-            for h in finding_hashes:
-                self._finding_hashes.add(h)
+        # Get recent window
+        window = self._snapshots[-self._window_size:]
 
-        # Update stagnation counter
-        if new_findings > 0:
-            self._cycles_since_finding = 0
+        # Calculate finding rate (findings per snapshot)
+        rates = []
+        for i in range(1, len(window)):
+            delta = window[i].findings_count - window[i - 1].findings_count
+            rates.append(delta)
+
+        if not rates:
+            return
+
+        avg_rate = sum(rates) / len(rates)
+        latest_rate = rates[-1]
+
+        # Detect stagnation (no new findings for N minutes)
+        if len(self._snapshots) >= 3:
+            recent_3 = self._snapshots[-3:]
+            if all(s.findings_count == recent_3[0].findings_count for s in recent_3):
+                time_since_progress = time.time() - self._snapshots[-3].timestamp
+                if time_since_progress > self._stagnation_minutes * 60:
+                    self._state = ConvergenceState.STAGNANT
+                    return
+
+        if avg_rate <= 0:
+            self._state = ConvergenceState.CONVERGED
+        elif avg_rate < self._diminishing_threshold:
+            self._state = ConvergenceState.DIMINISHING
+        elif latest_rate < avg_rate * 0.5:
+            self._state = ConvergenceState.PLATEAU
+        elif latest_rate > 0:
+            self._state = ConvergenceState.PROGRESSING
         else:
-            self._cycles_since_finding += 1
+            self._state = ConvergenceState.EXPLORING
 
-        return self.evaluate()
+    @property
+    def state(self) -> ConvergenceState:
+        return self._state
 
-    def evaluate(self) -> ConvergenceReport:
-        """Evaluate current convergence state."""
-        report = ConvergenceReport()
-        report.total_cycles = len(self._metrics)
-        report.total_findings = sum(m.findings for m in self._metrics)
-        report.cycles_since_finding = self._cycles_since_finding
-        report.budget_consumed = self._total_tokens / max(1, self._max_budget_tokens)
+    @property
+    def should_pivot(self) -> bool:
+        """Whether the current strategy should be changed."""
+        return self._state in (
+            ConvergenceState.DIMINISHING,
+            ConvergenceState.CONVERGED,
+            ConvergenceState.STAGNANT,
+        )
 
-        # Calculate finding rate (moving average)
-        window = self._metrics[-self._window_size:]
-        if window:
-            report.finding_rate = sum(m.new_findings for m in window) / len(window)
+    @property
+    def should_stop(self) -> bool:
+        """Whether the assessment should stop."""
+        return self._state == ConvergenceState.CONVERGED
 
-        # Calculate trend
-        if len(self._metrics) >= 4:
-            first_half = self._metrics[-self._window_size:-self._window_size // 2] or self._metrics[:2]
-            second_half = self._metrics[-self._window_size // 2:]
-            rate_first = sum(m.new_findings for m in first_half) / max(1, len(first_half))
-            rate_second = sum(m.new_findings for m in second_half) / max(1, len(second_half))
-            report.finding_rate_trend = rate_second - rate_first
+    def get_pivot_recommendation(
+        self,
+        current_phase: str,
+    ) -> PivotRecommendation | None:
+        """Get a pivot recommendation if appropriate."""
+        if not self.should_pivot:
+            return None
 
-        # Coverage estimate
-        report.coverage_estimate = self._estimate_coverage()
+        phase_transitions = {
+            "reconnaissance": ("scanning", "Move to vulnerability scanning"),
+            "scanning": ("exploitation", "Move to exploitation of found vulns"),
+            "exploitation": ("validation", "Move to finding validation"),
+            "validation": ("reporting", "Move to report generation"),
+        }
 
-        # Determine state
-        report.state = self._determine_state(report)
+        next_phase, explanation = phase_transitions.get(
+            current_phase,
+            ("reporting", "Assessment converged"),
+        )
 
-        # Generate recommendation
-        report.recommendation = self._generate_recommendation(report)
+        return PivotRecommendation(
+            reason=PivotReason.DIMINISHING_RETURNS,
+            current_phase=current_phase,
+            recommended_phase=next_phase,
+            explanation=explanation,
+            confidence=0.7,
+        )
 
-        return report
-
-    def _determine_state(self, report: ConvergenceReport) -> ConvergenceState:
-        """Determine convergence state from metrics."""
-        # Converged: high coverage + budget exhausted
-        if report.budget_consumed >= 0.95:
-            return ConvergenceState.CONVERGED
-
-        # Stagnant: no findings for too long
-        if report.cycles_since_finding >= self._stagnation_threshold:
-            return ConvergenceState.STAGNANT
-
-        # Plateau: finding rate declining significantly
-        if report.finding_rate_trend < -self._convergence_threshold and report.total_cycles > 5:
-            return ConvergenceState.PLATEAU
-
-        # Diverging: too many strategies without focus
-        if len(self._strategies_tried) > 10 and report.finding_rate < 0.1:
-            return ConvergenceState.DIVERGING
-
-        # Productive: positive finding rate
-        if report.finding_rate > 0.3:
-            return ConvergenceState.PRODUCTIVE
-
-        return ConvergenceState.EXPLORING
-
-    def _estimate_coverage(self) -> float:
-        """Estimate attack surface coverage."""
-        if not self._metrics:
+    def get_finding_rate(self) -> float:
+        """Get the current finding rate per minute."""
+        if len(self._snapshots) < 2:
             return 0.0
 
-        total_cycles = len(self._metrics)
-        strategies_used = len(self._strategies_tried)
-        unique_findings = len(self._finding_hashes)
+        recent = self._snapshots[-2:]
+        time_delta = recent[1].timestamp - recent[0].timestamp
+        if time_delta <= 0:
+            return 0.0
 
-        # Heuristic: More cycles + more strategies + diminishing returns → higher coverage
-        cycle_factor = 1 - math.exp(-total_cycles / 20)
-        strategy_factor = min(1.0, strategies_used / 8)
-        finding_factor = 1 - 1 / (1 + unique_findings * 0.1)
+        finding_delta = recent[1].findings_count - recent[0].findings_count
+        return finding_delta / (time_delta / 60)
 
-        # Weight-combine
-        coverage = 0.4 * cycle_factor + 0.3 * strategy_factor + 0.3 * finding_factor
-        return min(1.0, coverage)
+    def build_convergence_prompt(self) -> str:
+        """Build a prompt about convergence status."""
+        if not self._snapshots:
+            return ""
 
-    def _generate_recommendation(self, report: ConvergenceReport) -> str:
-        """Generate actionable recommendation."""
-        if report.state == ConvergenceState.CONVERGED:
-            return "Assessment complete. Generate final report."
+        latest = self._snapshots[-1]
+        elapsed = time.time() - self._start_time
 
-        if report.state == ConvergenceState.STAGNANT:
-            return "Switch to untried strategy or increase exploitation depth."
+        lines = [
+            "## Assessment Progress\n",
+            f"State: {self._state.value}",
+            f"Findings: {latest.findings_count}",
+            f"Coverage: {latest.coverage_estimate:.0%}",
+            f"Finding rate: {self.get_finding_rate():.1f}/min",
+            f"Elapsed: {elapsed / 60:.0f} min",
+        ]
 
-        if report.state == ConvergenceState.PLATEAU:
-            return "Finding rate declining. Try different attack vector or tool."
+        if self.should_pivot:
+            lines.append(f"\nRECOMMENDATION: Consider pivoting strategy ({self._state.value})")
 
-        if report.state == ConvergenceState.DIVERGING:
-            return "Too many strategies. Focus on most promising findings."
-
-        if report.state == ConvergenceState.PRODUCTIVE:
-            return "Continue current approach. It is producing results."
-
-        return "Continue exploration. Expand attack surface mapping."
-
-    def mark_coverage(self, region: str, tested: bool = True) -> None:
-        """Mark an attack surface region as tested."""
-        self._coverage_regions[region] = tested
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        report = self.evaluate()
         return {
-            "state": report.state.value,
-            "cycles": report.total_cycles,
-            "findings": report.total_findings,
-            "rate": round(report.finding_rate, 2),
-            "trend": round(report.finding_rate_trend, 3),
-            "coverage": round(report.coverage_estimate, 2),
-            "budget": round(report.budget_consumed, 2),
-            "strategies_tried": len(self._strategies_tried),
-            "recommendation": report.recommendation,
+            "state": self._state.value,
+            "snapshots": len(self._snapshots),
+            "finding_rate": round(self.get_finding_rate(), 2),
+            "should_pivot": self.should_pivot,
+            "should_stop": self.should_stop,
+            "elapsed_min": round((time.time() - self._start_time) / 60, 1),
         }
