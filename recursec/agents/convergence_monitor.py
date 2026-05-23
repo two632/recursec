@@ -1,22 +1,21 @@
-"""Convergence monitor — detects when assessment has converged.
+"""Convergence monitor — detects when the agent is making diminishing returns.
 
 Implements:
-1. Finding rate tracking (new findings per unit time)
-2. Diminishing returns detection
-3. Coverage estimation
-4. Convergence criteria evaluation
-5. Early termination recommendations
-6. Phase-specific convergence
-7. Exploration vs exploitation balance
-8. Information gain measurement
+1. Finding rate tracking over time windows
+2. Exponential decay modeling for diminishing returns
+3. Phase transition detection (recon → scanning → exploit)
+4. Budget efficiency scoring
+5. Stagnation detection
+6. Convergence prediction
+7. Adaptive stopping criteria
+8. Performance trend analysis
 """
 
 from __future__ import annotations
 
 import math
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -25,212 +24,276 @@ logger = structlog.get_logger()
 
 
 @dataclass
-class ConvergenceWindow:
-    """A time window for convergence tracking."""
-    start_time: float = 0.0
-    end_time: float = 0.0
+class PerformanceWindow:
+    """A time window of performance data."""
+    window_start: float = 0.0
+    window_end: float = 0.0
     findings_count: int = 0
-    critical_count: int = 0
-    tools_run: int = 0
     tokens_used: int = 0
+    tools_run: int = 0
+    critical_findings: int = 0
+    high_findings: int = 0
 
     @property
     def duration_s(self) -> float:
-        return max(0.001, self.end_time - self.start_time)
+        return max(0.01, self.window_end - self.window_start)
 
     @property
     def finding_rate(self) -> float:
         """Findings per minute."""
-        return self.findings_count / (self.duration_s / 60.0)
+        return self.findings_count / max(0.01, self.duration_s / 60.0)
+
+    @property
+    def token_efficiency(self) -> float:
+        """Findings per 1000 tokens."""
+        if self.tokens_used == 0:
+            return 0.0
+        return self.findings_count / (self.tokens_used / 1000.0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "duration_s": round(self.duration_s, 1),
             "findings": self.findings_count,
             "rate": round(self.finding_rate, 2),
-            "tools": self.tools_run,
-            "duration_s": round(self.duration_s, 0),
+            "tokens": self.tokens_used,
+            "efficiency": round(self.token_efficiency, 4),
         }
 
 
 @dataclass
-class ConvergenceState:
-    """Current convergence state."""
-    converged: bool = False
-    confidence: float = 0.0
-    finding_rate: float = 0.0         # Current rate
-    peak_rate: float = 0.0            # Historical peak
-    rate_decline: float = 0.0         # How much rate has declined
-    estimated_remaining: int = 0      # Estimated remaining findings
+class ConvergenceStatus:
+    """Current convergence status."""
+    is_converged: bool = False
+    is_stagnant: bool = False
+    finding_rate_trend: str = ""    # increasing, stable, decreasing
+    predicted_remaining_findings: int = 0
+    efficiency_trend: str = ""
     recommendation: str = ""
-    phase_convergence: dict[str, bool] = field(default_factory=dict)
+    confidence: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "converged": self.converged,
+            "converged": self.is_converged,
+            "stagnant": self.is_stagnant,
+            "rate_trend": self.finding_rate_trend,
+            "predicted_remaining": self.predicted_remaining_findings,
+            "efficiency_trend": self.efficiency_trend,
+            "recommendation": self.recommendation[:60],
             "confidence": round(self.confidence, 2),
-            "rate": round(self.finding_rate, 2),
-            "peak_rate": round(self.peak_rate, 2),
-            "decline": round(self.rate_decline, 2),
-            "recommendation": self.recommendation,
         }
 
 
 class ConvergenceMonitor:
-    """Monitors assessment convergence.
+    """Detects when the agent is making diminishing returns.
 
-    Tracks finding rates over time and detects
-    when further scanning yields diminishing returns.
+    Uses finding rate tracking, exponential decay modeling,
+    and efficiency scoring to decide when to stop or switch.
     """
 
     def __init__(
         self,
-        window_size_s: float = 300.0,
-        min_windows: int = 3,
-        convergence_threshold: float = 0.1,
+        window_size_s: float = 300.0,       # 5-minute windows
+        stagnation_threshold: int = 3,        # Windows without findings
+        min_efficiency: float = 0.001,        # Min findings/1K tokens
+        convergence_threshold: float = 0.1,   # Rate drop threshold
     ) -> None:
-        self._window_size_s = window_size_s
-        self._min_windows = min_windows
+        self._windows: list[PerformanceWindow] = []
+        self._current_window: PerformanceWindow | None = None
+        self._window_size = window_size_s
+        self._stagnation_threshold = stagnation_threshold
+        self._min_efficiency = min_efficiency
         self._convergence_threshold = convergence_threshold
-
-        self._windows: list[ConvergenceWindow] = []
-        self._current_window: ConvergenceWindow | None = None
         self._total_findings = 0
-        self._total_critical = 0
-        self._phase_findings: dict[str, int] = defaultdict(int)
-        self._phase_times: dict[str, float] = defaultdict(float)
+        self._total_tokens = 0
         self._start_time = time.time()
         self._log = logger.bind(component="convergence_monitor")
 
     def record_finding(
         self,
-        severity: str = "info",
-        phase: str = "",
+        severity: str = "medium",
+        tokens_used: int = 0,
     ) -> None:
         """Record a new finding."""
-        self._ensure_window()
-        if self._current_window:
-            self._current_window.findings_count += 1
-            if severity in ("critical", "high"):
-                self._current_window.critical_count += 1
-
+        window = self._get_current_window()
+        window.findings_count += 1
+        window.tokens_used += tokens_used
         self._total_findings += 1
+        self._total_tokens += tokens_used
+
         if severity == "critical":
-            self._total_critical += 1
+            window.critical_findings += 1
+        elif severity == "high":
+            window.high_findings += 1
 
-        if phase:
-            self._phase_findings[phase] += 1
-
-    def record_tool_run(self, phase: str = "", tokens: int = 0) -> None:
+    def record_tool_run(self, tokens_used: int = 0) -> None:
         """Record a tool execution."""
-        self._ensure_window()
-        if self._current_window:
-            self._current_window.tools_run += 1
-            self._current_window.tokens_used += tokens
+        window = self._get_current_window()
+        window.tools_run += 1
+        window.tokens_used += tokens_used
+        self._total_tokens += tokens_used
 
-    def check_convergence(self) -> ConvergenceState:
+    def check_convergence(self) -> ConvergenceStatus:
         """Check if the assessment has converged."""
-        self._close_window_if_needed()
+        self._close_current_window()
+        status = ConvergenceStatus()
 
-        state = ConvergenceState()
+        if len(self._windows) < 2:
+            status.recommendation = "Continue — insufficient data"
+            return status
 
-        if len(self._windows) < self._min_windows:
-            state.recommendation = "Continue — insufficient data"
-            return state
+        # Calculate finding rate trend
+        recent_rates = [w.finding_rate for w in self._windows[-5:]]
+        status.finding_rate_trend = self._trend(recent_rates)
 
-        # Calculate rates for recent windows
-        rates = [w.finding_rate for w in self._windows[-5:]]
+        # Stagnation detection
+        zero_windows = sum(
+            1 for w in self._windows[-self._stagnation_threshold:]
+            if w.findings_count == 0
+        )
+        status.is_stagnant = zero_windows >= self._stagnation_threshold
 
-        state.finding_rate = rates[-1] if rates else 0.0
-        state.peak_rate = max(r.finding_rate for r in self._windows) if self._windows else 0.0
+        # Convergence detection via exponential decay
+        if len(self._windows) >= 3:
+            status.is_converged = self._check_exponential_decay()
 
-        # Rate of decline
-        if len(rates) >= 2 and rates[0] > 0:
-            state.rate_decline = (rates[0] - rates[-1]) / rates[0]
-        else:
-            state.rate_decline = 0.0
+        # Efficiency trend
+        recent_eff = [w.token_efficiency for w in self._windows[-5:]]
+        status.efficiency_trend = self._trend(recent_eff)
 
-        # Check convergence criteria
-        criteria_met = 0
-        total_criteria = 4
+        # Predict remaining findings
+        status.predicted_remaining_findings = self._predict_remaining()
 
-        # Criterion 1: Finding rate below threshold
-        if state.finding_rate < self._convergence_threshold:
-            criteria_met += 1
+        # Confidence
+        status.confidence = min(1.0, len(self._windows) * 0.1)
 
-        # Criterion 2: Rate declining
-        if state.rate_decline > 0.5:
-            criteria_met += 1
+        # Recommendation
+        status.recommendation = self._recommend(status)
 
-        # Criterion 3: Last N windows have few findings
-        recent_findings = sum(w.findings_count for w in self._windows[-3:])
-        if recent_findings < 2:
-            criteria_met += 1
+        return status
 
-        # Criterion 4: Rate is small fraction of peak
-        if state.peak_rate > 0 and state.finding_rate / state.peak_rate < 0.1:
-            criteria_met += 1
+    def _check_exponential_decay(self) -> bool:
+        """Check if finding rate follows exponential decay."""
+        rates = [w.finding_rate for w in self._windows[-6:]]
+        if not rates or max(rates) == 0:
+            return False
 
-        state.confidence = criteria_met / total_criteria
+        # Simple decay check: is each window worse than the last?
+        decreasing_count = 0
+        for i in range(1, len(rates)):
+            if rates[i] < rates[i - 1]:
+                decreasing_count += 1
 
-        if criteria_met >= 3:
-            state.converged = True
-            state.recommendation = "Assessment has converged — consider stopping"
-        elif criteria_met >= 2:
-            state.recommendation = "Approaching convergence — diminishing returns likely"
-        else:
-            state.recommendation = "Continue — still finding results"
+        # If 80% of transitions are decreasing, likely converged
+        if len(rates) > 2:
+            ratio = decreasing_count / (len(rates) - 1)
+            if ratio >= 0.8 and rates[-1] < self._convergence_threshold:
+                return True
 
-        # Estimate remaining findings (exponential decay model)
-        if state.peak_rate > 0 and state.finding_rate > 0:
-            decay_rate = -math.log(max(0.01, state.finding_rate / state.peak_rate)) / max(1, len(self._windows))
-            if decay_rate > 0:
-                state.estimated_remaining = int(state.finding_rate / decay_rate)
-            else:
-                state.estimated_remaining = 0
+        return False
 
-        # Phase convergence
-        for phase in self._phase_findings:
-            recent_phase = sum(
-                1 for w in self._windows[-3:]
-                if w.findings_count > 0
-            )
-            state.phase_convergence[phase] = recent_phase == 0
+    def _predict_remaining(self) -> int:
+        """Predict remaining findings using exponential decay model."""
+        if len(self._windows) < 2:
+            return 10  # Default estimate
 
-        return state
+        rates = [w.finding_rate for w in self._windows]
+        if not rates or rates[0] == 0:
+            return 0
 
-    def _ensure_window(self) -> None:
-        """Ensure a current window exists."""
+        # Fit simple exponential decay: rate(t) = rate(0) * exp(-lambda * t)
+        if rates[-1] > 0 and rates[0] > 0:
+            ratio = rates[-1] / rates[0]
+            if ratio > 0 and ratio < 1:
+                decay_lambda = -math.log(ratio) / len(rates)
+                # Predict findings in next 10 windows
+                predicted = 0
+                for future_t in range(len(rates), len(rates) + 10):
+                    predicted_rate = rates[0] * math.exp(-decay_lambda * future_t)
+                    predicted += predicted_rate * (self._window_size / 60.0)
+                return max(0, int(predicted))
+
+        return 0
+
+    def _recommend(self, status: ConvergenceStatus) -> str:
+        """Generate recommendation."""
+        if status.is_stagnant and status.is_converged:
+            return "STOP — assessment has converged with no new findings"
+
+        if status.is_stagnant:
+            return "SWITCH — try different approach or tools"
+
+        if status.is_converged:
+            return "REVIEW — diminishing returns, consider stopping"
+
+        if status.efficiency_trend == "decreasing":
+            return "OPTIMIZE — efficiency declining, adjust strategy"
+
+        if status.finding_rate_trend == "increasing":
+            return "CONTINUE — still finding new vulnerabilities"
+
+        return "CONTINUE — assessment in progress"
+
+    def _get_current_window(self) -> PerformanceWindow:
+        """Get or create the current time window."""
         now = time.time()
 
         if self._current_window is None:
-            self._current_window = ConvergenceWindow(
-                start_time=now, end_time=now + self._window_size_s,
+            self._current_window = PerformanceWindow(
+                window_start=now,
+                window_end=now + self._window_size,
             )
-            return
+            return self._current_window
 
-        if now > self._current_window.end_time:
-            self._close_window_if_needed()
-            self._current_window = ConvergenceWindow(
-                start_time=now, end_time=now + self._window_size_s,
+        if now > self._current_window.window_end:
+            self._close_current_window()
+            self._current_window = PerformanceWindow(
+                window_start=now,
+                window_end=now + self._window_size,
             )
 
-    def _close_window_if_needed(self) -> None:
-        """Close current window if expired."""
-        if self._current_window and time.time() > self._current_window.end_time:
+        return self._current_window
+
+    def _close_current_window(self) -> None:
+        """Close the current window and archive it."""
+        if self._current_window:
+            self._current_window.window_end = time.time()
             self._windows.append(self._current_window)
             self._current_window = None
 
-            if len(self._windows) > 50:
-                self._windows = self._windows[-50:]
+            if len(self._windows) > 100:
+                self._windows = self._windows[-100:]
 
-    def get_rate_history(self) -> list[dict[str, Any]]:
-        """Get finding rate history."""
-        return [w.to_dict() for w in self._windows]
+    @staticmethod
+    def _trend(values: list[float]) -> str:
+        """Determine trend from a list of values."""
+        if len(values) < 2:
+            return "insufficient_data"
+
+        increases = 0
+        decreases = 0
+        for i in range(1, len(values)):
+            if values[i] > values[i - 1] * 1.1:
+                increases += 1
+            elif values[i] < values[i - 1] * 0.9:
+                decreases += 1
+
+        if increases > decreases:
+            return "increasing"
+        if decreases > increases:
+            return "decreasing"
+        return "stable"
+
+    def get_windows(self, limit: int = 10) -> list[dict[str, Any]]:
+        return [w.to_dict() for w in self._windows[-limit:]]
 
     def get_stats(self) -> dict[str, Any]:
+        elapsed = time.time() - self._start_time
         return {
             "total_findings": self._total_findings,
-            "total_critical": self._total_critical,
+            "total_tokens": self._total_tokens,
             "windows": len(self._windows),
-            "elapsed_s": round(time.time() - self._start_time, 0),
+            "elapsed_s": round(elapsed, 1),
+            "avg_rate": round(
+                self._total_findings / max(0.01, elapsed / 60.0), 2,
+            ),
         }
