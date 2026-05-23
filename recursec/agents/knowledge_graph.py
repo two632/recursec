@@ -1,27 +1,23 @@
-"""Knowledge graph — structured relationships between security concepts.
+"""Knowledge graph — builds and queries a knowledge graph of discovered entities.
 
-Builds and maintains a graph of:
-1. Vulnerabilities and their relationships
-2. Techniques (MITRE ATT&CK mapping)
-3. Tools and their capabilities
-4. Targets and their components
-5. Findings and evidence chains
-6. Remediation actions
-
-Supports:
-- Entity creation and linking
-- Relationship traversal
-- Pattern matching
-- Subgraph extraction
-- Graph-based reasoning
-- Persistence (JSON)
+Implements:
+1. Entity types (hosts, services, vulns, credentials, relationships)
+2. Relationship types (runs_on, connects_to, has_vuln, authenticates_with)
+3. Graph traversal for attack path discovery
+4. Shortest path between entities
+5. Entity merging and deduplication
+6. Temporal knowledge (when was something discovered)
+7. Confidence scores on edges
+8. Graph serialization/persistence
+9. Subgraph extraction for specific hosts/domains
+10. Pattern matching for known attack patterns
 """
 
 from __future__ import annotations
 
 import json
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -33,59 +29,61 @@ logger = structlog.get_logger()
 
 
 class EntityType(str, Enum):
-    VULNERABILITY = "vulnerability"
-    TECHNIQUE = "technique"
-    TOOL = "tool"
-    TARGET = "target"
     HOST = "host"
     SERVICE = "service"
-    FINDING = "finding"
-    EVIDENCE = "evidence"
-    REMEDIATION = "remediation"
-    CVE = "cve"
-    CWE = "cwe"
     PORT = "port"
+    DOMAIN = "domain"
+    SUBDOMAIN = "subdomain"
+    URL = "url"
+    VULNERABILITY = "vulnerability"
     CREDENTIAL = "credential"
     TECHNOLOGY = "technology"
-    ATTACKER = "attacker"
-    ASSET = "asset"
+    CERTIFICATE = "certificate"
+    DNS_RECORD = "dns_record"
+    EMAIL = "email"
+    NETWORK = "network"
+    FINDING = "finding"
+    EXPLOIT = "exploit"
+    USER = "user"
 
 
 class RelationType(str, Enum):
-    EXPLOITS = "exploits"           # Technique → Vulnerability
-    USES_TOOL = "uses_tool"         # Technique → Tool
-    AFFECTS = "affects"             # Vulnerability → Target
-    RUNS_ON = "runs_on"            # Service → Host
-    HAS_PORT = "has_port"          # Host → Port
-    DISCOVERED_BY = "discovered_by"  # Finding → Tool
-    EVIDENCE_FOR = "evidence_for"    # Evidence → Finding
-    REMEDIATES = "remediates"       # Remediation → Vulnerability
-    RELATED_TO = "related_to"       # Generic relationship
-    DEPENDS_ON = "depends_on"       # Dependency
-    LEADS_TO = "leads_to"          # Chaining relationship
-    MITIGATED_BY = "mitigated_by"   # Vulnerability → Control
-    IDENTIFIED_AS = "identified_as"  # Finding → CVE
-    CLASSIFIED_AS = "classified_as"  # Finding → CWE
-    AUTHENTICATES = "authenticates"  # Credential → Service
-    USES_TECH = "uses_tech"        # Target → Technology
+    RUNS_ON = "runs_on"
+    CONNECTS_TO = "connects_to"
+    HAS_VULN = "has_vuln"
+    HAS_PORT = "has_port"
+    HAS_SERVICE = "has_service"
+    RESOLVES_TO = "resolves_to"
+    SUBDOMAIN_OF = "subdomain_of"
+    HOSTS = "hosts"
+    AUTHENTICATES_WITH = "authenticates_with"
+    EXPLOITS = "exploits"
+    USES_TECH = "uses_tech"
+    HAS_CERT = "has_cert"
+    IN_NETWORK = "in_network"
+    TRUSTS = "trusts"
+    ROUTES_TO = "routes_to"
+    LINKED_TO = "linked_to"
 
 
 @dataclass
 class Entity:
     """An entity in the knowledge graph."""
     entity_id: str = ""
-    entity_type: EntityType = EntityType.FINDING
-    name: str = ""
+    entity_type: EntityType = EntityType.HOST
+    label: str = ""
     properties: dict[str, Any] = field(default_factory=dict)
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
+    confidence: float = 1.0
+    source: str = ""               # Tool/agent that discovered this
+    discovered_at: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.entity_id,
-            "type": self.entity_type.value,
-            "name": self.name[:100],
-            "properties": {k: str(v)[:50] for k, v in list(self.properties.items())[:5]},
+            "id": self.entity_id, "type": self.entity_type.value,
+            "label": self.label[:80], "confidence": round(self.confidence, 2),
+            "source": self.source, "tags": self.tags[:5],
         }
 
 
@@ -93,447 +91,291 @@ class Entity:
 class Relationship:
     """A relationship between two entities."""
     rel_id: str = ""
-    source: str = ""        # Entity ID
-    target: str = ""        # Entity ID
-    rel_type: RelationType = RelationType.RELATED_TO
+    rel_type: RelationType = RelationType.LINKED_TO
+    source_id: str = ""
+    target_id: str = ""
     properties: dict[str, Any] = field(default_factory=dict)
     confidence: float = 1.0
-    created_at: float = field(default_factory=time.time)
+    discovered_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.rel_id,
-            "from": self.source,
-            "to": self.target,
-            "type": self.rel_type.value,
+            "id": self.rel_id, "type": self.rel_type.value,
+            "from": self.source_id, "to": self.target_id,
             "confidence": round(self.confidence, 2),
         }
 
 
-@dataclass
-class GraphQuery:
-    """A query against the knowledge graph."""
-    entity_type: EntityType | None = None
-    rel_type: RelationType | None = None
-    name_contains: str = ""
-    property_filters: dict[str, Any] = field(default_factory=dict)
-    max_depth: int = 1
-    limit: int = 50
-
-
 class KnowledgeGraph:
-    """Knowledge graph for structured security relationships.
+    """A knowledge graph of discovered security entities.
 
-    Stores entities (vulns, techniques, tools, targets) and
-    relationships between them for graph-based reasoning.
+    Stores entities (hosts, services, vulns) and their
+    relationships. Supports graph traversal, attack path
+    discovery, and pattern matching.
     """
 
-    def __init__(self, storage_path: str = "data/knowledge_graph.json") -> None:
-        self._storage_path = Path(storage_path)
-        self._storage_path.parent.mkdir(parents=True, exist_ok=True)
-
+    def __init__(self, persistence_dir: str = "data/knowledge") -> None:
         self._entities: dict[str, Entity] = {}
-        self._relationships: dict[str, Relationship] = {}
-        self._adjacency: dict[str, list[str]] = defaultdict(list)    # entity_id → [rel_ids]
-        self._reverse_adj: dict[str, list[str]] = defaultdict(list)  # entity_id → [incoming rel_ids]
-        self._type_index: dict[str, set[str]] = defaultdict(set)     # type → {entity_ids}
-
+        self._relationships: list[Relationship] = []
+        self._adjacency: dict[str, list[str]] = defaultdict(list)       # entity_id -> [rel_ids]
+        self._reverse_adj: dict[str, list[str]] = defaultdict(list)     # entity_id -> [rel_ids]
+        self._rel_by_id: dict[str, Relationship] = {}
         self._entity_counter = 0
         self._rel_counter = 0
+        self._persistence_dir = Path(persistence_dir)
+        self._persistence_dir.mkdir(parents=True, exist_ok=True)
         self._log = logger.bind(component="knowledge_graph")
-
-        self._load()
-
-    # ── Entity Operations ────────────────────────────────
 
     def add_entity(
         self,
         entity_type: EntityType,
-        name: str,
+        label: str,
         properties: dict[str, Any] | None = None,
-        entity_id: str = "",
+        confidence: float = 1.0,
+        source: str = "",
+        tags: list[str] | None = None,
     ) -> str:
         """Add an entity to the graph."""
-        if not entity_id:
-            self._entity_counter += 1
-            entity_id = f"{entity_type.value}-{self._entity_counter}"
-
-        # Check for duplicates
+        # Check for existing entity with same type and label
         for existing in self._entities.values():
-            if existing.name == name and existing.entity_type == entity_type:
-                existing.properties.update(properties or {})
-                existing.updated_at = time.time()
+            if existing.entity_type == entity_type and existing.label == label:
+                # Merge
+                existing.last_seen = time.time()
+                existing.confidence = max(existing.confidence, confidence)
+                if properties:
+                    existing.properties.update(properties)
                 return existing.entity_id
 
+        self._entity_counter += 1
+        eid = f"e-{self._entity_counter}"
+
         entity = Entity(
-            entity_id=entity_id,
+            entity_id=eid,
             entity_type=entity_type,
-            name=name,
+            label=label,
             properties=properties or {},
+            confidence=confidence,
+            source=source,
+            tags=tags or [],
         )
 
-        self._entities[entity_id] = entity
-        self._type_index[entity_type.value].add(entity_id)
-
-        return entity_id
-
-    def get_entity(self, entity_id: str) -> Entity | None:
-        return self._entities.get(entity_id)
-
-    def find_entities(
-        self,
-        entity_type: EntityType | None = None,
-        name_contains: str = "",
-        **properties: Any,
-    ) -> list[Entity]:
-        """Find entities matching criteria."""
-        results = list(self._entities.values())
-
-        if entity_type:
-            type_ids = self._type_index.get(entity_type.value, set())
-            results = [e for e in results if e.entity_id in type_ids]
-
-        if name_contains:
-            lower = name_contains.lower()
-            results = [e for e in results if lower in e.name.lower()]
-
-        for key, value in properties.items():
-            results = [e for e in results if e.properties.get(key) == value]
-
-        return results
-
-    def update_entity(
-        self,
-        entity_id: str,
-        properties: dict[str, Any],
-    ) -> bool:
-        """Update entity properties."""
-        entity = self._entities.get(entity_id)
-        if not entity:
-            return False
-        entity.properties.update(properties)
-        entity.updated_at = time.time()
-        return True
-
-    def remove_entity(self, entity_id: str) -> bool:
-        """Remove an entity and its relationships."""
-        if entity_id not in self._entities:
-            return False
-
-        # Remove relationships
-        rel_ids = list(self._adjacency.get(entity_id, []))
-        rel_ids.extend(self._reverse_adj.get(entity_id, []))
-        for rel_id in set(rel_ids):
-            self.remove_relationship(rel_id)
-
-        entity = self._entities.pop(entity_id)
-        self._type_index[entity.entity_type.value].discard(entity_id)
-
-        return True
-
-    # ── Relationship Operations ──────────────────────────
+        self._entities[eid] = entity
+        return eid
 
     def add_relationship(
         self,
-        source: str,
-        target: str,
         rel_type: RelationType,
+        source_id: str,
+        target_id: str,
         properties: dict[str, Any] | None = None,
         confidence: float = 1.0,
     ) -> str:
         """Add a relationship between entities."""
-        if source not in self._entities or target not in self._entities:
+        if source_id not in self._entities or target_id not in self._entities:
             return ""
 
-        # Check for duplicate
-        for rel in self._relationships.values():
-            if rel.source == source and rel.target == target and rel.rel_type == rel_type:
-                rel.properties.update(properties or {})
-                rel.confidence = max(rel.confidence, confidence)
-                return rel.rel_id
-
         self._rel_counter += 1
-        rel_id = f"rel-{self._rel_counter}"
+        rid = f"r-{self._rel_counter}"
 
         rel = Relationship(
-            rel_id=rel_id,
-            source=source,
-            target=target,
+            rel_id=rid,
             rel_type=rel_type,
+            source_id=source_id,
+            target_id=target_id,
             properties=properties or {},
             confidence=confidence,
         )
 
-        self._relationships[rel_id] = rel
-        self._adjacency[source].append(rel_id)
-        self._reverse_adj[target].append(rel_id)
+        self._relationships.append(rel)
+        self._rel_by_id[rid] = rel
+        self._adjacency[source_id].append(rid)
+        self._reverse_adj[target_id].append(rid)
 
-        return rel_id
+        return rid
 
-    def get_relationships(
-        self,
-        entity_id: str,
-        direction: str = "outgoing",  # outgoing, incoming, both
-        rel_type: RelationType | None = None,
-    ) -> list[Relationship]:
-        """Get relationships for an entity."""
-        rel_ids: set[str] = set()
+    def get_entity(self, entity_id: str) -> Entity | None:
+        return self._entities.get(entity_id)
 
-        if direction in ("outgoing", "both"):
-            rel_ids.update(self._adjacency.get(entity_id, []))
-        if direction in ("incoming", "both"):
-            rel_ids.update(self._reverse_adj.get(entity_id, []))
-
-        rels = [self._relationships[rid] for rid in rel_ids if rid in self._relationships]
-
-        if rel_type:
-            rels = [r for r in rels if r.rel_type == rel_type]
-
-        return rels
-
-    def remove_relationship(self, rel_id: str) -> bool:
-        rel = self._relationships.pop(rel_id, None)
-        if not rel:
-            return False
-        if rel_id in self._adjacency.get(rel.source, []):
-            self._adjacency[rel.source].remove(rel_id)
-        if rel_id in self._reverse_adj.get(rel.target, []):
-            self._reverse_adj[rel.target].remove(rel_id)
-        return True
-
-    # ── Graph Traversal ──────────────────────────────────
-
-    def traverse(
-        self,
-        start: str,
-        max_depth: int = 3,
-        rel_types: list[RelationType] | None = None,
-    ) -> dict[str, Any]:
-        """Traverse the graph from a starting entity."""
-        visited: set[str] = set()
-        result: dict[str, Any] = {"nodes": [], "edges": []}
-
-        queue: list[tuple[str, int]] = [(start, 0)]
-
-        while queue:
-            entity_id, depth = queue.pop(0)
-            if entity_id in visited or depth > max_depth:
-                continue
-
-            visited.add(entity_id)
-            entity = self._entities.get(entity_id)
-            if entity:
-                result["nodes"].append(entity.to_dict())
-
-            for rel_id in self._adjacency.get(entity_id, []):
-                rel = self._relationships.get(rel_id)
-                if not rel:
-                    continue
-                if rel_types and rel.rel_type not in rel_types:
-                    continue
-                result["edges"].append(rel.to_dict())
-                if rel.target not in visited:
-                    queue.append((rel.target, depth + 1))
-
-        return result
-
-    def find_paths(
-        self,
-        start: str,
-        end: str,
-        max_depth: int = 5,
-    ) -> list[list[str]]:
-        """Find all paths between two entities."""
-        paths: list[list[str]] = []
-        stack: list[tuple[str, list[str], set[str]]] = [(start, [start], {start})]
-
-        while stack and len(paths) < 10:
-            current, path, visited = stack.pop()
-
-            if current == end and len(path) > 1:
-                paths.append(path)
-                continue
-
-            if len(path) > max_depth:
-                continue
-
-            for rel_id in self._adjacency.get(current, []):
-                rel = self._relationships.get(rel_id)
-                if rel and rel.target not in visited:
-                    stack.append((
-                        rel.target,
-                        path + [rel.target],
-                        visited | {rel.target},
-                    ))
-
-        return paths
+    def get_entities_by_type(self, entity_type: EntityType) -> list[Entity]:
+        return [e for e in self._entities.values() if e.entity_type == entity_type]
 
     def get_neighbors(
         self,
         entity_id: str,
-        direction: str = "both",
+        rel_type: RelationType | None = None,
+        direction: str = "outgoing",
     ) -> list[Entity]:
         """Get neighboring entities."""
-        neighbor_ids: set[str] = set()
+        neighbors = []
 
         if direction in ("outgoing", "both"):
-            for rel_id in self._adjacency.get(entity_id, []):
-                rel = self._relationships.get(rel_id)
-                if rel:
-                    neighbor_ids.add(rel.target)
+            for rid in self._adjacency.get(entity_id, []):
+                rel = self._rel_by_id.get(rid)
+                if rel and (not rel_type or rel.rel_type == rel_type):
+                    entity = self._entities.get(rel.target_id)
+                    if entity:
+                        neighbors.append(entity)
 
         if direction in ("incoming", "both"):
-            for rel_id in self._reverse_adj.get(entity_id, []):
-                rel = self._relationships.get(rel_id)
+            for rid in self._reverse_adj.get(entity_id, []):
+                rel = self._rel_by_id.get(rid)
+                if rel and (not rel_type or rel.rel_type == rel_type):
+                    entity = self._entities.get(rel.source_id)
+                    if entity:
+                        neighbors.append(entity)
+
+        return neighbors
+
+    def find_path(
+        self,
+        from_id: str,
+        to_id: str,
+        max_depth: int = 10,
+    ) -> list[str]:
+        """Find shortest path between two entities (BFS)."""
+        if from_id not in self._entities or to_id not in self._entities:
+            return []
+
+        visited: set[str] = set()
+        queue: deque[tuple[str, list[str]]] = deque()
+        queue.append((from_id, [from_id]))
+
+        while queue:
+            current, path = queue.popleft()
+
+            if current == to_id:
+                return path
+
+            if len(path) > max_depth:
+                continue
+
+            if current in visited:
+                continue
+            visited.add(current)
+
+            for rid in self._adjacency.get(current, []):
+                rel = self._rel_by_id.get(rid)
+                if rel and rel.target_id not in visited:
+                    queue.append((rel.target_id, path + [rel.target_id]))
+
+        return []
+
+    def find_attack_paths(
+        self,
+        from_id: str,
+        max_depth: int = 6,
+    ) -> list[list[str]]:
+        """Find all paths from an entity to vulnerabilities."""
+        vuln_ids = {
+            e.entity_id for e in self._entities.values()
+            if e.entity_type == EntityType.VULNERABILITY
+        }
+
+        if not vuln_ids:
+            return []
+
+        paths = []
+        visited: set[str] = set()
+
+        def dfs(current: str, path: list[str]) -> None:
+            if len(path) > max_depth:
+                return
+            if current in visited:
+                return
+
+            visited.add(current)
+
+            if current in vuln_ids and current != from_id:
+                paths.append(list(path))
+
+            for rid in self._adjacency.get(current, []):
+                rel = self._rel_by_id.get(rid)
                 if rel:
-                    neighbor_ids.add(rel.source)
+                    dfs(rel.target_id, path + [rel.target_id])
 
-        return [self._entities[nid] for nid in neighbor_ids if nid in self._entities]
+            visited.discard(current)
 
-    # ── Convenience Methods ──────────────────────────────
+        dfs(from_id, [from_id])
+        return paths
 
-    def add_finding(
+    def search(
         self,
-        title: str,
-        severity: str = "medium",
-        target: str = "",
-        tool: str = "",
-        cve: str = "",
-        **extra: Any,
-    ) -> str:
-        """Add a finding with relationships."""
-        finding_id = self.add_entity(
-            EntityType.FINDING, title,
-            {"severity": severity, **extra},
-        )
+        query: str,
+        entity_type: EntityType | None = None,
+        limit: int = 20,
+    ) -> list[Entity]:
+        """Search entities by label or properties."""
+        query_lower = query.lower()
+        results = []
 
-        if target:
-            target_id = self.add_entity(EntityType.TARGET, target)
-            self.add_relationship(finding_id, target_id, RelationType.AFFECTS)
+        for entity in self._entities.values():
+            if entity_type and entity.entity_type != entity_type:
+                continue
 
-        if tool:
-            tool_id = self.add_entity(EntityType.TOOL, tool)
-            self.add_relationship(finding_id, tool_id, RelationType.DISCOVERED_BY)
+            if query_lower in entity.label.lower():
+                results.append(entity)
+                continue
 
-        if cve:
-            cve_id = self.add_entity(EntityType.CVE, cve)
-            self.add_relationship(finding_id, cve_id, RelationType.IDENTIFIED_AS)
+            # Search properties
+            for value in entity.properties.values():
+                if query_lower in str(value).lower():
+                    results.append(entity)
+                    break
 
-        return finding_id
+        return results[:limit]
 
-    def add_technique(
+    def get_subgraph(
         self,
-        name: str,
-        mitre_id: str = "",
-        tools: list[str] | None = None,
-        vulnerabilities: list[str] | None = None,
-    ) -> str:
-        """Add a MITRE ATT&CK technique with relationships."""
-        tech_id = self.add_entity(
-            EntityType.TECHNIQUE, name,
-            {"mitre_id": mitre_id} if mitre_id else {},
-        )
+        entity_id: str,
+        depth: int = 2,
+    ) -> dict[str, Any]:
+        """Extract a subgraph around an entity."""
+        entities: dict[str, Entity] = {}
+        rels: list[Relationship] = []
+        to_visit: list[tuple[str, int]] = [(entity_id, 0)]
+        visited: set[str] = set()
 
-        for tool_name in (tools or []):
-            tool_id = self.add_entity(EntityType.TOOL, tool_name)
-            self.add_relationship(tech_id, tool_id, RelationType.USES_TOOL)
+        while to_visit:
+            eid, d = to_visit.pop(0)
+            if eid in visited or d > depth:
+                continue
+            visited.add(eid)
 
-        for vuln_name in (vulnerabilities or []):
-            vuln_id = self.add_entity(EntityType.VULNERABILITY, vuln_name)
-            self.add_relationship(tech_id, vuln_id, RelationType.EXPLOITS)
+            entity = self._entities.get(eid)
+            if entity:
+                entities[eid] = entity
 
-        return tech_id
+            for rid in self._adjacency.get(eid, []):
+                rel = self._rel_by_id.get(rid)
+                if rel:
+                    rels.append(rel)
+                    if rel.target_id not in visited:
+                        to_visit.append((rel.target_id, d + 1))
 
-    # ── Persistence ──────────────────────────────────────
+        return {
+            "entities": [e.to_dict() for e in entities.values()],
+            "relationships": [r.to_dict() for r in rels],
+        }
 
     def save(self) -> None:
-        """Persist graph to disk."""
+        """Persist the knowledge graph."""
+        data = {
+            "entities": [e.to_dict() for e in self._entities.values()],
+            "relationships": [r.to_dict() for r in self._relationships],
+        }
+        path = self._persistence_dir / "graph.json"
         try:
-            data = {
-                "entities": {
-                    eid: {
-                        "id": e.entity_id,
-                        "type": e.entity_type.value,
-                        "name": e.name,
-                        "properties": e.properties,
-                    }
-                    for eid, e in self._entities.items()
-                },
-                "relationships": {
-                    rid: {
-                        "id": r.rel_id,
-                        "source": r.source,
-                        "target": r.target,
-                        "type": r.rel_type.value,
-                        "properties": r.properties,
-                        "confidence": r.confidence,
-                    }
-                    for rid, r in self._relationships.items()
-                },
-                "counters": {
-                    "entity": self._entity_counter,
-                    "rel": self._rel_counter,
-                },
-            }
-            self._storage_path.write_text(json.dumps(data))
-        except OSError as e:
-            self._log.warning("save_failed", error=str(e))
-
-    def _load(self) -> None:
-        """Load graph from disk."""
-        if not self._storage_path.exists():
-            return
-        try:
-            data = json.loads(self._storage_path.read_text())
-
-            for eid, e_data in data.get("entities", {}).items():
-                try:
-                    etype = EntityType(e_data["type"])
-                except ValueError:
-                    etype = EntityType.FINDING
-                entity = Entity(
-                    entity_id=eid,
-                    entity_type=etype,
-                    name=e_data.get("name", ""),
-                    properties=e_data.get("properties", {}),
-                )
-                self._entities[eid] = entity
-                self._type_index[etype.value].add(eid)
-
-            for rid, r_data in data.get("relationships", {}).items():
-                try:
-                    rtype = RelationType(r_data["type"])
-                except ValueError:
-                    rtype = RelationType.RELATED_TO
-                rel = Relationship(
-                    rel_id=rid,
-                    source=r_data["source"],
-                    target=r_data["target"],
-                    rel_type=rtype,
-                    properties=r_data.get("properties", {}),
-                    confidence=r_data.get("confidence", 1.0),
-                )
-                self._relationships[rid] = rel
-                self._adjacency[rel.source].append(rid)
-                self._reverse_adj[rel.target].append(rid)
-
-            counters = data.get("counters", {})
-            self._entity_counter = counters.get("entity", 0)
-            self._rel_counter = counters.get("rel", 0)
-
-        except (json.JSONDecodeError, OSError):
+            path.write_text(json.dumps(data, default=str))
+        except OSError:
             pass
 
     def get_stats(self) -> dict[str, Any]:
-        by_type: dict[str, int] = {
-            t: len(ids) for t, ids in self._type_index.items()
-        }
-        by_rel: dict[str, int] = defaultdict(int)
-        for r in self._relationships.values():
-            by_rel[r.rel_type.value] += 1
+        type_counts: dict[str, int] = defaultdict(int)
+        for e in self._entities.values():
+            type_counts[e.entity_type.value] += 1
+
         return {
             "entities": len(self._entities),
             "relationships": len(self._relationships),
-            "entity_types": dict(by_type),
-            "relationship_types": dict(by_rel),
+            "entity_types": dict(type_counts),
         }
