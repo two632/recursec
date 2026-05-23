@@ -1,23 +1,25 @@
-"""Scope manager — enforces assessment scope boundaries.
+"""Scope manager — manages assessment scope and prevents out-of-scope actions.
 
 Implements:
-1. Target scope definition (in-scope, out-of-scope)
-2. IP/CIDR range validation
-3. Domain/subdomain matching
-4. URL path restrictions
-5. Time window enforcement
-6. Rate limiting per target
-7. Scope violation detection and alerting
-8. Dynamic scope updates
+1. Scope definition (targets, ports, protocols)
+2. In-scope validation for all actions
+3. IP/CIDR range matching
+4. Domain and subdomain matching
+5. Port range validation
+6. Protocol restrictions
+7. Exclusion management
+8. Scope violation alerting
+9. Dynamic scope expansion/restriction
+10. Scope history tracking
 """
 
 from __future__ import annotations
 
 import ipaddress
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
 
 import structlog
 
@@ -26,273 +28,330 @@ logger = structlog.get_logger()
 
 @dataclass
 class ScopeRule:
-    """A single scope rule."""
+    """A scope rule definition."""
     rule_id: str = ""
-    rule_type: str = ""          # domain, ip, cidr, url, port
-    pattern: str = ""
-    is_include: bool = True      # True=in-scope, False=exclusion
+    rule_type: str = ""          # include, exclude
+    target_type: str = ""        # ip, cidr, domain, port, protocol, url_path
+    value: str = ""
     description: str = ""
+    added_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.rule_id, "type": self.rule_type,
-            "pattern": self.pattern[:80],
-            "include": self.is_include,
+            "target": self.target_type, "value": self.value[:40],
         }
-
-
-@dataclass
-class RateLimit:
-    """Rate limit for a target."""
-    target: str = ""
-    max_requests_per_minute: int = 60
-    max_requests_per_second: int = 5
-    current_minute_count: int = 0
-    current_second_count: int = 0
-    minute_window_start: float = field(default_factory=time.time)
-    second_window_start: float = field(default_factory=time.time)
 
 
 @dataclass
 class ScopeViolation:
-    """A detected scope violation."""
+    """A scope violation record."""
+    violation_id: str = ""
     target: str = ""
     action: str = ""
-    rule: str = ""
+    rule_violated: str = ""
+    agent_id: str = ""
     timestamp: float = field(default_factory=time.time)
+    blocked: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "target": self.target[:80],
-            "action": self.action[:60],
-            "rule": self.rule[:60],
+            "id": self.violation_id, "target": self.target[:40],
+            "action": self.action[:40], "blocked": self.blocked,
         }
 
 
 class ScopeManager:
-    """Enforces assessment scope boundaries.
+    """Manages assessment scope and prevents out-of-scope actions.
 
     Validates all targets and actions against defined
-    scope rules. Blocks out-of-scope operations.
+    scope rules to prevent unauthorized scanning.
     """
 
     def __init__(self) -> None:
         self._include_rules: list[ScopeRule] = []
         self._exclude_rules: list[ScopeRule] = []
-        self._rate_limits: dict[str, RateLimit] = {}
         self._violations: list[ScopeViolation] = []
         self._rule_counter = 0
-        self._time_start: float = 0
-        self._time_end: float = 0
+        self._violation_counter = 0
+        self._check_count = 0
         self._log = logger.bind(component="scope_manager")
 
-    def add_target(self, target: str, description: str = "") -> str:
-        """Add a target to scope (auto-detects type)."""
+        # Permanently blocked targets
+        self._blocked_ranges: list[str] = [
+            "10.0.0.0/8",       # Private
+            "172.16.0.0/12",    # Private (can be overridden)
+            "192.168.0.0/16",   # Private (can be overridden)
+            "127.0.0.0/8",      # Loopback
+            "169.254.0.0/16",   # Link-local
+        ]
+        self._blocked_domains: list[str] = [
+            "localhost",
+            "*.local",
+        ]
+        self._allow_private = False
+
+    def add_target(
+        self,
+        value: str,
+        target_type: str = "auto",
+        description: str = "",
+    ) -> str:
+        """Add an in-scope target."""
+        if target_type == "auto":
+            target_type = self._detect_type(value)
+
         self._rule_counter += 1
-        rule_id = f"scope-{self._rule_counter}"
-
-        rule_type = self._detect_type(target)
-
         rule = ScopeRule(
-            rule_id=rule_id,
-            rule_type=rule_type,
-            pattern=target,
-            is_include=True,
+            rule_id=f"rule-{self._rule_counter}",
+            rule_type="include",
+            target_type=target_type,
+            value=value,
             description=description,
         )
-
         self._include_rules.append(rule)
+        return rule.rule_id
 
-        # Auto-add subdomains for domains
-        if rule_type == "domain":
-            self._rule_counter += 1
-            sub_rule = ScopeRule(
-                rule_id=f"scope-{self._rule_counter}",
-                rule_type="domain",
-                pattern=f"*.{target}",
-                is_include=True,
-                description=f"Subdomains of {target}",
-            )
-            self._include_rules.append(sub_rule)
+    def exclude_target(
+        self,
+        value: str,
+        target_type: str = "auto",
+        description: str = "",
+    ) -> str:
+        """Add an excluded target."""
+        if target_type == "auto":
+            target_type = self._detect_type(value)
 
-        return rule_id
-
-    def add_exclusion(self, target: str, description: str = "") -> str:
-        """Add an exclusion to scope."""
         self._rule_counter += 1
-        rule_id = f"scope-{self._rule_counter}"
-
         rule = ScopeRule(
-            rule_id=rule_id,
-            rule_type=self._detect_type(target),
-            pattern=target,
-            is_include=False,
+            rule_id=f"rule-{self._rule_counter}",
+            rule_type="exclude",
+            target_type=target_type,
+            value=value,
             description=description,
         )
-
         self._exclude_rules.append(rule)
-        return rule_id
+        return rule.rule_id
 
-    def set_time_window(self, start: float, end: float) -> None:
-        """Set allowed time window for testing."""
-        self._time_start = start
-        self._time_end = end
+    def allow_private_ranges(self, allow: bool = True) -> None:
+        """Allow scanning of private IP ranges."""
+        self._allow_private = allow
 
-    def set_rate_limit(
+    def is_in_scope(
         self,
         target: str,
-        per_minute: int = 60,
-        per_second: int = 5,
-    ) -> None:
-        """Set rate limit for a target."""
-        self._rate_limits[target] = RateLimit(
-            target=target,
-            max_requests_per_minute=per_minute,
-            max_requests_per_second=per_second,
-        )
-
-    def is_in_scope(self, target: str) -> bool:
+        agent_id: str = "",
+        action: str = "",
+    ) -> bool:
         """Check if a target is in scope."""
-        # Time window check
-        if self._time_start and self._time_end:
-            now = time.time()
-            if now < self._time_start or now > self._time_end:
-                self._record_violation(target, "access", "Outside time window")
-                return False
+        self._check_count += 1
 
-        # Check exclusions first (exclusions override includes)
+        # Check exclusions first
         for rule in self._exclude_rules:
-            if self._matches(target, rule):
+            if self._matches_rule(target, rule):
+                self._record_violation(target, action, rule.rule_id, agent_id)
                 return False
 
-        # Check includes
+        # Check blocked ranges (unless private allowed)
+        if not self._allow_private:
+            if self._is_blocked(target):
+                self._record_violation(target, action, "blocked_range", agent_id)
+                return False
+
+        # Check if any include rule matches
         if not self._include_rules:
-            return True  # No rules = everything in scope
+            # No rules defined — everything is out of scope
+            return False
 
         for rule in self._include_rules:
-            if self._matches(target, rule):
+            if self._matches_rule(target, rule):
                 return True
 
-        self._record_violation(target, "access", "Not in scope")
+        # Not matched by any include rule
+        self._record_violation(target, action, "no_include_match", agent_id)
         return False
 
-    def check_rate_limit(self, target: str) -> bool:
-        """Check if rate limit allows the request."""
-        limit = self._rate_limits.get(target)
-        if not limit:
-            return True
+    def _matches_rule(self, target: str, rule: ScopeRule) -> bool:
+        """Check if target matches a rule."""
+        if rule.target_type == "ip":
+            return self._match_ip(target, rule.value)
+        elif rule.target_type == "cidr":
+            return self._match_cidr(target, rule.value)
+        elif rule.target_type == "domain":
+            return self._match_domain(target, rule.value)
+        elif rule.target_type == "port":
+            return self._match_port(target, rule.value)
+        elif rule.target_type == "url":
+            return target.startswith(rule.value) or rule.value in target
+        return False
 
-        now = time.time()
+    def _match_ip(self, target: str, rule_ip: str) -> bool:
+        """Match target against an IP."""
+        # Extract IP from target (could be ip:port or url)
+        target_ip = self._extract_ip(target)
+        return target_ip == rule_ip
 
-        # Reset second window
-        if now - limit.second_window_start >= 1.0:
-            limit.current_second_count = 0
-            limit.second_window_start = now
-
-        # Reset minute window
-        if now - limit.minute_window_start >= 60.0:
-            limit.current_minute_count = 0
-            limit.minute_window_start = now
-
-        if limit.current_second_count >= limit.max_requests_per_second:
+    def _match_cidr(self, target: str, cidr: str) -> bool:
+        """Match target against a CIDR range."""
+        target_ip = self._extract_ip(target)
+        if not target_ip:
             return False
 
-        if limit.current_minute_count >= limit.max_requests_per_minute:
-            return False
-
-        limit.current_second_count += 1
-        limit.current_minute_count += 1
-        return True
-
-    def _matches(self, target: str, rule: ScopeRule) -> bool:
-        """Check if a target matches a scope rule."""
-        if rule.rule_type == "domain":
-            return self._match_domain(target, rule.pattern)
-        elif rule.rule_type == "ip":
-            return self._match_ip(target, rule.pattern)
-        elif rule.rule_type == "cidr":
-            return self._match_cidr(target, rule.pattern)
-        elif rule.rule_type == "url":
-            return self._match_url(target, rule.pattern)
-        return target == rule.pattern
-
-    def _match_domain(self, target: str, pattern: str) -> bool:
-        """Match domain with wildcard support."""
-        # Extract hostname from URL if needed
-        hostname = target
-        if "://" in target:
-            parsed = urlparse(target)
-            hostname = parsed.hostname or target
-
-        hostname = hostname.lower().strip()
-        pattern = pattern.lower().strip()
-
-        if pattern.startswith("*."):
-            suffix = pattern[2:]
-            return hostname == suffix or hostname.endswith("." + suffix)
-
-        return hostname == pattern
-
-    def _match_ip(self, target: str, pattern: str) -> bool:
-        """Match IP address."""
         try:
-            return ipaddress.ip_address(target) == ipaddress.ip_address(pattern)
-        except ValueError:
-            return target == pattern
-
-    def _match_cidr(self, target: str, pattern: str) -> bool:
-        """Match IP against CIDR range."""
-        try:
-            network = ipaddress.ip_network(pattern, strict=False)
-            addr = ipaddress.ip_address(target)
-            return addr in network
+            network = ipaddress.ip_network(cidr, strict=False)
+            ip = ipaddress.ip_address(target_ip)
+            return ip in network
         except ValueError:
             return False
 
-    def _match_url(self, target: str, pattern: str) -> bool:
-        """Match URL pattern."""
-        if not target.startswith(("http://", "https://")):
-            target = f"https://{target}"
+    def _match_domain(self, target: str, domain: str) -> bool:
+        """Match target against a domain pattern."""
+        target_domain = self._extract_domain(target)
+        if not target_domain:
+            return False
 
-        return target.startswith(pattern)
+        # Wildcard matching
+        if domain.startswith("*."):
+            suffix = domain[2:]
+            return target_domain.endswith(suffix) or target_domain == suffix
+        elif domain.startswith("."):
+            return target_domain.endswith(domain) or target_domain == domain[1:]
 
-    def _detect_type(self, target: str) -> str:
-        """Detect target type."""
-        if "/" in target and "." in target.split("/")[0]:
-            # Could be CIDR
+        return target_domain == domain or target_domain.endswith("." + domain)
+
+    def _match_port(self, target: str, port_spec: str) -> bool:
+        """Match target against port spec (single or range)."""
+        target_port = self._extract_port(target)
+        if target_port is None:
+            return False
+
+        if "-" in port_spec:
+            parts = port_spec.split("-")
+            if len(parts) == 2:
+                try:
+                    low, high = int(parts[0]), int(parts[1])
+                    return low <= target_port <= high
+                except ValueError:
+                    return False
+        else:
             try:
-                ipaddress.ip_network(target, strict=False)
+                return target_port == int(port_spec)
+            except ValueError:
+                return False
+
+        return False
+
+    def _is_blocked(self, target: str) -> bool:
+        """Check if target is in blocked ranges."""
+        target_ip = self._extract_ip(target)
+        if target_ip:
+            for cidr in self._blocked_ranges:
+                try:
+                    network = ipaddress.ip_network(cidr, strict=False)
+                    if ipaddress.ip_address(target_ip) in network:
+                        return True
+                except ValueError:
+                    pass
+
+        target_domain = self._extract_domain(target)
+        if target_domain:
+            for blocked in self._blocked_domains:
+                if blocked.startswith("*."):
+                    if target_domain.endswith(blocked[2:]):
+                        return True
+                elif target_domain == blocked:
+                    return True
+
+        return False
+
+    def _record_violation(
+        self,
+        target: str,
+        action: str,
+        rule: str,
+        agent_id: str,
+    ) -> None:
+        """Record a scope violation."""
+        self._violation_counter += 1
+        violation = ScopeViolation(
+            violation_id=f"sv-{self._violation_counter}",
+            target=target,
+            action=action,
+            rule_violated=rule,
+            agent_id=agent_id,
+        )
+        self._violations.append(violation)
+
+        if len(self._violations) > 500:
+            self._violations = self._violations[-500:]
+
+    @staticmethod
+    def _detect_type(value: str) -> str:
+        """Auto-detect the type of a target value."""
+        if "/" in value and any(c.isdigit() for c in value.split("/")[-1]):
+            try:
+                ipaddress.ip_network(value, strict=False)
                 return "cidr"
             except ValueError:
                 pass
 
         try:
-            ipaddress.ip_address(target)
+            ipaddress.ip_address(value.split(":")[0])
             return "ip"
         except ValueError:
             pass
 
-        if target.startswith(("http://", "https://")):
-            return "url"
+        if re.match(r"^\d+(-\d+)?$", value):
+            return "port"
 
-        if "." in target:
-            return "domain"
+        if value.startswith("http://") or value.startswith("https://"):
+            return "url"
 
         return "domain"
 
-    def _record_violation(self, target: str, action: str, rule: str) -> None:
-        violation = ScopeViolation(target=target, action=action, rule=rule)
-        self._violations.append(violation)
-        if len(self._violations) > 1000:
-            self._violations = self._violations[-1000:]
+    @staticmethod
+    def _extract_ip(target: str) -> str:
+        """Extract IP address from target string."""
+        # Remove protocol
+        cleaned = re.sub(r"^https?://", "", target)
+        # Remove port and path
+        cleaned = cleaned.split(":")[0].split("/")[0]
 
-    def get_violations(self, limit: int = 50) -> list[dict[str, Any]]:
+        try:
+            ipaddress.ip_address(cleaned)
+            return cleaned
+        except ValueError:
+            return ""
+
+    @staticmethod
+    def _extract_domain(target: str) -> str:
+        """Extract domain from target string."""
+        cleaned = re.sub(r"^https?://", "", target)
+        cleaned = cleaned.split(":")[0].split("/")[0]
+
+        if re.match(r"^[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}$", cleaned):
+            return cleaned.lower()
+        return ""
+
+    @staticmethod
+    def _extract_port(target: str) -> int | None:
+        """Extract port from target string."""
+        cleaned = re.sub(r"^https?://", "", target)
+        if ":" in cleaned:
+            port_str = cleaned.split(":")[1].split("/")[0]
+            try:
+                return int(port_str)
+            except ValueError:
+                return None
+        return None
+
+    def get_violations(self, limit: int = 20) -> list[dict[str, Any]]:
         return [v.to_dict() for v in self._violations[-limit:]]
 
     def get_stats(self) -> dict[str, Any]:
         return {
-            "include_rules": len(self._include_rules),
-            "exclude_rules": len(self._exclude_rules),
+            "includes": len(self._include_rules),
+            "excludes": len(self._exclude_rules),
+            "checks": self._check_count,
             "violations": len(self._violations),
-            "rate_limits": len(self._rate_limits),
         }
