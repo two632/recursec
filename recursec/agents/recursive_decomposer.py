@@ -1,19 +1,18 @@
-"""Recursive task decomposer — breaks complex tasks into sub-tasks recursively.
+"""Recursive task decomposer — breaks complex goals into sub-tasks.
 
-Core to the recursive multi-agent architecture. Implements:
-1. HTN-style hierarchical task decomposition
-2. Depth-bounded recursive splitting
-3. Sub-task dependency resolution
-4. Parallel sub-task identification
-5. Result aggregation from sub-tasks
-6. Decomposition strategy selection
-7. Base case detection (when to stop splitting)
-8. Context inheritance for sub-tasks
+Implements:
+1. Goal decomposition into sub-tasks
+2. Recursive depth-limited decomposition
+3. Budget allocation across sub-tasks
+4. Dependency detection between sub-tasks
+5. Result aggregation from child tasks
+6. Base case detection (atomic tasks)
+7. Convergence-based early termination
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -23,365 +22,384 @@ import structlog
 logger = structlog.get_logger()
 
 
-class TaskComplexity(str, Enum):
-    TRIVIAL = "trivial"      # Single action, no decomposition
-    SIMPLE = "simple"        # 2-3 steps
-    MODERATE = "moderate"    # 4-8 steps, some parallelism
-    COMPLEX = "complex"      # 9+ steps, deep decomposition
-    RECURSIVE = "recursive"  # Needs recursive sub-agent spawning
-
-
-class DecompStrategy(str, Enum):
-    SEQUENTIAL = "sequential"     # One after another
-    PARALLEL = "parallel"         # All at once
-    MIXED = "mixed"               # Some parallel, some sequential
-    DIVIDE_CONQUER = "divide_conquer"  # Split target space
-    PIPELINE = "pipeline"         # Output of one feeds next
-    ITERATIVE = "iterative"       # Repeat until convergence
+class TaskType(str, Enum):
+    COMPOSITE = "composite"      # Can be decomposed further
+    ATOMIC = "atomic"            # Base case, execute directly
+    PARALLEL = "parallel"        # Sub-tasks run in parallel
+    SEQUENTIAL = "sequential"    # Sub-tasks run in order
 
 
 class SubTaskStatus(str, Enum):
     PENDING = "pending"
-    READY = "ready"
-    DELEGATED = "delegated"
-    IN_PROGRESS = "in_progress"
+    DECOMPOSING = "decomposing"
+    EXECUTING = "executing"
+    AGGREGATING = "aggregating"
     COMPLETED = "completed"
     FAILED = "failed"
-    AGGREGATED = "aggregated"
+    SKIPPED = "skipped"
 
 
 @dataclass
 class SubTask:
-    """A sub-task produced by decomposition."""
+    """A sub-task in the decomposition tree."""
     task_id: str = ""
     parent_id: str = ""
-    title: str = ""
-    description: str = ""
-    task_type: str = ""          # recon, scan, analyze, exploit, validate
-    target: str = ""
-    assigned_role: str = ""
-    assigned_model: str = ""
-    tools: list[str] = field(default_factory=list)
-    context: dict[str, Any] = field(default_factory=dict)
-    dependencies: list[str] = field(default_factory=list)
-    status: SubTaskStatus = SubTaskStatus.PENDING
     depth: int = 0
-    estimated_tokens: int = 500
-    result: dict[str, Any] = field(default_factory=dict)
+    task_type: TaskType = TaskType.ATOMIC
+    status: SubTaskStatus = SubTaskStatus.PENDING
+    goal: str = ""
+    role: str = ""
+    tools: list[str] = field(default_factory=list)
+    knowledge_domains: list[str] = field(default_factory=list)
+    token_budget: int = 0
+    time_budget_s: float = 0.0
     children: list[str] = field(default_factory=list)
-
-    @property
-    def is_leaf(self) -> bool:
-        return len(self.children) == 0
-
-    @property
-    def is_ready(self) -> bool:
-        return self.status == SubTaskStatus.READY
+    dependencies: list[str] = field(default_factory=list)
+    result: dict[str, Any] = field(default_factory=dict)
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+    completed_at: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.task_id,
-            "parent": self.parent_id[:15],
-            "title": self.title[:30],
-            "type": self.task_type[:10],
-            "status": self.status.value,
+            "id": self.task_id[:10],
             "depth": self.depth,
+            "type": self.task_type.value,
+            "status": self.status.value,
+            "goal": self.goal[:30],
             "children": len(self.children),
-            "deps": len(self.dependencies),
+            "findings": len(self.findings),
         }
 
 
 @dataclass
 class DecompositionResult:
-    """Result of decomposing a task."""
+    """Result of a full decomposition."""
     root_task_id: str = ""
-    strategy: DecompStrategy = DecompStrategy.SEQUENTIAL
-    sub_tasks: list[SubTask] = field(default_factory=list)
+    total_tasks: int = 0
     max_depth: int = 0
-    total_estimated_tokens: int = 0
-    parallel_groups: list[list[str]] = field(default_factory=list)
+    total_findings: list[dict[str, Any]] = field(default_factory=list)
+    total_tokens_used: int = 0
+    duration_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "root": self.root_task_id[:15],
-            "strategy": self.strategy.value,
-            "tasks": len(self.sub_tasks),
-            "max_depth": self.max_depth,
-            "est_tokens": self.total_estimated_tokens,
-            "parallel_groups": len(self.parallel_groups),
+            "root": self.root_task_id[:10],
+            "tasks": self.total_tasks,
+            "depth": self.max_depth,
+            "findings": len(self.total_findings),
+            "tokens": self.total_tokens_used,
         }
 
 
-# ── Decomposition Templates ──────────────────────────────────
+# ── Decomposition templates ───────────────────────────────────
 
-DECOMP_TEMPLATES: dict[str, list[dict[str, Any]]] = {
+DECOMPOSITION_TEMPLATES: dict[str, list[dict[str, Any]]] = {
     "full_assessment": [
-        {"title": "Scope validation", "type": "validate", "role": "coordinator",
-         "tools": ["nmap"], "tokens": 300},
-        {"title": "Subdomain enumeration", "type": "recon", "role": "recon",
-         "tools": ["subfinder", "amass"], "tokens": 500, "parallel_group": 0},
-        {"title": "Port scanning", "type": "recon", "role": "recon",
-         "tools": ["nmap", "masscan"], "tokens": 500, "parallel_group": 0},
-        {"title": "Technology fingerprinting", "type": "recon", "role": "recon",
-         "tools": ["whatweb", "httpx"], "tokens": 300, "parallel_group": 0},
-        {"title": "Vulnerability scanning", "type": "scan", "role": "scanner",
-         "tools": ["nuclei", "nikto"], "tokens": 800, "deps": ["Port scanning"]},
-        {"title": "Directory enumeration", "type": "scan", "role": "scanner",
-         "tools": ["ffuf", "feroxbuster"], "tokens": 600, "parallel_group": 1},
-        {"title": "Parameter discovery", "type": "scan", "role": "scanner",
-         "tools": ["arjun"], "tokens": 400, "parallel_group": 1},
-        {"title": "Analyze findings", "type": "analyze", "role": "analyzer",
-         "model": "hermes-14b", "tokens": 3000,
-         "deps": ["Vulnerability scanning", "Directory enumeration"]},
-        {"title": "Deep code review", "type": "analyze", "role": "analyzer",
-         "model": "qwen-coder-14b", "tokens": 5000},
-        {"title": "Exploit verification", "type": "exploit", "role": "exploiter",
-         "model": "whiterabbitneo-7b", "tokens": 4000, "deps": ["Analyze findings"]},
-        {"title": "Cross-validate findings", "type": "validate", "role": "validator",
-         "model": "deepseek-r1-7b", "tokens": 3000, "deps": ["Exploit verification"]},
-        {"title": "Generate report", "type": "report", "role": "reporter",
-         "model": "hermes-14b", "tokens": 2000, "deps": ["Cross-validate findings"]},
+        {"goal": "Perform passive reconnaissance", "role": "recon", "type": "composite",
+         "kbs": ["osint", "infrastructure"], "tools": ["subfinder", "amass", "dig", "whois"]},
+        {"goal": "Perform active scanning", "role": "scanner", "type": "composite",
+         "kbs": ["network", "webapp"], "tools": ["nmap", "nuclei", "nikto"]},
+        {"goal": "Analyze discovered vulnerabilities", "role": "code_auditor", "type": "composite",
+         "kbs": ["injection", "business_logic", "cryptography"]},
+        {"goal": "Attempt exploitation of confirmed vulns", "role": "exploiter", "type": "composite",
+         "kbs": ["binary_analysis", "lateral_movement", "privesc"]},
+        {"goal": "Validate all findings", "role": "validator", "type": "atomic",
+         "kbs": ["compliance"]},
     ],
-    "quick_scan": [
-        {"title": "Port scan", "type": "recon", "role": "recon",
-         "tools": ["nmap"], "tokens": 300},
-        {"title": "Vuln scan", "type": "scan", "role": "scanner",
-         "tools": ["nuclei"], "tokens": 500, "deps": ["Port scan"]},
-        {"title": "Analyze", "type": "analyze", "role": "analyzer",
-         "model": "hermes-14b", "tokens": 2000, "deps": ["Vuln scan"]},
-        {"title": "Report", "type": "report", "role": "reporter",
-         "model": "hermes-14b", "tokens": 1000, "deps": ["Analyze"]},
+    "web_assessment": [
+        {"goal": "Enumerate web application surface", "role": "recon", "type": "composite",
+         "tools": ["httpx", "ffuf", "gobuster"]},
+        {"goal": "Test for injection vulnerabilities", "role": "scanner", "type": "parallel",
+         "kbs": ["injection"], "tools": ["sqlmap", "commix", "dalfox"]},
+        {"goal": "Test business logic flaws", "role": "scanner", "type": "parallel",
+         "kbs": ["business_logic"], "tools": ["burp"]},
+        {"goal": "Test authentication mechanisms", "role": "scanner", "type": "parallel",
+         "kbs": ["business_logic", "cryptography"]},
+        {"goal": "Test API security", "role": "scanner", "type": "parallel",
+         "kbs": ["api_security"]},
     ],
-    "code_audit": [
-        {"title": "Static analysis", "type": "scan", "role": "scanner",
-         "tools": ["semgrep", "bandit"], "tokens": 500, "parallel_group": 0},
-        {"title": "Dependency audit", "type": "scan", "role": "scanner",
-         "tools": ["trivy", "grype"], "tokens": 300, "parallel_group": 0},
-        {"title": "Manual code review", "type": "analyze", "role": "analyzer",
-         "model": "qwen-coder-14b", "tokens": 6000,
-         "deps": ["Static analysis"]},
-        {"title": "Deep pattern analysis", "type": "analyze", "role": "analyzer",
-         "model": "yi-9b-200k", "tokens": 8000,
-         "deps": ["Static analysis"]},
-        {"title": "Validate findings", "type": "validate", "role": "validator",
-         "model": "deepseek-r1-7b", "tokens": 3000,
-         "deps": ["Manual code review", "Deep pattern analysis"]},
-        {"title": "Report", "type": "report", "role": "reporter",
-         "model": "hermes-14b", "tokens": 1500, "deps": ["Validate findings"]},
+    "network_assessment": [
+        {"goal": "Discover network hosts and services", "role": "recon", "type": "atomic",
+         "tools": ["nmap", "masscan"]},
+        {"goal": "Enumerate network services", "role": "scanner", "type": "parallel",
+         "tools": ["enum4linux", "crackmapexec"]},
+        {"goal": "Test for network vulnerabilities", "role": "scanner", "type": "composite",
+         "kbs": ["network", "cryptography"]},
+        {"goal": "Attempt lateral movement", "role": "exploiter", "type": "composite",
+         "kbs": ["lateral_movement", "active_directory"]},
     ],
-    "recon_only": [
-        {"title": "Subdomain enum", "type": "recon", "role": "recon",
-         "tools": ["subfinder"], "tokens": 300, "parallel_group": 0},
-        {"title": "Port scan", "type": "recon", "role": "recon",
-         "tools": ["nmap"], "tokens": 400, "parallel_group": 0},
-        {"title": "DNS enumeration", "type": "recon", "role": "recon",
-         "tools": ["dnsx"], "tokens": 200, "parallel_group": 0},
-        {"title": "Web probe", "type": "recon", "role": "recon",
-         "tools": ["httpx"], "tokens": 200, "parallel_group": 0},
-        {"title": "Tech fingerprint", "type": "recon", "role": "recon",
-         "tools": ["whatweb"], "tokens": 200},
-        {"title": "Compile recon report", "type": "analyze", "role": "analyzer",
-         "model": "hermes-14b", "tokens": 2000,
-         "deps": ["Subdomain enum", "Port scan", "DNS enumeration", "Web probe"]},
+    "cloud_assessment": [
+        {"goal": "Enumerate cloud resources and configs", "role": "recon", "type": "composite",
+         "kbs": ["cloud_security"], "tools": ["aws-cli", "scoutsuite"]},
+        {"goal": "Test IAM and access controls", "role": "scanner", "type": "parallel",
+         "kbs": ["cloud_security"]},
+        {"goal": "Test for data exposure", "role": "scanner", "type": "parallel",
+         "kbs": ["cloud_security", "supply_chain"]},
+        {"goal": "Test container security", "role": "scanner", "type": "parallel",
+         "kbs": ["cloud_security"], "tools": ["trivy", "kube-bench"]},
+    ],
+    "recon_subtasks": [
+        {"goal": "DNS enumeration", "role": "recon", "type": "atomic",
+         "tools": ["subfinder", "amass", "dig"]},
+        {"goal": "Port scanning", "role": "recon", "type": "atomic",
+         "tools": ["nmap", "masscan"]},
+        {"goal": "Technology detection", "role": "recon", "type": "atomic",
+         "tools": ["httpx", "whatweb"]},
+        {"goal": "OSINT gathering", "role": "osint", "type": "atomic",
+         "kbs": ["osint"], "tools": ["theharvester"]},
     ],
 }
 
 
 class RecursiveDecomposer:
-    """Breaks complex tasks into sub-tasks recursively.
+    """Recursively decomposes goals into executable sub-tasks.
 
-    Core of the recursive multi-agent architecture — determines
-    what gets delegated, to whom, and in what order.
+    Uses templates and LLM-guided decomposition
+    to break complex security assessment goals
+    into bounded, atomic tasks with proper
+    budget allocation.
     """
 
     def __init__(
         self,
-        max_depth: int = 5,
-        max_sub_tasks: int = 50,
+        max_depth: int = 4,
+        budget_decay: float = 0.7,
     ) -> None:
         self._tasks: dict[str, SubTask] = {}
-        self._task_counter = 0
+        self._counter = 0
         self._max_depth = max_depth
-        self._max_sub_tasks = max_sub_tasks
+        self._budget_decay = budget_decay
         self._log = logger.bind(component="recursive_decomposer")
 
     def decompose(
         self,
         goal: str,
-        target: str = "",
-        template: str = "",
-        context: dict[str, Any] | None = None,
-        depth: int = 0,
-    ) -> DecompositionResult:
-        """Decompose a task into sub-tasks."""
-        # Create root task
-        self._task_counter += 1
-        root = SubTask(
-            task_id=f"dt-{self._task_counter}",
-            title=goal,
-            target=target,
-            context=context or {},
+        template: str = "full_assessment",
+        token_budget: int = 100000,
+        time_budget_s: float = 3600.0,
+    ) -> SubTask:
+        """Decompose a goal using a template."""
+        root = self._create_task(
+            goal=goal,
+            parent_id="",
+            depth=0,
+            task_type=TaskType.COMPOSITE,
+            token_budget=token_budget,
+            time_budget_s=time_budget_s,
+        )
+
+        # Apply template
+        template_steps = DECOMPOSITION_TEMPLATES.get(template, [])
+        if template_steps:
+            self._apply_template(root, template_steps)
+
+        return root
+
+    def _create_task(
+        self,
+        goal: str,
+        parent_id: str,
+        depth: int,
+        task_type: TaskType = TaskType.ATOMIC,
+        role: str = "",
+        tools: list[str] | None = None,
+        knowledge_domains: list[str] | None = None,
+        token_budget: int = 0,
+        time_budget_s: float = 0.0,
+    ) -> SubTask:
+        """Create a new sub-task."""
+        self._counter += 1
+        task = SubTask(
+            task_id=f"task-{self._counter}",
+            parent_id=parent_id,
             depth=depth,
+            task_type=task_type,
+            goal=goal,
+            role=role,
+            tools=tools or [],
+            knowledge_domains=knowledge_domains or [],
+            token_budget=token_budget,
+            time_budget_s=time_budget_s,
         )
-        self._tasks[root.task_id] = root
+        self._tasks[task.task_id] = task
+        return task
 
-        # Select template
-        template_name = template or self._select_template(goal)
-        template_data = DECOMP_TEMPLATES.get(template_name, DECOMP_TEMPLATES["quick_scan"])
+    def _apply_template(
+        self,
+        parent: SubTask,
+        steps: list[dict[str, Any]],
+    ) -> None:
+        """Apply a decomposition template to a parent task."""
+        child_count = len(steps)
+        if child_count == 0:
+            return
 
-        # Create sub-tasks from template
-        sub_tasks = []
-        task_id_map: dict[str, str] = {}
-        parallel_groups: dict[int, list[str]] = defaultdict(list)
+        per_child_budget = int(parent.token_budget * self._budget_decay / max(1, child_count))
+        per_child_time = parent.time_budget_s * self._budget_decay / max(1, child_count)
 
-        for step in template_data:
-            self._task_counter += 1
-            task = SubTask(
-                task_id=f"dt-{self._task_counter}",
-                parent_id=root.task_id,
-                title=step["title"],
-                task_type=step.get("type", ""),
-                target=target,
-                assigned_role=step.get("role", ""),
-                assigned_model=step.get("model", ""),
+        for step in steps:
+            task_type_str = step.get("type", "atomic")
+            try:
+                task_type = TaskType(task_type_str)
+            except ValueError:
+                task_type = TaskType.ATOMIC
+
+            child = self._create_task(
+                goal=step.get("goal", ""),
+                parent_id=parent.task_id,
+                depth=parent.depth + 1,
+                task_type=task_type,
+                role=step.get("role", ""),
                 tools=step.get("tools", []),
-                depth=depth + 1,
-                estimated_tokens=step.get("tokens", 500),
-                context=context or {},
+                knowledge_domains=step.get("kbs", []),
+                token_budget=per_child_budget,
+                time_budget_s=per_child_time,
             )
+            parent.children.append(child.task_id)
 
-            # Track for dependency resolution
-            task_id_map[step["title"]] = task.task_id
+            # Recursively decompose composite children
+            if task_type == TaskType.COMPOSITE and parent.depth + 1 < self._max_depth:
+                sub_template = self._get_sub_template(child.role, child.goal)
+                if sub_template:
+                    self._apply_template(child, sub_template)
 
-            # Parallel group
-            if "parallel_group" in step:
-                parallel_groups[step["parallel_group"]].append(task.task_id)
+    def _get_sub_template(
+        self,
+        role: str,
+        goal: str,
+    ) -> list[dict[str, Any]]:
+        """Get a sub-decomposition template based on role/goal."""
+        goal_lower = goal.lower()
+        if "recon" in goal_lower:
+            return DECOMPOSITION_TEMPLATES.get("recon_subtasks", [])
+        return []
 
-            sub_tasks.append(task)
-            self._tasks[task.task_id] = task
-            root.children.append(task.task_id)
-
-        # Resolve dependencies
-        for step, task in zip(template_data, sub_tasks):
-            for dep_title in step.get("deps", []):
-                dep_id = task_id_map.get(dep_title)
-                if dep_id:
-                    task.dependencies.append(dep_id)
-
-        # Mark ready tasks (no dependencies)
-        for task in sub_tasks:
-            if not task.dependencies:
-                task.status = SubTaskStatus.READY
-
-        # Determine strategy
-        strategy = self._determine_strategy(sub_tasks, parallel_groups)
-
-        total_tokens = sum(t.estimated_tokens for t in sub_tasks)
-
-        return DecompositionResult(
-            root_task_id=root.task_id,
-            strategy=strategy,
-            sub_tasks=sub_tasks,
-            max_depth=depth + 1,
-            total_estimated_tokens=total_tokens,
-            parallel_groups=[list(g) for g in parallel_groups.values()],
-        )
-
-    def complete_sub_task(
+    def complete_task(
         self,
         task_id: str,
-        result: dict[str, Any],
-        success: bool = True,
-    ) -> list[SubTask]:
-        """Mark a sub-task as complete and unblock dependents."""
+        result: dict[str, Any] | None = None,
+        findings: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Mark a task as completed."""
         task = self._tasks.get(task_id)
         if not task:
-            return []
+            return
 
-        task.status = SubTaskStatus.COMPLETED if success else SubTaskStatus.FAILED
-        task.result = result
+        task.status = SubTaskStatus.COMPLETED
+        task.completed_at = time.time()
+        if result:
+            task.result = result
+        if findings:
+            task.findings = findings
 
-        # Unblock dependent tasks
-        newly_ready = []
-        for other in self._tasks.values():
-            if task_id in other.dependencies:
-                other.dependencies.remove(task_id)
-                if not other.dependencies and other.status == SubTaskStatus.PENDING:
-                    other.status = SubTaskStatus.READY
-                    newly_ready.append(other)
-
-        return newly_ready
-
-    def aggregate_results(self, root_task_id: str) -> dict[str, Any]:
-        """Aggregate results from all sub-tasks of a root task."""
-        root = self._tasks.get(root_task_id)
-        if not root:
-            return {}
-
-        all_results: dict[str, Any] = {
-            "root_task": root.title,
-            "target": root.target,
-            "sub_task_results": [],
-            "total_sub_tasks": len(root.children),
-            "completed": 0,
-            "failed": 0,
-        }
-
-        for child_id in root.children:
-            child = self._tasks.get(child_id)
-            if child:
-                all_results["sub_task_results"].append({
-                    "title": child.title,
-                    "status": child.status.value,
-                    "result": child.result,
-                })
-                if child.status == SubTaskStatus.COMPLETED:
-                    all_results["completed"] += 1
-                elif child.status == SubTaskStatus.FAILED:
-                    all_results["failed"] += 1
-
-        return all_results
-
-    @staticmethod
-    def _select_template(goal: str) -> str:
-        """Select a decomposition template based on the goal."""
-        goal_lower = goal.lower()
-
-        if any(kw in goal_lower for kw in ("code", "audit", "review", "source")):
-            return "code_audit"
-
-        if any(kw in goal_lower for kw in ("recon", "discover", "enumerate")):
-            return "recon_only"
-
-        if any(kw in goal_lower for kw in ("quick", "fast", "basic")):
-            return "quick_scan"
-
-        return "full_assessment"
-
-    @staticmethod
-    def _determine_strategy(
-        sub_tasks: list[SubTask],
-        parallel_groups: dict[int, list[str]],
-    ) -> DecompStrategy:
-        """Determine the decomposition strategy."""
-        if parallel_groups:
-            return DecompStrategy.MIXED
-
-        has_deps = any(t.dependencies for t in sub_tasks)
-        if has_deps:
-            return DecompStrategy.PIPELINE
-
-        return DecompStrategy.SEQUENTIAL
+    def fail_task(self, task_id: str, reason: str = "") -> None:
+        """Mark a task as failed."""
+        task = self._tasks.get(task_id)
+        if not task:
+            return
+        task.status = SubTaskStatus.FAILED
+        task.result = {"error": reason}
 
     def get_ready_tasks(self) -> list[SubTask]:
-        return [t for t in self._tasks.values() if t.status == SubTaskStatus.READY]
+        """Get tasks ready for execution (atomic + pending + deps met)."""
+        ready = []
+        for task in self._tasks.values():
+            if task.status != SubTaskStatus.PENDING:
+                continue
+            if task.task_type != TaskType.ATOMIC:
+                continue
+            # Check dependencies
+            deps_met = all(
+                self._tasks.get(dep, SubTask()).status == SubTaskStatus.COMPLETED
+                for dep in task.dependencies
+            )
+            if deps_met:
+                ready.append(task)
+        return ready
+
+    def aggregate_results(self, task_id: str) -> DecompositionResult:
+        """Aggregate results from all sub-tasks."""
+        task = self._tasks.get(task_id)
+        if not task:
+            return DecompositionResult()
+
+        all_findings: list[dict[str, Any]] = []
+        total_tokens = 0
+        max_depth = 0
+
+        # Traverse tree
+        stack = [task_id]
+        visited: set[str] = set()
+        task_count = 0
+
+        while stack:
+            tid = stack.pop()
+            if tid in visited:
+                continue
+            visited.add(tid)
+            task_count += 1
+
+            t = self._tasks.get(tid)
+            if not t:
+                continue
+
+            all_findings.extend(t.findings)
+            total_tokens += t.token_budget
+            if t.depth > max_depth:
+                max_depth = t.depth
+
+            for child_id in t.children:
+                stack.append(child_id)
+
+        return DecompositionResult(
+            root_task_id=task_id,
+            total_tasks=task_count,
+            max_depth=max_depth,
+            total_findings=all_findings,
+            total_tokens_used=total_tokens,
+        )
+
+    def build_decomposition_prompt(
+        self,
+        task_id: str,
+    ) -> str:
+        """Build decomposition context for LLM."""
+        task = self._tasks.get(task_id)
+        if not task:
+            return ""
+
+        lines = [
+            f"## Task Decomposition (depth {task.depth})\n",
+            f"Goal: {task.goal}",
+            f"Type: {task.task_type.value}",
+            f"Role: {task.role}",
+            f"Budget: {task.token_budget} tokens, {task.time_budget_s:.0f}s",
+            "",
+        ]
+
+        if task.children:
+            lines.append("Sub-tasks:")
+            for cid in task.children:
+                child = self._tasks.get(cid)
+                if child:
+                    lines.append(
+                        f"  [{child.status.value}] {child.goal[:40]} "
+                        f"({child.task_type.value}, {len(child.findings)} findings)"
+                    )
+
+        if task.knowledge_domains:
+            lines.append(f"Knowledge: {', '.join(task.knowledge_domains)}")
+
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
-        for task in self._tasks.values():
-            status_counts[task.status.value] += 1
+        status_counts: dict[str, int] = {}
+        for t in self._tasks.values():
+            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
+
         return {
             "total_tasks": len(self._tasks),
-            "statuses": dict(status_counts),
-            "max_depth_seen": max((t.depth for t in self._tasks.values()), default=0),
+            "by_status": status_counts,
+            "max_depth": max((t.depth for t in self._tasks.values()), default=0),
         }
