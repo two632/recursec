@@ -1,19 +1,19 @@
-"""OODA loop engine — Observe→Orient→Decide→Act cycle.
+"""OODA loop engine — Observe-Orient-Decide-Act cycle.
 
 Implements:
 1. OODA phase management
-2. Observation aggregation
-3. Orientation analysis (threat modeling)
-4. Decision matrix construction
-5. Action execution tracking
-6. Loop feedback integration
+2. Observation collection from tools/scans
+3. Orientation (situation awareness, threat modeling)
+4. Decision making with LLM reasoning
+5. Action execution and feedback
+6. Loop iteration with convergence tracking
 7. Phase transition rules
-8. Stagnation recovery within OODA
 """
 
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -28,28 +28,40 @@ class OODAPhase(str, Enum):
     ORIENT = "orient"
     DECIDE = "decide"
     ACT = "act"
-    FEEDBACK = "feedback"      # Post-action feedback loop
 
 
 class ObservationType(str, Enum):
     TOOL_OUTPUT = "tool_output"
-    LLM_ANALYSIS = "llm_analysis"
-    USER_INPUT = "user_input"
-    ENVIRONMENTAL = "environmental"
+    SCAN_RESULT = "scan_result"
+    NETWORK_STATE = "network_state"
+    SERVICE_INFO = "service_info"
+    VULN_INDICATOR = "vuln_indicator"
+    ERROR_SIGNAL = "error_signal"
     FINDING = "finding"
-    ERROR = "error"
-    ANOMALY = "anomaly"
+    AGENT_REPORT = "agent_report"
+
+
+class DecisionType(str, Enum):
+    RUN_TOOL = "run_tool"
+    SPAWN_AGENT = "spawn_agent"
+    CHANGE_STRATEGY = "change_strategy"
+    INVESTIGATE_DEEPER = "investigate_deeper"
+    VALIDATE_FINDING = "validate_finding"
+    REPORT_FINDING = "report_finding"
+    SKIP = "skip"
+    ESCALATE = "escalate"
+    PIVOT = "pivot"
 
 
 @dataclass
 class Observation:
-    """An observation from the Observe phase."""
+    """Data collected during observe phase."""
     obs_id: str = ""
     obs_type: ObservationType = ObservationType.TOOL_OUTPUT
     source: str = ""
-    content: str = ""
-    importance: float = 0.5      # 0-1
-    actionable: bool = True
+    data: str = ""
+    severity: str = "info"
+    tags: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,81 +69,65 @@ class Observation:
             "id": self.obs_id[:10],
             "type": self.obs_type.value,
             "source": self.source[:15],
-            "content": self.content[:40],
-            "importance": round(self.importance, 2),
+            "severity": self.severity,
         }
 
 
 @dataclass
 class Orientation:
-    """Analysis from the Orient phase."""
+    """Situational awareness from orient phase."""
     threats: list[str] = field(default_factory=list)
     opportunities: list[str] = field(default_factory=list)
-    constraints: list[str] = field(default_factory=list)
-    knowledge_gaps: list[str] = field(default_factory=list)
-    attack_surface_changes: list[str] = field(default_factory=list)
-    priority_shift: str = ""
+    unknowns: list[str] = field(default_factory=list)
+    attack_surface_summary: str = ""
+    current_hypothesis: str = ""
+    confidence: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "threats": len(self.threats),
             "opportunities": len(self.opportunities),
-            "constraints": len(self.constraints),
-            "gaps": len(self.knowledge_gaps),
-            "priority": self.priority_shift[:30],
+            "unknowns": len(self.unknowns),
+            "confidence": round(self.confidence, 2),
         }
 
 
 @dataclass
 class Decision:
-    """A decision from the Decide phase."""
-    decision_id: str = ""
-    action_type: str = ""        # scan, exploit, analyze, validate, report
-    target: str = ""
+    """Decision from decide phase."""
+    decision_type: DecisionType = DecisionType.RUN_TOOL
+    action: str = ""
     tool: str = ""
-    strategy: str = ""
+    args: list[str] = field(default_factory=list)
+    reasoning: str = ""
+    priority: int = 0
     confidence: float = 0.5
-    expected_value: float = 0.5
-    alternatives: list[str] = field(default_factory=list)
-    rationale: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.decision_id[:10],
-            "action": self.action_type[:12],
-            "tool": self.tool[:10],
+            "type": self.decision_type.value,
+            "action": self.action[:20],
+            "priority": self.priority,
             "confidence": round(self.confidence, 2),
-            "ev": round(self.expected_value, 2),
-            "rationale": self.rationale[:30],
         }
 
 
 @dataclass
-class Action:
-    """An action from the Act phase."""
-    action_id: str = ""
-    decision_id: str = ""
-    tool: str = ""
-    command: str = ""
-    started_at: float = field(default_factory=time.time)
-    completed_at: float = 0.0
+class ActionResult:
+    """Result from act phase."""
+    decision: Decision = field(default_factory=Decision)
     success: bool = False
-    output_summary: str = ""
+    output: str = ""
+    new_observations: list[Observation] = field(default_factory=list)
     findings: list[dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def duration_s(self) -> float:
-        if self.completed_at > 0:
-            return self.completed_at - self.started_at
-        return time.time() - self.started_at
+    duration_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.action_id[:10],
-            "tool": self.tool[:10],
             "success": self.success,
-            "duration": round(self.duration_s, 1),
+            "new_obs": len(self.new_observations),
             "findings": len(self.findings),
+            "duration_s": round(self.duration_s, 2),
         }
 
 
@@ -139,63 +135,143 @@ class Action:
 class OODACycle:
     """A complete OODA cycle."""
     cycle_id: str = ""
-    cycle_num: int = 0
-    phase: OODAPhase = OODAPhase.OBSERVE
+    cycle_number: int = 0
+    current_phase: OODAPhase = OODAPhase.OBSERVE
     observations: list[Observation] = field(default_factory=list)
     orientation: Orientation = field(default_factory=Orientation)
     decisions: list[Decision] = field(default_factory=list)
-    actions: list[Action] = field(default_factory=list)
+    results: list[ActionResult] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     completed_at: float = 0.0
 
     @property
     def duration_s(self) -> float:
-        if self.completed_at > 0:
-            return self.completed_at - self.started_at
-        return time.time() - self.started_at
+        if self.completed_at == 0:
+            return time.time() - self.started_at
+        return self.completed_at - self.started_at
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.cycle_id[:10],
-            "num": self.cycle_num,
-            "phase": self.phase.value,
-            "observations": len(self.observations),
+            "cycle": self.cycle_number,
+            "phase": self.current_phase.value,
+            "obs": len(self.observations),
             "decisions": len(self.decisions),
-            "actions": len(self.actions),
-            "duration": round(self.duration_s, 1),
         }
 
 
-class OODALoopEngine:
-    """OODA loop engine for security assessment.
+# ── Orientation templates ─────────────────────────────────────
 
-    Implements the Observe→Orient→Decide→Act cycle
-    for systematic security testing with feedback.
+ORIENTATION_PROMPTS: dict[str, str] = {
+    "initial_recon": (
+        "ORIENT PHASE — Initial Reconnaissance:\n"
+        "Given the observations so far, analyze:\n"
+        "1. What is the target's technology stack?\n"
+        "2. What services are exposed?\n"
+        "3. What are the most likely attack vectors?\n"
+        "4. What information is still missing?\n"
+        "5. What should we investigate next?"
+    ),
+    "vulnerability_analysis": (
+        "ORIENT PHASE — Vulnerability Analysis:\n"
+        "Given scan results, analyze:\n"
+        "1. Which findings are most likely true positives?\n"
+        "2. What is the exploitation difficulty for each?\n"
+        "3. Can any findings be chained together?\n"
+        "4. What additional scans should confirm findings?\n"
+        "5. Priority ranking of findings?"
+    ),
+    "exploitation_planning": (
+        "ORIENT PHASE — Exploitation Planning:\n"
+        "Given confirmed vulnerabilities, analyze:\n"
+        "1. Which vuln has highest impact with lowest risk?\n"
+        "2. What exploitation technique is most appropriate?\n"
+        "3. What tools and payloads are needed?\n"
+        "4. What are the potential failure modes?\n"
+        "5. How do we verify successful exploitation?"
+    ),
+    "post_exploitation": (
+        "ORIENT PHASE — Post-Exploitation:\n"
+        "Given successful exploitation, analyze:\n"
+        "1. What access level was achieved?\n"
+        "2. What lateral movement opportunities exist?\n"
+        "3. What sensitive data is accessible?\n"
+        "4. What privilege escalation paths are available?\n"
+        "5. What evidence should be collected?"
+    ),
+}
+
+
+# ── Decision templates ────────────────────────────────────────
+
+DECISION_RULES: list[dict[str, Any]] = [
+    {
+        "condition": "no_observations",
+        "decision": DecisionType.RUN_TOOL,
+        "action": "Start reconnaissance with nmap and subfinder",
+        "priority": 100,
+    },
+    {
+        "condition": "open_ports_found",
+        "decision": DecisionType.RUN_TOOL,
+        "action": "Run service version detection and vulnerability scanning",
+        "priority": 80,
+    },
+    {
+        "condition": "web_service_found",
+        "decision": DecisionType.SPAWN_AGENT,
+        "action": "Spawn web scanning agent for deep analysis",
+        "priority": 85,
+    },
+    {
+        "condition": "vuln_indicator_found",
+        "decision": DecisionType.VALIDATE_FINDING,
+        "action": "Validate vulnerability with alternative tool/method",
+        "priority": 90,
+    },
+    {
+        "condition": "confirmed_vuln",
+        "decision": DecisionType.INVESTIGATE_DEEPER,
+        "action": "Attempt exploitation with controlled payload",
+        "priority": 95,
+    },
+    {
+        "condition": "stagnation_detected",
+        "decision": DecisionType.PIVOT,
+        "action": "Change strategy or move to next phase",
+        "priority": 70,
+    },
+    {
+        "condition": "budget_low",
+        "decision": DecisionType.REPORT_FINDING,
+        "action": "Compile findings and generate report",
+        "priority": 60,
+    },
+]
+
+
+class OODAEngine:
+    """OODA loop execution engine.
+
+    Manages observation collection, situation
+    orientation, decision making, and action
+    execution in a feedback loop.
     """
 
     def __init__(self, max_cycles: int = 50) -> None:
         self._cycles: list[OODACycle] = []
         self._current: OODACycle | None = None
-        self._counter = 0
         self._max_cycles = max_cycles
+        self._counter = 0
         self._log = logger.bind(component="ooda_loop")
-
-        # Phase transition rules
-        self._phase_transitions: dict[OODAPhase, OODAPhase] = {
-            OODAPhase.OBSERVE: OODAPhase.ORIENT,
-            OODAPhase.ORIENT: OODAPhase.DECIDE,
-            OODAPhase.DECIDE: OODAPhase.ACT,
-            OODAPhase.ACT: OODAPhase.FEEDBACK,
-            OODAPhase.FEEDBACK: OODAPhase.OBSERVE,
-        }
 
     def start_cycle(self) -> OODACycle:
         """Start a new OODA cycle."""
         self._counter += 1
         cycle = OODACycle(
             cycle_id=f"ooda-{self._counter}",
-            cycle_num=self._counter,
-            phase=OODAPhase.OBSERVE,
+            cycle_number=self._counter,
+            current_phase=OODAPhase.OBSERVE,
         )
         self._current = cycle
         return cycle
@@ -204,22 +280,21 @@ class OODALoopEngine:
         self,
         obs_type: ObservationType,
         source: str,
-        content: str,
-        importance: float = 0.5,
-        actionable: bool = True,
-    ) -> Observation | None:
-        """Add an observation to the current cycle."""
-        if not self._current or self._current.phase != OODAPhase.OBSERVE:
-            return None
+        data: str,
+        severity: str = "info",
+        tags: list[str] | None = None,
+    ) -> Observation:
+        """Add an observation to current cycle."""
+        if not self._current:
+            self.start_cycle()
 
-        self._counter += 1
         obs = Observation(
-            obs_id=f"obs-{self._counter}",
+            obs_id=f"obs-{self._counter}-{len(self._current.observations)}",
             obs_type=obs_type,
             source=source,
-            content=content,
-            importance=importance,
-            actionable=actionable,
+            data=data,
+            severity=severity,
+            tags=tags or [],
         )
         self._current.observations.append(obs)
         return obs
@@ -228,184 +303,138 @@ class OODALoopEngine:
         self,
         threats: list[str] | None = None,
         opportunities: list[str] | None = None,
-        constraints: list[str] | None = None,
-        knowledge_gaps: list[str] | None = None,
-        priority_shift: str = "",
-    ) -> Orientation | None:
-        """Complete the Orient phase."""
+        unknowns: list[str] | None = None,
+        hypothesis: str = "",
+        confidence: float = 0.5,
+    ) -> Orientation:
+        """Set orientation for current cycle."""
         if not self._current:
-            return None
+            self.start_cycle()
 
-        self._current.phase = OODAPhase.ORIENT
         orientation = Orientation(
             threats=threats or [],
             opportunities=opportunities or [],
-            constraints=constraints or [],
-            knowledge_gaps=knowledge_gaps or [],
-            priority_shift=priority_shift,
+            unknowns=unknowns or [],
+            current_hypothesis=hypothesis,
+            confidence=confidence,
         )
         self._current.orientation = orientation
+        self._current.current_phase = OODAPhase.ORIENT
         return orientation
 
     def decide(
         self,
-        action_type: str,
-        target: str = "",
+        decision_type: DecisionType,
+        action: str,
         tool: str = "",
-        strategy: str = "",
+        args: list[str] | None = None,
+        reasoning: str = "",
+        priority: int = 0,
         confidence: float = 0.5,
-        expected_value: float = 0.5,
-        alternatives: list[str] | None = None,
-        rationale: str = "",
-    ) -> Decision | None:
-        """Make a decision."""
+    ) -> Decision:
+        """Add a decision to current cycle."""
         if not self._current:
-            return None
+            self.start_cycle()
 
-        self._current.phase = OODAPhase.DECIDE
-        self._counter += 1
         decision = Decision(
-            decision_id=f"dec-{self._counter}",
-            action_type=action_type,
-            target=target,
+            decision_type=decision_type,
+            action=action,
             tool=tool,
-            strategy=strategy,
+            args=args or [],
+            reasoning=reasoning,
+            priority=priority,
             confidence=confidence,
-            expected_value=expected_value,
-            alternatives=alternatives or [],
-            rationale=rationale,
         )
         self._current.decisions.append(decision)
+        self._current.current_phase = OODAPhase.DECIDE
         return decision
 
-    def act(
+    def record_action_result(
         self,
-        decision_id: str,
-        tool: str,
-        command: str = "",
-    ) -> Action | None:
-        """Start an action."""
-        if not self._current:
-            return None
-
-        self._current.phase = OODAPhase.ACT
-        self._counter += 1
-        action = Action(
-            action_id=f"act-{self._counter}",
-            decision_id=decision_id,
-            tool=tool,
-            command=command,
-        )
-        self._current.actions.append(action)
-        return action
-
-    def complete_action(
-        self,
-        action_id: str,
+        decision: Decision,
         success: bool,
-        output_summary: str = "",
+        output: str = "",
+        new_observations: list[Observation] | None = None,
         findings: list[dict[str, Any]] | None = None,
-    ) -> bool:
-        """Complete an action."""
+        duration_s: float = 0.0,
+    ) -> ActionResult:
+        """Record result of an action."""
         if not self._current:
-            return False
+            self.start_cycle()
 
-        for action in self._current.actions:
-            if action.action_id == action_id:
-                action.success = success
-                action.completed_at = time.time()
-                action.output_summary = output_summary
-                if findings:
-                    action.findings.extend(findings)
-                return True
-
-        return False
+        result = ActionResult(
+            decision=decision,
+            success=success,
+            output=output,
+            new_observations=new_observations or [],
+            findings=findings or [],
+            duration_s=duration_s,
+        )
+        self._current.results.append(result)
+        self._current.current_phase = OODAPhase.ACT
+        return result
 
     def complete_cycle(self) -> OODACycle | None:
-        """Complete the current OODA cycle."""
+        """Complete the current cycle."""
         if not self._current:
             return None
 
-        self._current.phase = OODAPhase.FEEDBACK
         self._current.completed_at = time.time()
         self._cycles.append(self._current)
-
         completed = self._current
         self._current = None
         return completed
 
     def should_continue(self) -> bool:
-        """Check if we should continue cycling."""
-        if len(self._cycles) >= self._max_cycles:
-            return False
+        """Check if more cycles should run."""
+        return self._counter < self._max_cycles
 
-        # Check for diminishing returns
-        if len(self._cycles) >= 5:
-            recent = self._cycles[-5:]
+    def build_ooda_prompt(
+        self,
+        phase: str = "initial_recon",
+    ) -> str:
+        """Build OODA-phase prompt for LLM."""
+        lines = []
+
+        orient_prompt = ORIENTATION_PROMPTS.get(phase, ORIENTATION_PROMPTS["initial_recon"])
+        lines.append(orient_prompt)
+
+        # Add recent observations
+        if self._current and self._current.observations:
+            lines.append("\n## Recent Observations:")
+            for obs in self._current.observations[-5:]:
+                lines.append(f"- [{obs.obs_type.value}] {obs.source}: {obs.data[:100]}")
+
+        # Add cycle history summary
+        if self._cycles:
+            lines.append(f"\n## Completed Cycles: {len(self._cycles)}")
             total_findings = sum(
-                len(a.findings) for c in recent for a in c.actions
+                len(r.findings)
+                for cycle in self._cycles
+                for r in cycle.results
             )
-            if total_findings == 0:
-                return False
-
-        return True
-
-    def get_cycle_summary(self) -> dict[str, Any]:
-        """Get summary of all cycles."""
-        total_observations = sum(len(c.observations) for c in self._cycles)
-        total_decisions = sum(len(c.decisions) for c in self._cycles)
-        total_actions = sum(len(c.actions) for c in self._cycles)
-        total_findings = sum(
-            len(a.findings) for c in self._cycles for a in c.actions
-        )
-
-        return {
-            "cycles": len(self._cycles),
-            "observations": total_observations,
-            "decisions": total_decisions,
-            "actions": total_actions,
-            "findings": total_findings,
-            "avg_cycle_time": round(
-                sum(c.duration_s for c in self._cycles) / max(1, len(self._cycles)),
-                1,
-            ),
-        }
-
-    def build_feedback_prompt(self) -> str:
-        """Build a feedback prompt from the last cycle."""
-        if not self._cycles:
-            return ""
-
-        last = self._cycles[-1]
-        lines = ["## OODA Cycle Feedback\n"]
-        lines.append(f"Cycle {last.cycle_num}:")
-
-        # Observations
-        if last.observations:
-            lines.append(f"\nObservations ({len(last.observations)}):")
-            for obs in last.observations[:5]:
-                lines.append(f"  [{obs.obs_type.value}] {obs.content[:50]}")
-
-        # Orientation
-        orient = last.orientation
-        if orient.threats:
-            lines.append(f"\nThreats: {', '.join(orient.threats[:3])}")
-        if orient.opportunities:
-            lines.append(f"Opportunities: {', '.join(orient.opportunities[:3])}")
-        if orient.knowledge_gaps:
-            lines.append(f"Knowledge gaps: {', '.join(orient.knowledge_gaps[:3])}")
-
-        # Actions
-        if last.actions:
-            lines.append(f"\nActions ({len(last.actions)}):")
-            for act in last.actions:
-                status = "OK" if act.success else "FAIL"
-                lines.append(f"  [{status}] {act.tool}: {act.output_summary[:40]}")
+            lines.append(f"Total findings: {total_findings}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        summary = self.get_cycle_summary()
-        summary["current_phase"] = self._current.phase.value if self._current else "none"
-        summary["max_cycles"] = self._max_cycles
-        return summary
+        total_obs = sum(len(c.observations) for c in self._cycles)
+        total_decisions = sum(len(c.decisions) for c in self._cycles)
+        total_findings = sum(
+            len(r.findings)
+            for c in self._cycles
+            for r in c.results
+        )
+
+        phase_counts: dict[str, int] = defaultdict(int)
+        for cycle in self._cycles:
+            for decision in cycle.decisions:
+                phase_counts[decision.decision_type.value] += 1
+
+        return {
+            "cycles": len(self._cycles),
+            "total_observations": total_obs,
+            "total_decisions": total_decisions,
+            "total_findings": total_findings,
+            "by_decision_type": dict(phase_counts),
+        }
