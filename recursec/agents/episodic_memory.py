@@ -1,25 +1,21 @@
-"""Episodic memory — stores and retrieves complete episodes of agent experience.
+"""Episodic memory — records and retrieves assessment episodes.
 
-Unlike experience replay (individual transitions), episodic memory
-stores rich, contextualized episodes with narrative structure. Implements:
-1. Episode recording with temporal ordering
-2. Episode indexing and retrieval
-3. Similarity-based episode search
-4. Episode summarization
-5. Cue-based memory recall
-6. Memory consolidation (short-term → long-term)
-7. Forgetting curves (less-accessed memories fade)
-8. Cross-episode pattern detection
+Implements:
+1. Episode recording (full assessment sequence)
+2. Step-by-step action history
+3. Episode search and retrieval
+4. Pattern extraction from episodes
+5. Success/failure classification
+6. Temporal indexing
+7. Episode summarization for context injection
 """
 
 from __future__ import annotations
 
-import json
-import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -27,367 +23,294 @@ import structlog
 logger = structlog.get_logger()
 
 
+class StepType(str, Enum):
+    OBSERVE = "observe"
+    REASON = "reason"
+    DECIDE = "decide"
+    EXECUTE = "execute"
+    VALIDATE = "validate"
+    REPORT = "report"
+
+
+class EpisodeOutcome(str, Enum):
+    SUCCESS = "success"          # Found real vulnerabilities
+    PARTIAL = "partial"          # Found some findings
+    FAILURE = "failure"          # No actionable findings
+    ABORTED = "aborted"          # Budget/time exhausted
+    ERROR = "error"              # System error
+
+
 @dataclass
-class MemoryEvent:
-    """A single event within an episode."""
-    event_id: str = ""
-    event_type: str = ""          # action, observation, decision, finding, error
-    content: str = ""
-    agent_id: str = ""
+class EpisodeStep:
+    """A single step in an episode."""
+    step_number: int = 0
+    step_type: StepType = StepType.EXECUTE
+    action: str = ""
     tool: str = ""
     model: str = ""
-    importance: float = 0.5
+    input_summary: str = ""
+    output_summary: str = ""
+    findings_count: int = 0
+    tokens_used: int = 0
+    duration_s: float = 0.0
+    success: bool = True
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.event_id,
-            "type": self.event_type[:15],
-            "content": self.content[:60],
-            "importance": round(self.importance, 2),
+            "step": self.step_number,
+            "type": self.step_type.value,
+            "action": self.action[:20],
+            "findings": self.findings_count,
+            "success": self.success,
         }
 
 
 @dataclass
 class Episode:
-    """A complete episode of agent experience."""
+    """A complete assessment episode."""
     episode_id: str = ""
-    title: str = ""
     target: str = ""
-    goal: str = ""
-    events: list[MemoryEvent] = field(default_factory=list)
-    outcome: str = ""              # success, failure, partial
-    key_findings: list[str] = field(default_factory=list)
-    lessons_learned: list[str] = field(default_factory=list)
-    tags: list[str] = field(default_factory=list)
+    target_type: str = ""
+    steps: list[EpisodeStep] = field(default_factory=list)
+    outcome: EpisodeOutcome = EpisodeOutcome.PARTIAL
+    total_findings: int = 0
+    critical_findings: int = 0
+    high_findings: int = 0
+    tools_used: list[str] = field(default_factory=list)
+    models_used: list[str] = field(default_factory=list)
+    strategies_used: list[str] = field(default_factory=list)
     total_tokens: int = 0
-    created_at: float = field(default_factory=time.time)
-    access_count: int = 0
-    last_accessed: float = 0.0
-    importance: float = 0.5
-    consolidated: bool = False
-
-    @property
-    def duration_s(self) -> float:
-        if not self.events:
-            return 0.0
-        return self.events[-1].timestamp - self.events[0].timestamp
-
-    @property
-    def memory_strength(self) -> float:
-        """How strong this memory is (decays with time, boosted by access)."""
-        if self.last_accessed == 0:
-            age = time.time() - self.created_at
-        else:
-            age = time.time() - self.last_accessed
-
-        # Ebbinghaus forgetting curve
-        base_strength = self.importance * (1 + math.log1p(self.access_count))
-        decay = math.exp(-age / (86400.0 * 7))  # ~1 week half-life
-        return base_strength * decay
+    total_duration_s: float = 0.0
+    started_at: float = field(default_factory=time.time)
+    completed_at: float = 0.0
+    tags: list[str] = field(default_factory=list)
+    lessons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.episode_id,
-            "title": self.title[:40],
+            "id": self.episode_id[:10],
             "target": self.target[:20],
-            "outcome": self.outcome,
-            "events": len(self.events),
-            "findings": len(self.key_findings),
-            "strength": round(self.memory_strength, 3),
-            "accesses": self.access_count,
+            "outcome": self.outcome.value,
+            "steps": len(self.steps),
+            "findings": self.total_findings,
+            "tokens": self.total_tokens,
         }
 
 
-@dataclass
-class MemoryQuery:
-    """A query to search episodic memory."""
-    target: str = ""
-    goal: str = ""
-    tags: list[str] = field(default_factory=list)
-    outcome_filter: str = ""
-    min_importance: float = 0.0
-    limit: int = 10
-
-
 class EpisodicMemory:
-    """Stores and retrieves complete episodes of agent experience.
+    """Records and retrieves assessment episodes.
 
-    Rich episodic memory with temporal ordering, forgetting
-    curves, consolidation, and pattern detection.
+    Stores complete assessment episodes with
+    step-by-step history for pattern extraction
+    and learning.
     """
 
-    def __init__(
-        self,
-        data_dir: str = "data/episodic_memory",
-        max_episodes: int = 500,
-        max_short_term: int = 50,
-    ) -> None:
-        self._data_dir = Path(data_dir)
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._long_term: dict[str, Episode] = {}
-        self._short_term: list[Episode] = []
-        self._active_episode: Episode | None = None
-        self._episode_counter = 0
-        self._event_counter = 0
+    def __init__(self, max_episodes: int = 1000) -> None:
+        self._episodes: dict[str, Episode] = {}
+        self._counter = 0
         self._max_episodes = max_episodes
-        self._max_short_term = max_short_term
         self._log = logger.bind(component="episodic_memory")
 
     def start_episode(
         self,
-        title: str,
-        target: str = "",
-        goal: str = "",
+        target: str,
+        target_type: str = "",
         tags: list[str] | None = None,
     ) -> Episode:
         """Start recording a new episode."""
-        # Close any active episode
-        if self._active_episode:
-            self.end_episode()
-
-        self._episode_counter += 1
+        self._counter += 1
         episode = Episode(
-            episode_id=f"ep-{self._episode_counter}",
-            title=title,
+            episode_id=f"ep-{self._counter}",
             target=target,
-            goal=goal,
+            target_type=target_type,
             tags=tags or [],
         )
+        self._episodes[episode.episode_id] = episode
 
-        self._active_episode = episode
+        # Trim old episodes
+        if len(self._episodes) > self._max_episodes:
+            oldest = sorted(
+                self._episodes.values(),
+                key=lambda e: e.started_at,
+            )
+            for old in oldest[:len(self._episodes) - self._max_episodes]:
+                del self._episodes[old.episode_id]
+
         return episode
 
-    def record_event(
+    def add_step(
         self,
-        event_type: str,
-        content: str,
-        agent_id: str = "",
+        episode_id: str,
+        step_type: StepType,
+        action: str,
         tool: str = "",
         model: str = "",
-        importance: float = 0.5,
-    ) -> MemoryEvent | None:
-        """Record an event in the current episode."""
-        if not self._active_episode:
+        input_summary: str = "",
+        output_summary: str = "",
+        findings_count: int = 0,
+        tokens_used: int = 0,
+        duration_s: float = 0.0,
+        success: bool = True,
+    ) -> EpisodeStep | None:
+        """Add a step to an episode."""
+        episode = self._episodes.get(episode_id)
+        if not episode:
             return None
 
-        self._event_counter += 1
-        event = MemoryEvent(
-            event_id=f"ev-{self._event_counter}",
-            event_type=event_type,
-            content=content,
-            agent_id=agent_id,
+        step = EpisodeStep(
+            step_number=len(episode.steps) + 1,
+            step_type=step_type,
+            action=action,
             tool=tool,
             model=model,
-            importance=importance,
+            input_summary=input_summary,
+            output_summary=output_summary,
+            findings_count=findings_count,
+            tokens_used=tokens_used,
+            duration_s=duration_s,
+            success=success,
         )
+        episode.steps.append(step)
 
-        self._active_episode.events.append(event)
-        return event
+        # Update episode stats
+        episode.total_tokens += tokens_used
+        episode.total_findings += findings_count
 
-    def end_episode(
+        if tool and tool not in episode.tools_used:
+            episode.tools_used.append(tool)
+        if model and model not in episode.models_used:
+            episode.models_used.append(model)
+
+        return step
+
+    def complete_episode(
         self,
-        outcome: str = "unknown",
-        key_findings: list[str] | None = None,
-        lessons_learned: list[str] | None = None,
+        episode_id: str,
+        outcome: EpisodeOutcome = EpisodeOutcome.PARTIAL,
+        lessons: list[str] | None = None,
     ) -> Episode | None:
-        """End the current episode and store it."""
-        if not self._active_episode:
+        """Complete an episode."""
+        episode = self._episodes.get(episode_id)
+        if not episode:
             return None
 
-        episode = self._active_episode
         episode.outcome = outcome
-        episode.key_findings = key_findings or []
-        episode.lessons_learned = lessons_learned or []
+        episode.completed_at = time.time()
+        episode.total_duration_s = episode.completed_at - episode.started_at
+        episode.lessons = lessons or []
 
-        # Calculate importance
-        episode.importance = self._calculate_importance(episode)
-
-        # Store in short-term memory
-        self._short_term.append(episode)
-        if len(self._short_term) > self._max_short_term:
-            self._consolidate()
-
-        # Persist
-        self._save_episode(episode)
-
-        self._active_episode = None
         return episode
 
-    def recall(self, query: MemoryQuery) -> list[Episode]:
-        """Recall episodes matching a query."""
-        results = []
+    def search_episodes(
+        self,
+        target_type: str = "",
+        outcome: EpisodeOutcome | None = None,
+        min_findings: int = 0,
+        tags: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[Episode]:
+        """Search episodes by criteria."""
+        matches = []
+        for episode in self._episodes.values():
+            if target_type and episode.target_type != target_type:
+                continue
+            if outcome and episode.outcome != outcome:
+                continue
+            if episode.total_findings < min_findings:
+                continue
+            if tags:
+                if not any(t in episode.tags for t in tags):
+                    continue
+            matches.append(episode)
 
-        all_episodes = list(self._long_term.values()) + self._short_term
+        matches.sort(key=lambda e: e.total_findings, reverse=True)
+        return matches[:limit]
 
-        for episode in all_episodes:
-            score = self._match_score(episode, query)
-            if score > 0:
-                results.append((score, episode))
+    def get_successful_patterns(
+        self,
+        target_type: str = "",
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Extract successful patterns from episodes."""
+        successful = self.search_episodes(
+            target_type=target_type,
+            outcome=EpisodeOutcome.SUCCESS,
+            limit=20,
+        )
 
-        # Sort by relevance
-        results.sort(key=lambda x: x[0], reverse=True)
+        tool_freq: dict[str, int] = defaultdict(int)
+        strategy_freq: dict[str, int] = defaultdict(int)
 
-        recalled = []
-        for _, episode in results[:query.limit]:
-            episode.access_count += 1
-            episode.last_accessed = time.time()
-            recalled.append(episode)
+        for episode in successful:
+            for tool in episode.tools_used:
+                tool_freq[tool] += 1
+            for strat in episode.strategies_used:
+                strategy_freq[strat] += 1
 
-        return recalled
+        patterns: list[dict[str, Any]] = []
 
-    def recall_by_cue(self, cue: str) -> list[Episode]:
-        """Recall episodes triggered by a cue (keyword/phrase)."""
-        cue_lower = cue.lower()
-        results = []
+        top_tools = sorted(tool_freq.items(), key=lambda x: x[1], reverse=True)[:limit]
+        for tool, count in top_tools:
+            patterns.append({
+                "type": "tool",
+                "name": tool,
+                "frequency": count,
+            })
 
-        all_episodes = list(self._long_term.values()) + self._short_term
-
-        for episode in all_episodes:
-            relevance = 0.0
-
-            # Check title
-            if cue_lower in episode.title.lower():
-                relevance += 0.5
-
-            # Check target
-            if cue_lower in episode.target.lower():
-                relevance += 0.3
-
-            # Check events
-            for event in episode.events:
-                if cue_lower in event.content.lower():
-                    relevance += 0.1
-
-            # Check tags
-            if cue_lower in [t.lower() for t in episode.tags]:
-                relevance += 0.4
-
-            if relevance > 0:
-                results.append((relevance * episode.memory_strength, episode))
-
-        results.sort(key=lambda x: x[0], reverse=True)
-        return [ep for _, ep in results[:10]]
-
-    def find_patterns(self) -> list[dict[str, Any]]:
-        """Detect patterns across episodes."""
-        patterns = []
-
-        all_episodes = list(self._long_term.values()) + self._short_term
-
-        # Pattern: Common tools in successful episodes
-        successful_tools: dict[str, int] = defaultdict(int)
-        failed_tools: dict[str, int] = defaultdict(int)
-
-        for episode in all_episodes:
-            tool_set = {e.tool for e in episode.events if e.tool}
-            for tool in tool_set:
-                if episode.outcome == "success":
-                    successful_tools[tool] += 1
-                elif episode.outcome == "failure":
-                    failed_tools[tool] += 1
-
-        # Tools that correlate with success
-        for tool, success_count in successful_tools.items():
-            fail_count = failed_tools.get(tool, 0)
-            if success_count > fail_count * 2 and success_count >= 3:
-                patterns.append({
-                    "type": "tool_success_correlation",
-                    "tool": tool,
-                    "success_count": success_count,
-                    "fail_count": fail_count,
-                })
-
-        # Pattern: Target type → outcome correlation
-        target_outcomes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for episode in all_episodes:
-            target_type = episode.target.split(":")[:1]
-            target_key = target_type[0] if target_type else "unknown"
-            target_outcomes[target_key][episode.outcome] += 1
-
-        for target_type, outcomes in target_outcomes.items():
-            if outcomes.get("success", 0) > 5:
-                patterns.append({
-                    "type": "target_success_pattern",
-                    "target_type": target_type,
-                    "outcomes": dict(outcomes),
-                })
+        top_strats = sorted(strategy_freq.items(), key=lambda x: x[1], reverse=True)[:limit]
+        for strat, count in top_strats:
+            patterns.append({
+                "type": "strategy",
+                "name": strat,
+                "frequency": count,
+            })
 
         return patterns
 
-    def _consolidate(self) -> None:
-        """Consolidate short-term memories into long-term storage."""
-        for episode in self._short_term:
-            if episode.memory_strength > 0.1:
-                self._long_term[episode.episode_id] = episode
-                episode.consolidated = True
+    def build_episodic_prompt(
+        self,
+        target_type: str = "",
+        max_episodes: int = 3,
+    ) -> str:
+        """Build prompt from past episodes."""
+        lines = ["## Past Assessment Episodes\n"]
 
-        self._short_term = []
+        recent = self.search_episodes(
+            target_type=target_type,
+            min_findings=1,
+            limit=max_episodes,
+        )
 
-        # Evict weakest from long-term if over limit
-        if len(self._long_term) > self._max_episodes:
-            sorted_eps = sorted(
-                self._long_term.values(),
-                key=lambda e: e.memory_strength,
+        if not recent:
+            lines.append("No relevant past episodes.")
+            return "\n".join(lines)
+
+        for episode in recent:
+            lines.append(
+                f"### {episode.target} ({episode.outcome.value}): "
+                f"{episode.total_findings} findings"
             )
-            for ep in sorted_eps[:len(self._long_term) - self._max_episodes]:
-                del self._long_term[ep.episode_id]
+            lines.append(f"  Tools: {', '.join(episode.tools_used[:5])}")
+            if episode.lessons:
+                lines.append(f"  Lessons: {'; '.join(episode.lessons[:3])}")
 
-    def _match_score(self, episode: Episode, query: MemoryQuery) -> float:
-        """Score how well an episode matches a query."""
-        score = 0.0
+        patterns = self.get_successful_patterns(target_type=target_type)
+        if patterns:
+            lines.append("\n### Successful Patterns")
+            for pattern in patterns[:5]:
+                lines.append(f"  - {pattern['type']}: {pattern['name']} ({pattern['frequency']}x)")
 
-        if query.target and query.target.lower() in episode.target.lower():
-            score += 0.3
-
-        if query.goal and query.goal.lower() in episode.goal.lower():
-            score += 0.3
-
-        if query.tags:
-            matching_tags = set(query.tags) & set(episode.tags)
-            score += 0.2 * (len(matching_tags) / len(query.tags))
-
-        if query.outcome_filter and episode.outcome == query.outcome_filter:
-            score += 0.2
-
-        if episode.importance < query.min_importance:
-            return 0.0
-
-        return score * episode.memory_strength
-
-    @staticmethod
-    def _calculate_importance(episode: Episode) -> float:
-        """Calculate episode importance."""
-        importance = 0.5
-
-        # Findings boost importance
-        importance += min(0.3, len(episode.key_findings) * 0.1)
-
-        # Success is more important to remember
-        if episode.outcome == "success":
-            importance += 0.1
-
-        # Long episodes (more detail) are more important
-        if len(episode.events) > 10:
-            importance += 0.1
-
-        return min(1.0, importance)
-
-    def _save_episode(self, episode: Episode) -> None:
-        """Save episode to disk."""
-        path = self._data_dir / f"{episode.episode_id}.json"
-        try:
-            data = episode.to_dict()
-            data["events"] = [e.to_dict() for e in episode.events]
-            path.write_text(json.dumps(data, indent=2, default=str))
-        except OSError:
-            pass
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
+        outcome_counts: dict[str, int] = defaultdict(int)
+        for ep in self._episodes.values():
+            outcome_counts[ep.outcome.value] += 1
+
         return {
-            "short_term": len(self._short_term),
-            "long_term": len(self._long_term),
-            "total_episodes": self._episode_counter,
-            "total_events": self._event_counter,
-            "active": self._active_episode is not None,
+            "total_episodes": len(self._episodes),
+            "total_findings": sum(ep.total_findings for ep in self._episodes.values()),
+            "total_tokens": sum(ep.total_tokens for ep in self._episodes.values()),
+            "by_outcome": dict(outcome_counts),
         }

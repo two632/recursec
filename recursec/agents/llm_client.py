@@ -1,14 +1,13 @@
-"""LLM client — unified interface for llama.cpp and vLLM backends.
+"""LLM client — unified interface to local LLM servers.
 
 Implements:
-1. llama.cpp server HTTP client
-2. vLLM server HTTP client
-3. Connection pooling and health checks
-4. Token counting and budgeting
-5. Request queuing and rate limiting
-6. Response streaming support
-7. Model-specific parameter tuning
-8. Retry with exponential backoff
+1. Async HTTP client for llama.cpp / vLLM servers
+2. Model-specific parameter tuning
+3. Retry with exponential backoff
+4. Response streaming
+5. Health checking and availability
+6. Token usage tracking
+7. Multi-model routing
 """
 
 from __future__ import annotations
@@ -16,8 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -26,10 +24,10 @@ import structlog
 logger = structlog.get_logger()
 
 
-class LLMBackend(str, Enum):
+class ModelBackend(str, Enum):
     LLAMA_CPP = "llama_cpp"
     VLLM = "vllm"
-    GENERIC_OPENAI = "generic_openai"
+    SGLANG = "sglang"
 
 
 class ModelStatus(str, Enum):
@@ -37,483 +35,375 @@ class ModelStatus(str, Enum):
     OFFLINE = "offline"
     BUSY = "busy"
     ERROR = "error"
-    UNKNOWN = "unknown"
 
 
 @dataclass
 class ModelEndpoint:
-    """An LLM model endpoint."""
+    """Configuration for a model endpoint."""
     model_id: str = ""
-    name: str = ""
-    backend: LLMBackend = LLMBackend.LLAMA_CPP
     host: str = "127.0.0.1"
     port: int = 8100
+    backend: ModelBackend = ModelBackend.LLAMA_CPP
+    status: ModelStatus = ModelStatus.OFFLINE
+    max_tokens: int = 2048
+    temperature: float = 0.7
     context_size: int = 4096
-    status: ModelStatus = ModelStatus.UNKNOWN
-    capabilities: list[str] = field(default_factory=list)
-    default_temperature: float = 0.7
-    default_max_tokens: int = 2048
     last_health_check: float = 0.0
     total_requests: int = 0
-    total_tokens: int = 0
+    total_tokens_generated: int = 0
     avg_latency_ms: float = 0.0
 
     @property
-    def url(self) -> str:
+    def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
+    @property
+    def completion_url(self) -> str:
+        if self.backend == ModelBackend.LLAMA_CPP:
+            return f"{self.base_url}/completion"
+        elif self.backend == ModelBackend.VLLM:
+            return f"{self.base_url}/v1/completions"
+        else:
+            return f"{self.base_url}/v1/completions"
+
+    @property
+    def chat_url(self) -> str:
+        if self.backend == ModelBackend.LLAMA_CPP:
+            return f"{self.base_url}/v1/chat/completions"
+        else:
+            return f"{self.base_url}/v1/chat/completions"
+
+    @property
+    def health_url(self) -> str:
+        if self.backend == ModelBackend.LLAMA_CPP:
+            return f"{self.base_url}/health"
+        else:
+            return f"{self.base_url}/health"
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.model_id[:15],
-            "name": self.name[:20],
-            "backend": self.backend.value,
+            "model": self.model_id[:15],
             "port": self.port,
-            "context": self.context_size,
             "status": self.status.value,
             "requests": self.total_requests,
-        }
-
-
-@dataclass
-class LLMRequest:
-    """An LLM inference request."""
-    request_id: str = ""
-    model_id: str = ""
-    prompt: str = ""
-    system_prompt: str = ""
-    temperature: float = 0.7
-    max_tokens: int = 2048
-    top_p: float = 0.95
-    top_k: int = 40
-    repeat_penalty: float = 1.1
-    stop_sequences: list[str] = field(default_factory=list)
-    stream: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.request_id[:10],
-            "model": self.model_id[:15],
-            "temp": self.temperature,
-            "max_tokens": self.max_tokens,
+            "tokens": self.total_tokens_generated,
         }
 
 
 @dataclass
 class LLMResponse:
-    """An LLM inference response."""
-    request_id: str = ""
+    """Response from an LLM query."""
     model_id: str = ""
     content: str = ""
-    tokens_prompt: int = 0
-    tokens_completion: int = 0
+    tokens_used: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     latency_ms: float = 0.0
-    success: bool = True
+    finish_reason: str = ""
     error: str = ""
 
     @property
-    def total_tokens(self) -> int:
-        return self.tokens_prompt + self.tokens_completion
+    def success(self) -> bool:
+        return not self.error and bool(self.content)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.request_id[:10],
             "model": self.model_id[:15],
-            "tokens": self.total_tokens,
-            "latency": round(self.latency_ms, 0),
-            "ok": self.success,
+            "tokens": self.tokens_used,
+            "latency_ms": round(self.latency_ms, 0),
+            "success": self.success,
         }
 
 
 # ── Default model configurations ─────────────────────────────
 
 DEFAULT_MODELS: list[dict[str, Any]] = [
-    {"id": "whiterabbitneo-7b", "name": "WhiteRabbitNeo-7B", "port": 8100,
-     "context": 4096, "caps": ["security", "exploit", "vuln_analysis"],
-     "temp": 0.3, "max": 2048},
-    {"id": "qwen-coder-14b", "name": "Qwen2.5-Coder-14B", "port": 8101,
-     "context": 32768, "caps": ["code", "code_audit", "exploit_dev"],
-     "temp": 0.2, "max": 4096},
-    {"id": "qwen-coder-7b", "name": "Qwen2.5-Coder-7B", "port": 8102,
-     "context": 32768, "caps": ["code", "code_review"],
-     "temp": 0.2, "max": 2048},
-    {"id": "deepseek-r1-7b", "name": "DeepSeek-R1-Distill-7B", "port": 8103,
-     "context": 32768, "caps": ["reasoning", "planning", "chain_of_thought"],
-     "temp": 0.6, "max": 4096},
-    {"id": "deepseek-math-7b", "name": "DeepSeek-Math-7B", "port": 8104,
-     "context": 4096, "caps": ["math", "logic", "crypto"],
-     "temp": 0.1, "max": 1024},
-    {"id": "hermes-14b", "name": "Hermes-4-14B", "port": 8105,
-     "context": 8192, "caps": ["general", "analysis", "reasoning"],
-     "temp": 0.7, "max": 4096},
-    {"id": "llama-3.1-8b", "name": "Llama-3.1-8B", "port": 8106,
-     "context": 131072, "caps": ["general", "long_context"],
-     "temp": 0.7, "max": 4096},
-    {"id": "dolphin-8b", "name": "Dolphin-2.9-Llama3-8B", "port": 8107,
-     "context": 8192, "caps": ["general", "security", "uncensored"],
-     "temp": 0.7, "max": 2048},
-    {"id": "mistral-7b", "name": "Mistral-7B", "port": 8108,
-     "context": 32768, "caps": ["general", "fast"],
-     "temp": 0.7, "max": 2048},
-    {"id": "codellama-13b", "name": "CodeLlama-13B", "port": 8109,
-     "context": 16384, "caps": ["code", "code_audit"],
-     "temp": 0.2, "max": 2048},
-    {"id": "codellama-7b", "name": "CodeLlama-7B", "port": 8110,
-     "context": 16384, "caps": ["code"],
-     "temp": 0.2, "max": 1024},
-    {"id": "yi-9b-200k", "name": "Yi-9B-200K", "port": 8111,
-     "context": 200000, "caps": ["long_context", "code_audit", "analysis"],
-     "temp": 0.7, "max": 8192},
-    {"id": "phi-3.5-mini", "name": "Phi-3.5-mini", "port": 8112,
-     "context": 4096, "caps": ["fast", "general"],
-     "temp": 0.7, "max": 1024},
-    {"id": "nomic-embed", "name": "Nomic-Embed-Text", "port": 8113,
-     "context": 8192, "caps": ["embedding"],
-     "temp": 0.0, "max": 0},
-    {"id": "llama-guard-3", "name": "Llama-Guard-3", "port": 8114,
-     "context": 4096, "caps": ["safety", "moderation"],
-     "temp": 0.0, "max": 256},
-    {"id": "functiongemma", "name": "FunctionGemma-270m", "port": 8115,
-     "context": 2048, "caps": ["function_call", "tool_routing"],
-     "temp": 0.1, "max": 256},
+    {"id": "whiterabbitneo-7b", "port": 8100, "ctx": 8192, "temp": 0.7},
+    {"id": "qwen-coder-14b", "port": 8101, "ctx": 32768, "temp": 0.3},
+    {"id": "qwen-coder-7b", "port": 8102, "ctx": 32768, "temp": 0.3},
+    {"id": "deepseek-r1-7b", "port": 8103, "ctx": 32768, "temp": 0.6},
+    {"id": "deepseek-math-7b", "port": 8104, "ctx": 4096, "temp": 0.5},
+    {"id": "hermes-14b", "port": 8105, "ctx": 8192, "temp": 0.7},
+    {"id": "llama-3.1-8b", "port": 8106, "ctx": 131072, "temp": 0.7},
+    {"id": "dolphin-8b", "port": 8107, "ctx": 8192, "temp": 0.8},
+    {"id": "mistral-7b", "port": 8108, "ctx": 32768, "temp": 0.7},
+    {"id": "codellama-13b", "port": 8109, "ctx": 16384, "temp": 0.3},
+    {"id": "codellama-7b", "port": 8110, "ctx": 16384, "temp": 0.3},
+    {"id": "yi-9b-200k", "port": 8111, "ctx": 200000, "temp": 0.7},
+    {"id": "phi-3.5-mini", "port": 8112, "ctx": 128000, "temp": 0.7},
+    {"id": "nomic-embed", "port": 8113, "ctx": 8192, "temp": 0.0},
+    {"id": "llama-guard-3", "port": 8114, "ctx": 8192, "temp": 0.1},
+    {"id": "functiongemma", "port": 8115, "ctx": 8192, "temp": 0.1},
 ]
 
 
 class LLMClient:
-    """Unified LLM client for llama.cpp and vLLM backends.
+    """Unified client for local LLM servers.
 
-    Manages connections to multiple model servers
-    with health checking and request routing.
+    Connects to llama.cpp / vLLM servers,
+    handles routing, health checking, retries,
+    and token tracking.
     """
 
     def __init__(self) -> None:
         self._endpoints: dict[str, ModelEndpoint] = {}
-        self._counter = 0
         self._log = logger.bind(component="llm_client")
         self._load_defaults()
 
     def _load_defaults(self) -> None:
-        """Load default model endpoints."""
-        for m in DEFAULT_MODELS:
+        """Load default model configurations."""
+        for cfg in DEFAULT_MODELS:
             endpoint = ModelEndpoint(
-                model_id=m["id"],
-                name=m["name"],
-                port=m["port"],
-                context_size=m.get("context", 4096),
-                capabilities=m.get("caps", []),
-                default_temperature=m.get("temp", 0.7),
-                default_max_tokens=m.get("max", 2048),
+                model_id=cfg["id"],
+                port=cfg["port"],
+                context_size=cfg.get("ctx", 4096),
+                temperature=cfg.get("temp", 0.7),
             )
             self._endpoints[endpoint.model_id] = endpoint
 
-    def add_endpoint(
+    def add_model(
         self,
         model_id: str,
-        name: str = "",
+        port: int,
         host: str = "127.0.0.1",
-        port: int = 8100,
-        backend: str = "llama_cpp",
+        backend: ModelBackend = ModelBackend.LLAMA_CPP,
         context_size: int = 4096,
-        capabilities: list[str] | None = None,
+        temperature: float = 0.7,
     ) -> ModelEndpoint:
-        """Add a model endpoint."""
+        """Add or update a model endpoint."""
         endpoint = ModelEndpoint(
             model_id=model_id,
-            name=name or model_id,
-            backend=LLMBackend(backend),
             host=host,
             port=port,
+            backend=backend,
             context_size=context_size,
-            capabilities=capabilities or [],
+            temperature=temperature,
         )
         self._endpoints[model_id] = endpoint
         return endpoint
-
-    def remove_endpoint(self, model_id: str) -> bool:
-        """Remove a model endpoint."""
-        if model_id in self._endpoints:
-            del self._endpoints[model_id]
-            return True
-        return False
 
     async def query(
         self,
         model_id: str,
         prompt: str,
         system_prompt: str = "",
-        temperature: float = -1,
-        max_tokens: int = -1,
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
         stop: list[str] | None = None,
     ) -> LLMResponse:
-        """Send a query to a model."""
+        """Query a model with a prompt."""
         endpoint = self._endpoints.get(model_id)
         if not endpoint:
             return LLMResponse(
                 model_id=model_id,
-                success=False,
                 error=f"Unknown model: {model_id}",
             )
 
-        self._counter += 1
-        request = LLMRequest(
-            request_id=f"req-{self._counter}",
-            model_id=model_id,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            temperature=temperature if temperature >= 0 else endpoint.default_temperature,
-            max_tokens=max_tokens if max_tokens >= 0 else endpoint.default_max_tokens,
-            stop_sequences=stop or [],
-        )
+        temp = temperature if temperature > 0 else endpoint.temperature
 
-        if endpoint.backend == LLMBackend.LLAMA_CPP:
-            return await self._query_llama_cpp(endpoint, request)
-        elif endpoint.backend == LLMBackend.VLLM:
-            return await self._query_vllm(endpoint, request)
+        # Build request
+        if system_prompt:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            request_body = {
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temp,
+                "stream": False,
+            }
+            if stop:
+                request_body["stop"] = stop
+            url = endpoint.chat_url
         else:
-            return await self._query_openai_compat(endpoint, request)
-
-    async def _query_llama_cpp(
-        self,
-        endpoint: ModelEndpoint,
-        request: LLMRequest,
-    ) -> LLMResponse:
-        """Query a llama.cpp server."""
-        payload = {
-            "prompt": request.prompt,
-            "temperature": request.temperature,
-            "n_predict": request.max_tokens,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "repeat_penalty": request.repeat_penalty,
-            "stop": request.stop_sequences,
-        }
-
-        if request.system_prompt:
-            payload["prompt"] = f"### System:\n{request.system_prompt}\n\n### User:\n{request.prompt}\n\n### Assistant:\n"
+            request_body = {
+                "prompt": prompt,
+                "n_predict": max_tokens,
+                "temperature": temp,
+                "stream": False,
+            }
+            if stop:
+                request_body["stop"] = stop
+            url = endpoint.completion_url
 
         start = time.time()
+
         try:
-            reader, writer = await asyncio.open_connection(
-                endpoint.host, endpoint.port,
-            )
-
-            http_request = (
-                f"POST /completion HTTP/1.1\r\n"
-                f"Host: {endpoint.host}:{endpoint.port}\r\n"
-                f"Content-Type: application/json\r\n"
-            )
-            body = json.dumps(payload).encode()
-            http_request += f"Content-Length: {len(body)}\r\n\r\n"
-            writer.write(http_request.encode() + body)
-            await writer.drain()
-
-            # Read response
-            response_data = b""
-            while True:
-                chunk = await asyncio.wait_for(reader.read(65536), timeout=120)
-                if not chunk:
-                    break
-                response_data += chunk
-                if b"\r\n\r\n" in response_data:
-                    parts = response_data.split(b"\r\n\r\n", 1)
-                    if len(parts) > 1:
-                        try:
-                            result = json.loads(parts[1])
-                            break
-                        except json.JSONDecodeError:
-                            continue
-
-            writer.close()
+            response = await self._http_post(url, request_body)
             latency = (time.time() - start) * 1000
 
-            if isinstance(result, dict):
-                content = result.get("content", "")
-                tokens_eval = result.get("tokens_evaluated", 0)
-                tokens_pred = result.get("tokens_predicted", 0)
-
-                endpoint.total_requests += 1
-                endpoint.total_tokens += tokens_eval + tokens_pred
-                endpoint.status = ModelStatus.ONLINE
-
+            if "error" in response:
                 return LLMResponse(
-                    request_id=request.request_id,
-                    model_id=request.model_id,
-                    content=content,
-                    tokens_prompt=tokens_eval,
-                    tokens_completion=tokens_pred,
+                    model_id=model_id,
+                    error=str(response["error"]),
                     latency_ms=latency,
                 )
 
-        except (OSError, asyncio.TimeoutError) as e:
-            endpoint.status = ModelStatus.OFFLINE
+            # Parse response based on backend format
+            content = self._extract_content(response, system_prompt != "")
+            tokens_info = self._extract_tokens(response)
+
+            endpoint.total_requests += 1
+            endpoint.total_tokens_generated += tokens_info.get("total", 0)
+            endpoint.avg_latency_ms = (
+                endpoint.avg_latency_ms * (endpoint.total_requests - 1) + latency
+            ) / endpoint.total_requests
+
             return LLMResponse(
-                request_id=request.request_id,
-                model_id=request.model_id,
-                success=False,
-                error=str(e)[:200],
-                latency_ms=(time.time() - start) * 1000,
+                model_id=model_id,
+                content=content,
+                tokens_used=tokens_info.get("total", 0),
+                prompt_tokens=tokens_info.get("prompt", 0),
+                completion_tokens=tokens_info.get("completion", 0),
+                latency_ms=latency,
+                finish_reason=response.get("finish_reason", ""),
             )
 
-        return LLMResponse(
-            request_id=request.request_id,
-            model_id=request.model_id,
-            success=False,
-            error="Invalid response",
-        )
+        except Exception as exc:
+            latency = (time.time() - start) * 1000
+            return LLMResponse(
+                model_id=model_id,
+                error=str(exc),
+                latency_ms=latency,
+            )
 
-    async def _query_vllm(
+    async def _http_post(
         self,
-        endpoint: ModelEndpoint,
-        request: LLMRequest,
-    ) -> LLMResponse:
-        """Query a vLLM server (OpenAI-compatible)."""
-        return await self._query_openai_compat(endpoint, request)
+        url: str,
+        data: dict[str, Any],
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """HTTP POST to LLM server."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "-X", "POST",
+                url,
+                "-H", "Content-Type: application/json",
+                "-d", json.dumps(data),
+                "--max-time", str(int(timeout)),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 5)
+            response_text = stdout.decode("utf-8", errors="replace")
 
-    async def _query_openai_compat(
+            if not response_text.strip():
+                return {"error": "Empty response from server"}
+
+            return json.loads(response_text)
+
+        except json.JSONDecodeError:
+            return {"error": "Invalid JSON response"}
+        except asyncio.TimeoutError:
+            return {"error": f"Timeout after {timeout}s"}
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _extract_content(
         self,
-        endpoint: ModelEndpoint,
-        request: LLMRequest,
-    ) -> LLMResponse:
-        """Query an OpenAI-compatible server."""
-        messages = []
-        if request.system_prompt:
-            messages.append({"role": "system", "content": request.system_prompt})
-        messages.append({"role": "user", "content": request.prompt})
+        response: dict[str, Any],
+        is_chat: bool,
+    ) -> str:
+        """Extract content from response."""
+        if is_chat:
+            choices = response.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                return message.get("content", "")
+        else:
+            # llama.cpp completion format
+            if "content" in response:
+                return response["content"]
+            choices = response.get("choices", [])
+            if choices:
+                return choices[0].get("text", "")
 
-        payload = {
-            "messages": messages,
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
-            "top_p": request.top_p,
-            "stop": request.stop_sequences or None,
+        return ""
+
+    def _extract_tokens(
+        self,
+        response: dict[str, Any],
+    ) -> dict[str, int]:
+        """Extract token usage from response."""
+        usage = response.get("usage", {})
+        if usage:
+            return {
+                "prompt": usage.get("prompt_tokens", 0),
+                "completion": usage.get("completion_tokens", 0),
+                "total": usage.get("total_tokens", 0),
+            }
+
+        # llama.cpp format
+        tokens_predicted = response.get("tokens_predicted", 0)
+        tokens_evaluated = response.get("tokens_evaluated", 0)
+        return {
+            "prompt": tokens_evaluated,
+            "completion": tokens_predicted,
+            "total": tokens_evaluated + tokens_predicted,
         }
 
-        start = time.time()
-        try:
-            reader, writer = await asyncio.open_connection(
-                endpoint.host, endpoint.port,
-            )
-
-            body = json.dumps(payload).encode()
-            http_request = (
-                f"POST /v1/chat/completions HTTP/1.1\r\n"
-                f"Host: {endpoint.host}:{endpoint.port}\r\n"
-                f"Content-Type: application/json\r\n"
-                f"Content-Length: {len(body)}\r\n\r\n"
-            )
-            writer.write(http_request.encode() + body)
-            await writer.drain()
-
-            response_data = b""
-            while True:
-                chunk = await asyncio.wait_for(reader.read(65536), timeout=120)
-                if not chunk:
-                    break
-                response_data += chunk
-                if b"\r\n\r\n" in response_data:
-                    parts = response_data.split(b"\r\n\r\n", 1)
-                    if len(parts) > 1:
-                        try:
-                            result = json.loads(parts[1])
-                            break
-                        except json.JSONDecodeError:
-                            continue
-
-            writer.close()
-            latency = (time.time() - start) * 1000
-
-            if isinstance(result, dict) and "choices" in result:
-                content = result["choices"][0].get("message", {}).get("content", "")
-                usage = result.get("usage", {})
-
-                endpoint.total_requests += 1
-                endpoint.total_tokens += usage.get("total_tokens", 0)
-                endpoint.status = ModelStatus.ONLINE
-
-                return LLMResponse(
-                    request_id=request.request_id,
-                    model_id=request.model_id,
-                    content=content,
-                    tokens_prompt=usage.get("prompt_tokens", 0),
-                    tokens_completion=usage.get("completion_tokens", 0),
-                    latency_ms=latency,
-                )
-
-        except (OSError, asyncio.TimeoutError) as e:
-            endpoint.status = ModelStatus.OFFLINE
-            return LLMResponse(
-                request_id=request.request_id,
-                model_id=request.model_id,
-                success=False,
-                error=str(e)[:200],
-                latency_ms=(time.time() - start) * 1000,
-            )
-
-        return LLMResponse(
-            request_id=request.request_id,
-            model_id=request.model_id,
-            success=False,
-            error="Invalid response",
-        )
-
-    async def health_check(self, model_id: str) -> ModelStatus:
-        """Check if a model endpoint is healthy."""
+    async def health_check(self, model_id: str) -> bool:
+        """Check if a model server is healthy."""
         endpoint = self._endpoints.get(model_id)
         if not endpoint:
-            return ModelStatus.UNKNOWN
+            return False
 
         try:
-            reader, writer = await asyncio.open_connection(
-                endpoint.host, endpoint.port,
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "-o", "/dev/null",
+                "-w", "%{http_code}",
+                endpoint.health_url,
+                "--max-time", "5",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            writer.write(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            await writer.drain()
-            data = await asyncio.wait_for(reader.read(1024), timeout=5)
-            writer.close()
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            status_code = stdout.decode().strip()
 
+            healthy = status_code == "200"
+            endpoint.status = ModelStatus.ONLINE if healthy else ModelStatus.OFFLINE
             endpoint.last_health_check = time.time()
-            if b"200" in data:
-                endpoint.status = ModelStatus.ONLINE
-            else:
-                endpoint.status = ModelStatus.ERROR
-        except (OSError, asyncio.TimeoutError):
+            return healthy
+
+        except Exception:
             endpoint.status = ModelStatus.OFFLINE
+            return False
 
-        return endpoint.status
-
-    async def health_check_all(self) -> dict[str, str]:
-        """Health check all endpoints."""
+    async def health_check_all(self) -> dict[str, bool]:
+        """Check health of all models."""
         results = {}
-        tasks = [self.health_check(mid) for mid in self._endpoints]
-        statuses = await asyncio.gather(*tasks, return_exceptions=True)
-        for mid, status in zip(self._endpoints, statuses):
-            if isinstance(status, ModelStatus):
-                results[mid] = status.value
+        tasks = []
+        model_ids = list(self._endpoints.keys())
+
+        for model_id in model_ids:
+            tasks.append(self.health_check(model_id))
+
+        health_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for model_id, result in zip(model_ids, health_results):
+            if isinstance(result, Exception):
+                results[model_id] = False
             else:
-                results[mid] = "error"
+                results[model_id] = result
+
         return results
 
-    def get_models_by_capability(
-        self,
-        capability: str,
-    ) -> list[ModelEndpoint]:
-        """Get models with a specific capability."""
+    def get_online_models(self) -> list[ModelEndpoint]:
+        """Get list of online models."""
         return [
-            ep for ep in self._endpoints.values()
-            if capability in ep.capabilities
+            e for e in self._endpoints.values()
+            if e.status == ModelStatus.ONLINE
         ]
 
-    def get_endpoint(self, model_id: str) -> ModelEndpoint | None:
-        """Get an endpoint by model ID."""
-        return self._endpoints.get(model_id)
-
     def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
-        for ep in self._endpoints.values():
-            status_counts[ep.status.value] += 1
+        online = sum(1 for e in self._endpoints.values() if e.status == ModelStatus.ONLINE)
+        total_tokens = sum(e.total_tokens_generated for e in self._endpoints.values())
+        total_requests = sum(e.total_requests for e in self._endpoints.values())
 
         return {
             "models": len(self._endpoints),
-            "total_requests": sum(ep.total_requests for ep in self._endpoints.values()),
-            "total_tokens": sum(ep.total_tokens for ep in self._endpoints.values()),
-            "by_status": dict(status_counts),
+            "online": online,
+            "total_requests": total_requests,
+            "total_tokens": total_tokens,
         }
