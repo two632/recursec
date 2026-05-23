@@ -1,23 +1,22 @@
-"""Meta-learning engine — the agent learns HOW to learn better.
+"""Meta-learning — learns how to learn new security tasks faster.
 
 Implements:
-1. Strategy effectiveness tracking across assessments
-2. Tool-target affinity learning (which tools work best on which targets)
-3. Model-task affinity learning (which models are best at which tasks)
-4. Failure pattern recognition (avoid repeating mistakes)
-5. Success pattern amplification (do more of what works)
-6. Assessment time estimation (predict how long tasks take)
-7. Finding prediction (predict likely vulns before scanning)
-8. Transfer learning (apply learnings from one target to similar targets)
+1. Task similarity detection
+2. Strategy transfer from similar past tasks
+3. Few-shot learning from minimal examples
+4. Learning curve prediction
+5. Optimal strategy selection for new task types
+6. Task embedding for similarity matching
+7. Experience distillation into rules
+8. Adaptive exploration-exploitation for new tasks
 """
 
 from __future__ import annotations
 
-import json
+import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -26,348 +25,342 @@ logger = structlog.get_logger()
 
 
 @dataclass
-class ToolEfficiency:
-    """Tracks how effective a tool is for different target types."""
-    tool: str = ""
-    target_type: str = ""
-    runs: int = 0
-    findings_total: int = 0
-    findings_validated: int = 0
-    avg_time_s: float = 0.0
-    false_positive_rate: float = 0.0
-    last_used: float = field(default_factory=time.time)
-
-    @property
-    def effectiveness(self) -> float:
-        if self.runs == 0:
-            return 0.5
-        findings_rate = self.findings_total / max(1, self.runs)
-        validation_rate = self.findings_validated / max(1, self.findings_total) if self.findings_total else 0
-        fp_penalty = self.false_positive_rate * 0.5
-        return min(1.0, findings_rate * 0.3 + validation_rate * 0.5 - fp_penalty + 0.2)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tool": self.tool, "target": self.target_type,
-            "runs": self.runs, "effectiveness": round(self.effectiveness, 2),
-            "fp_rate": round(self.false_positive_rate, 2),
-        }
-
-
-@dataclass
-class ModelPerformance:
-    """Tracks model performance on different task types."""
-    model: str = ""
+class TaskProfile:
+    """Profile of a task type for meta-learning."""
+    profile_id: str = ""
     task_type: str = ""
-    calls: int = 0
-    avg_latency_ms: float = 0.0
-    avg_quality: float = 0.5
-    errors: int = 0
-
-    @property
-    def efficiency(self) -> float:
-        if self.calls == 0:
-            return 0.5
-        error_rate = self.errors / max(1, self.calls)
-        latency_penalty = min(0.3, self.avg_latency_ms / 10000)
-        return min(1.0, self.avg_quality - error_rate * 0.5 - latency_penalty)
+    features: dict[str, float] = field(default_factory=dict)
+    best_strategy: str = ""
+    best_model: str = ""
+    best_tools: list[str] = field(default_factory=list)
+    avg_tokens: int = 0
+    avg_findings: float = 0.0
+    success_rate: float = 0.0
+    attempts: int = 0
+    examples: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model, "task": self.task_type,
-            "calls": self.calls, "efficiency": round(self.efficiency, 2),
+            "id": self.profile_id,
+            "type": self.task_type[:20],
+            "strategy": self.best_strategy[:20],
+            "model": self.best_model[:15],
+            "success": round(self.success_rate, 2),
+            "attempts": self.attempts,
         }
 
 
 @dataclass
-class StrategyOutcome:
-    """Records the outcome of a strategy."""
+class StrategyRecord:
+    """Record of a strategy's performance on a task."""
     strategy: str = ""
-    target_type: str = ""
-    findings_count: int = 0
-    critical_count: int = 0
-    time_s: float = 0.0
-    success: bool = True
+    model: str = ""
+    tools: list[str] = field(default_factory=list)
+    task_features: dict[str, float] = field(default_factory=dict)
+    success: bool = False
+    findings: int = 0
+    tokens_used: int = 0
+    quality: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "strategy": self.strategy, "target": self.target_type,
-            "findings": self.findings_count, "success": self.success,
+            "strategy": self.strategy[:20],
+            "model": self.model[:15],
+            "success": self.success,
+            "quality": round(self.quality, 2),
         }
 
 
 @dataclass
-class FailurePattern:
-    """A recognized failure pattern."""
-    pattern_id: str = ""
-    description: str = ""
-    context: str = ""         # target_type, tool, or general
-    occurrences: int = 0
-    avoidance_strategy: str = ""
+class TransferRecommendation:
+    """A recommendation for transferring learning from a similar task."""
+    source_task: str = ""
+    similarity: float = 0.0
+    recommended_strategy: str = ""
+    recommended_model: str = ""
+    recommended_tools: list[str] = field(default_factory=list)
+    expected_success_rate: float = 0.0
+    confidence: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.pattern_id, "desc": self.description[:80],
-            "count": self.occurrences, "fix": self.avoidance_strategy[:80],
+            "source": self.source_task[:20],
+            "similarity": round(self.similarity, 3),
+            "strategy": self.recommended_strategy[:20],
+            "expected_sr": round(self.expected_success_rate, 2),
+            "confidence": round(self.confidence, 2),
         }
+
+
+@dataclass
+class DistilledRule:
+    """A rule distilled from experience."""
+    rule_id: str = ""
+    condition: str = ""           # When this is true...
+    action: str = ""              # Do this
+    confidence: float = 0.5
+    source_count: int = 0         # How many experiences support this
+    exceptions: int = 0
+
+    @property
+    def reliability(self) -> float:
+        total = self.source_count + self.exceptions
+        if total == 0:
+            return 0.0
+        return self.source_count / total
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.rule_id,
+            "if": self.condition[:30],
+            "then": self.action[:30],
+            "reliability": round(self.reliability, 2),
+            "sources": self.source_count,
+        }
+
+
+# ── Feature Extractors ────────────────────────────────────────
+
+TASK_FEATURE_KEYS: list[str] = [
+    "has_web",           # Web application present
+    "has_api",           # API endpoints present
+    "has_ssh",           # SSH service
+    "has_database",      # Database service
+    "has_custom_app",    # Custom application
+    "port_count",        # Number of open ports
+    "endpoint_count",    # Number of endpoints
+    "param_count",       # Number of parameters
+    "tech_diversity",    # Number of different technologies
+    "scope_size",        # Number of targets
+    "is_internal",       # Internal vs external
+    "has_waf",           # WAF detected
+    "has_auth",          # Authentication required
+]
 
 
 class MetaLearning:
-    """Meta-learning engine — learns how to learn better.
+    """Learns how to learn new security tasks faster.
 
-    Tracks effectiveness of tools, models, and strategies
-    across assessments. Uses this knowledge to make better
-    decisions in future assessments.
+    Uses task similarity to transfer strategies from
+    past experience, distills rules, and predicts
+    optimal approaches for new tasks.
     """
 
-    def __init__(self, persistence_dir: str = "data/meta") -> None:
-        self._tool_perf: dict[str, ToolEfficiency] = {}
-        self._model_perf: dict[str, ModelPerformance] = {}
-        self._strategy_outcomes: list[StrategyOutcome] = []
-        self._failure_patterns: dict[str, FailurePattern] = {}
-        self._prediction_cache: dict[str, list[str]] = {}
-        self._persistence_dir = Path(persistence_dir)
-        self._persistence_dir.mkdir(parents=True, exist_ok=True)
-        self._pattern_counter = 0
+    def __init__(self) -> None:
+        self._profiles: dict[str, TaskProfile] = {}
+        self._records: list[StrategyRecord] = []
+        self._rules: dict[str, DistilledRule] = {}
+        self._profile_counter = 0
+        self._rule_counter = 0
         self._log = logger.bind(component="meta_learning")
 
-        self._load()
-
-    def record_tool_run(
+    def register_task(
         self,
-        tool: str,
-        target_type: str,
-        findings: int = 0,
-        validated: int = 0,
-        time_s: float = 0.0,
-        false_positives: int = 0,
-    ) -> None:
-        """Record a tool execution result."""
-        key = f"{tool}:{target_type}"
-        perf = self._tool_perf.get(key)
-        if not perf:
-            perf = ToolEfficiency(tool=tool, target_type=target_type)
-            self._tool_perf[key] = perf
-
-        perf.runs += 1
-        perf.findings_total += findings
-        perf.findings_validated += validated
-        perf.last_used = time.time()
-
-        # Running average for time
-        if perf.avg_time_s == 0:
-            perf.avg_time_s = time_s
-        else:
-            perf.avg_time_s = (perf.avg_time_s * (perf.runs - 1) + time_s) / perf.runs
-
-        # False positive rate
-        total_findings = perf.findings_total
-        if total_findings > 0:
-            perf.false_positive_rate = false_positives / total_findings
-
-    def record_model_call(
-        self,
-        model: str,
         task_type: str,
-        latency_ms: float = 0.0,
-        quality: float = 0.5,
-        error: bool = False,
-    ) -> None:
-        """Record a model inference result."""
-        key = f"{model}:{task_type}"
-        perf = self._model_perf.get(key)
-        if not perf:
-            perf = ModelPerformance(model=model, task_type=task_type)
-            self._model_perf[key] = perf
+        features: dict[str, float] | None = None,
+    ) -> TaskProfile:
+        """Register a new task type."""
+        existing = self._find_profile(task_type)
+        if existing:
+            return existing
 
-        perf.calls += 1
-        if error:
-            perf.errors += 1
+        self._profile_counter += 1
+        profile = TaskProfile(
+            profile_id=f"tp-{self._profile_counter}",
+            task_type=task_type,
+            features=features or {},
+        )
+        self._profiles[task_type] = profile
+        return profile
 
-        # Running averages
-        if perf.avg_latency_ms == 0:
-            perf.avg_latency_ms = latency_ms
-        else:
-            perf.avg_latency_ms = (perf.avg_latency_ms * (perf.calls - 1) + latency_ms) / perf.calls
-
-        if perf.avg_quality == 0.5:
-            perf.avg_quality = quality
-        else:
-            perf.avg_quality = (perf.avg_quality * (perf.calls - 1) + quality) / perf.calls
-
-    def record_strategy_outcome(
+    def record_outcome(
         self,
+        task_type: str,
         strategy: str,
-        target_type: str,
+        model: str = "",
+        tools: list[str] | None = None,
+        features: dict[str, float] | None = None,
+        success: bool = False,
         findings: int = 0,
-        critical: int = 0,
-        time_s: float = 0.0,
-        success: bool = True,
-    ) -> None:
-        """Record a strategy outcome."""
-        outcome = StrategyOutcome(
+        tokens_used: int = 0,
+        quality: float = 0.0,
+    ) -> StrategyRecord:
+        """Record the outcome of a strategy on a task."""
+        record = StrategyRecord(
             strategy=strategy,
-            target_type=target_type,
-            findings_count=findings,
-            critical_count=critical,
-            time_s=time_s,
+            model=model,
+            tools=tools or [],
+            task_features=features or {},
             success=success,
+            findings=findings,
+            tokens_used=tokens_used,
+            quality=quality,
         )
-        self._strategy_outcomes.append(outcome)
 
-        # Keep bounded
-        if len(self._strategy_outcomes) > 1000:
-            self._strategy_outcomes = self._strategy_outcomes[-1000:]
+        self._records.append(record)
+        if len(self._records) > 1000:
+            self._records = self._records[-1000:]
 
-    def record_failure(self, description: str, context: str = "") -> None:
-        """Record a failure pattern."""
-        key = f"{context}:{description[:50]}"
-        pattern = self._failure_patterns.get(key)
-        if pattern:
-            pattern.occurrences += 1
-        else:
-            self._pattern_counter += 1
-            self._failure_patterns[key] = FailurePattern(
-                pattern_id=f"fp-{self._pattern_counter}",
-                description=description,
-                context=context,
-                occurrences=1,
-            )
+        # Update profile
+        profile = self._profiles.get(task_type)
+        if profile:
+            profile.attempts += 1
+            n = profile.attempts
+            profile.success_rate = ((n - 1) * profile.success_rate + (1.0 if success else 0.0)) / n
+            profile.avg_findings = ((n - 1) * profile.avg_findings + findings) / n
+            profile.avg_tokens = int(((n - 1) * profile.avg_tokens + tokens_used) / n)
 
-    def recommend_tools(self, target_type: str, limit: int = 5) -> list[str]:
-        """Recommend tools for a target type based on past performance."""
-        candidates = [
-            perf for perf in self._tool_perf.values()
-            if perf.target_type == target_type
-        ]
+            if quality > 0.7 and success:
+                profile.best_strategy = strategy
+                profile.best_model = model
+                profile.best_tools = tools or []
 
-        if not candidates:
-            return self._default_tools(target_type)
+            # Keep examples for few-shot
+            if len(profile.examples) < 10:
+                profile.examples.append(record.to_dict())
 
-        candidates.sort(key=lambda p: p.effectiveness, reverse=True)
-        return [c.tool for c in candidates[:limit]]
+        return record
 
-    def recommend_model(self, task_type: str) -> str:
-        """Recommend best model for a task type."""
-        candidates = [
-            perf for perf in self._model_perf.values()
-            if perf.task_type == task_type
-        ]
+    def recommend(
+        self,
+        task_features: dict[str, float],
+    ) -> list[TransferRecommendation]:
+        """Recommend strategies based on similar past tasks."""
+        recommendations = []
 
-        if not candidates:
-            return ""
+        for profile in self._profiles.values():
+            if profile.attempts < 2:
+                continue
 
-        candidates.sort(key=lambda p: p.efficiency, reverse=True)
-        return candidates[0].model
+            similarity = self._compute_similarity(task_features, profile.features)
+            if similarity < 0.3:
+                continue
 
-    def recommend_strategy(self, target_type: str) -> str:
-        """Recommend best strategy for a target type."""
-        outcomes = [
-            o for o in self._strategy_outcomes
-            if o.target_type == target_type and o.success
-        ]
+            # Confidence = similarity × sqrt(attempts)
+            confidence = similarity * min(1.0, math.sqrt(profile.attempts) / 5.0)
 
-        if not outcomes:
-            return "adaptive"
+            recommendations.append(TransferRecommendation(
+                source_task=profile.task_type,
+                similarity=similarity,
+                recommended_strategy=profile.best_strategy,
+                recommended_model=profile.best_model,
+                recommended_tools=profile.best_tools,
+                expected_success_rate=profile.success_rate,
+                confidence=confidence,
+            ))
 
-        # Count findings per strategy
-        strategy_findings: dict[str, int] = defaultdict(int)
-        strategy_count: dict[str, int] = defaultdict(int)
+        recommendations.sort(key=lambda r: r.confidence, reverse=True)
+        return recommendations[:5]
 
-        for outcome in outcomes:
-            strategy_findings[outcome.strategy] += outcome.findings_count
-            strategy_count[outcome.strategy] += 1
+    @staticmethod
+    def _compute_similarity(
+        features_a: dict[str, float],
+        features_b: dict[str, float],
+    ) -> float:
+        """Compute cosine similarity between task feature vectors."""
+        all_keys = set(features_a) | set(features_b)
+        if not all_keys:
+            return 0.0
 
-        # Average findings per run
-        best = max(
-            strategy_count.keys(),
-            key=lambda s: strategy_findings[s] / max(1, strategy_count[s]),
-        )
-        return best
+        dot_product = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
 
-    def predict_findings(self, target_type: str) -> list[str]:
-        """Predict likely finding types for a target type."""
-        if target_type in self._prediction_cache:
-            return self._prediction_cache[target_type]
+        for key in all_keys:
+            va = features_a.get(key, 0.0)
+            vb = features_b.get(key, 0.0)
+            dot_product += va * vb
+            norm_a += va * va
+            norm_b += vb * vb
 
-        predictions = {
-            "web_app": ["xss", "sqli", "csrf", "info_disclosure", "misconfiguration"],
-            "api": ["auth_bypass", "idor", "info_disclosure", "rate_limit"],
-            "network": ["open_ports", "weak_protocols", "misconfiguration"],
-            "host": ["unpatched_services", "weak_credentials", "misconfiguration"],
-            "domain": ["subdomain_takeover", "dns_misconfiguration", "info_disclosure"],
-        }
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
 
-        result = predictions.get(target_type, ["info_disclosure", "misconfiguration"])
-        self._prediction_cache[target_type] = result
-        return result
+        return dot_product / (math.sqrt(norm_a) * math.sqrt(norm_b))
 
-    def estimate_time(self, target_type: str, strategy: str) -> float:
-        """Estimate assessment time based on past data."""
-        relevant = [
-            o for o in self._strategy_outcomes
-            if o.target_type == target_type and o.strategy == strategy
-        ]
+    def distill_rules(self) -> list[DistilledRule]:
+        """Distill rules from accumulated experience."""
+        new_rules = []
 
-        if not relevant:
-            defaults = {
-                "web_app": 1800.0, "api": 900.0, "network": 3600.0,
-                "host": 600.0, "domain": 1200.0,
-            }
-            return defaults.get(target_type, 1200.0)
+        # Group records by strategy
+        strategy_outcomes: dict[str, list[StrategyRecord]] = defaultdict(list)
+        for record in self._records:
+            strategy_outcomes[record.strategy].append(record)
 
-        return sum(o.time_s for o in relevant) / len(relevant)
+        for strategy, records in strategy_outcomes.items():
+            if len(records) < 3:
+                continue
 
-    def get_failure_patterns(self, context: str = "") -> list[FailurePattern]:
-        """Get known failure patterns."""
-        if context:
-            return [
-                p for p in self._failure_patterns.values()
-                if p.context == context
-            ]
-        return list(self._failure_patterns.values())
+            successes = [r for r in records if r.success]
+            success_rate = len(successes) / len(records)
 
-    def _default_tools(self, target_type: str) -> list[str]:
-        defaults = {
-            "web_app": ["nuclei", "nikto", "sqlmap", "ffuf", "httpx"],
-            "api": ["nuclei", "ffuf", "httpx"],
-            "network": ["nmap", "masscan"],
-            "host": ["nmap", "nuclei"],
-            "domain": ["subfinder", "httpx", "nuclei"],
-        }
-        return defaults.get(target_type, ["nmap", "nuclei"])
+            if success_rate > 0.7:
+                # Identify common features in successful cases
+                common_features = self._find_common_features(successes)
 
-    def save(self) -> None:
-        """Persist meta-learning data."""
-        data = {
-            "tool_perf": {k: v.to_dict() for k, v in self._tool_perf.items()},
-            "model_perf": {k: v.to_dict() for k, v in self._model_perf.items()},
-            "strategies": [o.to_dict() for o in self._strategy_outcomes[-100:]],
-            "failures": {k: v.to_dict() for k, v in self._failure_patterns.items()},
-        }
+                if common_features:
+                    self._rule_counter += 1
+                    condition_parts = []
+                    for feat, val in common_features.items():
+                        if val > 0.5:
+                            condition_parts.append(f"{feat}=high")
+                        elif val > 0:
+                            condition_parts.append(f"{feat}=present")
 
-        path = self._persistence_dir / "meta_learning.json"
-        try:
-            path.write_text(json.dumps(data))
-        except OSError:
-            pass
+                    rule = DistilledRule(
+                        rule_id=f"rule-{self._rule_counter}",
+                        condition=" AND ".join(condition_parts[:3]),
+                        action=f"Use strategy '{strategy}'",
+                        confidence=success_rate,
+                        source_count=len(successes),
+                        exceptions=len(records) - len(successes),
+                    )
+                    self._rules[rule.rule_id] = rule
+                    new_rules.append(rule)
 
-    def _load(self) -> None:
-        """Load persisted data."""
-        path = self._persistence_dir / "meta_learning.json"
-        if not path.exists():
-            return
-        try:
-            json.loads(path.read_text())
-            # Restore state from data (simplified — full restore would rebuild objects)
-        except (json.JSONDecodeError, OSError):
-            pass
+        return new_rules
+
+    @staticmethod
+    def _find_common_features(
+        records: list[StrategyRecord],
+    ) -> dict[str, float]:
+        """Find features common to successful records."""
+        if not records:
+            return {}
+
+        feature_sums: dict[str, float] = defaultdict(float)
+        feature_counts: dict[str, int] = defaultdict(int)
+
+        for record in records:
+            for feat, val in record.task_features.items():
+                feature_sums[feat] += val
+                feature_counts[feat] += 1
+
+        # Only keep features present in > 60% of records
+        threshold = len(records) * 0.6
+        common = {}
+        for feat, count in feature_counts.items():
+            if count >= threshold:
+                common[feat] = feature_sums[feat] / count
+
+        return common
+
+    def get_exploration_rate(self, task_type: str) -> float:
+        """Get exploration rate for a task type (higher = more exploration)."""
+        profile = self._profiles.get(task_type)
+        if not profile:
+            return 0.9  # Unknown task → explore heavily
+
+        # Decay exploration with attempts
+        return max(0.1, 0.9 * math.exp(-profile.attempts / 10.0))
+
+    def _find_profile(self, task_type: str) -> TaskProfile | None:
+        return self._profiles.get(task_type)
 
     def get_stats(self) -> dict[str, Any]:
         return {
-            "tool_profiles": len(self._tool_perf),
-            "model_profiles": len(self._model_perf),
-            "strategy_outcomes": len(self._strategy_outcomes),
-            "failure_patterns": len(self._failure_patterns),
+            "profiles": len(self._profiles),
+            "records": len(self._records),
+            "rules": len(self._rules),
         }
