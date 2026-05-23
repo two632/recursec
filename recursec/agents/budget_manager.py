@@ -1,448 +1,328 @@
-"""Budget manager — resource tracking and allocation for agent operations.
+"""Budget manager — per-agent and per-task token/time budget tracking.
 
-Manages:
-- Token budgets (per-agent and global)
-- Time budgets (wall clock limits)
-- Step budgets (maximum operations)
-- API call budgets (rate limiting)
-- Memory budgets (context window management)
-- Cost estimation and tracking
-
-Features:
-- Hierarchical budgets (global → team → agent)
-- Budget borrowing (agents can request more from global pool)
-- Budget alerts (warnings at thresholds)
-- Budget forecasting (estimated remaining capacity)
-- Budget reporting (usage analytics)
+Implements:
+1. Hierarchical budget allocation (assessment → agent → task)
+2. Token usage tracking with alerts
+3. Time budget enforcement
+4. Budget decay for child agents
+5. Cost estimation by model
+6. Budget reallocation from underperforming agents
+7. Budget utilization reporting
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 import structlog
 
 logger = structlog.get_logger()
 
 
-class ResourceType(str, Enum):
-    TOKENS = "tokens"
-    TIME_S = "time_s"
-    STEPS = "steps"
-    API_CALLS = "api_calls"
-    MEMORY_BYTES = "memory_bytes"
+class BudgetLevel(str, Enum):
+    ASSESSMENT = "assessment"
+    AGENT = "agent"
+    TASK = "task"
 
 
-class BudgetAlert(str, Enum):
-    WARNING_75 = "warning_75"    # 75% used
-    WARNING_90 = "warning_90"    # 90% used
-    CRITICAL_95 = "critical_95"  # 95% used
-    EXHAUSTED = "exhausted"      # 100% used
+class BudgetStatus(str, Enum):
+    HEALTHY = "healthy"       # < 50% used
+    WARNING = "warning"       # 50-80% used
+    CRITICAL = "critical"     # 80-95% used
+    EXHAUSTED = "exhausted"   # > 95% used
 
 
 @dataclass
-class ResourceBudget:
-    """Budget for a single resource type."""
-    resource_type: ResourceType
-    limit: float
-    used: float = 0.0
-    reserved: float = 0.0  # Reserved by in-progress operations
-    alerts_fired: set[str] = field(default_factory=set)
+class TokenBudget:
+    """A token budget allocation."""
+    budget_id: str = ""
+    level: BudgetLevel = BudgetLevel.TASK
+    owner: str = ""          # Agent or task ID
+    parent_id: str = ""      # Parent budget
+    allocated: int = 10000
+    used: int = 0
+    reserved: int = 0        # Reserved for children
+    created_at: float = field(default_factory=time.time)
 
     @property
-    def available(self) -> float:
-        return max(0.0, self.limit - self.used - self.reserved)
+    def remaining(self) -> int:
+        return max(0, self.allocated - self.used - self.reserved)
 
     @property
     def utilization(self) -> float:
-        return (self.used / self.limit * 100) if self.limit > 0 else 0.0
+        if self.allocated == 0:
+            return 1.0
+        return self.used / self.allocated
 
     @property
-    def is_exhausted(self) -> bool:
-        return self.used >= self.limit
-
-    def consume(self, amount: float) -> bool:
-        """Consume resources. Returns True if successful."""
-        if self.used + amount > self.limit:
-            return False
-        self.used += amount
-        return True
-
-    def reserve(self, amount: float) -> bool:
-        """Reserve resources for upcoming use."""
-        if self.used + self.reserved + amount > self.limit:
-            return False
-        self.reserved += amount
-        return True
-
-    def commit_reservation(self, amount: float) -> None:
-        """Convert a reservation into actual usage."""
-        self.reserved = max(0.0, self.reserved - amount)
-        self.used += amount
-
-    def release_reservation(self, amount: float) -> None:
-        """Release a reservation without consuming."""
-        self.reserved = max(0.0, self.reserved - amount)
-
-    def check_alerts(self) -> BudgetAlert | None:
-        """Check if any alert thresholds are crossed."""
-        pct = self.utilization
-        if pct >= 100 and "exhausted" not in self.alerts_fired:
-            self.alerts_fired.add("exhausted")
-            return BudgetAlert.EXHAUSTED
-        if pct >= 95 and "critical_95" not in self.alerts_fired:
-            self.alerts_fired.add("critical_95")
-            return BudgetAlert.CRITICAL_95
-        if pct >= 90 and "warning_90" not in self.alerts_fired:
-            self.alerts_fired.add("warning_90")
-            return BudgetAlert.WARNING_90
-        if pct >= 75 and "warning_75" not in self.alerts_fired:
-            self.alerts_fired.add("warning_75")
-            return BudgetAlert.WARNING_75
-        return None
+    def status(self) -> BudgetStatus:
+        u = self.utilization
+        if u >= 0.95:
+            return BudgetStatus.EXHAUSTED
+        if u >= 0.80:
+            return BudgetStatus.CRITICAL
+        if u >= 0.50:
+            return BudgetStatus.WARNING
+        return BudgetStatus.HEALTHY
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "type": self.resource_type.value,
-            "limit": self.limit, "used": round(self.used, 1),
-            "reserved": round(self.reserved, 1),
-            "available": round(self.available, 1),
-            "utilization": round(self.utilization, 1),
+            "id": self.budget_id[:10],
+            "owner": self.owner[:12],
+            "allocated": self.allocated,
+            "used": self.used,
+            "remaining": self.remaining,
+            "status": self.status.value,
         }
 
 
 @dataclass
-class AgentBudget:
-    """Budget allocation for a single agent."""
-    agent_id: str
-    budgets: dict[ResourceType, ResourceBudget] = field(default_factory=dict)
-    parent_pool: str = ""  # ID of parent budget pool
-    started_at: float = field(default_factory=time.time)
+class TimeBudget:
+    """A time budget allocation."""
+    budget_id: str = ""
+    owner: str = ""
+    allocated_s: float = 600.0
+    started_at: float = 0.0
 
-    def add_budget(self, resource_type: ResourceType, limit: float) -> None:
-        self.budgets[resource_type] = ResourceBudget(resource_type=resource_type, limit=limit)
-
-    def consume(self, resource_type: ResourceType, amount: float) -> bool:
-        budget = self.budgets.get(resource_type)
-        if not budget:
-            return True  # No budget means unlimited
-        return budget.consume(amount)
-
-    def available(self, resource_type: ResourceType) -> float:
-        budget = self.budgets.get(resource_type)
-        if not budget:
-            return float("inf")
-        return budget.available
-
-    def is_exhausted(self, resource_type: ResourceType | None = None) -> bool:
-        if resource_type:
-            budget = self.budgets.get(resource_type)
-            return budget.is_exhausted if budget else False
-        return any(b.is_exhausted for b in self.budgets.values())
-
-    def check_alerts(self) -> list[tuple[ResourceType, BudgetAlert]]:
-        alerts = []
-        for rtype, budget in self.budgets.items():
-            alert = budget.check_alerts()
-            if alert:
-                alerts.append((rtype, alert))
-        return alerts
-
-    def elapsed_time(self) -> float:
+    @property
+    def elapsed_s(self) -> float:
+        if self.started_at == 0:
+            return 0.0
         return time.time() - self.started_at
+
+    @property
+    def remaining_s(self) -> float:
+        return max(0.0, self.allocated_s - self.elapsed_s)
+
+    @property
+    def utilization(self) -> float:
+        if self.allocated_s == 0:
+            return 1.0
+        return self.elapsed_s / self.allocated_s
+
+    @property
+    def is_expired(self) -> bool:
+        return self.elapsed_s >= self.allocated_s
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "agent_id": self.agent_id,
-            "budgets": {k.value: v.to_dict() for k, v in self.budgets.items()},
-            "elapsed_s": round(self.elapsed_time(), 1),
+            "id": self.budget_id[:10],
+            "owner": self.owner[:12],
+            "allocated_s": self.allocated_s,
+            "elapsed_s": round(self.elapsed_s, 1),
+            "remaining_s": round(self.remaining_s, 1),
         }
 
 
-AlertCallback = Callable[[str, ResourceType, BudgetAlert], None]
+@dataclass
+class UsageRecord:
+    """A token usage event."""
+    record_id: str = ""
+    budget_id: str = ""
+    model_id: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    duration_ms: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model_id[:12],
+            "prompt": self.prompt_tokens,
+            "completion": self.completion_tokens,
+            "total": self.total_tokens,
+        }
+
+
+# ── Default budgets per level ────────────────────────────────
+
+DEFAULT_BUDGETS: dict[str, int] = {
+    "assessment": 1000000,     # 1M tokens per assessment
+    "agent": 100000,           # 100K per agent
+    "task": 10000,             # 10K per task
+}
+
+BUDGET_DECAY = 0.7  # Child gets 70% of parent remaining
 
 
 class BudgetManager:
-    """Global budget manager for multi-agent operations.
+    """Manages token and time budgets hierarchically.
 
-    Manages hierarchical budgets:
-    - Global pool (total resources available)
-    - Per-assessment budgets (allocated from global)
-    - Per-agent budgets (allocated from assessment)
+    Tracks usage per assessment, agent, and task,
+    enforces limits, and supports reallocation
+    from underperforming to high-value agents.
     """
 
-    def __init__(
+    def __init__(self) -> None:
+        self._token_budgets: dict[str, TokenBudget] = {}
+        self._time_budgets: dict[str, TimeBudget] = {}
+        self._usage_records: list[UsageRecord] = []
+        self._counter = 0
+        self._log = logger.bind(component="budget_manager")
+
+    def create_budget(
         self,
-        global_token_limit: int = 2000000,
-        global_time_limit_s: float = 7200.0,
-        global_step_limit: int = 1000,
-        global_api_call_limit: int = 5000,
-    ) -> None:
-        self._global = AgentBudget(agent_id="global")
-        self._global.add_budget(ResourceType.TOKENS, global_token_limit)
-        self._global.add_budget(ResourceType.TIME_S, global_time_limit_s)
-        self._global.add_budget(ResourceType.STEPS, global_step_limit)
-        self._global.add_budget(ResourceType.API_CALLS, global_api_call_limit)
+        level: BudgetLevel,
+        owner: str,
+        tokens: int = 0,
+        time_s: float = 0.0,
+        parent_id: str = "",
+    ) -> tuple[TokenBudget, TimeBudget]:
+        """Create a budget allocation."""
+        self._counter += 1
+        bid = f"budget-{self._counter}"
 
-        self._agent_budgets: dict[str, AgentBudget] = {}
-        self._alert_callbacks: list[AlertCallback] = []
-        self._usage_log: list[dict[str, Any]] = []
-        self._max_log_size = 5000
+        # Default tokens by level
+        if tokens == 0:
+            tokens = DEFAULT_BUDGETS.get(level.value, 10000)
 
-    def allocate(
-        self,
-        agent_id: str,
-        token_limit: int = 100000,
-        time_limit_s: float = 600.0,
-        step_limit: int = 100,
-        api_call_limit: int = 500,
-    ) -> AgentBudget:
-        """Allocate budgets to an agent."""
-        budget = AgentBudget(agent_id=agent_id, parent_pool="global")
-        budget.add_budget(ResourceType.TOKENS, token_limit)
-        budget.add_budget(ResourceType.TIME_S, time_limit_s)
-        budget.add_budget(ResourceType.STEPS, step_limit)
-        budget.add_budget(ResourceType.API_CALLS, api_call_limit)
-        self._agent_budgets[agent_id] = budget
-        return budget
+        # If parent exists, respect parent budget
+        if parent_id and parent_id in self._token_budgets:
+            parent = self._token_budgets[parent_id]
+            max_child = int(parent.remaining * BUDGET_DECAY)
+            tokens = min(tokens, max_child)
+            parent.reserved += tokens
 
-    def consume(self, agent_id: str, resource_type: ResourceType, amount: float) -> bool:
-        """Consume resources from an agent's budget."""
-        # Check agent budget
-        agent_budget = self._agent_budgets.get(agent_id)
-        if agent_budget:
-            if not agent_budget.consume(resource_type, amount):
-                self._fire_alert(agent_id, resource_type, BudgetAlert.EXHAUSTED)
-                return False
-
-        # Also consume from global
-        if not self._global.consume(resource_type, amount):
-            self._fire_alert("global", resource_type, BudgetAlert.EXHAUSTED)
-            return False
-
-        # Log usage
-        self._log_usage(agent_id, resource_type, amount)
-
-        # Check alerts
-        if agent_budget:
-            for rtype, alert in agent_budget.check_alerts():
-                self._fire_alert(agent_id, rtype, alert)
-        for rtype, alert in self._global.check_alerts():
-            self._fire_alert("global", rtype, alert)
-
-        return True
-
-    def can_afford(self, agent_id: str, resource_type: ResourceType, amount: float) -> bool:
-        """Check if an agent can afford a resource consumption."""
-        agent_budget = self._agent_budgets.get(agent_id)
-        if agent_budget:
-            if agent_budget.available(resource_type) < amount:
-                return False
-        return self._global.available(resource_type) >= amount
-
-    def borrow(self, agent_id: str, resource_type: ResourceType, amount: float) -> bool:
-        """Try to borrow additional budget from the global pool.
-
-        This increases the agent's budget limit if global resources are available.
-        """
-        if self._global.available(resource_type) < amount:
-            return False
-
-        agent_budget = self._agent_budgets.get(agent_id)
-        if not agent_budget:
-            return False
-
-        budget = agent_budget.budgets.get(resource_type)
-        if budget:
-            budget.limit += amount
-
-        logger.info(
-            "budget_borrowed",
-            agent=agent_id, resource=resource_type.value,
-            amount=amount,
+        token_budget = TokenBudget(
+            budget_id=bid,
+            level=level,
+            owner=owner,
+            parent_id=parent_id,
+            allocated=tokens,
         )
-        return True
+        self._token_budgets[bid] = token_budget
 
-    def register_alert_callback(self, callback: AlertCallback) -> None:
-        self._alert_callbacks.append(callback)
+        # Time budget
+        if time_s == 0:
+            time_s = {
+                "assessment": 14400.0,  # 4 hours
+                "agent": 3600.0,        # 1 hour
+                "task": 600.0,          # 10 minutes
+            }.get(level.value, 600.0)
 
-    def forecast(self, agent_id: str) -> dict[str, Any]:
-        """Forecast remaining capacity for an agent."""
-        budget = self._agent_budgets.get(agent_id)
+        time_budget = TimeBudget(
+            budget_id=bid,
+            owner=owner,
+            allocated_s=time_s,
+        )
+        self._time_budgets[bid] = time_budget
+
+        return token_budget, time_budget
+
+    def record_usage(
+        self,
+        budget_id: str,
+        model_id: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        duration_ms: float = 0.0,
+    ) -> bool:
+        """Record token usage against a budget."""
+        budget = self._token_budgets.get(budget_id)
         if not budget:
-            return {"error": "Agent not found"}
+            return False
 
-        elapsed = budget.elapsed_time()
-        if elapsed < 1.0:
-            return {"status": "too_early"}
+        total = prompt_tokens + completion_tokens
+        budget.used += total
 
-        forecasts: dict[str, Any] = {}
-        for rtype, rb in budget.budgets.items():
-            if rb.used == 0:
-                continue
-            rate = rb.used / elapsed
-            remaining = rb.available
-            if rate > 0:
-                time_remaining = remaining / rate
-            else:
-                time_remaining = float("inf")
-
-            forecasts[rtype.value] = {
-                "rate_per_s": round(rate, 2),
-                "remaining": round(remaining, 1),
-                "estimated_exhaustion_s": round(time_remaining, 1) if time_remaining != float("inf") else None,
-            }
-
-        return forecasts
-
-    def get_global_status(self) -> dict[str, Any]:
-        return self._global.to_dict()
-
-    def get_agent_status(self, agent_id: str) -> dict[str, Any] | None:
-        budget = self._agent_budgets.get(agent_id)
-        return budget.to_dict() if budget else None
-
-    def get_all_status(self) -> dict[str, Any]:
-        return {
-            "global": self._global.to_dict(),
-            "agents": {
-                aid: b.to_dict() for aid, b in self._agent_budgets.items()
-            },
-        }
-
-    def get_usage_report(self, agent_id: str = "") -> dict[str, Any]:
-        """Get usage report with analytics."""
-        logs = self._usage_log
-        if agent_id:
-            logs = [entry for entry in logs if entry["agent"] == agent_id]
-
-        by_resource: dict[str, float] = defaultdict(float)
-        by_agent: dict[str, float] = defaultdict(float)
-        for entry in logs:
-            by_resource[entry["resource"]] += entry["amount"]
-            by_agent[entry["agent"]] += entry["amount"]
-
-        return {
-            "total_entries": len(logs),
-            "by_resource": dict(by_resource),
-            "by_agent": dict(by_agent),
-        }
-
-    def _fire_alert(self, agent_id: str, resource_type: ResourceType, alert: BudgetAlert) -> None:
-        logger.warning(
-            "budget_alert",
-            agent=agent_id, resource=resource_type.value, alert=alert.value,
+        self._counter += 1
+        record = UsageRecord(
+            record_id=f"usage-{self._counter}",
+            budget_id=budget_id,
+            model_id=model_id,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total,
+            duration_ms=duration_ms,
         )
-        for cb in self._alert_callbacks:
-            try:
-                cb(agent_id, resource_type, alert)
-            except Exception:
-                pass
+        self._usage_records.append(record)
 
-    def _log_usage(self, agent_id: str, resource_type: ResourceType, amount: float) -> None:
-        self._usage_log.append({
-            "agent": agent_id,
-            "resource": resource_type.value,
-            "amount": amount,
-            "timestamp": time.time(),
-        })
-        if len(self._usage_log) > self._max_log_size:
-            self._usage_log = self._usage_log[-self._max_log_size:]
+        # Propagate to parent
+        if budget.parent_id and budget.parent_id in self._token_budgets:
+            parent = self._token_budgets[budget.parent_id]
+            parent.used += total
 
+        return True
 
-class ConvergenceDetector:
-    """Detects when an agent or assessment has converged (stopped making progress).
+    def start_timer(self, budget_id: str) -> None:
+        """Start the time budget timer."""
+        tb = self._time_budgets.get(budget_id)
+        if tb and tb.started_at == 0:
+            tb.started_at = time.time()
 
-    Uses multiple signals:
-    1. Finding rate — are we still discovering new things?
-    2. Information gain — are tool outputs giving new information?
-    3. Action diversity — are we repeating the same actions?
-    4. Confidence trend — is our confidence stabilizing?
-    5. Coverage — have we tested all attack surfaces?
-    """
+    def check_budget(self, budget_id: str) -> tuple[BudgetStatus, int, float]:
+        """Check budget status. Returns (status, tokens_remaining, time_remaining_s)."""
+        tb = self._token_budgets.get(budget_id)
+        tmb = self._time_budgets.get(budget_id)
 
-    def __init__(
+        tokens_left = tb.remaining if tb else 0
+        time_left = tmb.remaining_s if tmb else 0.0
+        status = tb.status if tb else BudgetStatus.EXHAUSTED
+
+        return status, tokens_left, time_left
+
+    def reallocate(
         self,
-        min_cycles: int = 5,
-        finding_rate_threshold: float = 0.1,
-        diversity_threshold: float = 0.3,
-        confidence_stability_window: int = 5,
-    ) -> None:
-        self._min_cycles = min_cycles
-        self._finding_rate_threshold = finding_rate_threshold
-        self._diversity_threshold = diversity_threshold
-        self._confidence_window = confidence_stability_window
+        from_id: str,
+        to_id: str,
+        tokens: int = 0,
+    ) -> bool:
+        """Reallocate tokens from one budget to another."""
+        from_budget = self._token_budgets.get(from_id)
+        to_budget = self._token_budgets.get(to_id)
 
-        self._finding_timestamps: list[float] = []
-        self._action_history: list[str] = []
-        self._confidence_history: list[float] = []
-        self._info_gain_history: list[float] = []
+        if not from_budget or not to_budget:
+            return False
 
-    def record_finding(self) -> None:
-        self._finding_timestamps.append(time.time())
+        available = from_budget.remaining
+        transfer = min(tokens or available, available)
 
-    def record_action(self, action_type: str) -> None:
-        self._action_history.append(action_type)
+        if transfer <= 0:
+            return False
 
-    def record_confidence(self, confidence: float) -> None:
-        self._confidence_history.append(confidence)
+        from_budget.allocated -= transfer
+        to_budget.allocated += transfer
 
-    def record_info_gain(self, gain: float) -> None:
-        """Record information gain (0.0 = no new info, 1.0 = lots of new info)."""
-        self._info_gain_history.append(gain)
+        return True
 
-    def has_converged(self) -> tuple[bool, str]:
-        """Check if the process has converged. Returns (converged, reason)."""
-        if len(self._action_history) < self._min_cycles:
-            return False, "insufficient_data"
+    def build_budget_prompt(self, budget_id: str = "") -> str:
+        """Build budget context for LLM."""
+        lines = ["## Budget Status\n"]
 
-        signals = []
+        if budget_id:
+            tb = self._token_budgets.get(budget_id)
+            tmb = self._time_budgets.get(budget_id)
+            if tb:
+                lines.append(f"Tokens: {tb.used}/{tb.allocated} ({tb.status.value})")
+            if tmb:
+                lines.append(f"Time: {tmb.elapsed_s:.0f}s/{tmb.allocated_s:.0f}s")
+        else:
+            # Show all assessment-level budgets
+            for tb in self._token_budgets.values():
+                if tb.level == BudgetLevel.ASSESSMENT:
+                    lines.append(
+                        f"  [{tb.owner[:12]}] {tb.used}/{tb.allocated} "
+                        f"tokens ({tb.status.value})"
+                    )
 
-        # 1. Finding rate declining
-        if self._finding_timestamps:
-            recent = sum(1 for t in self._finding_timestamps if time.time() - t < 120)
-            older = sum(1 for t in self._finding_timestamps if 120 <= time.time() - t < 240)
-            if older > 0 and recent / max(1, older) < self._finding_rate_threshold:
-                signals.append("finding_rate_declining")
-
-        # 2. Action diversity low (repeating same actions)
-        if len(self._action_history) >= 10:
-            recent_10 = self._action_history[-10:]
-            unique_ratio = len(set(recent_10)) / 10.0
-            if unique_ratio < self._diversity_threshold:
-                signals.append("low_action_diversity")
-
-        # 3. Confidence stabilized
-        if len(self._confidence_history) >= self._confidence_window:
-            recent_conf = self._confidence_history[-self._confidence_window:]
-            conf_range = max(recent_conf) - min(recent_conf)
-            if conf_range < 0.05:
-                signals.append("confidence_stabilized")
-
-        # 4. No information gain
-        if len(self._info_gain_history) >= 5:
-            recent_gain = self._info_gain_history[-5:]
-            if all(g < 0.1 for g in recent_gain):
-                signals.append("no_info_gain")
-
-        # Converged if 2+ signals agree
-        if len(signals) >= 2:
-            return True, f"converged: {', '.join(signals)}"
-
-        return False, "in_progress"
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
+        total_allocated = sum(tb.allocated for tb in self._token_budgets.values())
+        total_used = sum(tb.used for tb in self._token_budgets.values())
+
+        status_counts: dict[str, int] = {}
+        for tb in self._token_budgets.values():
+            status_counts[tb.status.value] = status_counts.get(tb.status.value, 0) + 1
+
         return {
-            "total_findings": len(self._finding_timestamps),
-            "total_actions": len(self._action_history),
-            "confidence_samples": len(self._confidence_history),
-            "current_confidence": self._confidence_history[-1] if self._confidence_history else 0,
-            "action_diversity": (
-                len(set(self._action_history[-10:])) / 10.0
-                if len(self._action_history) >= 10 else 1.0
-            ),
+            "budgets": len(self._token_budgets),
+            "total_allocated": total_allocated,
+            "total_used": total_used,
+            "usage_records": len(self._usage_records),
+            "by_status": status_counts,
         }
