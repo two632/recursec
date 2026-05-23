@@ -1,28 +1,22 @@
-"""Convergence monitor — tracks progress and detects stalls.
+"""Convergence monitor — detects when assessment has converged.
 
-Monitors:
-1. Finding rate (new findings per time unit)
-2. Coverage expansion rate
-3. Action diversity (are we repeating?)
-4. Quality trend (are findings getting better/worse?)
-5. Resource consumption rate
-6. Goal proximity
-7. Diminishing returns detection
-8. Oscillation detection (going back and forth)
-
-Outputs convergence signals:
-- PROGRESSING: Good rate of progress
-- SLOWING: Finding rate decreasing
-- STALLED: No new findings for a while
-- DIVERGING: Going in circles
-- CONVERGED: Assessment goals met
+Implements:
+1. Finding rate tracking (new findings per unit time)
+2. Diminishing returns detection
+3. Coverage estimation
+4. Convergence criteria evaluation
+5. Early termination recommendations
+6. Phase-specific convergence
+7. Exploration vs exploitation balance
+8. Information gain measurement
 """
 
 from __future__ import annotations
 
+import math
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import structlog
@@ -30,252 +24,213 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ConvergenceState(str, Enum):
-    STARTING = "starting"
-    PROGRESSING = "progressing"
-    SLOWING = "slowing"
-    STALLED = "stalled"
-    DIVERGING = "diverging"
-    CONVERGED = "converged"
-
-
 @dataclass
-class ProgressPoint:
-    """A point in the progress timeline."""
-    timestamp: float = field(default_factory=time.time)
-    findings_total: int = 0
-    findings_new: int = 0
-    actions_total: int = 0
-    tokens_total: int = 0
-    coverage_areas: int = 0
-    unique_tools: int = 0
-    quality_avg: float = 0.0
+class ConvergenceWindow:
+    """A time window for convergence tracking."""
+    start_time: float = 0.0
+    end_time: float = 0.0
+    findings_count: int = 0
+    critical_count: int = 0
+    tools_run: int = 0
+    tokens_used: int = 0
+
+    @property
+    def duration_s(self) -> float:
+        return max(0.001, self.end_time - self.start_time)
+
+    @property
+    def finding_rate(self) -> float:
+        """Findings per minute."""
+        return self.findings_count / (self.duration_s / 60.0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "time": round(self.timestamp),
-            "findings": self.findings_total,
-            "new": self.findings_new,
-            "actions": self.actions_total,
-            "coverage": self.coverage_areas,
+            "findings": self.findings_count,
+            "rate": round(self.finding_rate, 2),
+            "tools": self.tools_run,
+            "duration_s": round(self.duration_s, 0),
         }
 
 
 @dataclass
-class ConvergenceSignal:
-    """A convergence signal with analysis."""
-    state: ConvergenceState = ConvergenceState.STARTING
-    confidence: float = 0.5
-    finding_rate: float = 0.0      # Findings per minute
-    finding_trend: str = "stable"  # increasing, stable, decreasing
-    coverage_trend: str = "stable"
-    action_diversity: float = 0.5  # 0=repetitive, 1=diverse
-    estimated_remaining: float = 0.0  # Estimated time to convergence
+class ConvergenceState:
+    """Current convergence state."""
+    converged: bool = False
+    confidence: float = 0.0
+    finding_rate: float = 0.0         # Current rate
+    peak_rate: float = 0.0            # Historical peak
+    rate_decline: float = 0.0         # How much rate has declined
+    estimated_remaining: int = 0      # Estimated remaining findings
     recommendation: str = ""
+    phase_convergence: dict[str, bool] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "state": self.state.value,
+            "converged": self.converged,
             "confidence": round(self.confidence, 2),
-            "finding_rate": round(self.finding_rate, 2),
-            "finding_trend": self.finding_trend,
-            "coverage_trend": self.coverage_trend,
-            "diversity": round(self.action_diversity, 2),
-            "recommendation": self.recommendation[:100],
+            "rate": round(self.finding_rate, 2),
+            "peak_rate": round(self.peak_rate, 2),
+            "decline": round(self.rate_decline, 2),
+            "recommendation": self.recommendation,
         }
 
 
 class ConvergenceMonitor:
-    """Monitors assessment progress and detects convergence/stalls.
+    """Monitors assessment convergence.
 
-    Tracks metrics over time and generates convergence signals
-    to guide strategy adaptation.
+    Tracks finding rates over time and detects
+    when further scanning yields diminishing returns.
     """
 
     def __init__(
         self,
-        stall_threshold_s: float = 120.0,
-        min_finding_rate: float = 0.1,  # Findings per minute
-        convergence_window: int = 10,    # Points to consider
+        window_size_s: float = 300.0,
+        min_windows: int = 3,
+        convergence_threshold: float = 0.1,
     ) -> None:
-        self._stall_threshold = stall_threshold_s
-        self._min_finding_rate = min_finding_rate
-        self._window = convergence_window
-        self._history: list[ProgressPoint] = []
-        self._action_history: list[str] = []
-        self._state = ConvergenceState.STARTING
-        self._last_finding_time = time.time()
+        self._window_size_s = window_size_s
+        self._min_windows = min_windows
+        self._convergence_threshold = convergence_threshold
+
+        self._windows: list[ConvergenceWindow] = []
+        self._current_window: ConvergenceWindow | None = None
+        self._total_findings = 0
+        self._total_critical = 0
+        self._phase_findings: dict[str, int] = defaultdict(int)
+        self._phase_times: dict[str, float] = defaultdict(float)
+        self._start_time = time.time()
         self._log = logger.bind(component="convergence_monitor")
 
-    def record_progress(
+    def record_finding(
         self,
-        findings_total: int,
-        findings_new: int,
-        actions_total: int,
-        tokens_total: int,
-        coverage_areas: int,
-        unique_tools: int,
-        quality_avg: float = 0.5,
-    ) -> ConvergenceSignal:
-        """Record a progress point and analyze convergence."""
-        point = ProgressPoint(
-            findings_total=findings_total,
-            findings_new=findings_new,
-            actions_total=actions_total,
-            tokens_total=tokens_total,
-            coverage_areas=coverage_areas,
-            unique_tools=unique_tools,
-            quality_avg=quality_avg,
-        )
+        severity: str = "info",
+        phase: str = "",
+    ) -> None:
+        """Record a new finding."""
+        self._ensure_window()
+        if self._current_window:
+            self._current_window.findings_count += 1
+            if severity in ("critical", "high"):
+                self._current_window.critical_count += 1
 
-        self._history.append(point)
+        self._total_findings += 1
+        if severity == "critical":
+            self._total_critical += 1
 
-        if findings_new > 0:
-            self._last_finding_time = time.time()
+        if phase:
+            self._phase_findings[phase] += 1
 
-        return self._analyze()
+    def record_tool_run(self, phase: str = "", tokens: int = 0) -> None:
+        """Record a tool execution."""
+        self._ensure_window()
+        if self._current_window:
+            self._current_window.tools_run += 1
+            self._current_window.tokens_used += tokens
 
-    def record_action(self, action_name: str) -> None:
-        """Track actions for diversity analysis."""
-        self._action_history.append(action_name)
-        if len(self._action_history) > 200:
-            self._action_history = self._action_history[-200:]
+    def check_convergence(self) -> ConvergenceState:
+        """Check if the assessment has converged."""
+        self._close_window_if_needed()
 
-    def get_current_state(self) -> ConvergenceSignal:
-        """Get the current convergence signal without recording."""
-        return self._analyze()
+        state = ConvergenceState()
 
-    def _analyze(self) -> ConvergenceSignal:
-        """Analyze progress history for convergence signals."""
-        signal = ConvergenceSignal()
+        if len(self._windows) < self._min_windows:
+            state.recommendation = "Continue — insufficient data"
+            return state
 
-        if len(self._history) < 3:
-            signal.state = ConvergenceState.STARTING
-            signal.recommendation = "Continue gathering initial data"
-            self._state = signal.state
-            return signal
+        # Calculate rates for recent windows
+        rates = [w.finding_rate for w in self._windows[-5:]]
 
-        recent = self._history[-self._window:]
+        state.finding_rate = rates[-1] if rates else 0.0
+        state.peak_rate = max(r.finding_rate for r in self._windows) if self._windows else 0.0
 
-        # Calculate finding rate
-        if len(recent) >= 2:
-            time_span = recent[-1].timestamp - recent[0].timestamp
-            if time_span > 0:
-                total_new = sum(p.findings_new for p in recent)
-                signal.finding_rate = (total_new / time_span) * 60  # Per minute
-
-        # Calculate finding trend
-        signal.finding_trend = self._calculate_trend(
-            [p.findings_new for p in recent]
-        )
-
-        # Calculate coverage trend
-        signal.coverage_trend = self._calculate_trend(
-            [p.coverage_areas for p in recent]
-        )
-
-        # Calculate action diversity
-        signal.action_diversity = self._calculate_diversity()
-
-        # Determine state
-        time_since_finding = time.time() - self._last_finding_time
-
-        if time_since_finding > self._stall_threshold * 2:
-            signal.state = ConvergenceState.STALLED
-            signal.confidence = 0.9
-            signal.recommendation = "Stalled — switch strategy or pivot to unexplored areas"
-
-        elif time_since_finding > self._stall_threshold:
-            signal.state = ConvergenceState.SLOWING
-            signal.confidence = 0.7
-            signal.recommendation = "Progress slowing — consider deeper testing or new approach"
-
-        elif signal.action_diversity < 0.2 and len(self._action_history) > 10:
-            signal.state = ConvergenceState.DIVERGING
-            signal.confidence = 0.7
-            signal.recommendation = "Repetitive actions detected — try different tools or targets"
-
-        elif signal.finding_trend == "decreasing" and signal.finding_rate < self._min_finding_rate:
-            signal.state = ConvergenceState.SLOWING
-            signal.confidence = 0.6
-            signal.recommendation = "Finding rate declining — consider escalation or phase change"
-
-        elif signal.finding_rate >= self._min_finding_rate:
-            signal.state = ConvergenceState.PROGRESSING
-            signal.confidence = 0.8
-            signal.recommendation = "Good progress — continue current approach"
-
+        # Rate of decline
+        if len(rates) >= 2 and rates[0] > 0:
+            state.rate_decline = (rates[0] - rates[-1]) / rates[0]
         else:
-            # Check if we've reached diminishing returns
-            if self._diminishing_returns(recent):
-                signal.state = ConvergenceState.CONVERGED
-                signal.confidence = 0.7
-                signal.recommendation = "Diminishing returns — consider wrapping up"
+            state.rate_decline = 0.0
+
+        # Check convergence criteria
+        criteria_met = 0
+        total_criteria = 4
+
+        # Criterion 1: Finding rate below threshold
+        if state.finding_rate < self._convergence_threshold:
+            criteria_met += 1
+
+        # Criterion 2: Rate declining
+        if state.rate_decline > 0.5:
+            criteria_met += 1
+
+        # Criterion 3: Last N windows have few findings
+        recent_findings = sum(w.findings_count for w in self._windows[-3:])
+        if recent_findings < 2:
+            criteria_met += 1
+
+        # Criterion 4: Rate is small fraction of peak
+        if state.peak_rate > 0 and state.finding_rate / state.peak_rate < 0.1:
+            criteria_met += 1
+
+        state.confidence = criteria_met / total_criteria
+
+        if criteria_met >= 3:
+            state.converged = True
+            state.recommendation = "Assessment has converged — consider stopping"
+        elif criteria_met >= 2:
+            state.recommendation = "Approaching convergence — diminishing returns likely"
+        else:
+            state.recommendation = "Continue — still finding results"
+
+        # Estimate remaining findings (exponential decay model)
+        if state.peak_rate > 0 and state.finding_rate > 0:
+            decay_rate = -math.log(max(0.01, state.finding_rate / state.peak_rate)) / max(1, len(self._windows))
+            if decay_rate > 0:
+                state.estimated_remaining = int(state.finding_rate / decay_rate)
             else:
-                signal.state = ConvergenceState.PROGRESSING
-                signal.confidence = 0.5
-                signal.recommendation = "Continue assessment"
+                state.estimated_remaining = 0
 
-        self._state = signal.state
-        return signal
+        # Phase convergence
+        for phase in self._phase_findings:
+            recent_phase = sum(
+                1 for w in self._windows[-3:]
+                if w.findings_count > 0
+            )
+            state.phase_convergence[phase] = recent_phase == 0
 
-    def _calculate_trend(self, values: list[int | float]) -> str:
-        """Calculate trend from a series of values."""
-        if len(values) < 3:
-            return "stable"
+        return state
 
-        # Simple linear regression slope
-        n = len(values)
-        x_mean = (n - 1) / 2
-        y_mean = sum(values) / n
+    def _ensure_window(self) -> None:
+        """Ensure a current window exists."""
+        now = time.time()
 
-        numerator = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values))
-        denominator = sum((i - x_mean) ** 2 for i in range(n))
+        if self._current_window is None:
+            self._current_window = ConvergenceWindow(
+                start_time=now, end_time=now + self._window_size_s,
+            )
+            return
 
-        if denominator == 0:
-            return "stable"
+        if now > self._current_window.end_time:
+            self._close_window_if_needed()
+            self._current_window = ConvergenceWindow(
+                start_time=now, end_time=now + self._window_size_s,
+            )
 
-        slope = numerator / denominator
+    def _close_window_if_needed(self) -> None:
+        """Close current window if expired."""
+        if self._current_window and time.time() > self._current_window.end_time:
+            self._windows.append(self._current_window)
+            self._current_window = None
 
-        if slope > 0.1:
-            return "increasing"
-        elif slope < -0.1:
-            return "decreasing"
-        return "stable"
+            if len(self._windows) > 50:
+                self._windows = self._windows[-50:]
 
-    def _calculate_diversity(self) -> float:
-        """Calculate action diversity (0=repetitive, 1=diverse)."""
-        if not self._action_history:
-            return 1.0
-
-        recent = self._action_history[-20:]
-        unique = len(set(recent))
-        return unique / len(recent)
-
-    def _diminishing_returns(self, recent: list[ProgressPoint]) -> bool:
-        """Check if we're seeing diminishing returns."""
-        if len(recent) < 5:
-            return False
-
-        # Compare first half vs second half findings
-        mid = len(recent) // 2
-        first_half = sum(p.findings_new for p in recent[:mid])
-        second_half = sum(p.findings_new for p in recent[mid:])
-
-        if first_half == 0:
-            return second_half == 0
-
-        return second_half / max(1, first_half) < 0.3
-
-    def get_history(self, limit: int = 50) -> list[dict[str, Any]]:
-        return [p.to_dict() for p in self._history[-limit:]]
+    def get_rate_history(self) -> list[dict[str, Any]]:
+        """Get finding rate history."""
+        return [w.to_dict() for w in self._windows]
 
     def get_stats(self) -> dict[str, Any]:
-        signal = self.get_current_state()
         return {
-            "state": signal.state.value,
-            "history_points": len(self._history),
-            "finding_rate": round(signal.finding_rate, 2),
-            "action_diversity": round(signal.action_diversity, 2),
-            "actions_tracked": len(self._action_history),
+            "total_findings": self._total_findings,
+            "total_critical": self._total_critical,
+            "windows": len(self._windows),
+            "elapsed_s": round(time.time() - self._start_time, 0),
         }

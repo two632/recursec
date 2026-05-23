@@ -1,380 +1,322 @@
-"""Recursive agent spawner — creates and manages hierarchical agent trees.
+"""Recursive spawner — spawns and manages child agent hierarchies.
 
-Implements the core recursive agent architecture:
-1. Parent agents decompose tasks and spawn children
-2. Children can spawn grandchildren (bounded depth)
-3. Results flow back up through the hierarchy
-4. Failed children can be respawned or replaced
-5. Resource budgets cascade with diminishing allocation
-6. Context is inherited and narrowed at each level
-7. Coordination between sibling agents
-8. Dynamic depth adjustment based on complexity
+Implements:
+1. Recursive agent creation with depth limits
+2. Context inheritance (parent → child)
+3. Result aggregation (child → parent)
+4. Budget splitting across children
+5. Child monitoring and health checks
+6. Convergence-based early termination
+7. Agent specialization based on task decomposition
+8. Spawn throttling and resource management
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 import structlog
 
 logger = structlog.get_logger()
 
 
-class AgentState(str, Enum):
-    PENDING = "pending"
+class SpawnReason(str, Enum):
+    TASK_DECOMPOSITION = "task_decomposition"
+    SPECIALIZATION = "specialization"
+    PARALLEL_EXECUTION = "parallel_execution"
+    DEPTH_EXPLORATION = "depth_exploration"
+    VALIDATION = "validation"
+    RETRY = "retry"
+
+
+class ChildStatus(str, Enum):
     SPAWNING = "spawning"
     RUNNING = "running"
-    WAITING = "waiting"
-    AGGREGATING = "aggregating"
     COMPLETED = "completed"
     FAILED = "failed"
-    TERMINATED = "terminated"
+    TIMEOUT = "timeout"
+    KILLED = "killed"
 
 
 @dataclass
-class SpawnedAgent:
-    """A spawned agent in the hierarchy."""
-    agent_id: str = ""
-    role: str = ""
+class SpawnedChild:
+    """A spawned child agent."""
+    child_id: str = ""
     parent_id: str = ""
-    depth: int = 0
-    state: AgentState = AgentState.PENDING
-
-    # Task
+    role: str = ""
     task: str = ""
-    target: str = ""
-    tools: list[str] = field(default_factory=list)
-    context: dict[str, Any] = field(default_factory=dict)
-
-    # Budgets
-    token_budget: int = 50000
+    reason: SpawnReason = SpawnReason.TASK_DECOMPOSITION
+    depth: int = 0
+    max_depth: int = 5
+    token_budget: int = 100_000
     tokens_used: int = 0
-    step_budget: int = 100
-    steps_taken: int = 0
-    time_budget_s: float = 300.0
-
-    # Results
-    findings: list[dict[str, Any]] = field(default_factory=list)
+    time_budget_s: float = 600.0
+    status: ChildStatus = ChildStatus.SPAWNING
     result: dict[str, Any] = field(default_factory=dict)
-    error: str = ""
-
-    # Children
-    children: list[str] = field(default_factory=list)
-    max_children: int = 5
-
-    # Timing
-    created_at: float = field(default_factory=time.time)
-    started_at: float = 0.0
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    context: dict[str, Any] = field(default_factory=dict)
+    spawned_at: float = field(default_factory=time.time)
     completed_at: float = 0.0
 
     @property
-    def is_active(self) -> bool:
-        return self.state in (AgentState.RUNNING, AgentState.WAITING, AgentState.AGGREGATING)
-
-    @property
     def duration_s(self) -> float:
-        end = self.completed_at or time.time()
-        start = self.started_at or self.created_at
-        return end - start
-
-    @property
-    def budget_used_pct(self) -> float:
-        if self.token_budget == 0:
-            return 0.0
-        return self.tokens_used / self.token_budget
+        if self.completed_at:
+            return self.completed_at - self.spawned_at
+        return time.time() - self.spawned_at
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.agent_id,
-            "role": self.role,
-            "parent": self.parent_id,
-            "depth": self.depth,
-            "state": self.state.value,
-            "task": self.task[:80],
-            "children": len(self.children),
+            "id": self.child_id, "parent": self.parent_id,
+            "role": self.role, "depth": self.depth,
+            "status": self.status.value,
             "findings": len(self.findings),
-            "budget": f"{self.budget_used_pct:.0%}",
+            "duration_s": round(self.duration_s, 1),
         }
 
 
 @dataclass
 class SpawnRequest:
-    """Request to spawn a child agent."""
+    """A request to spawn a child agent."""
     role: str = ""
     task: str = ""
-    target: str = ""
-    tools: list[str] = field(default_factory=list)
+    reason: SpawnReason = SpawnReason.TASK_DECOMPOSITION
     context: dict[str, Any] = field(default_factory=dict)
-    token_budget: int = 0      # 0 = auto-allocate from parent
-    step_budget: int = 0
-    time_budget_s: float = 0.0
+    token_budget: int = 50_000
+    time_budget_s: float = 300.0
     priority: int = 5
 
 
 class RecursiveSpawner:
-    """Creates and manages hierarchical agent trees.
+    """Manages recursive agent spawning and hierarchies.
 
-    Spawns child agents with cascading budgets and context,
-    tracks the full tree, and aggregates results.
+    Spawns child agents for task decomposition,
+    manages their lifecycle, and aggregates results.
     """
 
     def __init__(
         self,
-        max_depth: int = 4,
-        max_total_agents: int = 50,
-        budget_cascade_factor: float = 0.6,
+        max_depth: int = 5,
+        max_children_per_agent: int = 10,
+        max_total_agents: int = 100,
+        total_token_budget: int = 5_000_000,
     ) -> None:
         self._max_depth = max_depth
+        self._max_children_per_agent = max_children_per_agent
         self._max_total = max_total_agents
-        self._cascade_factor = budget_cascade_factor
+        self._total_budget = total_token_budget
 
-        self._agents: dict[str, SpawnedAgent] = {}
-        self._tree: dict[str, list[str]] = defaultdict(list)  # parent → [children]
-        self._agent_counter = 0
+        self._children: dict[str, SpawnedChild] = {}
+        self._parent_children: dict[str, list[str]] = defaultdict(list)
+        self._child_counter = 0
+        self._total_spawned = 0
+        self._tokens_used = 0
+        self._agent_handlers: dict[str, Callable[..., Coroutine[Any, Any, dict[str, Any]]]] = {}
         self._log = logger.bind(component="recursive_spawner")
 
-    def create_root(
+    def register_handler(
         self,
-        role: str = "coordinator",
-        task: str = "",
-        target: str = "",
-        token_budget: int = 100000,
-        step_budget: int = 200,
-        time_budget_s: float = 600.0,
-    ) -> SpawnedAgent:
-        """Create the root agent."""
-        self._agent_counter += 1
-        agent_id = f"agent-{self._agent_counter}"
+        role: str,
+        handler: Callable[..., Coroutine[Any, Any, dict[str, Any]]],
+    ) -> None:
+        """Register an agent handler for a role."""
+        self._agent_handlers[role] = handler
 
-        agent = SpawnedAgent(
-            agent_id=agent_id,
-            role=role,
-            depth=0,
-            task=task,
-            target=target,
-            token_budget=token_budget,
-            step_budget=step_budget,
-            time_budget_s=time_budget_s,
-        )
+    def can_spawn(self, parent_id: str, depth: int) -> bool:
+        """Check if spawning is allowed."""
+        if depth >= self._max_depth:
+            return False
 
-        self._agents[agent_id] = agent
-        return agent
+        if self._total_spawned >= self._max_total:
+            return False
 
-    def spawn_child(
+        children_count = len(self._parent_children.get(parent_id, []))
+        if children_count >= self._max_children_per_agent:
+            return False
+
+        if self._tokens_used >= self._total_budget:
+            return False
+
+        return True
+
+    def spawn(
         self,
         parent_id: str,
         request: SpawnRequest,
-    ) -> SpawnedAgent | None:
+        depth: int = 0,
+    ) -> str:
         """Spawn a child agent."""
-        parent = self._agents.get(parent_id)
-        if not parent:
-            self._log.warning("parent_not_found", parent_id=parent_id)
-            return None
+        if not self.can_spawn(parent_id, depth):
+            return ""
 
-        # Check depth
-        child_depth = parent.depth + 1
-        if child_depth > self._max_depth:
-            self._log.warning("max_depth_reached", depth=child_depth)
-            return None
+        self._child_counter += 1
+        self._total_spawned += 1
+        child_id = f"child-{self._child_counter}"
 
-        # Check total agents
-        if len(self._agents) >= self._max_total:
-            self._log.warning("max_agents_reached", total=len(self._agents))
-            return None
+        # Inherit context from parent
+        parent_context = {}
+        parent = self._children.get(parent_id)
+        if parent:
+            parent_context = dict(parent.context)
+        parent_context.update(request.context)
 
-        # Check parent children limit
-        if len(parent.children) >= parent.max_children:
-            self._log.warning("max_children_reached", parent=parent_id)
-            return None
-
-        # Allocate budgets
-        if request.token_budget == 0:
-            request.token_budget = int(
-                (parent.token_budget - parent.tokens_used) * self._cascade_factor
-                / max(1, parent.max_children - len(parent.children))
-            )
-        if request.step_budget == 0:
-            request.step_budget = int(
-                (parent.step_budget - parent.steps_taken) * self._cascade_factor
-                / max(1, parent.max_children - len(parent.children))
-            )
-        if request.time_budget_s == 0:
-            remaining = parent.time_budget_s - parent.duration_s
-            request.time_budget_s = (
-                remaining * self._cascade_factor
-                / max(1, parent.max_children - len(parent.children))
-            )
-
-        # Create child
-        self._agent_counter += 1
-        agent_id = f"agent-{self._agent_counter}"
-
-        # Inherit and narrow context
-        child_context = dict(parent.context)
-        child_context.update(request.context)
-        child_context["parent_task"] = parent.task[:100]
-        child_context["parent_role"] = parent.role
-
-        child = SpawnedAgent(
-            agent_id=agent_id,
-            role=request.role,
+        child = SpawnedChild(
+            child_id=child_id,
             parent_id=parent_id,
-            depth=child_depth,
+            role=request.role,
             task=request.task,
-            target=request.target or parent.target,
-            tools=request.tools,
-            context=child_context,
+            reason=request.reason,
+            depth=depth,
+            max_depth=self._max_depth,
             token_budget=request.token_budget,
-            step_budget=request.step_budget,
             time_budget_s=request.time_budget_s,
-            max_children=max(1, parent.max_children - 1),
+            context=parent_context,
         )
 
-        self._agents[agent_id] = child
-        self._tree[parent_id].append(agent_id)
-        parent.children.append(agent_id)
+        self._children[child_id] = child
+        self._parent_children[parent_id].append(child_id)
 
-        self._log.info(
-            "child_spawned",
-            child=agent_id, parent=parent_id,
-            role=request.role, depth=child_depth,
-        )
+        return child_id
 
-        return child
+    async def execute(self, child_id: str) -> dict[str, Any]:
+        """Execute a spawned child agent."""
+        child = self._children.get(child_id)
+        if not child:
+            return {"error": "child_not_found"}
 
-    def start_agent(self, agent_id: str) -> bool:
-        agent = self._agents.get(agent_id)
-        if not agent:
-            return False
-        agent.state = AgentState.RUNNING
-        agent.started_at = time.time()
-        return True
+        child.status = ChildStatus.RUNNING
 
-    def complete_agent(
+        handler = self._agent_handlers.get(child.role)
+        if not handler:
+            child.status = ChildStatus.FAILED
+            child.result = {"error": f"no_handler_for_{child.role}"}
+            return child.result
+
+        try:
+            result = await asyncio.wait_for(
+                handler(child.task, child.context),
+                timeout=child.time_budget_s,
+            )
+
+            child.status = ChildStatus.COMPLETED
+            child.result = result
+            child.findings = result.get("findings", [])
+            child.completed_at = time.time()
+
+            return result
+
+        except asyncio.TimeoutError:
+            child.status = ChildStatus.TIMEOUT
+            child.completed_at = time.time()
+            return {"error": "timeout", "partial": child.result}
+
+        except Exception as e:
+            child.status = ChildStatus.FAILED
+            child.result = {"error": str(e)[:200]}
+            child.completed_at = time.time()
+            return child.result
+
+    async def spawn_and_execute(
         self,
-        agent_id: str,
-        findings: list[dict[str, Any]] | None = None,
-        result: dict[str, Any] | None = None,
-    ) -> None:
-        """Mark agent as completed."""
-        agent = self._agents.get(agent_id)
-        if not agent:
-            return
-        agent.state = AgentState.COMPLETED
-        agent.completed_at = time.time()
-        agent.findings = findings or []
-        agent.result = result or {}
+        parent_id: str,
+        request: SpawnRequest,
+        depth: int = 0,
+    ) -> dict[str, Any]:
+        """Spawn and immediately execute a child."""
+        child_id = self.spawn(parent_id, request, depth)
+        if not child_id:
+            return {"error": "spawn_denied"}
 
-        # Propagate findings up
-        if agent.parent_id:
-            parent = self._agents.get(agent.parent_id)
-            if parent:
-                parent.findings.extend(agent.findings)
+        return await self.execute(child_id)
 
-    def fail_agent(self, agent_id: str, error: str = "") -> None:
-        agent = self._agents.get(agent_id)
-        if not agent:
-            return
-        agent.state = AgentState.FAILED
-        agent.completed_at = time.time()
-        agent.error = error
+    async def fan_out(
+        self,
+        parent_id: str,
+        requests: list[SpawnRequest],
+        depth: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Spawn multiple children and execute in parallel."""
+        child_ids = []
+        for req in requests:
+            cid = self.spawn(parent_id, req, depth)
+            if cid:
+                child_ids.append(cid)
 
-    def terminate_agent(self, agent_id: str) -> None:
-        """Terminate an agent and its children."""
-        agent = self._agents.get(agent_id)
-        if not agent:
-            return
-        agent.state = AgentState.TERMINATED
-        agent.completed_at = time.time()
+        if not child_ids:
+            return []
 
-        # Terminate children recursively
-        for child_id in agent.children:
-            self.terminate_agent(child_id)
+        tasks = [self.execute(cid) for cid in child_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    def respawn_failed(self, agent_id: str) -> SpawnedAgent | None:
-        """Respawn a failed agent."""
-        original = self._agents.get(agent_id)
-        if not original or original.state != AgentState.FAILED:
-            return None
+        processed = []
+        for result in results:
+            if isinstance(result, Exception):
+                processed.append({"error": str(result)[:200]})
+            else:
+                processed.append(result)
 
-        if not original.parent_id:
-            return None
+        return processed
 
-        request = SpawnRequest(
-            role=original.role,
-            task=original.task,
-            target=original.target,
-            tools=original.tools,
-            context=original.context,
-        )
+    def aggregate_findings(self, parent_id: str) -> list[dict[str, Any]]:
+        """Aggregate findings from all children of a parent."""
+        all_findings: list[dict[str, Any]] = []
+        child_ids = self._parent_children.get(parent_id, [])
 
-        return self.spawn_child(original.parent_id, request)
+        for cid in child_ids:
+            child = self._children.get(cid)
+            if child and child.findings:
+                all_findings.extend(child.findings)
 
-    def get_agent(self, agent_id: str) -> SpawnedAgent | None:
-        return self._agents.get(agent_id)
+        # Deduplicate by title
+        seen_titles: set[str] = set()
+        unique: list[dict[str, Any]] = []
+        for finding in all_findings:
+            title = finding.get("title", "")
+            if title not in seen_titles:
+                seen_titles.add(title)
+                unique.append(finding)
 
-    def get_children(self, agent_id: str) -> list[SpawnedAgent]:
-        child_ids = self._tree.get(agent_id, [])
-        return [self._agents[cid] for cid in child_ids if cid in self._agents]
+        return unique
 
-    def get_active_agents(self) -> list[SpawnedAgent]:
-        return [a for a in self._agents.values() if a.is_active]
-
-    def get_tree(self, root_id: str = "") -> dict[str, Any]:
-        """Get the agent tree structure."""
-        if not root_id:
-            roots = [a for a in self._agents.values() if not a.parent_id]
-            if not roots:
-                return {}
-            root_id = roots[0].agent_id
-
-        return self._build_tree(root_id)
-
-    def _build_tree(self, agent_id: str) -> dict[str, Any]:
-        agent = self._agents.get(agent_id)
-        if not agent:
-            return {}
-        return {
-            "agent": agent.to_dict(),
-            "children": [
-                self._build_tree(cid) for cid in agent.children
-            ],
-        }
-
-    def aggregate_findings(self, root_id: str = "") -> list[dict[str, Any]]:
-        """Aggregate findings from all agents."""
-        findings = []
-        for agent in self._agents.values():
-            if root_id and not self._is_descendant(agent.agent_id, root_id):
-                continue
-            findings.extend(agent.findings)
-        return findings
-
-    def _is_descendant(self, agent_id: str, ancestor_id: str) -> bool:
-        if agent_id == ancestor_id:
+    def kill(self, child_id: str) -> bool:
+        """Kill a child agent."""
+        child = self._children.get(child_id)
+        if child and child.status == ChildStatus.RUNNING:
+            child.status = ChildStatus.KILLED
+            child.completed_at = time.time()
             return True
-        agent = self._agents.get(agent_id)
-        if not agent or not agent.parent_id:
-            return False
-        return self._is_descendant(agent.parent_id, ancestor_id)
+        return False
+
+    def get_hierarchy(self, root_id: str) -> dict[str, Any]:
+        """Get the full hierarchy tree from a root."""
+        def build_tree(pid: str) -> dict[str, Any]:
+            child_ids = self._parent_children.get(pid, [])
+            children_data = []
+            for cid in child_ids:
+                child = self._children.get(cid)
+                if child:
+                    child_data = child.to_dict()
+                    child_data["children"] = build_tree(cid).get("children", [])
+                    children_data.append(child_data)
+            return {"id": pid, "children": children_data}
+
+        return build_tree(root_id)
 
     def get_stats(self) -> dict[str, Any]:
-        by_state: dict[str, int] = defaultdict(int)
-        by_role: dict[str, int] = defaultdict(int)
-        max_depth = 0
-        for a in self._agents.values():
-            by_state[a.state.value] += 1
-            by_role[a.role] += 1
-            max_depth = max(max_depth, a.depth)
+        status_counts: dict[str, int] = defaultdict(int)
+        for child in self._children.values():
+            status_counts[child.status.value] += 1
+
         return {
-            "total_agents": len(self._agents),
-            "active": len(self.get_active_agents()),
-            "max_depth": max_depth,
-            "by_state": dict(by_state),
-            "by_role": dict(by_role),
-            "total_findings": sum(len(a.findings) for a in self._agents.values()),
+            "total_spawned": self._total_spawned,
+            "active": sum(
+                1 for c in self._children.values()
+                if c.status == ChildStatus.RUNNING
+            ),
+            "max_depth": self._max_depth,
+            "status": dict(status_counts),
         }
