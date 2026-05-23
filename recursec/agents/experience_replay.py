@@ -1,19 +1,19 @@
-"""Experience replay — learning from past assessment patterns.
+"""Experience replay — learning from past assessments.
 
 Implements:
-1. Action-outcome pair recording
-2. Strategy effectiveness tracking
-3. Tool performance monitoring
-4. Model accuracy tracking per domain
-5. Replay buffer with prioritized sampling
-6. Adaptive weighting from experience
-7. Cross-assessment pattern transfer
+1. Experience storage (successful/failed actions)
+2. Similarity-based experience retrieval
+3. Strategy success rate tracking
+4. Temporal decay for relevance
+5. Experience compression
+6. Pattern generalization from experiences
+7. Context-aware experience suggestion
 """
 
 from __future__ import annotations
 
+import hashlib
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -23,382 +23,353 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ActionType(str, Enum):
-    TOOL_CALL = "tool_call"
-    LLM_QUERY = "llm_query"
-    STRATEGY_SELECTION = "strategy_selection"
-    PHASE_TRANSITION = "phase_transition"
-    AGENT_SPAWN = "agent_spawn"
-    MANUAL_DECISION = "manual_decision"
+class ExperienceOutcome(str, Enum):
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILURE = "failure"
+    FALSE_POSITIVE = "false_positive"
 
 
-class Outcome(str, Enum):
-    SUCCESS = "success"          # Found vulnerability
-    PARTIAL = "partial"          # Some useful info
-    FAILURE = "failure"          # No useful result
-    ERROR = "error"              # Execution error
-    TIMEOUT = "timeout"
+class ExperienceCategory(str, Enum):
+    TOOL_USE = "tool_use"
+    STRATEGY = "strategy"
+    FINDING = "finding"
+    EXPLOITATION = "exploitation"
+    REASONING = "reasoning"
+    BYPASS = "bypass"
 
 
 @dataclass
 class Experience:
-    """A recorded experience (action → outcome)."""
+    """A recorded experience from past operations."""
     experience_id: str = ""
-    action_type: ActionType = ActionType.TOOL_CALL
-    action: str = ""
-    context: str = ""            # What was the situation
-    outcome: Outcome = Outcome.FAILURE
-    reward: float = 0.0          # -1.0 to 1.0
-    findings_produced: int = 0
-    tokens_used: int = 0
-    duration_s: float = 0.0
+    category: ExperienceCategory = ExperienceCategory.TOOL_USE
+    outcome: ExperienceOutcome = ExperienceOutcome.SUCCESS
+    context_hash: str = ""       # Hash of context for similarity
+    target_type: str = ""        # web, network, cloud, mobile, etc.
+    service_type: str = ""       # apache, nginx, mysql, etc.
+    action: str = ""             # What was done
+    result_summary: str = ""     # What happened
+    lesson: str = ""             # What was learned
     tool_used: str = ""
-    model_used: str = ""
-    strategy: str = ""
-    target_type: str = ""
-    timestamp: float = field(default_factory=time.time)
+    tokens_spent: int = 0
+    time_spent_s: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    access_count: int = 0
+    last_accessed: float = 0.0
+    tags: list[str] = field(default_factory=list)
+
+    @property
+    def age_hours(self) -> float:
+        return (time.time() - self.created_at) / 3600
+
+    @property
+    def relevance_score(self) -> float:
+        base = {
+            ExperienceOutcome.SUCCESS: 1.0,
+            ExperienceOutcome.PARTIAL: 0.6,
+            ExperienceOutcome.FAILURE: 0.3,
+            ExperienceOutcome.FALSE_POSITIVE: 0.2,
+        }.get(self.outcome, 0.5)
+        # Temporal decay: half-life of 168 hours (1 week)
+        decay = 0.5 ** (self.age_hours / 168)
+        # Boost frequently accessed
+        access_boost = min(0.2, self.access_count * 0.02)
+        return base * decay + access_boost
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.experience_id[:10],
-            "action": self.action[:20],
+            "category": self.category.value,
             "outcome": self.outcome.value,
-            "reward": round(self.reward, 2),
-            "findings": self.findings_produced,
-        }
-
-
-@dataclass
-class ToolStats:
-    """Aggregated statistics for a tool."""
-    tool_name: str = ""
-    total_uses: int = 0
-    successes: int = 0
-    failures: int = 0
-    avg_duration_s: float = 0.0
-    avg_findings: float = 0.0
-    total_findings: int = 0
-
-    @property
-    def success_rate(self) -> float:
-        if self.total_uses == 0:
-            return 0.0
-        return self.successes / self.total_uses
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tool": self.tool_name[:15],
-            "uses": self.total_uses,
-            "success_rate": round(self.success_rate, 2),
-            "avg_findings": round(self.avg_findings, 2),
-        }
-
-
-@dataclass
-class ModelStats:
-    """Aggregated statistics for a model."""
-    model_id: str = ""
-    total_queries: int = 0
-    accurate_results: int = 0
-    domains_used: dict[str, int] = field(default_factory=dict)
-    avg_tokens_per_query: float = 0.0
-    avg_reward: float = 0.0
-
-    @property
-    def accuracy(self) -> float:
-        if self.total_queries == 0:
-            return 0.0
-        return self.accurate_results / self.total_queries
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "model": self.model_id[:15],
-            "queries": self.total_queries,
-            "accuracy": round(self.accuracy, 2),
-            "avg_reward": round(self.avg_reward, 2),
+            "action": self.action[:30],
+            "relevance": round(self.relevance_score, 2),
         }
 
 
 @dataclass
 class StrategyStats:
-    """Aggregated statistics for a strategy."""
+    """Statistics for a strategy's success rate."""
     strategy_name: str = ""
     total_uses: int = 0
-    total_reward: float = 0.0
-    total_findings: int = 0
-    avg_reward: float = 0.0
-    best_target_types: list[str] = field(default_factory=list)
+    successes: int = 0
+    partial_successes: int = 0
+    failures: int = 0
+    avg_tokens: float = 0.0
+    avg_time_s: float = 0.0
+
+    @property
+    def success_rate(self) -> float:
+        if self.total_uses == 0:
+            return 0.0
+        return (self.successes + self.partial_successes * 0.5) / self.total_uses
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "strategy": self.strategy_name[:15],
+            "strategy": self.strategy_name[:20],
             "uses": self.total_uses,
-            "avg_reward": round(self.avg_reward, 2),
-            "findings": self.total_findings,
+            "success_rate": round(self.success_rate, 2),
         }
 
 
-class ExperienceReplay:
-    """Experience replay system for learning from past actions.
+@dataclass
+class GeneralizedPattern:
+    """A pattern generalized from multiple experiences."""
+    pattern_id: str = ""
+    description: str = ""
+    conditions: list[str] = field(default_factory=list)
+    recommended_action: str = ""
+    success_rate: float = 0.0
+    evidence_count: int = 0
 
-    Records action-outcome pairs, tracks tool/model/strategy
-    effectiveness, and provides experience-based recommendations.
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.pattern_id[:10],
+            "desc": self.description[:30],
+            "success": round(self.success_rate, 2),
+            "evidence": self.evidence_count,
+        }
+
+
+class ExperienceReplayBuffer:
+    """Stores and retrieves experiences for learning.
+
+    Records successful and failed actions,
+    provides similarity-based retrieval, and
+    generalizes patterns across experiences.
     """
 
-    def __init__(
-        self,
-        buffer_size: int = 10000,
-    ) -> None:
-        self._experiences: list[Experience] = []
-        self._buffer_size = buffer_size
+    def __init__(self, max_experiences: int = 10000) -> None:
+        self._experiences: dict[str, Experience] = {}
+        self._strategies: dict[str, StrategyStats] = {}
+        self._patterns: dict[str, GeneralizedPattern] = {}
         self._counter = 0
-        self._tool_stats: dict[str, ToolStats] = {}
-        self._model_stats: dict[str, ModelStats] = {}
-        self._strategy_stats: dict[str, StrategyStats] = {}
+        self._max = max_experiences
         self._log = logger.bind(component="experience_replay")
 
     def record(
         self,
-        action_type: ActionType,
+        category: ExperienceCategory,
+        outcome: ExperienceOutcome,
         action: str,
-        outcome: Outcome,
-        reward: float = 0.0,
-        context: str = "",
-        findings_produced: int = 0,
-        tokens_used: int = 0,
-        duration_s: float = 0.0,
-        tool_used: str = "",
-        model_used: str = "",
-        strategy: str = "",
+        result_summary: str,
         target_type: str = "",
+        service_type: str = "",
+        tool_used: str = "",
+        tokens_spent: int = 0,
+        time_spent_s: float = 0.0,
+        lesson: str = "",
+        tags: list[str] | None = None,
     ) -> Experience:
-        """Record an experience."""
+        """Record a new experience."""
         self._counter += 1
+
+        # Generate context hash for similarity matching
+        context_str = f"{target_type}:{service_type}:{action}"
+        context_hash = hashlib.sha256(context_str.encode()).hexdigest()[:16]
+
         exp = Experience(
             experience_id=f"exp-{self._counter}",
-            action_type=action_type,
-            action=action,
-            context=context,
+            category=category,
             outcome=outcome,
-            reward=reward,
-            findings_produced=findings_produced,
-            tokens_used=tokens_used,
-            duration_s=duration_s,
-            tool_used=tool_used,
-            model_used=model_used,
-            strategy=strategy,
+            context_hash=context_hash,
             target_type=target_type,
+            service_type=service_type,
+            action=action,
+            result_summary=result_summary,
+            lesson=lesson,
+            tool_used=tool_used,
+            tokens_spent=tokens_spent,
+            time_spent_s=time_spent_s,
+            tags=tags or [],
         )
 
-        self._experiences.append(exp)
+        # Evict lowest relevance if at capacity
+        if len(self._experiences) >= self._max:
+            self._evict_lowest()
 
-        # Evict oldest if at capacity
-        if len(self._experiences) > self._buffer_size:
-            self._experiences.pop(0)
+        self._experiences[exp.experience_id] = exp
 
-        # Update stats
-        self._update_tool_stats(exp)
-        self._update_model_stats(exp)
-        self._update_strategy_stats(exp)
+        # Update strategy stats
+        self._update_strategy_stats(action, outcome, tokens_spent, time_spent_s)
 
         return exp
 
-    def _update_tool_stats(self, exp: Experience) -> None:
-        """Update tool statistics."""
-        if not exp.tool_used:
-            return
-
-        stats = self._tool_stats.get(exp.tool_used)
-        if not stats:
-            stats = ToolStats(tool_name=exp.tool_used)
-            self._tool_stats[exp.tool_used] = stats
-
-        stats.total_uses += 1
-        stats.total_findings += exp.findings_produced
-
-        if exp.outcome in (Outcome.SUCCESS, Outcome.PARTIAL):
-            stats.successes += 1
-        else:
-            stats.failures += 1
-
-        stats.avg_duration_s = (
-            stats.avg_duration_s * (stats.total_uses - 1) + exp.duration_s
-        ) / stats.total_uses
-
-        stats.avg_findings = stats.total_findings / stats.total_uses
-
-    def _update_model_stats(self, exp: Experience) -> None:
-        """Update model statistics."""
-        if not exp.model_used:
-            return
-
-        stats = self._model_stats.get(exp.model_used)
-        if not stats:
-            stats = ModelStats(model_id=exp.model_used)
-            self._model_stats[exp.model_used] = stats
-
-        stats.total_queries += 1
-
-        if exp.outcome in (Outcome.SUCCESS, Outcome.PARTIAL):
-            stats.accurate_results += 1
-
-        stats.avg_tokens_per_query = (
-            stats.avg_tokens_per_query * (stats.total_queries - 1) + exp.tokens_used
-        ) / stats.total_queries
-
-        stats.avg_reward = (
-            stats.avg_reward * (stats.total_queries - 1) + exp.reward
-        ) / stats.total_queries
-
-    def _update_strategy_stats(self, exp: Experience) -> None:
-        """Update strategy statistics."""
-        if not exp.strategy:
-            return
-
-        stats = self._strategy_stats.get(exp.strategy)
-        if not stats:
-            stats = StrategyStats(strategy_name=exp.strategy)
-            self._strategy_stats[exp.strategy] = stats
-
-        stats.total_uses += 1
-        stats.total_reward += exp.reward
-        stats.total_findings += exp.findings_produced
-        stats.avg_reward = stats.total_reward / stats.total_uses
-
-        if exp.target_type and exp.outcome == Outcome.SUCCESS:
-            if exp.target_type not in stats.best_target_types:
-                stats.best_target_types.append(exp.target_type)
-
-    def get_best_tool(
-        self,
-        min_uses: int = 3,
-    ) -> str:
-        """Get the best performing tool."""
-        candidates = [
-            s for s in self._tool_stats.values()
-            if s.total_uses >= min_uses
-        ]
-        if not candidates:
-            return ""
-
-        best = max(candidates, key=lambda s: s.success_rate * s.avg_findings)
-        return best.tool_name
-
-    def get_best_model(
-        self,
-        domain: str = "",
-        min_queries: int = 3,
-    ) -> str:
-        """Get the best performing model."""
-        candidates = [
-            s for s in self._model_stats.values()
-            if s.total_queries >= min_queries
-        ]
-        if not candidates:
-            return ""
-
-        best = max(candidates, key=lambda s: s.avg_reward)
-        return best.model_id
-
-    def get_best_strategy(
+    def retrieve_similar(
         self,
         target_type: str = "",
-        min_uses: int = 2,
-    ) -> str:
-        """Get the best performing strategy."""
-        candidates = [
-            s for s in self._strategy_stats.values()
-            if s.total_uses >= min_uses
-        ]
-        if target_type:
-            typed = [
-                s for s in candidates
-                if target_type in s.best_target_types
-            ]
-            if typed:
-                candidates = typed
-
-        if not candidates:
-            return ""
-
-        best = max(candidates, key=lambda s: s.avg_reward)
-        return best.strategy_name
-
-    def sample_experiences(
-        self,
-        action_type: ActionType | None = None,
-        outcome: Outcome | None = None,
-        count: int = 5,
+        service_type: str = "",
+        action: str = "",
+        category: ExperienceCategory | None = None,
+        limit: int = 5,
     ) -> list[Experience]:
-        """Sample experiences from the buffer."""
-        filtered = self._experiences
-        if action_type:
-            filtered = [e for e in filtered if e.action_type == action_type]
-        if outcome:
-            filtered = [e for e in filtered if e.outcome == outcome]
+        """Retrieve similar experiences."""
+        scored: list[tuple[float, Experience]] = []
 
-        # Prioritized sampling (higher reward = higher probability)
-        filtered.sort(key=lambda e: e.reward, reverse=True)
-        return filtered[:count]
+        for exp in self._experiences.values():
+            score = exp.relevance_score
+
+            # Boost for matching context
+            if target_type and exp.target_type == target_type:
+                score *= 1.5
+            if service_type and exp.service_type == service_type:
+                score *= 1.5
+            if category and exp.category == category:
+                score *= 1.3
+
+            # Simple keyword matching on action
+            if action:
+                action_words = set(action.lower().split())
+                exp_words = set(exp.action.lower().split())
+                overlap = len(action_words & exp_words)
+                if overlap > 0:
+                    score *= 1.0 + (overlap * 0.2)
+
+            scored.append((score, exp))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        results = [exp for _, exp in scored[:limit]]
+        for exp in results:
+            exp.access_count += 1
+            exp.last_accessed = time.time()
+
+        return results
+
+    def get_strategy_stats(self, strategy_name: str = "") -> list[StrategyStats]:
+        """Get strategy statistics."""
+        if strategy_name:
+            stats = self._strategies.get(strategy_name)
+            return [stats] if stats else []
+        return sorted(
+            self._strategies.values(),
+            key=lambda s: s.success_rate,
+            reverse=True,
+        )
+
+    def generalize_patterns(self) -> list[GeneralizedPattern]:
+        """Extract generalized patterns from experiences."""
+        # Group by context hash
+        groups: dict[str, list[Experience]] = {}
+        for exp in self._experiences.values():
+            groups.setdefault(exp.context_hash, []).append(exp)
+
+        new_patterns: list[GeneralizedPattern] = []
+        for context_hash, exps in groups.items():
+            if len(exps) < 3:
+                continue
+
+            successes = [e for e in exps if e.outcome == ExperienceOutcome.SUCCESS]
+            success_rate = len(successes) / len(exps)
+
+            if successes:
+                best = max(successes, key=lambda e: e.relevance_score)
+                pattern = GeneralizedPattern(
+                    pattern_id=f"gp-{context_hash[:8]}",
+                    description=f"Pattern for {best.target_type}/{best.service_type}",
+                    conditions=[
+                        f"target_type={best.target_type}",
+                        f"service_type={best.service_type}",
+                    ],
+                    recommended_action=best.action,
+                    success_rate=success_rate,
+                    evidence_count=len(exps),
+                )
+                self._patterns[pattern.pattern_id] = pattern
+                new_patterns.append(pattern)
+
+        return new_patterns
 
     def build_experience_prompt(
         self,
-        max_items: int = 5,
+        target_type: str = "",
+        service_type: str = "",
+        max_experiences: int = 5,
     ) -> str:
         """Build experience context for LLM."""
-        lines = ["## Experience Summary\n"]
+        lines = ["## Past Experiences\n"]
 
-        # Best tools
-        best_tools = sorted(
-            self._tool_stats.values(),
-            key=lambda s: s.success_rate * s.avg_findings,
-            reverse=True,
-        )[:3]
-        if best_tools:
-            lines.append("Top tools:")
-            for ts in best_tools:
-                lines.append(
-                    f"  - {ts.tool_name}: {ts.success_rate:.0%} success, "
-                    f"{ts.avg_findings:.1f} avg findings"
-                )
+        relevant = self.retrieve_similar(
+            target_type=target_type,
+            service_type=service_type,
+            limit=max_experiences,
+        )
 
-        # Best strategies
-        best_strats = sorted(
-            self._strategy_stats.values(),
-            key=lambda s: s.avg_reward,
-            reverse=True,
-        )[:3]
-        if best_strats:
-            lines.append("Top strategies:")
-            for ss in best_strats:
-                lines.append(
-                    f"  - {ss.strategy_name}: avg reward {ss.avg_reward:.2f}, "
-                    f"{ss.total_findings} findings"
-                )
+        if not relevant:
+            lines.append("No relevant past experiences.")
+            return "\n".join(lines)
 
-        # Recent successful patterns
-        successes = [
-            e for e in self._experiences
-            if e.outcome == Outcome.SUCCESS
-        ][-max_items:]
-        if successes:
-            lines.append("Recent successes:")
-            for exp in successes:
-                lines.append(
-                    f"  - {exp.action[:30]} → {exp.findings_produced} findings"
-                )
+        for exp in relevant:
+            outcome_icon = {
+                "success": "+",
+                "partial": "~",
+                "failure": "-",
+                "false_positive": "!",
+            }.get(exp.outcome.value, "?")
+
+            lines.append(
+                f"  [{outcome_icon}] {exp.action[:50]}\n"
+                f"      → {exp.result_summary[:50]}"
+            )
+            if exp.lesson:
+                lines.append(f"      Lesson: {exp.lesson[:50]}")
+
+        # Top strategies
+        strategies = self.get_strategy_stats()
+        if strategies:
+            lines.append("\nStrategy success rates:")
+            for s in strategies[:3]:
+                lines.append(f"  {s.strategy_name}: {s.success_rate:.0%} ({s.total_uses} uses)")
 
         return "\n".join(lines)
 
+    def _update_strategy_stats(
+        self,
+        action: str,
+        outcome: ExperienceOutcome,
+        tokens: int,
+        time_s: float,
+    ) -> None:
+        """Update strategy statistics."""
+        # Use first word of action as strategy name
+        strategy_name = action.split()[0] if action else "unknown"
+
+        stats = self._strategies.get(strategy_name)
+        if not stats:
+            stats = StrategyStats(strategy_name=strategy_name)
+            self._strategies[strategy_name] = stats
+
+        stats.total_uses += 1
+        if outcome == ExperienceOutcome.SUCCESS:
+            stats.successes += 1
+        elif outcome == ExperienceOutcome.PARTIAL:
+            stats.partial_successes += 1
+        else:
+            stats.failures += 1
+
+        # Running average
+        n = stats.total_uses
+        stats.avg_tokens = ((n - 1) * stats.avg_tokens + tokens) / n
+        stats.avg_time_s = ((n - 1) * stats.avg_time_s + time_s) / n
+
+    def _evict_lowest(self) -> None:
+        """Evict lowest-relevance experience."""
+        if not self._experiences:
+            return
+        lowest = min(
+            self._experiences.values(),
+            key=lambda e: e.relevance_score,
+        )
+        del self._experiences[lowest.experience_id]
+
     def get_stats(self) -> dict[str, Any]:
-        outcome_counts: dict[str, int] = defaultdict(int)
-        for exp in self._experiences:
-            outcome_counts[exp.outcome.value] += 1
+        outcome_counts: dict[str, int] = {}
+        for exp in self._experiences.values():
+            outcome_counts[exp.outcome.value] = outcome_counts.get(exp.outcome.value, 0) + 1
 
         return {
             "total_experiences": len(self._experiences),
-            "tools_tracked": len(self._tool_stats),
-            "models_tracked": len(self._model_stats),
-            "strategies_tracked": len(self._strategy_stats),
-            "by_outcome": dict(outcome_counts),
+            "by_outcome": outcome_counts,
+            "strategies": len(self._strategies),
+            "patterns": len(self._patterns),
         }

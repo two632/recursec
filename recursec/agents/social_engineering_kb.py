@@ -1,11 +1,11 @@
 """Social engineering knowledge base.
 
-Knowledge about social engineering attacks:
-1. Phishing campaign analysis
-2. Pretexting frameworks
-3. Vishing (voice phishing)
-4. Physical security assessment
-5. Social media intelligence
+Deep knowledge about social engineering:
+1. Phishing campaign techniques
+2. Pretexting and impersonation
+3. Physical social engineering
+4. Credential harvesting
+5. Social media reconnaissance
 """
 
 from __future__ import annotations
@@ -39,164 +39,181 @@ class SocialEngPattern:
 
 SOCIAL_ENG_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "se-001", "name": "Phishing Campaign Analysis",
+        "id": "se-001", "name": "Phishing Infrastructure",
         "category": "phishing", "severity": "high",
-        "desc": "Analyzing and detecting phishing infrastructure.",
+        "desc": "Building and detecting phishing infrastructure.",
         "detection": (
-            "PHISHING ANALYSIS:\n"
-            "INFRASTRUCTURE DETECTION:\n"
-            "  - Check newly registered domains (< 30 days)\n"
-            "  - Lookalike domain detection:\n"
-            "    dnstwist <domain>  # Generate and check permutations\n"
-            "    urlcrazy <domain>  # Alternative domain fuzzer\n"
-            "  - Check certificate transparency logs:\n"
-            "    crt.sh/?q=%.<domain>\n"
-            "  - Analyze DNS records:\n"
-            "    dig <suspicious_domain> +short\n"
-            "    whois <suspicious_domain>\n"
-            "EMAIL ANALYSIS:\n"
-            "  - Check SPF, DKIM, DMARC records:\n"
-            "    dig TXT <domain> | grep spf\n"
-            "    dig TXT _dmarc.<domain>\n"
-            "  - Analyze email headers for forging\n"
-            "  - Check Received headers chain\n"
-            "  - Verify Return-Path matches From\n"
-            "LANDING PAGE ANALYSIS:\n"
-            "  - Screenshot with httpx -screenshot\n"
-            "  - Compare visual similarity to legitimate\n"
-            "  - Check for credential harvesting forms\n"
-            "  - Analyze JavaScript for data exfiltration\n"
-            "  - Check embedded links and redirects"
-        ),
-        "tools": ["dnstwist", "urlcrazy", "theharvester"],
-    },
-    {
-        "id": "se-002", "name": "OSINT for Social Engineering",
-        "category": "osint_se", "severity": "medium",
-        "desc": "Gathering intelligence for social engineering attacks.",
-        "detection": (
-            "SOCIAL ENGINEERING OSINT:\n"
-            "PEOPLE INTELLIGENCE:\n"
-            "  - LinkedIn: org chart, roles, technologies\n"
-            "  - GitHub: employee repos, email addresses, code\n"
-            "  - Social media: personal info, interests, routines\n"
-            "  - Breach databases: compromised credentials\n"
-            "  - Job postings: technology stack, tools used\n"
-            "EMAIL HARVESTING:\n"
-            "  theHarvester -d <domain> -b all\n"
-            "  hunter.io (email pattern detection)\n"
-            "  # Verify emails\n"
-            "  smtp-user-enum -M VRFY -D <domain> -U users.txt\n"
-            "ORGANIZATIONAL MAPPING:\n"
-            "  - Identify IT admins (highest value targets)\n"
-            "  - Map reporting structure\n"
-            "  - Identify new employees (less security-aware)\n"
-            "  - Find contractors (weaker security controls)\n"
-            "TECHNOLOGY PROFILING:\n"
-            "  - Wappalyzer: Detect web technologies\n"
-            "  - BuiltWith: Historical technology usage\n"
-            "  - Shodan: Exposed services and versions\n"
-            "  - Security job postings reveal tools in use"
-        ),
-        "tools": ["theharvester", "sherlock", "maltego"],
-    },
-    {
-        "id": "se-003", "name": "Credential Stuffing and Spraying",
-        "category": "credential", "severity": "high",
-        "desc": "Automated credential attacks using leaked data.",
-        "detection": (
-            "CREDENTIAL ATTACKS:\n"
-            "CREDENTIAL STUFFING:\n"
-            "  - Use leaked credentials from breaches\n"
-            "  - Test across multiple services\n"
-            "  - Tools:\n"
-            "    sentry-mba  # Multi-threaded credential checker\n"
-            "    storm-breaker  # Credential stuffing framework\n"
-            "  - Proxy rotation to avoid blocking\n"
-            "  - Respect rate limits to stay under radar\n"
-            "PASSWORD SPRAYING:\n"
-            "  - Use common passwords across many accounts\n"
-            "  - Low and slow to avoid lockout\n"
-            "  - Tools:\n"
-            "    sprayhound  # AD password spraying\n"
-            "    trevorspray  # O365/Azure spraying\n"
-            "    o365spray -d <domain> --spray -u users.txt -p <password>\n"
-            "  - Common passwords to try:\n"
-            "    Season+Year: Winter2026!, Summer2026!\n"
-            "    Company+number: CompanyName1!\n"
-            "    Welcome1!, Password123!\n"
-            "DEFAULT CREDENTIALS:\n"
-            "  - Check default-creds-cheat-sheet on GitHub\n"
-            "  - Common: admin/admin, root/toor, admin/password\n"
-            "  - Device-specific defaults (routers, printers, SCADA)\n"
-            "BREACH CHECKING:\n"
-            "  - HaveIBeenPwned API\n"
-            "  - DeHashed (paid, more comprehensive)\n"
-            "  - Check paste sites for dumps"
-        ),
-        "tools": ["hydra", "sprayhound", "trevorspray"],
-    },
-    {
-        "id": "se-004", "name": "Physical Security Assessment",
-        "category": "physical", "severity": "high",
-        "desc": "Physical security testing methodology.",
-        "detection": (
-            "PHYSICAL SECURITY:\n"
+            "PHISHING INFRASTRUCTURE:\n"
             "RECONNAISSANCE:\n"
-            "  - Google Maps/Earth: Building layout, entrances\n"
-            "  - Social media: Office photos showing layouts\n"
-            "  - Job site visits during business hours\n"
-            "  - Dumpster diving for documents/devices\n"
-            "ACCESS CONTROL TESTING:\n"
-            "  - Tailgating: Follow authorized person through door\n"
-            "  - Badge cloning (Proxmark3 + RFID cloner)\n"
-            "  - Lock picking/bypassing\n"
-            "  - Smoke detector exit button exploitation\n"
-            "  - Under-door tool for lever handles\n"
-            "NETWORK ACCESS:\n"
-            "  - Unattended Ethernet ports in lobbies\n"
-            "  - Rogue wireless access points\n"
-            "  - Bash Bunny / Rubber Ducky USB drops\n"
-            "  - LAN Turtle (stealth network implant)\n"
-            "  - WiFi Pineapple (rogue AP)\n"
-            "DOCUMENT TESTING:\n"
-            "  - Sensitive documents in trash/recycling\n"
-            "  - Visible on desks/monitors\n"
-            "  - Clean desk policy compliance\n"
-            "  - Printer/copier memory extraction"
+            "  - Identify target email format (first.last@company.com)\n"
+            "  - Harvest emails: theHarvester, Hunter.io, LinkedIn\n"
+            "  theHarvester -d company.com -b all\n"
+            "  - Identify email protection (SPF, DKIM, DMARC)\n"
+            "  dig TXT company.com  # SPF record\n"
+            "  dig TXT _dmarc.company.com  # DMARC policy\n"
+            "  dig TXT selector._domainkey.company.com  # DKIM\n"
+            "DOMAIN ANALYSIS:\n"
+            "  - Lookalike domain detection\n"
+            "  dnstwist company.com  # Generate lookalikes\n"
+            "  - Check registered lookalikes\n"
+            "  - Monitor certificate transparency logs\n"
+            "  - Check domain age and registration info\n"
+            "DETECTION:\n"
+            "  - SPF alignment check (envelope from vs header from)\n"
+            "  - DKIM signature validation\n"
+            "  - DMARC policy enforcement\n"
+            "  - Header analysis (X-Originating-IP, Received chain)\n"
+            "  - URL analysis in email body\n"
+            "  - Attachment analysis (macro, exploit docs)\n"
+            "TOOLS:\n"
+            "  - GoPhish: Phishing simulation framework\n"
+            "  - King Phisher: Campaign management\n"
+            "  - Evilginx2: Transparent reverse proxy for MFA bypass\n"
+            "  - Modlishka: Reverse proxy phishing"
         ),
-        "tools": ["proxmark3", "wifi-pineapple"],
+        "tools": ["gophish", "evilginx2", "theharvester"],
     },
     {
-        "id": "se-005", "name": "Awareness and Training Metrics",
-        "category": "metrics", "severity": "medium",
-        "desc": "Measuring social engineering resilience.",
+        "id": "se-002", "name": "Credential Harvesting Techniques",
+        "category": "credential", "severity": "critical",
+        "desc": "Techniques for harvesting credentials.",
         "detection": (
-            "SE METRICS AND MEASUREMENT:\n"
-            "PHISHING SIMULATION:\n"
-            "  - GoPhish: Open-source phishing framework\n"
-            "    gophish  # Start server\n"
-            "    # Create campaign with templates\n"
-            "    # Track: opened, clicked, submitted\n"
-            "  - King Phisher: Advanced phishing toolkit\n"
-            "  - Metrics to track:\n"
-            "    Click rate: % who clicked link\n"
-            "    Submit rate: % who entered credentials\n"
-            "    Report rate: % who reported to IT\n"
-            "    Time to click: How quickly users fell for it\n"
-            "RISK SCORING:\n"
-            "  - Department-level vulnerability scores\n"
-            "  - Individual repeat offender tracking\n"
-            "  - Correlation with job role\n"
-            "  - Improvement over time (training effectiveness)\n"
-            "REPORTING:\n"
-            "  - Executive summary with risk metrics\n"
-            "  - Department breakdown\n"
-            "  - Trend analysis over multiple campaigns\n"
-            "  - Comparison with industry benchmarks\n"
-            "  - Specific recommendations per finding"
+            "CREDENTIAL HARVESTING:\n"
+            "WEB-BASED:\n"
+            "  - Clone target login page\n"
+            "  - Transparent proxy (evilginx2, modlishka)\n"
+            "  - Captures credentials AND session cookies\n"
+            "  - Bypasses MFA (real-time proxy)\n"
+            "  evilginx2:\n"
+            "    phishlets hostname <site> <domain>\n"
+            "    phishlets enable <site>\n"
+            "    lures create <site>\n"
+            "WIFI-BASED:\n"
+            "  - Evil twin with captive portal\n"
+            "  - WiFi Pineapple\n"
+            "  - Capture WPA handshake + credential page\n"
+            "DOCUMENT-BASED:\n"
+            "  - Macro-enabled documents\n"
+            "  - HTA files via email\n"
+            "  - SVG files with embedded scripts\n"
+            "  - PDF with JavaScript actions\n"
+            "BROWSER-BASED:\n"
+            "  - Browser-in-the-Browser (BITB) attack\n"
+            "  - Fake OAuth consent screens\n"
+            "  - JavaScript keylogger injection\n"
+            "  - Clipboard hijacking\n"
+            "DETECTION INDICATORS:\n"
+            "  - URL mismatch with claimed sender\n"
+            "  - Recently registered domains\n"
+            "  - Self-signed or suspicious certificates\n"
+            "  - Unusual redirect chains"
         ),
-        "tools": ["gophish", "king-phisher"],
+        "tools": ["evilginx2", "gophish"],
+    },
+    {
+        "id": "se-003", "name": "OSINT for Social Engineering",
+        "category": "osint", "severity": "medium",
+        "desc": "Open-source intelligence gathering for SE attacks.",
+        "detection": (
+            "OSINT FOR SOCIAL ENGINEERING:\n"
+            "PEOPLE INTELLIGENCE:\n"
+            "  - LinkedIn: Employees, roles, technologies\n"
+            "  - GitHub: Developer emails, code patterns\n"
+            "  - Social media: Personal info, relationships\n"
+            "  - Job postings: Internal technologies used\n"
+            "TOOLS:\n"
+            "  # Email discovery\n"
+            "  theHarvester -d company.com -b all\n"
+            "  # Username enumeration\n"
+            "  sherlock <username>  # Check 300+ sites\n"
+            "  # Full OSINT\n"
+            "  maltego  # Visual link analysis\n"
+            "  recon-ng  # OSINT framework\n"
+            "  spiderfoot -s company.com  # Automated\n"
+            "INFRASTRUCTURE OSINT:\n"
+            "  - DNS records (subdomains, mail servers)\n"
+            "  - Certificate transparency (crt.sh)\n"
+            "  - Shodan/Censys for exposed services\n"
+            "  - Wayback Machine for old content\n"
+            "  - Google dorking for sensitive docs\n"
+            "    site:company.com filetype:pdf\n"
+            "    site:company.com inurl:admin\n"
+            "    site:company.com 'password' filetype:xlsx\n"
+            "BREACH DATA:\n"
+            "  - HaveIBeenPwned (API for programmatic check)\n"
+            "  - DeHashed for credential lookup\n"
+            "  - IntelX for historical data"
+        ),
+        "tools": ["theharvester", "sherlock", "spiderfoot"],
+    },
+    {
+        "id": "se-004", "name": "Vishing and Voice Attacks",
+        "category": "vishing", "severity": "high",
+        "desc": "Voice-based social engineering techniques.",
+        "detection": (
+            "VISHING (Voice Phishing):\n"
+            "TECHNIQUES:\n"
+            "  - IT helpdesk impersonation\n"
+            "  - VPN/password reset pretext\n"
+            "  - Vendor/supplier impersonation\n"
+            "  - Executive impersonation (CEO fraud)\n"
+            "  - Technical support scam\n"
+            "CALLER ID SPOOFING:\n"
+            "  - SIP-based VoIP spoofing\n"
+            "  - Display company's own number\n"
+            "  - Use local area codes\n"
+            "AI-ENHANCED:\n"
+            "  - Voice cloning (deepfake audio)\n"
+            "  - Real-time voice modification\n"
+            "  - AI-generated conversation scripts\n"
+            "  - Automated call campaigns\n"
+            "DETECTION:\n"
+            "  - Callback verification to known numbers\n"
+            "  - Caller ID verification policies\n"
+            "  - Voice biometric analysis\n"
+            "  - Call recording and review\n"
+            "  - Out-of-band verification for sensitive requests\n"
+            "ASSESSMENT:\n"
+            "  - Test helpdesk procedures\n"
+            "  - Attempt password resets via phone\n"
+            "  - Test out-of-band verification compliance\n"
+            "  - Document policy violations"
+        ),
+        "tools": ["asterisk", "sipvicious"],
+    },
+    {
+        "id": "se-005", "name": "Physical Security Testing",
+        "category": "physical", "severity": "high",
+        "desc": "Physical security assessment techniques.",
+        "detection": (
+            "PHYSICAL SECURITY TESTING:\n"
+            "ACCESS CONTROL:\n"
+            "  - Tailgating/piggybacking test\n"
+            "  - Badge cloning (Proxmark3)\n"
+            "  - Lock picking assessment\n"
+            "  - Window/door security check\n"
+            "  - After-hours access test\n"
+            "BADGE CLONING:\n"
+            "  - Proxmark3 for RFID/NFC\n"
+            "  - Read and clone access cards\n"
+            "  - Supports HID, MIFARE, EM4100\n"
+            "  - Long-range readers for covert cloning\n"
+            "SURVEILLANCE:\n"
+            "  - Camera coverage mapping\n"
+            "  - Blind spot identification\n"
+            "  - Guard patrol patterns\n"
+            "  - Alarm system testing\n"
+            "ASSESSMENT AREAS:\n"
+            "  - Lobby/reception security\n"
+            "  - Server room access controls\n"
+            "  - Document disposal (dumpster diving)\n"
+            "  - Clean desk policy compliance\n"
+            "  - USB drop test (baiting)\n"
+            "  - WiFi from parking lot\n"
+            "  - Visible screens from outside\n"
+            "  - Unlocked workstations"
+        ),
+        "tools": ["proxmark3", "flipper-zero"],
     },
 ]
 
@@ -210,7 +227,7 @@ class SocialEngineeringKB:
 
     def __init__(self) -> None:
         self._patterns: dict[str, SocialEngPattern] = {}
-        self._log = logger.bind(component="social_engineering_kb")
+        self._log = logger.bind(component="social_eng_kb")
         self._load_patterns()
 
     def _load_patterns(self) -> None:
