@@ -1,14 +1,16 @@
-"""Output parser — parses and structures LLM outputs for agent consumption.
+"""Output parser — parses structured output from security tools.
 
 Implements:
-1. JSON extraction from LLM output
-2. Structured data extraction
-3. Action parsing (tool calls, decisions)
-4. Confidence extraction
-5. Finding extraction
-6. Plan extraction
-7. Error detection in outputs
-8. Format validation and repair
+1. Nmap output parsing (text + XML)
+2. Nuclei output parsing (JSON + text)
+3. SQLMap output parsing
+4. Nikto output parsing
+5. Gobuster/ffuf output parsing
+6. SSLyze/testssl.sh output parsing
+7. Hydra/Medusa output parsing
+8. Semgrep output parsing
+9. WPScan output parsing
+10. Generic JSON/text parsers
 """
 
 from __future__ import annotations
@@ -24,354 +26,564 @@ logger = structlog.get_logger()
 
 
 @dataclass
-class ParsedAction:
-    """A parsed action from LLM output."""
-    action_type: str = ""        # tool_call, decision, delegate, report, think
-    tool_name: str = ""
-    tool_args: dict[str, Any] = field(default_factory=dict)
-    reasoning: str = ""
-    confidence: float = 0.5
-    raw_text: str = ""
+class ParsedHost:
+    """A parsed host from tool output."""
+    ip: str = ""
+    hostname: str = ""
+    os_guess: str = ""
+    ports: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "up"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "type": self.action_type,
-            "tool": self.tool_name[:30],
-            "args": len(self.tool_args),
-            "confidence": round(self.confidence, 2),
+            "ip": self.ip,
+            "hostname": self.hostname[:30],
+            "os": self.os_guess[:30],
+            "ports": len(self.ports),
+            "status": self.status,
         }
 
 
 @dataclass
-class ParsedFinding:
-    """A parsed security finding from LLM output."""
+class ParsedVuln:
+    """A parsed vulnerability from tool output."""
+    vuln_id: str = ""
     title: str = ""
-    severity: str = ""
-    description: str = ""
+    severity: str = "medium"
+    target: str = ""
+    url: str = ""
+    template: str = ""
+    matcher: str = ""
     evidence: str = ""
-    remediation: str = ""
-    confidence: float = 0.5
-    cwe: str = ""
-    cvss: float = 0.0
+    tool: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.vuln_id[:15],
             "title": self.title[:40],
             "severity": self.severity,
-            "confidence": round(self.confidence, 2),
+            "target": self.target[:25],
+            "tool": self.tool[:10],
         }
 
 
 @dataclass
-class ParsedPlan:
-    """A parsed plan from LLM output."""
-    steps: list[dict[str, str]] = field(default_factory=list)
-    tools_needed: list[str] = field(default_factory=list)
-    estimated_time_s: float = 0.0
-    priority: str = ""
+class ParsedCredential:
+    """A parsed credential from brute-force tool output."""
+    host: str = ""
+    port: int = 0
+    service: str = ""
+    username: str = ""
+    password: str = ""
+    tool: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "steps": len(self.steps),
-            "tools": self.tools_needed[:5],
-            "priority": self.priority,
+            "host": self.host[:20],
+            "port": self.port,
+            "service": self.service[:10],
+            "user": self.username[:15],
+            "tool": self.tool[:10],
+        }
+
+
+@dataclass
+class ParsedEndpoint:
+    """A parsed endpoint from directory/content scanning."""
+    url: str = ""
+    status_code: int = 0
+    size: int = 0
+    content_type: str = ""
+    redirect: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "url": self.url[:50],
+            "status": self.status_code,
+            "size": self.size,
         }
 
 
 @dataclass
 class ParseResult:
-    """Result of parsing LLM output."""
-    success: bool = False
-    actions: list[ParsedAction] = field(default_factory=list)
-    findings: list[ParsedFinding] = field(default_factory=list)
-    plan: ParsedPlan | None = None
-    json_data: dict[str, Any] | None = None
-    thinking: str = ""
-    summary: str = ""
+    """Complete parsed result from a tool."""
+    tool: str = ""
+    success: bool = True
+    hosts: list[ParsedHost] = field(default_factory=list)
+    vulns: list[ParsedVuln] = field(default_factory=list)
+    credentials: list[ParsedCredential] = field(default_factory=list)
+    endpoints: list[ParsedEndpoint] = field(default_factory=list)
+    raw_data: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
-    raw_text: str = ""
+    summary: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "tool": self.tool[:15],
             "success": self.success,
-            "actions": len(self.actions),
-            "findings": len(self.findings),
-            "has_plan": self.plan is not None,
-            "has_json": self.json_data is not None,
+            "hosts": len(self.hosts),
+            "vulns": len(self.vulns),
+            "creds": len(self.credentials),
+            "endpoints": len(self.endpoints),
             "errors": len(self.errors),
         }
 
 
-# ── Extraction Patterns ───────────────────────────────────────
-
-JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
-JSON_OBJECT_PATTERN = re.compile(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", re.DOTALL)
-TOOL_CALL_PATTERN = re.compile(
-    r"(?:TOOL|ACTION|EXECUTE|RUN):\s*(\w+)\s*\((.*?)\)",
-    re.IGNORECASE | re.DOTALL,
-)
-CONFIDENCE_PATTERN = re.compile(
-    r"(?:confidence|certainty|probability)[\s:]*(\d+(?:\.\d+)?)\s*%?",
-    re.IGNORECASE,
-)
-SEVERITY_PATTERN = re.compile(
-    r"(?:severity|risk)[\s:]*(?:level\s*)?[\s:]*(critical|high|medium|low|info)",
-    re.IGNORECASE,
-)
-THINKING_PATTERN = re.compile(
-    r"<think(?:ing)?>(.*?)</think(?:ing)?>",
-    re.DOTALL | re.IGNORECASE,
-)
-PLAN_STEP_PATTERN = re.compile(
-    r"(?:^|\n)\s*(?:\d+[\.\)]\s*|[-*]\s*)(.*?)(?=\n|$)",
-)
-
-
 class OutputParser:
-    """Parses and structures LLM outputs for agent consumption.
-
-    Extracts actions, findings, plans, and structured data
-    from free-form LLM responses.
-    """
+    """Parses output from various security tools into structured data."""
 
     def __init__(self) -> None:
-        self._parse_counter = 0
-        self._total_errors = 0
+        self._parsers: dict[str, Any] = {
+            "nmap": self._parse_nmap,
+            "nuclei": self._parse_nuclei,
+            "sqlmap": self._parse_sqlmap,
+            "nikto": self._parse_nikto,
+            "gobuster": self._parse_gobuster,
+            "ffuf": self._parse_ffuf,
+            "hydra": self._parse_hydra,
+            "semgrep": self._parse_semgrep,
+            "wpscan": self._parse_wpscan,
+            "testssl": self._parse_testssl,
+            "subfinder": self._parse_subfinder,
+            "httpx": self._parse_httpx,
+        }
         self._log = logger.bind(component="output_parser")
 
-    def parse(self, text: str) -> ParseResult:
-        """Parse LLM output into structured data."""
-        self._parse_counter += 1
-        result = ParseResult(raw_text=text)
+    def parse(self, tool: str, output: str) -> ParseResult:
+        """Parse tool output."""
+        parser = self._parsers.get(tool.lower())
+        if not parser:
+            return self._parse_generic(tool, output)
 
-        if not text or not text.strip():
-            result.errors.append("Empty output")
-            return result
+        try:
+            return parser(output)
+        except Exception as e:
+            return ParseResult(
+                tool=tool,
+                success=False,
+                errors=[str(e)],
+            )
 
-        # Extract thinking blocks
-        thinking_match = THINKING_PATTERN.search(text)
-        if thinking_match:
-            result.thinking = thinking_match.group(1).strip()
+    def _parse_nmap(self, output: str) -> ParseResult:
+        """Parse nmap text output."""
+        result = ParseResult(tool="nmap")
+        current_host = None
 
-        # Try JSON extraction
-        json_data = self._extract_json(text)
-        if json_data:
-            result.json_data = json_data
-            result.success = True
+        for line in output.split("\n"):
+            line = line.strip()
 
-            # Parse structured fields from JSON
-            if isinstance(json_data, dict):
-                self._parse_json_fields(json_data, result)
+            # Host discovery
+            host_match = re.match(
+                r"Nmap scan report for (\S+?)(?:\s+\((\d+\.\d+\.\d+\.\d+)\))?$",
+                line,
+            )
+            if host_match:
+                if current_host:
+                    result.hosts.append(current_host)
+                hostname = host_match.group(1)
+                ip = host_match.group(2) or hostname
+                current_host = ParsedHost(ip=ip, hostname=hostname)
+                continue
 
-        # Extract actions
-        actions = self._extract_actions(text)
-        if actions:
-            result.actions = actions
-            result.success = True
+            # Port line
+            port_match = re.match(
+                r"(\d+)/(tcp|udp)\s+(\S+)\s+(.*)$", line
+            )
+            if port_match and current_host:
+                port_num = int(port_match.group(1))
+                protocol = port_match.group(2)
+                state = port_match.group(3)
+                service = port_match.group(4).strip()
+                current_host.ports.append({
+                    "port": port_num,
+                    "protocol": protocol,
+                    "state": state,
+                    "service": service,
+                })
+                continue
 
-        # Extract findings
-        findings = self._extract_findings(text)
-        if findings:
-            result.findings = findings
-            result.success = True
+            # OS detection
+            os_match = re.match(r"OS details?:\s+(.+)$", line)
+            if os_match and current_host:
+                current_host.os_guess = os_match.group(1)
 
-        # Extract plan
-        plan = self._extract_plan(text)
-        if plan and plan.steps:
-            result.plan = plan
-            result.success = True
+            # Host status
+            if "Host is up" in line and current_host:
+                current_host.status = "up"
+            elif "Host seems down" in line and current_host:
+                current_host.status = "down"
 
-        # Generate summary
-        if not result.success:
-            result.summary = text[:200].strip()
-            result.success = True  # Raw text is valid output
+        if current_host:
+            result.hosts.append(current_host)
 
-        if result.errors:
-            self._total_errors += len(result.errors)
+        total_ports = sum(len(h.ports) for h in result.hosts)
+        result.summary = f"{len(result.hosts)} hosts, {total_ports} ports"
 
         return result
 
-    def _extract_json(self, text: str) -> dict[str, Any] | list[Any] | None:
-        """Extract JSON from text."""
-        # Try code blocks first
-        matches = JSON_BLOCK_PATTERN.findall(text)
-        for match in matches:
-            try:
-                return json.loads(match.strip())
-            except json.JSONDecodeError:
+    def _parse_nuclei(self, output: str) -> ParseResult:
+        """Parse nuclei output (JSON lines or text)."""
+        result = ParseResult(tool="nuclei")
+
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line:
                 continue
 
-        # Try raw JSON objects
-        matches = JSON_OBJECT_PATTERN.findall(text)
-        for match in matches:
-            try:
-                return json.loads(match)
-            except json.JSONDecodeError:
-                continue
+            # Try JSON parse first
+            if line.startswith("{"):
+                try:
+                    data = json.loads(line)
+                    vuln = ParsedVuln(
+                        vuln_id=data.get("template-id", ""),
+                        title=data.get("info", {}).get("name", ""),
+                        severity=data.get("info", {}).get("severity", "medium"),
+                        target=data.get("host", ""),
+                        url=data.get("matched-at", ""),
+                        template=data.get("template-id", ""),
+                        matcher=data.get("matcher-name", ""),
+                        evidence=data.get("extracted-results", [""])[0] if data.get("extracted-results") else "",
+                        tool="nuclei",
+                    )
+                    result.vulns.append(vuln)
+                    continue
+                except json.JSONDecodeError:
+                    pass
 
-        # Try the whole text as JSON
-        try:
-            return json.loads(text.strip())
-        except json.JSONDecodeError:
-            return None
-
-    def _extract_actions(self, text: str) -> list[ParsedAction]:
-        """Extract tool call actions from text."""
-        actions = []
-
-        # Pattern-based extraction
-        for match in TOOL_CALL_PATTERN.finditer(text):
-            tool_name = match.group(1).strip()
-            args_str = match.group(2).strip()
-
-            # Parse arguments
-            args = self._parse_tool_args(args_str)
-
-            actions.append(ParsedAction(
-                action_type="tool_call",
-                tool_name=tool_name,
-                tool_args=args,
-                raw_text=match.group(0),
-            ))
-
-        # Check JSON for actions
-        json_data = self._extract_json(text)
-        if isinstance(json_data, dict):
-            if "action" in json_data:
-                action = json_data["action"]
-                if isinstance(action, dict):
-                    actions.append(ParsedAction(
-                        action_type=action.get("type", "tool_call"),
-                        tool_name=action.get("tool", action.get("name", "")),
-                        tool_args=action.get("args", action.get("arguments", {})),
-                        reasoning=action.get("reasoning", ""),
-                    ))
-
-            if "actions" in json_data and isinstance(json_data["actions"], list):
-                for act in json_data["actions"]:
-                    if isinstance(act, dict):
-                        actions.append(ParsedAction(
-                            action_type=act.get("type", "tool_call"),
-                            tool_name=act.get("tool", act.get("name", "")),
-                            tool_args=act.get("args", act.get("arguments", {})),
-                        ))
-
-        # Extract confidence
-        conf_match = CONFIDENCE_PATTERN.search(text)
-        if conf_match and actions:
-            conf_val = float(conf_match.group(1))
-            if conf_val > 1:
-                conf_val /= 100
-            for action in actions:
-                action.confidence = conf_val
-
-        return actions
-
-    def _extract_findings(self, text: str) -> list[ParsedFinding]:
-        """Extract security findings from text."""
-        findings = []
-
-        # Try JSON extraction
-        json_data = self._extract_json(text)
-        if isinstance(json_data, dict):
-            finding_list = json_data.get("findings", json_data.get("vulnerabilities", []))
-            if isinstance(finding_list, list):
-                for item in finding_list:
-                    if isinstance(item, dict):
-                        findings.append(ParsedFinding(
-                            title=item.get("title", item.get("name", "")),
-                            severity=item.get("severity", "medium"),
-                            description=item.get("description", item.get("desc", "")),
-                            evidence=item.get("evidence", ""),
-                            remediation=item.get("remediation", item.get("fix", "")),
-                            confidence=item.get("confidence", 0.5),
-                            cwe=item.get("cwe", ""),
-                            cvss=item.get("cvss", 0.0),
-                        ))
-
-        # Pattern-based severity extraction
-        if not findings:
-            severity_matches = SEVERITY_PATTERN.finditer(text)
-            for match in severity_matches:
-                severity = match.group(1).lower()
-                # Get surrounding context
-                start = max(0, match.start() - 100)
-                end = min(len(text), match.end() + 200)
-                context = text[start:end].strip()
-
-                findings.append(ParsedFinding(
-                    title=context[:60],
-                    severity=severity,
-                    description=context,
+            # Text format: [severity] [template-id] [protocol] url
+            text_match = re.match(
+                r"\[(\w+)\]\s+\[([^\]]+)\]\s+\[(\w+)\]\s+(.+)$", line
+            )
+            if text_match:
+                result.vulns.append(ParsedVuln(
+                    severity=text_match.group(1).lower(),
+                    template=text_match.group(2),
+                    title=text_match.group(2),
+                    target=text_match.group(4),
+                    url=text_match.group(4),
+                    tool="nuclei",
                 ))
 
-        return findings
+        result.summary = f"{len(result.vulns)} findings"
+        return result
 
-    def _extract_plan(self, text: str) -> ParsedPlan:
-        """Extract a plan from text."""
-        plan = ParsedPlan()
+    def _parse_sqlmap(self, output: str) -> ParseResult:
+        """Parse sqlmap output."""
+        result = ParseResult(tool="sqlmap")
 
-        # Try JSON
-        json_data = self._extract_json(text)
-        if isinstance(json_data, dict) and "steps" in json_data:
-            steps = json_data["steps"]
-            if isinstance(steps, list):
-                for step in steps:
-                    if isinstance(step, dict):
-                        plan.steps.append(step)
-                    elif isinstance(step, str):
-                        plan.steps.append({"description": step})
-                plan.tools_needed = json_data.get("tools", [])
-                return plan
+        # Find injectable parameters
+        injectable_params: list[str] = []
+        db_type = ""
+        current_param = ""
 
-        # Pattern-based step extraction
-        step_matches = PLAN_STEP_PATTERN.findall(text)
-        for step_text in step_matches:
-            step_text = step_text.strip()
-            if len(step_text) > 10:  # Filter noise
-                plan.steps.append({"description": step_text})
+        for line in output.split("\n"):
+            line = line.strip()
 
-        return plan
+            param_match = re.search(
+                r"Parameter:\s+(\S+)\s+\((\w+)\)", line
+            )
+            if param_match:
+                current_param = param_match.group(1)
+                injectable_params.append(current_param)
 
-    def _parse_json_fields(
-        self,
-        data: dict[str, Any],
-        result: ParseResult,
-    ) -> None:
-        """Parse common fields from JSON data."""
-        if "reasoning" in data:
-            result.thinking = str(data["reasoning"])[:500]
-        if "summary" in data:
-            result.summary = str(data["summary"])[:200]
+            dbms_match = re.search(r"back-end DBMS:\s+(.+)$", line)
+            if dbms_match:
+                db_type = dbms_match.group(1)
 
-    @staticmethod
-    def _parse_tool_args(args_str: str) -> dict[str, Any]:
-        """Parse tool arguments from string."""
-        args: dict[str, Any] = {}
-        if not args_str:
-            return args
+            if "is vulnerable" in line.lower():
+                result.vulns.append(ParsedVuln(
+                    title=f"SQL Injection in {current_param}",
+                    severity="critical",
+                    evidence=line,
+                    tool="sqlmap",
+                ))
+
+        if injectable_params:
+            result.summary = (
+                f"Injectable params: {', '.join(injectable_params)}"
+                f"{f' (DB: {db_type})' if db_type else ''}"
+            )
+        else:
+            result.summary = "No injection points found"
+
+        return result
+
+    def _parse_nikto(self, output: str) -> ParseResult:
+        """Parse nikto output."""
+        result = ParseResult(tool="nikto")
+
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line.startswith("+ "):
+                continue
+
+            content = line[2:]
+
+            # Skip info lines
+            if any(kw in content.lower() for kw in (
+                "target ip:", "target hostname:", "target port:",
+                "start time:", "end time:", "server:",
+            )):
+                continue
+
+            # OSVDB reference
+            osvdb_match = re.match(r"OSVDB-(\d+):\s+(.+)$", content)
+            if osvdb_match:
+                result.vulns.append(ParsedVuln(
+                    vuln_id=f"OSVDB-{osvdb_match.group(1)}",
+                    title=osvdb_match.group(2)[:80],
+                    severity="medium",
+                    evidence=content,
+                    tool="nikto",
+                ))
+            elif "VULNERABLE" in content.upper():
+                result.vulns.append(ParsedVuln(
+                    title=content[:80],
+                    severity="high",
+                    evidence=content,
+                    tool="nikto",
+                ))
+
+        result.summary = f"{len(result.vulns)} findings"
+        return result
+
+    def _parse_gobuster(self, output: str) -> ParseResult:
+        """Parse gobuster output."""
+        result = ParseResult(tool="gobuster")
+
+        for line in output.split("\n"):
+            line = line.strip()
+            # Format: /path (Status: 200) [Size: 1234]
+            match = re.match(
+                r"(/\S*)\s+\(Status:\s+(\d+)\)\s+\[Size:\s+(\d+)\]", line
+            )
+            if match:
+                result.endpoints.append(ParsedEndpoint(
+                    url=match.group(1),
+                    status_code=int(match.group(2)),
+                    size=int(match.group(3)),
+                ))
+
+        result.summary = f"{len(result.endpoints)} endpoints"
+        return result
+
+    def _parse_ffuf(self, output: str) -> ParseResult:
+        """Parse ffuf output (JSON or text)."""
+        result = ParseResult(tool="ffuf")
 
         # Try JSON
         try:
-            parsed = json.loads(args_str)
-            if isinstance(parsed, dict):
-                return parsed
+            data = json.loads(output)
+            for item in data.get("results", []):
+                result.endpoints.append(ParsedEndpoint(
+                    url=item.get("url", ""),
+                    status_code=item.get("status", 0),
+                    size=item.get("length", 0),
+                    content_type=item.get("content-type", ""),
+                    redirect=item.get("redirectlocation", ""),
+                ))
+            result.summary = f"{len(result.endpoints)} endpoints"
+            return result
         except json.JSONDecodeError:
             pass
 
-        # Try key=value pairs
-        for part in args_str.split(","):
-            part = part.strip()
-            if "=" in part:
-                key, _, value = part.partition("=")
-                args[key.strip()] = value.strip().strip("\"'")
-            elif part:
-                args[f"arg{len(args)}"] = part.strip().strip("\"'")
+        # Text format
+        for line in output.split("\n"):
+            match = re.match(
+                r"\S+\s+\[Status:\s+(\d+),\s+Size:\s+(\d+)", line
+            )
+            if match:
+                result.endpoints.append(ParsedEndpoint(
+                    url=line.split()[0] if line.split() else "",
+                    status_code=int(match.group(1)),
+                    size=int(match.group(2)),
+                ))
 
-        return args
+        result.summary = f"{len(result.endpoints)} endpoints"
+        return result
 
-    def get_stats(self) -> dict[str, Any]:
-        return {
-            "total_parsed": self._parse_counter,
-            "total_errors": self._total_errors,
+    def _parse_hydra(self, output: str) -> ParseResult:
+        """Parse hydra output."""
+        result = ParseResult(tool="hydra")
+
+        for line in output.split("\n"):
+            # [PORT][SERVICE] host:IP login:USER password:PASS
+            match = re.search(
+                r"\[(\d+)\]\[(\w+)\]\s+host:\s+(\S+)\s+login:\s+(\S+)\s+password:\s+(\S+)",
+                line,
+            )
+            if match:
+                result.credentials.append(ParsedCredential(
+                    port=int(match.group(1)),
+                    service=match.group(2),
+                    host=match.group(3),
+                    username=match.group(4),
+                    password=match.group(5),
+                    tool="hydra",
+                ))
+
+        result.summary = f"{len(result.credentials)} credentials found"
+        return result
+
+    def _parse_semgrep(self, output: str) -> ParseResult:
+        """Parse semgrep output."""
+        result = ParseResult(tool="semgrep")
+
+        try:
+            data = json.loads(output)
+            for item in data.get("results", []):
+                result.vulns.append(ParsedVuln(
+                    vuln_id=item.get("check_id", ""),
+                    title=item.get("extra", {}).get("message", "")[:80],
+                    severity=item.get("extra", {}).get("severity", "medium").lower(),
+                    target=item.get("path", ""),
+                    evidence=item.get("extra", {}).get("lines", ""),
+                    tool="semgrep",
+                ))
+        except json.JSONDecodeError:
+            # Text format
+            for line in output.split("\n"):
+                if "error" in line.lower() or "warning" in line.lower():
+                    result.vulns.append(ParsedVuln(
+                        title=line[:80],
+                        severity="medium",
+                        tool="semgrep",
+                    ))
+
+        result.summary = f"{len(result.vulns)} code issues"
+        return result
+
+    def _parse_wpscan(self, output: str) -> ParseResult:
+        """Parse WPScan output."""
+        result = ParseResult(tool="wpscan")
+
+        try:
+            data = json.loads(output)
+
+            # Interesting findings
+            for finding in data.get("interesting_findings", []):
+                result.vulns.append(ParsedVuln(
+                    title=finding.get("to_s", "")[:80],
+                    severity="info",
+                    url=finding.get("url", ""),
+                    tool="wpscan",
+                ))
+
+            # Vulnerabilities
+            for vuln_list in data.get("plugins", {}).values():
+                for vuln in vuln_list.get("vulnerabilities", []):
+                    result.vulns.append(ParsedVuln(
+                        vuln_id=vuln.get("references", {}).get("cve", [""])[0],
+                        title=vuln.get("title", "")[:80],
+                        severity="high",
+                        tool="wpscan",
+                    ))
+        except json.JSONDecodeError:
+            # Text format
+            for line in output.split("\n"):
+                if "| [!]" in line:
+                    result.vulns.append(ParsedVuln(
+                        title=line.replace("| [!]", "").strip()[:80],
+                        severity="high",
+                        tool="wpscan",
+                    ))
+
+        result.summary = f"{len(result.vulns)} findings"
+        return result
+
+    def _parse_testssl(self, output: str) -> ParseResult:
+        """Parse testssl.sh output."""
+        result = ParseResult(tool="testssl")
+
+        severity_map = {
+            "CRITICAL": "critical",
+            "HIGH": "high",
+            "MEDIUM": "medium",
+            "LOW": "low",
+            "OK": "info",
+            "INFO": "info",
         }
+
+        for line in output.split("\n"):
+            for sev_key, sev_val in severity_map.items():
+                if sev_key in line and sev_val in ("critical", "high", "medium"):
+                    result.vulns.append(ParsedVuln(
+                        title=line.strip()[:80],
+                        severity=sev_val,
+                        tool="testssl",
+                    ))
+                    break
+
+        result.summary = f"{len(result.vulns)} TLS issues"
+        return result
+
+    def _parse_subfinder(self, output: str) -> ParseResult:
+        """Parse subfinder output."""
+        result = ParseResult(tool="subfinder")
+
+        for line in output.split("\n"):
+            line = line.strip()
+            if line and "." in line and not line.startswith("["):
+                result.hosts.append(ParsedHost(
+                    hostname=line,
+                    status="discovered",
+                ))
+
+        result.summary = f"{len(result.hosts)} subdomains"
+        return result
+
+    def _parse_httpx(self, output: str) -> ParseResult:
+        """Parse httpx output."""
+        result = ParseResult(tool="httpx")
+
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+
+            # Try JSON
+            try:
+                data = json.loads(line)
+                result.endpoints.append(ParsedEndpoint(
+                    url=data.get("url", ""),
+                    status_code=data.get("status_code", 0),
+                    size=data.get("content_length", 0),
+                    content_type=data.get("content_type", ""),
+                ))
+                continue
+            except json.JSONDecodeError:
+                pass
+
+            # Text: URL [status] [size]
+            match = re.match(r"(\S+)\s+\[(\d+)\]", line)
+            if match:
+                result.endpoints.append(ParsedEndpoint(
+                    url=match.group(1),
+                    status_code=int(match.group(2)),
+                ))
+
+        result.summary = f"{len(result.endpoints)} live URLs"
+        return result
+
+    def _parse_generic(self, tool: str, output: str) -> ParseResult:
+        """Generic parser for unknown tools."""
+        result = ParseResult(tool=tool)
+
+        # Try JSON
+        try:
+            data = json.loads(output)
+            result.raw_data = data
+            result.summary = f"JSON with {len(data)} keys" if isinstance(data, dict) else f"JSON array with {len(data)} items"
+            return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # Count interesting patterns
+        lines = output.split("\n")
+        result.raw_data = {"line_count": len(lines)}
+        result.summary = f"{len(lines)} lines of output"
+
+        return result
+
+    def get_supported_tools(self) -> list[str]:
+        return sorted(self._parsers.keys())
