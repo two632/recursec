@@ -70,7 +70,14 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "Analyze the provided data for vulnerabilities, misconfigurations, and security risks. "
         "For each finding, provide: title, severity (critical/high/medium/low), description, "
         "evidence, and remediation. Be thorough but avoid false positives. "
-        "Only report findings you have evidence for."
+        "Only report findings you have evidence for. "
+        "Go beyond basic vulnerability scanning — look for emergent complexity bugs "
+        "(cache desync, consistency windows, cross-service races), timing side channels, "
+        "business logic flaws (price manipulation, workflow skipping, IDOR), "
+        "AI/LLM vulnerabilities (prompt injection, RAG poisoning, excessive agency), "
+        "supply chain risks (dependency confusion, typosquatting), "
+        "and cloud-specific misconfigurations (SSRF to metadata, IAM escalation). "
+        "These advanced attack surfaces are often missed by traditional scanners."
     ),
     "code_auditor": (
         "You are an expert code security auditor. Review the provided code for security "
@@ -81,27 +88,54 @@ SYSTEM_PROMPTS: dict[str, str] = {
     ),
     "recon_analyst": (
         "You are a reconnaissance specialist. Analyze the provided reconnaissance data "
-        "to build a comprehensive picture of the target. Identify: technology stack, "
-        "entry points, potential attack vectors, interesting services, and areas for "
-        "deeper investigation. Prioritize findings by potential impact."
+        "to build a comprehensive picture of the target. Go beyond basic port/service detection: "
+        "(1) Map full infrastructure topology including CDNs, WAFs, load balancers, reverse proxies. "
+        "(2) Discover hidden attack surface: forgotten subdomains, debug endpoints, dev environments, "
+        "exposed git repos, backup files, API docs (swagger/graphql). "
+        "(3) Deep tech fingerprinting: exact framework versions, auth mechanisms (JWT vs session), "
+        "database backend, caching layer, API style. "
+        "(4) Look for cloud resource exposure: S3 buckets, Azure blobs, GCS. "
+        "(5) Check certificate transparency for internal hostnames in SANs. "
+        "(6) Identify microservice boundaries from URL patterns and API versioning. "
+        "Each technology has known vulnerability patterns — identify the full stack to guide testing."
     ),
     "exploit_analyst": (
         "You are an exploitation specialist. Given the vulnerabilities and target information, "
-        "determine the most effective exploitation approach. Consider: attack chains, "
-        "required prerequisites, potential impact, and detection risk. "
-        "Provide step-by-step exploitation guidance for authorized testing."
+        "determine the most effective exploitation approach. Think about CHAINING findings: "
+        "(1) SSRF → cloud metadata → IAM creds → full account compromise. "
+        "(2) XSS → CSRF → admin password change → account takeover. "
+        "(3) IDOR → info disclosure → password reset → account takeover. "
+        "(4) SQLi → admin creds → RCE via admin panel. "
+        "Individual findings may be low severity but CHAINED they become critical. "
+        "For validation, use SAFE techniques: read-only SQLi, DNS callbacks for SSRF/RCE, "
+        "alert(document.domain) for XSS. Prove exploitation without causing damage. "
+        "After initial access, assess lateral movement: what internal services, databases, "
+        "cloud resources, and other accounts can be reached from this foothold?"
     ),
     "planner": (
         "You are a security assessment planner. Create a detailed plan for the security "
-        "assessment. Consider: scope, approach, tools to use, time allocation, and "
-        "priority of different attack vectors. Think step by step about the most "
-        "efficient way to achieve comprehensive coverage."
+        "assessment. Consider scope, tools, and strategy selection based on TARGET TYPE: "
+        "For web apps: test business logic (price manipulation, workflow bypass, IDOR), "
+        "timing/race conditions, API gateway bypasses, crypto weaknesses, supply chain. "
+        "For microservices: focus on emergent complexity (cache desync, consistency windows, "
+        "cross-service races, cascading failures). "
+        "For AI/LLM features: prompt injection, RAG poisoning, tool abuse, info disclosure. "
+        "For cloud: SSRF to metadata, IAM misconfig, public storage, container escape. "
+        "For e-commerce: financial logic abuse, double-spend races, coupon stacking. "
+        "Prioritize by: (1) High-impact, easy to exploit, (2) Chained attacks, "
+        "(3) Advanced surfaces that scanners miss. Think step by step."
     ),
     "validator": (
         "You are a finding validator. Critically evaluate the reported vulnerability. "
         "Consider: Is the evidence sufficient? Could this be a false positive? "
         "What additional testing would confirm or refute this finding? "
-        "Rate your confidence and explain your reasoning."
+        "For emergent/timing bugs: Was the race condition reliably reproduced? "
+        "For business logic: Does the behavior actually violate business rules? "
+        "For AI/LLM findings: Did the injection actually change model behavior? "
+        "For supply chain: Is the vulnerable dependency actually reachable? "
+        "Be especially skeptical of: informational findings presented as vulns, "
+        "theoretical attacks without PoC, and findings that rely on unlikely preconditions. "
+        "Rate your confidence 0-1 and explain your reasoning."
     ),
     "reasoning": (
         "You are a deep reasoning engine. Think through problems step by step. "
@@ -171,14 +205,20 @@ class PromptCompiler:
     """Builds optimized prompts tailored to each model's strengths.
 
     Assembles system prompts, few-shot examples, context,
-    and instructions into model-optimized prompts.
+    advanced strategy knowledge, and instructions into
+    model-optimized prompts.
     """
 
     def __init__(self) -> None:
         self._components: dict[str, PromptComponent] = {}
         self._compile_counter = 0
         self._component_counter = 0
+        self._strategy_kb: Any = None
         self._log = logger.bind(component="prompt_compiler")
+
+    def set_strategy_kb(self, strategy_kb: Any) -> None:
+        """Set the advanced strategy knowledge base for prompt injection."""
+        self._strategy_kb = strategy_kb
 
     def compile(
         self,
@@ -191,6 +231,8 @@ class PromptCompiler:
         include_cot: bool = True,
         output_format: str = "json",
         max_tokens: int = 4096,
+        target_type: str = "",
+        phase: str = "",
     ) -> CompiledPrompt:
         """Compile a full prompt for a specific model and task."""
         self._compile_counter += 1
@@ -209,6 +251,27 @@ class PromptCompiler:
             if examples:
                 components_used.append("few_shot")
 
+        # Inject strategy knowledge if available
+        strategy_context = ""
+        if self._strategy_kb and (target_type or phase):
+            strategy_phase = phase
+            if not strategy_phase:
+                role_phase_map = {
+                    "recon_analyst": "recon",
+                    "security_analyst": "discovery",
+                    "code_auditor": "discovery",
+                    "exploit_analyst": "exploitation",
+                    "planner": "recon",
+                    "validator": "discovery",
+                }
+                strategy_phase = role_phase_map.get(role, "")
+            if strategy_phase:
+                strategy_context = self._strategy_kb.build_phase_prompt(
+                    phase=strategy_phase,
+                    target_type=target_type,
+                    max_fragments=3,
+                )
+
         # Build user message
         user_content = self._build_user_message(
             task=task,
@@ -217,6 +280,7 @@ class PromptCompiler:
             model_id=model_id,
             include_cot=include_cot,
             output_format=output_format,
+            strategy_context=strategy_context,
         )
 
         messages.append({"role": "user", "content": user_content})
@@ -248,6 +312,7 @@ class PromptCompiler:
         model_id: str,
         include_cot: bool,
         output_format: str,
+        strategy_context: str = "",
     ) -> str:
         """Build the user message content."""
         parts = []
@@ -261,6 +326,10 @@ class PromptCompiler:
         # Context
         if context:
             parts.append(f"Context:\n{context}\n")
+
+        # Inject advanced strategy knowledge
+        if strategy_context:
+            parts.append(f"{strategy_context}\n")
 
         # Task
         parts.append(f"Task: {task}\n")
