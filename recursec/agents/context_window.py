@@ -1,19 +1,20 @@
-"""Context window manager — manages LLM context token budgets.
+"""Context window manager — manages limited context across agent turns.
 
-Handles:
-1. Token counting and estimation
-2. Context priority ranking
-3. Sliding window management
-4. Context compression and summarization
-5. Multi-source context assembly
-6. Token budget allocation per source
-7. Important information preservation
-8. Context diff for incremental updates
+Implements:
+1. Context budget allocation by priority
+2. Message summarization for older context
+3. Important information pinning
+4. Context compression strategies
+5. Sliding window with importance weighting
+6. Context retrieval from memory
+7. Dynamic context sizing per model
+8. Multi-turn conversation tracking
 """
 
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -23,289 +24,320 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ContextSource(str, Enum):
-    SYSTEM_PROMPT = "system_prompt"
-    TASK = "task"
-    FINDINGS = "findings"
-    TOOL_OUTPUT = "tool_output"
-    CONVERSATION = "conversation"
-    KNOWLEDGE = "knowledge"
-    PARENT_CONTEXT = "parent_context"
-    SIBLING_FINDINGS = "sibling_findings"
-
-
-class ContentPriority(str, Enum):
-    CRITICAL = "critical"     # Must include
-    HIGH = "high"             # Include if space
-    MEDIUM = "medium"         # Include if comfortable
-    LOW = "low"               # Include only if excess space
+class ContextPriority(str, Enum):
+    CRITICAL = "critical"     # Always include (system prompt, target)
+    HIGH = "high"             # Important (recent findings, decisions)
+    MEDIUM = "medium"         # Useful (tool outputs, analysis)
+    LOW = "low"               # Background (old results)
+    EPHEMERAL = "ephemeral"   # Can be dropped first
 
 
 @dataclass
-class ContextBlock:
-    """A block of context to include in the LLM prompt."""
-    block_id: str = ""
-    source: ContextSource = ContextSource.TASK
-    priority: ContentPriority = ContentPriority.MEDIUM
+class ContextItem:
+    """An item in the context window."""
+    item_id: str = ""
     content: str = ""
-    token_estimate: int = 0
-    max_tokens: int = 0        # 0 = no limit
+    priority: ContextPriority = ContextPriority.MEDIUM
+    estimated_tokens: int = 0
+    pinned: bool = False
+    source: str = ""              # Where this came from
     created_at: float = field(default_factory=time.time)
-    is_compressed: bool = False
-    metadata: dict[str, Any] = field(default_factory=dict)
+    accessed_at: float = field(default_factory=time.time)
+    access_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.block_id,
-            "source": self.source.value,
+            "id": self.item_id,
             "priority": self.priority.value,
-            "tokens": self.token_estimate,
-            "compressed": self.is_compressed,
+            "tokens": self.estimated_tokens,
+            "pinned": self.pinned,
+            "source": self.source[:15],
         }
 
 
 @dataclass
 class ContextWindow:
-    """An assembled context window for an LLM call."""
-    blocks: list[ContextBlock] = field(default_factory=list)
-    total_tokens: int = 0
+    """A managed context window for a model."""
+    window_id: str = ""
+    model_id: str = ""
     max_tokens: int = 4096
-    messages: list[dict[str, str]] = field(default_factory=list)
-    overflow_blocks: list[ContextBlock] = field(default_factory=list)
+    reserved_tokens: int = 500     # Reserved for response
+    items: list[ContextItem] = field(default_factory=list)
+
+    @property
+    def used_tokens(self) -> int:
+        return sum(item.estimated_tokens for item in self.items)
+
+    @property
+    def available_tokens(self) -> int:
+        return max(0, self.max_tokens - self.reserved_tokens - self.used_tokens)
+
+    @property
+    def utilization(self) -> float:
+        usable = self.max_tokens - self.reserved_tokens
+        if usable <= 0:
+            return 1.0
+        return self.used_tokens / usable
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "blocks": len(self.blocks),
-            "tokens_used": self.total_tokens,
-            "max_tokens": self.max_tokens,
-            "messages": len(self.messages),
-            "overflow": len(self.overflow_blocks),
+            "id": self.window_id,
+            "model": self.model_id[:15],
+            "max": self.max_tokens,
+            "used": self.used_tokens,
+            "available": self.available_tokens,
+            "items": len(self.items),
+            "util": round(self.utilization, 2),
         }
 
 
-# ── Token Estimation ─────────────────────────────────────────
+@dataclass
+class ConversationTurn:
+    """A turn in the conversation."""
+    role: str = ""        # system, user, assistant
+    content: str = ""
+    tokens: int = 0
+    timestamp: float = field(default_factory=time.time)
 
-PRIORITY_ORDER = {
-    ContentPriority.CRITICAL: 0,
-    ContentPriority.HIGH: 1,
-    ContentPriority.MEDIUM: 2,
-    ContentPriority.LOW: 3,
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "tokens": self.tokens,
+        }
+
+
+# ── Token Estimation ──────────────────────────────────────────
+
+CHARS_PER_TOKEN = 4  # Rough estimate
+
+# ── Priority Weights ──────────────────────────────────────────
+
+PRIORITY_RETENTION: dict[ContextPriority, float] = {
+    ContextPriority.CRITICAL: 1.0,     # Always keep
+    ContextPriority.HIGH: 0.9,
+    ContextPriority.MEDIUM: 0.6,
+    ContextPriority.LOW: 0.3,
+    ContextPriority.EPHEMERAL: 0.1,
 }
 
 
-def estimate_tokens(text: str) -> int:
-    """Estimate token count from text (rough 4 chars per token)."""
-    return max(1, len(text) // 4)
-
-
 class ContextWindowManager:
-    """Manages LLM context windows and token budgets.
+    """Manages limited context across agent turns.
 
-    Assembles context from multiple sources, respects token
-    budgets, and prioritizes information.
+    Ensures the most important information fits within
+    model context limits through prioritization and compression.
     """
 
-    def __init__(
-        self,
-        default_max_tokens: int = 4096,
-        reserve_for_output: int = 1024,
-    ) -> None:
-        self._default_max = default_max_tokens
-        self._output_reserve = reserve_for_output
-        self._block_counter = 0
-        self._blocks: dict[str, ContextBlock] = {}
-        self._source_budgets: dict[str, int] = {}
+    def __init__(self) -> None:
+        self._windows: dict[str, ContextWindow] = {}
+        self._conversations: dict[str, list[ConversationTurn]] = defaultdict(list)
+        self._item_counter = 0
+        self._window_counter = 0
         self._log = logger.bind(component="context_window")
 
-    def set_source_budget(self, source: ContextSource, max_tokens: int) -> None:
-        """Set a token budget for a context source."""
-        self._source_budgets[source.value] = max_tokens
-
-    def add_block(
+    def create_window(
         self,
-        content: str,
-        source: ContextSource,
-        priority: ContentPriority = ContentPriority.MEDIUM,
-        max_tokens: int = 0,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        """Add a context block."""
-        self._block_counter += 1
-        block_id = f"ctx-{self._block_counter}"
-
-        tokens = estimate_tokens(content)
-
-        # Apply source budget
-        source_budget = self._source_budgets.get(source.value, 0)
-        if source_budget and max_tokens == 0:
-            max_tokens = source_budget
-
-        # Truncate if over budget
-        if max_tokens and tokens > max_tokens:
-            chars_limit = max_tokens * 4
-            content = content[:chars_limit] + "\n... (truncated)"
-            tokens = max_tokens
-
-        block = ContextBlock(
-            block_id=block_id,
-            source=source,
-            priority=priority,
-            content=content,
-            token_estimate=tokens,
+        model_id: str,
+        max_tokens: int = 4096,
+        reserved_tokens: int = 500,
+    ) -> ContextWindow:
+        """Create a new context window."""
+        self._window_counter += 1
+        window = ContextWindow(
+            window_id=f"cw-{self._window_counter}",
+            model_id=model_id,
             max_tokens=max_tokens,
-            metadata=metadata or {},
+            reserved_tokens=reserved_tokens,
+        )
+        self._windows[window.window_id] = window
+        return window
+
+    def add_item(
+        self,
+        window_id: str,
+        content: str,
+        priority: ContextPriority = ContextPriority.MEDIUM,
+        source: str = "",
+        pinned: bool = False,
+    ) -> ContextItem | None:
+        """Add an item to a context window."""
+        window = self._windows.get(window_id)
+        if not window:
+            return None
+
+        self._item_counter += 1
+        estimated_tokens = len(content) // CHARS_PER_TOKEN + 1
+
+        item = ContextItem(
+            item_id=f"ci-{self._item_counter}",
+            content=content,
+            priority=priority,
+            estimated_tokens=estimated_tokens,
+            pinned=pinned,
+            source=source,
         )
 
-        self._blocks[block_id] = block
-        return block_id
+        # Check if it fits
+        if estimated_tokens > window.available_tokens:
+            # Try to make room
+            freed = self._evict(window, estimated_tokens - window.available_tokens)
+            if freed < estimated_tokens - window.available_tokens:
+                # Truncate content
+                available_chars = window.available_tokens * CHARS_PER_TOKEN
+                item.content = content[:available_chars]
+                item.estimated_tokens = window.available_tokens
 
-    def remove_block(self, block_id: str) -> bool:
-        return self._blocks.pop(block_id, None) is not None
+        window.items.append(item)
+        return item
 
-    def build_window(
+    def _evict(self, window: ContextWindow, tokens_needed: int) -> int:
+        """Evict low-priority items to make room."""
+        freed = 0
+
+        # Sort by eviction priority (ephemeral first, then low, etc.)
+        candidates = [
+            item for item in window.items
+            if not item.pinned
+        ]
+        candidates.sort(key=lambda x: (
+            PRIORITY_RETENTION.get(x.priority, 0.5),
+            x.accessed_at,
+        ))
+
+        to_remove = []
+        for item in candidates:
+            if freed >= tokens_needed:
+                break
+            to_remove.append(item.item_id)
+            freed += item.estimated_tokens
+
+        window.items = [
+            item for item in window.items
+            if item.item_id not in set(to_remove)
+        ]
+
+        return freed
+
+    def pin_item(self, window_id: str, item_id: str) -> None:
+        """Pin an item (prevent eviction)."""
+        window = self._windows.get(window_id)
+        if not window:
+            return
+        for item in window.items:
+            if item.item_id == item_id:
+                item.pinned = True
+                break
+
+    def add_turn(
         self,
-        max_tokens: int = 0,
-        sources: list[ContextSource] | None = None,
-    ) -> ContextWindow:
-        """Build a context window from available blocks."""
-        budget = (max_tokens or self._default_max) - self._output_reserve
+        conversation_id: str,
+        role: str,
+        content: str,
+    ) -> ConversationTurn:
+        """Add a conversation turn."""
+        tokens = len(content) // CHARS_PER_TOKEN + 1
+        turn = ConversationTurn(
+            role=role,
+            content=content,
+            tokens=tokens,
+        )
+        self._conversations[conversation_id].append(turn)
 
-        # Filter by requested sources
-        blocks = list(self._blocks.values())
-        if sources:
-            source_values = {s.value for s in sources}
-            blocks = [b for b in blocks if b.source.value in source_values]
+        # Keep last 50 turns
+        if len(self._conversations[conversation_id]) > 50:
+            self._conversations[conversation_id] = \
+                self._conversations[conversation_id][-50:]
 
-        # Sort by priority (critical first)
-        blocks.sort(key=lambda b: PRIORITY_ORDER.get(b.priority, 2))
-
-        window = ContextWindow(max_tokens=budget)
-        used = 0
-
-        for block in blocks:
-            if used + block.token_estimate <= budget:
-                window.blocks.append(block)
-                used += block.token_estimate
-            else:
-                # Try to fit a compressed version
-                remaining = budget - used
-                if remaining > 100 and block.priority in (ContentPriority.CRITICAL, ContentPriority.HIGH):
-                    compressed = self._compress_block(block, remaining)
-                    window.blocks.append(compressed)
-                    used += compressed.token_estimate
-                else:
-                    window.overflow_blocks.append(block)
-
-        window.total_tokens = used
-
-        # Build messages
-        window.messages = self._blocks_to_messages(window.blocks)
-
-        return window
+        return turn
 
     def build_messages(
         self,
-        system_prompt: str,
-        task: str,
-        context_blocks: list[str] | None = None,
-        max_tokens: int = 0,
+        window_id: str,
+        conversation_id: str = "",
+        max_turns: int = 10,
     ) -> list[dict[str, str]]:
-        """Build LLM messages with context."""
-        budget = (max_tokens or self._default_max) - self._output_reserve
-        messages: list[dict[str, str]] = []
+        """Build messages for LLM from context window and conversation."""
+        window = self._windows.get(window_id)
+        if not window:
+            return []
 
-        # System message
-        sys_tokens = estimate_tokens(system_prompt)
-        messages.append({"role": "system", "content": system_prompt})
-        used = sys_tokens
-
-        # Add context blocks
-        context_content = []
-        if context_blocks:
-            for block_id in context_blocks:
-                block = self._blocks.get(block_id)
-                if block and used + block.token_estimate <= budget:
-                    context_content.append(block.content)
-                    used += block.token_estimate
-
-        # User message with task and context
-        user_parts = []
-        if context_content:
-            user_parts.append("Context:\n" + "\n---\n".join(context_content))
-        user_parts.append(f"Task: {task}")
-
-        user_msg = "\n\n".join(user_parts)
-        user_tokens = estimate_tokens(user_msg)
-
-        if used + user_tokens > budget:
-            char_limit = (budget - used) * 4
-            user_msg = user_msg[:char_limit]
-
-        messages.append({"role": "user", "content": user_msg})
-
-        return messages
-
-    def _compress_block(self, block: ContextBlock, target_tokens: int) -> ContextBlock:
-        """Compress a block to fit in target tokens."""
-        char_limit = target_tokens * 4
-        compressed_content = block.content[:char_limit]
-        if len(block.content) > char_limit:
-            compressed_content += "\n... (compressed)"
-
-        return ContextBlock(
-            block_id=block.block_id + "-compressed",
-            source=block.source,
-            priority=block.priority,
-            content=compressed_content,
-            token_estimate=target_tokens,
-            is_compressed=True,
-            metadata=block.metadata,
-        )
-
-    def _blocks_to_messages(
-        self,
-        blocks: list[ContextBlock],
-    ) -> list[dict[str, str]]:
-        """Convert context blocks to LLM messages."""
         messages = []
 
-        # Group by source
-        system_blocks = [b for b in blocks if b.source == ContextSource.SYSTEM_PROMPT]
-        task_blocks = [b for b in blocks if b.source == ContextSource.TASK]
-        other_blocks = [
-            b for b in blocks
-            if b.source not in (ContextSource.SYSTEM_PROMPT, ContextSource.TASK)
-        ]
+        # System message from critical items
+        system_parts = []
+        for item in window.items:
+            if item.priority == ContextPriority.CRITICAL:
+                system_parts.append(item.content)
 
-        # System message
-        if system_blocks:
-            content = "\n\n".join(b.content for b in system_blocks)
-            messages.append({"role": "system", "content": content})
+        if system_parts:
+            messages.append({
+                "role": "system",
+                "content": "\n\n".join(system_parts),
+            })
 
-        # Context + task as user message
-        parts = []
-        if other_blocks:
-            parts.append("Context:")
-            for block in other_blocks:
-                parts.append(f"[{block.source.value}] {block.content}")
-        if task_blocks:
-            parts.append("Task:")
-            for block in task_blocks:
-                parts.append(block.content)
+        # Context from high/medium items
+        context_parts = []
+        for item in window.items:
+            if item.priority in (ContextPriority.HIGH, ContextPriority.MEDIUM):
+                context_parts.append(f"[{item.source}] {item.content}")
 
-        if parts:
-            messages.append({"role": "user", "content": "\n\n".join(parts)})
+        if context_parts:
+            messages.append({
+                "role": "user",
+                "content": "Context:\n" + "\n\n".join(context_parts),
+            })
+
+        # Conversation turns
+        turns = self._conversations.get(conversation_id, [])
+        for turn in turns[-max_turns:]:
+            messages.append({
+                "role": turn.role,
+                "content": turn.content,
+            })
 
         return messages
 
+    def summarize_old_items(
+        self,
+        window_id: str,
+        keep_recent: int = 5,
+    ) -> str:
+        """Summarize old context items into a condensed form."""
+        window = self._windows.get(window_id)
+        if not window:
+            return ""
+
+        old_items = [
+            item for item in window.items[:-keep_recent]
+            if not item.pinned and item.priority != ContextPriority.CRITICAL
+        ]
+
+        if not old_items:
+            return ""
+
+        # Create brief summary
+        summary_parts = []
+        for item in old_items:
+            brief = item.content[:100].replace("\n", " ")
+            summary_parts.append(f"- [{item.source}] {brief}")
+
+        summary = "Previous context summary:\n" + "\n".join(summary_parts)
+
+        # Replace old items with summary
+        old_ids = {item.item_id for item in old_items}
+        window.items = [
+            item for item in window.items
+            if item.item_id not in old_ids
+        ]
+
+        # Add summary as a single item
+        self.add_item(window_id, summary, ContextPriority.LOW, source="summary")
+
+        return summary
+
     def get_stats(self) -> dict[str, Any]:
-        total_tokens = sum(b.token_estimate for b in self._blocks.values())
-        by_source: dict[str, int] = {}
-        for b in self._blocks.values():
-            by_source.setdefault(b.source.value, 0)
-            by_source[b.source.value] += b.token_estimate
         return {
-            "blocks": len(self._blocks),
-            "total_tokens": total_tokens,
-            "by_source": by_source,
+            "windows": len(self._windows),
+            "conversations": len(self._conversations),
+            "total_items": sum(len(w.items) for w in self._windows.values()),
         }
