@@ -1,22 +1,22 @@
-"""Session manager — manages assessment sessions and agent lifecycles.
+"""Session manager — manages assessment session lifecycle.
 
 Implements:
-1. Session creation and tracking
-2. Assessment lifecycle management
-3. Multi-session support (parallel assessments)
-4. Session persistence and recovery
-5. Session history and audit trail
-6. Resource allocation per session
-7. Session-scoped configuration
-8. Event streaming for live updates
+1. Session creation and configuration
+2. Session state persistence
+3. Session resume from checkpoint
+4. Session metrics tracking
+5. Multi-session management
+6. Session export and import
+7. Session comparison
+8. Session cleanup
 """
 
 from __future__ import annotations
 
 import json
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -25,30 +25,56 @@ import structlog
 logger = structlog.get_logger()
 
 
-class SessionStatus(str, Enum):
-    CREATED = "created"
-    INITIALIZING = "initializing"
-    RUNNING = "running"
-    PAUSED = "paused"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
 @dataclass
-class SessionEvent:
-    """An event in a session's lifecycle."""
-    event_id: str = ""
-    event_type: str = ""      # started, finding, tool_run, agent_spawned, error, completed
-    data: dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
+class SessionConfig:
+    """Configuration for a session."""
+    target: str = ""
+    target_type: str = "web_app"
+    stealth_mode: bool = False
+    validate_findings: bool = True
+    deep_mode: bool = False
+    max_time_s: float = 3600.0
+    token_budget: int = 5_000_000
+    max_agents: int = 20
+    custom_config: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.event_id,
-            "type": self.event_type,
-            "data": {k: str(v)[:100] for k, v in list(self.data.items())[:5]},
-            "time": self.timestamp,
+            "target": self.target[:40], "type": self.target_type,
+            "stealth": self.stealth_mode,
+            "validate": self.validate_findings,
+            "deep": self.deep_mode,
+            "max_time_s": self.max_time_s,
+            "budget": self.token_budget,
+        }
+
+
+@dataclass
+class SessionMetrics:
+    """Metrics for a session."""
+    findings_total: int = 0
+    findings_critical: int = 0
+    findings_high: int = 0
+    findings_medium: int = 0
+    findings_low: int = 0
+    tools_run: int = 0
+    agents_spawned: int = 0
+    tokens_used: int = 0
+    models_used: set[str] = field(default_factory=set)
+    errors: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "findings": self.findings_total,
+            "critical": self.findings_critical,
+            "high": self.findings_high,
+            "medium": self.findings_medium,
+            "low": self.findings_low,
+            "tools": self.tools_run,
+            "agents": self.agents_spawned,
+            "tokens": self.tokens_used,
+            "models": len(self.models_used),
+            "errors": self.errors,
         }
 
 
@@ -56,33 +82,20 @@ class SessionEvent:
 class Session:
     """An assessment session."""
     session_id: str = ""
-    name: str = ""
-    target: str = ""
-    goal: str = ""
-    status: SessionStatus = SessionStatus.CREATED
-    config: dict[str, Any] = field(default_factory=dict)
-
-    # Resources
-    agents_active: int = 0
-    agents_total: int = 0
-    tokens_used: int = 0
-    tools_used: list[str] = field(default_factory=list)
-
-    # Results
+    config: SessionConfig = field(default_factory=SessionConfig)
+    status: str = "created"        # created, running, paused, completed, failed
+    metrics: SessionMetrics = field(default_factory=SessionMetrics)
     findings: list[dict[str, Any]] = field(default_factory=list)
-    validated_findings: list[dict[str, Any]] = field(default_factory=list)
-
-    # History
-    events: list[SessionEvent] = field(default_factory=list)
-
-    # Timing
+    phase: str = ""                # Current phase
+    checkpoint: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
+    tags: list[str] = field(default_factory=list)
 
     @property
     def duration_s(self) -> float:
-        if self.completed_at:
+        if self.completed_at and self.started_at:
             return self.completed_at - self.started_at
         if self.started_at:
             return time.time() - self.started_at
@@ -91,249 +104,251 @@ class Session:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.session_id,
-            "name": self.name[:80],
-            "target": self.target,
-            "status": self.status.value,
-            "agents": f"{self.agents_active}/{self.agents_total}",
-            "findings": len(self.findings),
-            "validated": len(self.validated_findings),
-            "tokens": self.tokens_used,
-            "duration_s": round(self.duration_s, 1),
+            "target": self.config.target[:40],
+            "status": self.status,
+            "phase": self.phase[:20],
+            "findings": self.metrics.findings_total,
+            "duration_s": round(self.duration_s, 0),
         }
 
 
 class SessionManager:
-    """Manages assessment sessions.
+    """Manages assessment session lifecycle.
 
-    Creates, tracks, and persists sessions with
-    full event history and audit trail.
+    Creates, tracks, persists, and resumes
+    security assessment sessions.
     """
 
-    def __init__(
-        self,
-        max_concurrent: int = 5,
-        persistence_dir: str = "data/sessions",
-    ) -> None:
-        self._max_concurrent = max_concurrent
+    def __init__(self, data_dir: str = "data/sessions") -> None:
+        self._data_dir = Path(data_dir)
+        self._data_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, Session] = {}
         self._session_counter = 0
-        self._event_counter = 0
-        self._persistence_dir = Path(persistence_dir)
-        self._persistence_dir.mkdir(parents=True, exist_ok=True)
-        self._listeners: list[Any] = []
+        self._active_session: str = ""
         self._log = logger.bind(component="session_manager")
 
-        self._load_sessions()
-
-    def create_session(
+    def create(
         self,
         target: str,
-        goal: str = "",
-        name: str = "",
-        config: dict[str, Any] | None = None,
+        target_type: str = "web_app",
+        config: SessionConfig | None = None,
+        tags: list[str] | None = None,
     ) -> Session:
-        """Create a new assessment session."""
-        active = sum(
-            1 for s in self._sessions.values()
-            if s.status == SessionStatus.RUNNING
-        )
-        if active >= self._max_concurrent:
-            self._log.warning("max_concurrent_reached", active=active)
-
+        """Create a new session."""
         self._session_counter += 1
         session_id = f"session-{self._session_counter}"
 
+        if config is None:
+            config = SessionConfig(target=target, target_type=target_type)
+        else:
+            config.target = target
+            config.target_type = target_type
+
         session = Session(
             session_id=session_id,
-            name=name or f"Assessment of {target}",
-            target=target,
-            goal=goal or f"Security assessment of {target}",
-            config=config or {},
+            config=config,
+            tags=tags or [],
         )
 
         self._sessions[session_id] = session
-        self._add_event(session_id, "created", {"target": target})
-
         return session
 
-    def start_session(self, session_id: str) -> bool:
+    def start(self, session_id: str) -> bool:
         """Start a session."""
         session = self._sessions.get(session_id)
-        if not session or session.status != SessionStatus.CREATED:
+        if not session:
             return False
 
-        session.status = SessionStatus.RUNNING
+        session.status = "running"
         session.started_at = time.time()
-        self._add_event(session_id, "started", {})
+        self._active_session = session_id
         return True
 
-    def pause_session(self, session_id: str) -> bool:
+    def pause(self, session_id: str) -> bool:
+        """Pause a session."""
         session = self._sessions.get(session_id)
-        if not session or session.status != SessionStatus.RUNNING:
+        if not session or session.status != "running":
             return False
-        session.status = SessionStatus.PAUSED
-        self._add_event(session_id, "paused", {})
+
+        session.status = "paused"
+        self._save_checkpoint(session)
         return True
 
-    def resume_session(self, session_id: str) -> bool:
+    def resume(self, session_id: str) -> bool:
+        """Resume a paused session."""
         session = self._sessions.get(session_id)
-        if not session or session.status != SessionStatus.PAUSED:
+        if not session or session.status != "paused":
             return False
-        session.status = SessionStatus.RUNNING
-        self._add_event(session_id, "resumed", {})
+
+        session.status = "running"
+        self._active_session = session_id
         return True
 
-    def complete_session(
+    def complete(self, session_id: str) -> bool:
+        """Complete a session."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+
+        session.status = "completed"
+        session.completed_at = time.time()
+        self._save_session(session)
+
+        if self._active_session == session_id:
+            self._active_session = ""
+
+        return True
+
+    def fail(self, session_id: str, error: str = "") -> bool:
+        """Mark a session as failed."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+
+        session.status = "failed"
+        session.completed_at = time.time()
+        session.checkpoint["error"] = error
+        self._save_session(session)
+        return True
+
+    def add_finding(
         self,
         session_id: str,
-        findings: list[dict[str, Any]] | None = None,
-        validated: list[dict[str, Any]] | None = None,
-    ) -> bool:
-        session = self._sessions.get(session_id)
-        if not session:
-            return False
-
-        session.status = SessionStatus.COMPLETED
-        session.completed_at = time.time()
-        if findings:
-            session.findings = findings
-        if validated:
-            session.validated_findings = validated
-
-        self._add_event(session_id, "completed", {
-            "findings": len(session.findings),
-            "validated": len(session.validated_findings),
-            "duration_s": session.duration_s,
-        })
-
-        self._save_session(session)
-        return True
-
-    def fail_session(self, session_id: str, error: str = "") -> bool:
-        session = self._sessions.get(session_id)
-        if not session:
-            return False
-
-        session.status = SessionStatus.FAILED
-        session.completed_at = time.time()
-        self._add_event(session_id, "failed", {"error": error[:200]})
-        self._save_session(session)
-        return True
-
-    def cancel_session(self, session_id: str) -> bool:
-        session = self._sessions.get(session_id)
-        if not session:
-            return False
-
-        session.status = SessionStatus.CANCELLED
-        session.completed_at = time.time()
-        self._add_event(session_id, "cancelled", {})
-        self._save_session(session)
-        return True
-
-    def add_finding(self, session_id: str, finding: dict[str, Any]) -> None:
-        session = self._sessions.get(session_id)
-        if session:
-            session.findings.append(finding)
-            self._add_event(session_id, "finding", {
-                "title": finding.get("title", "")[:80],
-                "severity": finding.get("severity", ""),
-            })
-
-    def record_tool_use(self, session_id: str, tool: str) -> None:
-        session = self._sessions.get(session_id)
-        if session and tool not in session.tools_used:
-            session.tools_used.append(tool)
-
-    def record_agent(self, session_id: str, active: int, total: int) -> None:
-        session = self._sessions.get(session_id)
-        if session:
-            session.agents_active = active
-            session.agents_total = total
-
-    def record_tokens(self, session_id: str, tokens: int) -> None:
-        session = self._sessions.get(session_id)
-        if session:
-            session.tokens_used += tokens
-
-    def get_session(self, session_id: str) -> Session | None:
-        return self._sessions.get(session_id)
-
-    def get_all_sessions(self) -> list[Session]:
-        return list(self._sessions.values())
-
-    def get_active_sessions(self) -> list[Session]:
-        return [
-            s for s in self._sessions.values()
-            if s.status == SessionStatus.RUNNING
-        ]
-
-    def get_events(self, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        session = self._sessions.get(session_id)
-        if not session:
-            return []
-        return [e.to_dict() for e in session.events[-limit:]]
-
-    # ── Internal ─────────────────────────────────────────
-
-    def _add_event(
-        self,
-        session_id: str,
-        event_type: str,
-        data: dict[str, Any],
+        finding: dict[str, Any],
     ) -> None:
-        """Add an event to a session."""
-        self._event_counter += 1
-        event = SessionEvent(
-            event_id=f"ev-{self._event_counter}",
-            event_type=event_type,
-            data=data,
-        )
+        """Add a finding to a session."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return
 
+        session.findings.append(finding)
+        session.metrics.findings_total += 1
+
+        severity = finding.get("severity", "info")
+        if severity == "critical":
+            session.metrics.findings_critical += 1
+        elif severity == "high":
+            session.metrics.findings_high += 1
+        elif severity == "medium":
+            session.metrics.findings_medium += 1
+        elif severity == "low":
+            session.metrics.findings_low += 1
+
+    def record_tool_run(
+        self,
+        session_id: str,
+        tool: str = "",
+        tokens: int = 0,
+        model: str = "",
+    ) -> None:
+        """Record a tool run in the session."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return
+
+        session.metrics.tools_run += 1
+        session.metrics.tokens_used += tokens
+        if model:
+            session.metrics.models_used.add(model)
+
+    def set_phase(self, session_id: str, phase: str) -> None:
+        """Set the current phase of a session."""
         session = self._sessions.get(session_id)
         if session:
-            session.events.append(event)
-            # Keep events bounded
-            if len(session.events) > 200:
-                session.events = session.events[-200:]
+            session.phase = phase
+
+    def get_active(self) -> Session | None:
+        """Get the currently active session."""
+        if self._active_session:
+            return self._sessions.get(self._active_session)
+        return None
+
+    def _save_checkpoint(self, session: Session) -> None:
+        """Save a session checkpoint."""
+        session.checkpoint = {
+            "phase": session.phase,
+            "findings_count": session.metrics.findings_total,
+            "timestamp": time.time(),
+        }
+        self._save_session(session)
 
     def _save_session(self, session: Session) -> None:
-        """Persist a session to disk."""
+        """Save session to disk."""
         try:
-            path = self._persistence_dir / f"{session.session_id}.json"
-            data = session.to_dict()
-            data["events"] = [e.to_dict() for e in session.events[-50:]]
-            data["findings_data"] = session.findings[:100]
-            path.write_text(json.dumps(data))
+            path = self._data_dir / f"{session.session_id}.json"
+            data = {
+                "id": session.session_id,
+                "config": session.config.to_dict(),
+                "status": session.status,
+                "metrics": session.metrics.to_dict(),
+                "findings_count": len(session.findings),
+                "phase": session.phase,
+                "checkpoint": session.checkpoint,
+                "created_at": session.created_at,
+                "started_at": session.started_at,
+                "completed_at": session.completed_at,
+                "tags": session.tags,
+            }
+            path.write_text(json.dumps(data, indent=2, default=str))
         except OSError:
             pass
 
-    def _load_sessions(self) -> None:
-        """Load persisted sessions."""
+    def load_session(self, session_id: str) -> Session | None:
+        """Load a session from disk."""
+        path = self._data_dir / f"{session_id}.json"
+        if not path.exists():
+            return None
+
         try:
-            for path in self._persistence_dir.glob("session-*.json"):
-                data = json.loads(path.read_text())
-                session_id = data.get("id", "")
-                if session_id and session_id not in self._sessions:
-                    session = Session(
-                        session_id=session_id,
-                        name=data.get("name", ""),
-                        target=data.get("target", ""),
-                        status=SessionStatus.COMPLETED,
-                        findings=data.get("findings_data", []),
-                    )
-                    self._sessions[session_id] = session
-        except (json.JSONDecodeError, OSError):
-            pass
+            data = json.loads(path.read_text())
+            session = Session(
+                session_id=data["id"],
+                status=data.get("status", "completed"),
+                phase=data.get("phase", ""),
+                checkpoint=data.get("checkpoint", {}),
+                created_at=data.get("created_at", 0),
+                started_at=data.get("started_at", 0),
+                completed_at=data.get("completed_at", 0),
+                tags=data.get("tags", []),
+            )
+            self._sessions[session_id] = session
+            return session
+        except (json.JSONDecodeError, OSError, KeyError):
+            return None
+
+    def compare(
+        self,
+        session_id_1: str,
+        session_id_2: str,
+    ) -> dict[str, Any]:
+        """Compare two sessions."""
+        s1 = self._sessions.get(session_id_1)
+        s2 = self._sessions.get(session_id_2)
+
+        if not s1 or not s2:
+            return {"error": "session_not_found"}
+
+        return {
+            "session_1": s1.to_dict(),
+            "session_2": s2.to_dict(),
+            "findings_diff": s1.metrics.findings_total - s2.metrics.findings_total,
+            "critical_diff": s1.metrics.findings_critical - s2.metrics.findings_critical,
+            "duration_diff": round(s1.duration_s - s2.duration_s, 0),
+            "token_diff": s1.metrics.tokens_used - s2.metrics.tokens_used,
+        }
+
+    def list_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        return [s.to_dict() for s in list(self._sessions.values())[-limit:]]
 
     def get_stats(self) -> dict[str, Any]:
-        by_status: dict[str, int] = {}
+        status_counts: dict[str, int] = defaultdict(int)
         for session in self._sessions.values():
-            by_status.setdefault(session.status.value, 0)
-            by_status[session.status.value] += 1
+            status_counts[session.status] += 1
 
         return {
             "total": len(self._sessions),
-            "by_status": by_status,
-            "active": len(self.get_active_sessions()),
+            "active": self._active_session or "none",
+            "status": dict(status_counts),
         }
+
+
