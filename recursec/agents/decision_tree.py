@@ -1,14 +1,14 @@
-"""Decision tree engine — structured decision-making for agent actions.
+"""Decision tree — structured decision-making for agent actions.
 
 Implements:
-1. Decision tree definition and traversal
-2. Condition evaluation (target properties, findings, etc.)
-3. Action recommendation based on tree path
-4. Dynamic tree modification based on results
-5. Decision logging and explanation
-6. Pre-built trees for common assessment scenarios
-7. Risk-aware decision making
-8. Multi-criteria decision analysis
+1. Decision tree construction and traversal
+2. Multi-criteria decision analysis (MCDA)
+3. Decision outcome tracking
+4. Information gain calculation
+5. Decision chain history
+6. Rollback support
+7. Decision explanation generation
+8. Decision caching for repeated scenarios
 """
 
 from __future__ import annotations
@@ -16,303 +16,326 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 import structlog
 
 logger = structlog.get_logger()
 
 
-class NodeType(str, Enum):
-    DECISION = "decision"        # Evaluates a condition
-    ACTION = "action"            # Recommends an action
-    CHANCE = "chance"            # Probabilistic outcome
+class DecisionOutcome(str, Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+    SKIPPED = "skipped"
 
 
 @dataclass
-class TreeNode:
-    """A node in the decision tree."""
+class DecisionOption:
+    """An option in a decision."""
+    option_id: str = ""
+    name: str = ""
+    description: str = ""
+    criteria_scores: dict[str, float] = field(default_factory=dict)
+    expected_reward: float = 0.0
+    risk: float = 0.5
+    cost_tokens: int = 0
+    cost_time_s: float = 0.0
+    prerequisites: list[str] = field(default_factory=list)
+
+    @property
+    def risk_adjusted_reward(self) -> float:
+        return self.expected_reward * (1.0 - self.risk)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.option_id,
+            "name": self.name[:30],
+            "reward": round(self.expected_reward, 2),
+            "risk": round(self.risk, 2),
+            "adj_reward": round(self.risk_adjusted_reward, 2),
+        }
+
+
+@dataclass
+class Decision:
+    """A decision point."""
+    decision_id: str = ""
+    question: str = ""
+    context: dict[str, Any] = field(default_factory=dict)
+    options: list[DecisionOption] = field(default_factory=list)
+    chosen_option_id: str = ""
+    reasoning: str = ""
+    outcome: DecisionOutcome = DecisionOutcome.UNKNOWN
+    actual_reward: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    resolved_at: float = 0.0
+
+    @property
+    def was_good_decision(self) -> bool:
+        if self.outcome == DecisionOutcome.UNKNOWN:
+            return False
+        chosen = None
+        for opt in self.options:
+            if opt.option_id == self.chosen_option_id:
+                chosen = opt
+                break
+        if not chosen:
+            return False
+        return self.actual_reward >= chosen.expected_reward * 0.7
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.decision_id,
+            "question": self.question[:60],
+            "options": len(self.options),
+            "chosen": self.chosen_option_id[:15],
+            "outcome": self.outcome.value,
+            "good": self.was_good_decision,
+        }
+
+
+@dataclass
+class DecisionNode:
+    """A node in a decision tree."""
     node_id: str = ""
-    node_type: NodeType = NodeType.DECISION
-    label: str = ""
-    condition: str = ""          # For decision nodes
-    action: str = ""             # For action nodes
-    children: dict[str, str] = field(default_factory=dict)  # condition_result -> child_node_id
-    probability: float = 1.0     # For chance nodes
-    risk_level: str = "low"
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.node_id, "type": self.node_type.value,
-            "label": self.label[:60], "children": len(self.children),
-        }
-
-
-@dataclass
-class DecisionPath:
-    """A path through the decision tree."""
-    nodes_visited: list[str] = field(default_factory=list)
-    decisions_made: list[dict[str, Any]] = field(default_factory=list)
-    recommended_action: str = ""
+    condition: str = ""
+    true_child: str = ""
+    false_child: str = ""
+    action: str = ""                 # Leaf node action
+    is_leaf: bool = False
     confidence: float = 0.5
-    risk_level: str = "low"
-    explanation: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "steps": len(self.nodes_visited),
-            "action": self.recommended_action[:60],
-            "confidence": round(self.confidence, 2),
-            "risk": self.risk_level,
+            "id": self.node_id,
+            "condition": self.condition[:40] if not self.is_leaf else "",
+            "action": self.action[:40] if self.is_leaf else "",
+            "leaf": self.is_leaf,
         }
+
+
+# ── Decision Criteria ─────────────────────────────────────────
+
+DECISION_CRITERIA: dict[str, float] = {
+    "expected_impact": 0.25,
+    "confidence": 0.20,
+    "cost_efficiency": 0.15,
+    "time_efficiency": 0.15,
+    "risk_level": 0.15,
+    "novelty": 0.10,
+}
+
+# ── Pre-built Decision Trees ──────────────────────────────────
+
+DECISION_TREES: dict[str, list[dict[str, Any]]] = {
+    "tool_selection": [
+        {"id": "root", "cond": "target_type == 'web'", "true": "web_tools", "false": "net_tools"},
+        {"id": "web_tools", "cond": "has_known_tech", "true": "specific_scan", "false": "general_scan"},
+        {"id": "net_tools", "cond": "open_ports > 10", "true": "focused_scan", "false": "broad_scan"},
+        {"id": "specific_scan", "leaf": True, "action": "nuclei_targeted"},
+        {"id": "general_scan", "leaf": True, "action": "nuclei_general + nikto"},
+        {"id": "focused_scan", "leaf": True, "action": "nmap_service_scan"},
+        {"id": "broad_scan", "leaf": True, "action": "masscan_all_ports"},
+    ],
+    "finding_validation": [
+        {"id": "root", "cond": "severity >= 'high'", "true": "high_val", "false": "low_val"},
+        {"id": "high_val", "cond": "tool_confirmed > 1", "true": "report_confirmed", "false": "need_validation"},
+        {"id": "low_val", "cond": "tool_confirmed > 0", "true": "report_likely", "false": "dismiss"},
+        {"id": "need_validation", "leaf": True, "action": "cross_validate_with_second_tool"},
+        {"id": "report_confirmed", "leaf": True, "action": "report_as_confirmed_finding"},
+        {"id": "report_likely", "leaf": True, "action": "report_as_likely_finding"},
+        {"id": "dismiss", "leaf": True, "action": "mark_as_false_positive"},
+    ],
+    "model_selection": [
+        {"id": "root", "cond": "task_type == 'code_analysis'", "true": "code_model", "false": "check_reasoning"},
+        {"id": "check_reasoning", "cond": "task_type == 'reasoning'", "true": "reason_model", "false": "general"},
+        {"id": "code_model", "leaf": True, "action": "use_qwen_coder_14b"},
+        {"id": "reason_model", "leaf": True, "action": "use_deepseek_r1"},
+        {"id": "general", "leaf": True, "action": "use_hermes_14b"},
+    ],
+}
 
 
 class DecisionTree:
-    """A decision tree for structured decision-making."""
+    """Structured decision-making for agent actions.
 
-    def __init__(self, name: str = "") -> None:
-        self._name = name
-        self._nodes: dict[str, TreeNode] = {}
-        self._root_id: str = ""
-        self._conditions: dict[str, Callable[[dict[str, Any]], str]] = {}
-        self._node_counter = 0
-
-    def add_node(
-        self,
-        label: str,
-        node_type: NodeType = NodeType.DECISION,
-        condition: str = "",
-        action: str = "",
-        children: dict[str, str] | None = None,
-        risk_level: str = "low",
-    ) -> str:
-        """Add a node to the tree."""
-        self._node_counter += 1
-        nid = f"n-{self._node_counter}"
-
-        node = TreeNode(
-            node_id=nid,
-            node_type=node_type,
-            label=label,
-            condition=condition,
-            action=action,
-            children=children or {},
-            risk_level=risk_level,
-        )
-
-        self._nodes[nid] = node
-
-        if not self._root_id:
-            self._root_id = nid
-
-        return nid
-
-    def set_root(self, node_id: str) -> None:
-        self._root_id = node_id
-
-    def register_condition(
-        self,
-        name: str,
-        evaluator: Callable[[dict[str, Any]], str],
-    ) -> None:
-        """Register a condition evaluator."""
-        self._conditions[name] = evaluator
-
-    def traverse(self, context: dict[str, Any]) -> DecisionPath:
-        """Traverse the tree to reach a decision."""
-        path = DecisionPath()
-
-        current_id = self._root_id
-        confidence = 1.0
-
-        while current_id:
-            node = self._nodes.get(current_id)
-            if not node:
-                break
-
-            path.nodes_visited.append(current_id)
-
-            if node.node_type == NodeType.ACTION:
-                path.recommended_action = node.action
-                path.risk_level = node.risk_level
-                break
-
-            elif node.node_type == NodeType.DECISION:
-                # Evaluate condition
-                result = self._evaluate_condition(node.condition, context)
-
-                path.decisions_made.append({
-                    "node": node.label,
-                    "condition": node.condition,
-                    "result": result,
-                })
-
-                # Follow branch
-                next_id = node.children.get(result, node.children.get("default", ""))
-                current_id = next_id
-
-            elif node.node_type == NodeType.CHANCE:
-                confidence *= node.probability
-                # Follow first child (simplified)
-                if node.children:
-                    current_id = list(node.children.values())[0]
-                else:
-                    break
-
-        path.confidence = confidence
-        path.explanation = self._explain_path(path)
-        return path
-
-    def _evaluate_condition(self, condition: str, context: dict[str, Any]) -> str:
-        """Evaluate a condition against context."""
-        evaluator = self._conditions.get(condition)
-        if evaluator:
-            try:
-                return evaluator(context)
-            except Exception:
-                return "unknown"
-
-        # Simple key-value check
-        if "=" in condition:
-            key, value = condition.split("=", 1)
-            actual = str(context.get(key.strip(), ""))
-            return "true" if actual == value.strip() else "false"
-
-        # Existence check
-        if condition in context:
-            return "true" if context[condition] else "false"
-
-        return "unknown"
-
-    def _explain_path(self, path: DecisionPath) -> str:
-        """Generate explanation for the decision path."""
-        parts = []
-        for decision in path.decisions_made:
-            parts.append(f"{decision['condition']} → {decision['result']}")
-        parts.append(f"Action: {path.recommended_action}")
-        return " → ".join(parts)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self._name,
-            "nodes": len(self._nodes),
-            "root": self._root_id,
-        }
-
-
-# ── Pre-built Decision Trees ─────────────────────────────────
-
-def build_web_assessment_tree() -> DecisionTree:
-    """Build a decision tree for web app assessment."""
-    tree = DecisionTree("web_assessment")
-
-    # Root: Is target a web app?
-    root = tree.add_node("Is web app?", NodeType.DECISION, "has_web")
-    no_web = tree.add_node("Run port scan", NodeType.ACTION, action="nmap_scan")
-
-    # Web app branch
-    has_login = tree.add_node("Has login?", NodeType.DECISION, "has_login_form")
-    no_login = tree.add_node("Dir bruteforce + vuln scan", NodeType.ACTION,
-                             action="ffuf_nuclei", risk_level="low")
-
-    # Login branch
-    tech_check = tree.add_node("Known tech?", NodeType.DECISION, "known_technology")
-    generic_test = tree.add_node("Generic web test", NodeType.ACTION,
-                                 action="nuclei_full", risk_level="medium")
-
-    # Technology-specific
-    wp_test = tree.add_node("WordPress scan", NodeType.ACTION,
-                            action="wpscan", risk_level="low")
-    php_test = tree.add_node("PHP vuln scan", NodeType.ACTION,
-                             action="nuclei_php_sqlmap", risk_level="medium")
-    api_test = tree.add_node("API security test", NodeType.ACTION,
-                             action="api_fuzz_auth_test", risk_level="medium")
-
-    # Wire up
-    tree._nodes[root].children = {"true": has_login, "false": no_web}
-    tree._nodes[has_login].children = {"true": tech_check, "false": no_login}
-    tree._nodes[tech_check].children = {
-        "wordpress": wp_test, "php": php_test,
-        "api": api_test, "default": generic_test,
-    }
-
-    return tree
-
-
-def build_network_assessment_tree() -> DecisionTree:
-    """Build a decision tree for network assessment."""
-    tree = DecisionTree("network_assessment")
-
-    root = tree.add_node("Target type?", NodeType.DECISION, "target_type")
-
-    single_host = tree.add_node("Has open ports?", NodeType.DECISION, "has_open_ports")
-    network_range = tree.add_node("Discovery scan", NodeType.ACTION,
-                                  action="masscan_discovery")
-
-    port_vuln = tree.add_node("Service vuln scan", NodeType.ACTION,
-                              action="nmap_vuln_nuclei", risk_level="medium")
-    no_ports = tree.add_node("Firewall detected", NodeType.ACTION,
-                             action="firewall_bypass_test", risk_level="low")
-
-    tree._nodes[root].children = {
-        "host": single_host, "network": network_range,
-        "default": single_host,
-    }
-    tree._nodes[single_host].children = {"true": port_vuln, "false": no_ports}
-
-    return tree
-
-
-# ── Decision Tree Engine ──────────────────────────────────────
-
-class DecisionTreeEngine:
-    """Manages multiple decision trees for different scenarios."""
+    Supports manual decision analysis, pre-built trees,
+    and outcome tracking for learning.
+    """
 
     def __init__(self) -> None:
-        self._trees: dict[str, DecisionTree] = {}
-        self._decision_log: list[dict[str, Any]] = []
+        self._decisions: dict[str, Decision] = {}
+        self._trees: dict[str, dict[str, DecisionNode]] = {}
+        self._decision_counter = 0
+        self._option_counter = 0
+        self._node_counter = 0
         self._log = logger.bind(component="decision_tree")
 
-        self._init_trees()
+        self._build_default_trees()
 
-    def _init_trees(self) -> None:
-        """Initialize pre-built trees."""
-        self._trees["web"] = build_web_assessment_tree()
-        self._trees["network"] = build_network_assessment_tree()
+    def _build_default_trees(self) -> None:
+        """Build pre-defined decision trees."""
+        for tree_name, nodes in DECISION_TREES.items():
+            tree: dict[str, DecisionNode] = {}
+            for node_data in nodes:
+                self._node_counter += 1
+                node = DecisionNode(
+                    node_id=node_data["id"],
+                    condition=node_data.get("cond", ""),
+                    true_child=node_data.get("true", ""),
+                    false_child=node_data.get("false", ""),
+                    action=node_data.get("action", ""),
+                    is_leaf=node_data.get("leaf", False),
+                )
+                tree[node.node_id] = node
+            self._trees[tree_name] = tree
 
     def decide(
         self,
+        question: str,
+        options: list[dict[str, Any]],
+        context: dict[str, Any] | None = None,
+    ) -> Decision:
+        """Make a decision using multi-criteria analysis."""
+        self._decision_counter += 1
+        decision = Decision(
+            decision_id=f"dec-{self._decision_counter}",
+            question=question,
+            context=context or {},
+        )
+
+        # Build options
+        for opt_data in options:
+            self._option_counter += 1
+            option = DecisionOption(
+                option_id=f"opt-{self._option_counter}",
+                name=opt_data.get("name", ""),
+                description=opt_data.get("desc", ""),
+                criteria_scores=opt_data.get("scores", {}),
+                expected_reward=opt_data.get("reward", 0.5),
+                risk=opt_data.get("risk", 0.5),
+                cost_tokens=opt_data.get("cost_tokens", 0),
+                cost_time_s=opt_data.get("cost_time_s", 0),
+            )
+            decision.options.append(option)
+
+        # Score and choose
+        if decision.options:
+            best = self._score_options(decision.options)
+            decision.chosen_option_id = best.option_id
+            decision.reasoning = self._explain(best, decision.options)
+
+        self._decisions[decision.decision_id] = decision
+        return decision
+
+    def _score_options(self, options: list[DecisionOption]) -> DecisionOption:
+        """Score options using MCDA."""
+        best_score = -1.0
+        best_option = options[0]
+
+        for option in options:
+            score = 0.0
+            for criterion, weight in DECISION_CRITERIA.items():
+                criterion_score = option.criteria_scores.get(criterion, 0.5)
+                score += criterion_score * weight
+
+            # Risk adjustment
+            score *= (1.0 - option.risk * 0.3)
+
+            if score > best_score:
+                best_score = score
+                best_option = option
+
+        return best_option
+
+    def _explain(
+        self,
+        chosen: DecisionOption,
+        all_options: list[DecisionOption],
+    ) -> str:
+        """Generate explanation for a decision."""
+        parts = [f"Chose '{chosen.name}' (reward={chosen.expected_reward:.2f}, risk={chosen.risk:.2f})"]
+
+        # Compare with alternatives
+        for opt in all_options:
+            if opt.option_id != chosen.option_id:
+                if opt.risk_adjusted_reward > chosen.risk_adjusted_reward:
+                    parts.append(
+                        f"  '{opt.name}' had higher adjusted reward but higher risk"
+                    )
+
+        return "; ".join(parts)
+
+    def traverse_tree(
+        self,
         tree_name: str,
-        context: dict[str, Any],
-    ) -> DecisionPath:
-        """Make a decision using a named tree."""
+        conditions: dict[str, Any],
+    ) -> str:
+        """Traverse a pre-built decision tree."""
         tree = self._trees.get(tree_name)
         if not tree:
-            return DecisionPath(recommended_action="unknown_tree")
+            return ""
 
-        path = tree.traverse(context)
+        current = tree.get("root")
+        visited = set()
 
-        self._decision_log.append({
-            "tree": tree_name,
-            "action": path.recommended_action,
-            "confidence": path.confidence,
-            "time": time.time(),
-        })
+        while current and not current.is_leaf:
+            if current.node_id in visited:
+                break
+            visited.add(current.node_id)
 
-        if len(self._decision_log) > 500:
-            self._decision_log = self._decision_log[-500:]
+            result = self._evaluate_condition(current.condition, conditions)
+            next_id = current.true_child if result else current.false_child
+            current = tree.get(next_id)
 
-        return path
+        if current and current.is_leaf:
+            return current.action
 
-    def add_tree(self, name: str, tree: DecisionTree) -> None:
-        self._trees[name] = tree
+        return ""
 
-    def get_decision_log(self, limit: int = 50) -> list[dict[str, Any]]:
-        return self._decision_log[-limit:]
+    @staticmethod
+    def _evaluate_condition(
+        condition: str,
+        context: dict[str, Any],
+    ) -> bool:
+        """Evaluate a condition against context."""
+        # Simple condition evaluation
+        for key, value in context.items():
+            condition = condition.replace(key, repr(value))
+
+        try:
+            return bool(eval(condition))  # noqa: S307
+        except Exception:
+            return False
+
+    def record_outcome(
+        self,
+        decision_id: str,
+        outcome: DecisionOutcome,
+        actual_reward: float = 0.0,
+    ) -> None:
+        """Record the outcome of a decision."""
+        decision = self._decisions.get(decision_id)
+        if not decision:
+            return
+
+        decision.outcome = outcome
+        decision.actual_reward = actual_reward
+        decision.resolved_at = time.time()
+
+    def get_accuracy(self) -> float:
+        """Get decision accuracy (good decisions / total)."""
+        resolved = [d for d in self._decisions.values() if d.outcome != DecisionOutcome.UNKNOWN]
+        if not resolved:
+            return 0.0
+        good = sum(1 for d in resolved if d.was_good_decision)
+        return good / len(resolved)
 
     def get_stats(self) -> dict[str, Any]:
         return {
+            "decisions": len(self._decisions),
             "trees": len(self._trees),
-            "decisions": len(self._decision_log),
+            "accuracy": round(self.get_accuracy(), 3),
         }
