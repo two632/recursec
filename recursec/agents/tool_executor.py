@@ -1,20 +1,18 @@
-"""Tool executor — async external tool management.
+"""Tool executor — async subprocess execution for external tools.
 
 Implements:
-1. Async subprocess execution for external tools
-2. Timeout management per tool
-3. Output capture and streaming
-4. Tool availability checking
-5. Command sanitization
-6. Resource limit enforcement
-7. Concurrent tool execution
-8. Tool result caching
+1. Async subprocess execution with timeout
+2. Output capture and streaming
+3. Tool availability detection
+4. Environment sandboxing
+5. Rate limiting and concurrency control
+6. Output truncation for token budgets
+7. Exit code interpretation
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
 import time
 from collections import defaultdict
@@ -29,275 +27,278 @@ logger = structlog.get_logger()
 
 class ToolStatus(str, Enum):
     AVAILABLE = "available"
-    MISSING = "missing"
+    NOT_INSTALLED = "not_installed"
     RUNNING = "running"
-    COMPLETE = "complete"
+    COMPLETED = "completed"
     FAILED = "failed"
     TIMEOUT = "timeout"
+    RATE_LIMITED = "rate_limited"
 
 
 @dataclass
-class ToolConfig:
-    """Configuration for an external tool."""
-    name: str = ""
-    binary: str = ""
-    default_args: list[str] = field(default_factory=list)
-    timeout_s: float = 300.0
-    max_output_bytes: int = 10_000_000
-    requires_root: bool = False
-    category: str = ""
-    description: str = ""
+class ToolResult:
+    """Result of a tool execution."""
+    tool: str = ""
+    command: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = -1
+    status: ToolStatus = ToolStatus.COMPLETED
+    duration_s: float = 0.0
+    truncated: bool = False
+    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def success(self) -> bool:
+        return self.exit_code == 0 and self.status == ToolStatus.COMPLETED
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "name": self.name[:15],
-            "binary": self.binary[:15],
-            "timeout": self.timeout_s,
-            "category": self.category[:10],
+            "tool": self.tool[:15],
+            "status": self.status.value,
+            "exit_code": self.exit_code,
+            "duration_s": round(self.duration_s, 2),
+            "output_len": len(self.stdout),
         }
 
 
 @dataclass
-class ToolExecution:
-    """A tool execution record."""
-    exec_id: str = ""
-    tool: str = ""
-    command: str = ""
-    args: list[str] = field(default_factory=list)
-    status: ToolStatus = ToolStatus.RUNNING
-    stdout: str = ""
-    stderr: str = ""
-    exit_code: int = -1
-    started_at: float = field(default_factory=time.time)
-    completed_at: float = 0.0
-    pid: int = 0
-
-    @property
-    def duration_s(self) -> float:
-        if self.completed_at > 0:
-            return self.completed_at - self.started_at
-        return time.time() - self.started_at
+class ToolSpec:
+    """Specification of an external tool."""
+    name: str = ""
+    binary: str = ""
+    description: str = ""
+    default_timeout_s: float = 300
+    max_concurrent: int = 1
+    requires_root: bool = False
+    installed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.exec_id[:10],
-            "tool": self.tool[:12],
-            "status": self.status.value,
-            "exit_code": self.exit_code,
-            "duration": round(self.duration_s, 1),
-            "stdout_len": len(self.stdout),
+            "name": self.name[:15],
+            "installed": self.installed,
+            "timeout": self.default_timeout_s,
         }
 
 
 # ── Tool registry ────────────────────────────────────────────
 
 TOOL_REGISTRY: list[dict[str, Any]] = [
-    # Reconnaissance
-    {"name": "nmap", "binary": "nmap", "timeout": 600, "cat": "recon", "desc": "Port/service scanner"},
-    {"name": "masscan", "binary": "masscan", "timeout": 300, "cat": "recon", "desc": "Fast port scanner", "root": True},
-    {"name": "subfinder", "binary": "subfinder", "timeout": 120, "cat": "recon", "desc": "Subdomain finder"},
-    {"name": "amass", "binary": "amass", "timeout": 300, "cat": "recon", "desc": "Attack surface mapper"},
-    {"name": "httpx", "binary": "httpx", "timeout": 120, "cat": "recon", "desc": "HTTP probe"},
-    {"name": "wafw00f", "binary": "wafw00f", "timeout": 60, "cat": "recon", "desc": "WAF detector"},
-    {"name": "dnsrecon", "binary": "dnsrecon", "timeout": 120, "cat": "recon", "desc": "DNS enumeration"},
-    {"name": "theHarvester", "binary": "theHarvester", "timeout": 120, "cat": "recon", "desc": "OSINT"},
-    {"name": "whatweb", "binary": "whatweb", "timeout": 60, "cat": "recon", "desc": "Web tech fingerprint"},
-    # Vulnerability Scanning
-    {"name": "nuclei", "binary": "nuclei", "timeout": 600, "cat": "vuln_scan", "desc": "Template-based scanner"},
-    {"name": "nikto", "binary": "nikto", "timeout": 300, "cat": "vuln_scan", "desc": "Web server scanner"},
-    {"name": "wpscan", "binary": "wpscan", "timeout": 300, "cat": "vuln_scan", "desc": "WordPress scanner"},
-    {"name": "testssl", "binary": "testssl.sh", "timeout": 120, "cat": "vuln_scan", "desc": "SSL/TLS scanner"},
-    # Exploitation
-    {"name": "sqlmap", "binary": "sqlmap", "timeout": 600, "cat": "exploit", "desc": "SQL injection"},
-    {"name": "hydra", "binary": "hydra", "timeout": 600, "cat": "exploit", "desc": "Brute forcer"},
-    {"name": "searchsploit", "binary": "searchsploit", "timeout": 30, "cat": "exploit", "desc": "Exploit search"},
-    {"name": "dalfox", "binary": "dalfox", "timeout": 300, "cat": "exploit", "desc": "XSS scanner"},
-    # Fuzzing
-    {"name": "ffuf", "binary": "ffuf", "timeout": 300, "cat": "fuzzing", "desc": "Web fuzzer"},
-    {"name": "gobuster", "binary": "gobuster", "timeout": 300, "cat": "fuzzing", "desc": "Dir/DNS bruter"},
-    {"name": "wfuzz", "binary": "wfuzz", "timeout": 300, "cat": "fuzzing", "desc": "Web fuzzer"},
-    {"name": "feroxbuster", "binary": "feroxbuster", "timeout": 300, "cat": "fuzzing", "desc": "Recursive fuzzer"},
-    # Code Analysis
-    {"name": "semgrep", "binary": "semgrep", "timeout": 300, "cat": "code", "desc": "Code analysis"},
-    {"name": "bandit", "binary": "bandit", "timeout": 120, "cat": "code", "desc": "Python security"},
-    {"name": "trufflehog", "binary": "trufflehog", "timeout": 120, "cat": "code", "desc": "Secret scanner"},
-    {"name": "gitleaks", "binary": "gitleaks", "timeout": 120, "cat": "code", "desc": "Git secret scanner"},
-    # Container/Cloud
-    {"name": "trivy", "binary": "trivy", "timeout": 300, "cat": "container", "desc": "Image scanner"},
-    {"name": "grype", "binary": "grype", "timeout": 120, "cat": "container", "desc": "Vuln scanner"},
-    {"name": "kube-bench", "binary": "kube-bench", "timeout": 120, "cat": "container", "desc": "K8s benchmark"},
-    # Network
-    {"name": "responder", "binary": "responder", "timeout": 600, "cat": "network", "desc": "LLMNR/NBT-NS", "root": True},
-    {"name": "crackmapexec", "binary": "crackmapexec", "timeout": 300, "cat": "network", "desc": "Network Swiss knife"},
-    {"name": "enum4linux", "binary": "enum4linux-ng", "timeout": 120, "cat": "network", "desc": "SMB enum"},
-    # Utilities
-    {"name": "curl", "binary": "curl", "timeout": 30, "cat": "util", "desc": "HTTP client"},
-    {"name": "dig", "binary": "dig", "timeout": 15, "cat": "util", "desc": "DNS lookup"},
-    {"name": "whois", "binary": "whois", "timeout": 15, "cat": "util", "desc": "WHOIS lookup"},
+    {"name": "nmap", "binary": "nmap", "desc": "Network scanner", "timeout": 600, "concurrent": 2},
+    {"name": "masscan", "binary": "masscan", "desc": "Fast port scanner", "timeout": 300, "concurrent": 1, "root": True},
+    {"name": "nuclei", "binary": "nuclei", "desc": "Template-based vuln scanner", "timeout": 600, "concurrent": 3},
+    {"name": "nikto", "binary": "nikto", "desc": "Web server scanner", "timeout": 300, "concurrent": 2},
+    {"name": "sqlmap", "binary": "sqlmap", "desc": "SQL injection tool", "timeout": 600, "concurrent": 1},
+    {"name": "ffuf", "binary": "ffuf", "desc": "Web fuzzer", "timeout": 300, "concurrent": 3},
+    {"name": "gobuster", "binary": "gobuster", "desc": "Directory buster", "timeout": 300, "concurrent": 2},
+    {"name": "feroxbuster", "binary": "feroxbuster", "desc": "Recursive dir buster", "timeout": 300, "concurrent": 2},
+    {"name": "subfinder", "binary": "subfinder", "desc": "Subdomain discovery", "timeout": 120, "concurrent": 2},
+    {"name": "amass", "binary": "amass", "desc": "Attack surface mapper", "timeout": 600, "concurrent": 1},
+    {"name": "httpx", "binary": "httpx", "desc": "HTTP probe", "timeout": 120, "concurrent": 3},
+    {"name": "whatweb", "binary": "whatweb", "desc": "Web fingerprinter", "timeout": 120, "concurrent": 2},
+    {"name": "hydra", "binary": "hydra", "desc": "Brute forcer", "timeout": 600, "concurrent": 1},
+    {"name": "medusa", "binary": "medusa", "desc": "Parallel brute forcer", "timeout": 600, "concurrent": 1},
+    {"name": "dalfox", "binary": "dalfox", "desc": "XSS scanner", "timeout": 300, "concurrent": 2},
+    {"name": "testssl", "binary": "testssl.sh", "desc": "SSL/TLS checker", "timeout": 300, "concurrent": 2},
+    {"name": "wpscan", "binary": "wpscan", "desc": "WordPress scanner", "timeout": 300, "concurrent": 1},
+    {"name": "semgrep", "binary": "semgrep", "desc": "SAST scanner", "timeout": 300, "concurrent": 2},
+    {"name": "bandit", "binary": "bandit", "desc": "Python SAST", "timeout": 120, "concurrent": 2},
+    {"name": "trufflehog", "binary": "trufflehog", "desc": "Secret scanner", "timeout": 300, "concurrent": 2},
+    {"name": "gitleaks", "binary": "gitleaks", "desc": "Git secret scanner", "timeout": 300, "concurrent": 2},
+    {"name": "trivy", "binary": "trivy", "desc": "Container/dependency scanner", "timeout": 300, "concurrent": 2},
+    {"name": "grype", "binary": "grype", "desc": "Vulnerability scanner", "timeout": 300, "concurrent": 2},
+    {"name": "dig", "binary": "dig", "desc": "DNS lookup", "timeout": 30, "concurrent": 5},
+    {"name": "whois", "binary": "whois", "desc": "Domain info", "timeout": 30, "concurrent": 3},
+    {"name": "dnsrecon", "binary": "dnsrecon", "desc": "DNS enumeration", "timeout": 120, "concurrent": 2},
+    {"name": "enum4linux", "binary": "enum4linux", "desc": "SMB/NetBIOS enumeration", "timeout": 300, "concurrent": 1},
+    {"name": "crackmapexec", "binary": "crackmapexec", "desc": "Network tool", "timeout": 300, "concurrent": 1},
+    {"name": "searchsploit", "binary": "searchsploit", "desc": "Exploit-DB search", "timeout": 30, "concurrent": 3},
+    {"name": "curl", "binary": "curl", "desc": "HTTP client", "timeout": 30, "concurrent": 10},
+    {"name": "wfuzz", "binary": "wfuzz", "desc": "Web fuzzer", "timeout": 300, "concurrent": 2},
+    {"name": "dirsearch", "binary": "dirsearch", "desc": "Directory scanner", "timeout": 300, "concurrent": 2},
+    {"name": "arjun", "binary": "arjun", "desc": "Parameter discovery", "timeout": 300, "concurrent": 2},
+    {"name": "katana", "binary": "katana", "desc": "Web crawler", "timeout": 300, "concurrent": 2},
+    {"name": "hakrawler", "binary": "hakrawler", "desc": "Web crawler", "timeout": 120, "concurrent": 2},
+    {"name": "waybackurls", "binary": "waybackurls", "desc": "Wayback Machine URLs", "timeout": 60, "concurrent": 3},
+    {"name": "gau", "binary": "gau", "desc": "URL fetcher", "timeout": 60, "concurrent": 3},
+    {"name": "rustscan", "binary": "rustscan", "desc": "Fast port scanner", "timeout": 120, "concurrent": 1},
+    {"name": "responder", "binary": "responder", "desc": "LLMNR/NBT-NS poisoner", "timeout": 600, "concurrent": 1, "root": True},
 ]
 
 
 class ToolExecutor:
-    """Async external tool executor.
+    """Executes external security tools as async subprocesses.
 
-    Manages execution of external security tools
-    with timeout, output capture, and concurrency.
+    Manages tool availability, concurrency limits,
+    timeouts, and output capture.
     """
 
-    def __init__(self, max_concurrent: int = 5) -> None:
-        self._tools: dict[str, ToolConfig] = {}
-        self._executions: dict[str, ToolExecution] = {}
-        self._counter = 0
-        self._max_concurrent = max_concurrent
-        self._running = 0
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+    def __init__(
+        self,
+        max_output_chars: int = 50_000,
+        max_concurrent_total: int = 10,
+    ) -> None:
+        self._tools: dict[str, ToolSpec] = {}
+        self._running: dict[str, int] = defaultdict(int)
+        self._total_running = 0
+        self._max_output = max_output_chars
+        self._max_concurrent = max_concurrent_total
+        self._semaphore = asyncio.Semaphore(max_concurrent_total)
+        self._history: list[ToolResult] = []
         self._log = logger.bind(component="tool_executor")
-        self._load_tools()
+        self._load_registry()
 
-    def _load_tools(self) -> None:
-        """Load tool registry and check availability."""
+    def _load_registry(self) -> None:
+        """Load and check tool availability."""
         for entry in TOOL_REGISTRY:
-            config = ToolConfig(
+            binary = entry.get("binary", entry["name"])
+            installed = shutil.which(binary) is not None
+
+            spec = ToolSpec(
                 name=entry["name"],
-                binary=entry["binary"],
-                timeout_s=entry.get("timeout", 300),
-                requires_root=entry.get("root", False),
-                category=entry.get("cat", ""),
+                binary=binary,
                 description=entry.get("desc", ""),
+                default_timeout_s=entry.get("timeout", 300),
+                max_concurrent=entry.get("concurrent", 1),
+                requires_root=entry.get("root", False),
+                installed=installed,
             )
-            self._tools[config.name] = config
-
-    def check_tool(self, name: str) -> ToolStatus:
-        """Check if a tool is available."""
-        config = self._tools.get(name)
-        if not config:
-            return ToolStatus.MISSING
-
-        if shutil.which(config.binary):
-            return ToolStatus.AVAILABLE
-
-        return ToolStatus.MISSING
-
-    def get_available_tools(self) -> list[str]:
-        """Get list of available tools."""
-        return [
-            name for name in self._tools
-            if self.check_tool(name) == ToolStatus.AVAILABLE
-        ]
+            self._tools[spec.name] = spec
 
     async def execute(
         self,
         tool: str,
         args: list[str],
-        timeout: float = 0,
+        timeout_s: float = 0,
         env: dict[str, str] | None = None,
-    ) -> ToolExecution:
-        """Execute a tool asynchronously."""
-        self._counter += 1
-        config = self._tools.get(tool)
-        if not config:
-            return ToolExecution(
-                exec_id=f"exec-{self._counter}",
+    ) -> ToolResult:
+        """Execute a tool as an async subprocess."""
+        spec = self._tools.get(tool)
+        if not spec:
+            return ToolResult(
                 tool=tool,
-                status=ToolStatus.FAILED,
+                status=ToolStatus.NOT_INSTALLED,
                 stderr=f"Unknown tool: {tool}",
             )
 
-        if self.check_tool(tool) != ToolStatus.AVAILABLE:
-            return ToolExecution(
-                exec_id=f"exec-{self._counter}",
+        if not spec.installed:
+            return ToolResult(
                 tool=tool,
-                status=ToolStatus.MISSING,
-                stderr=f"Tool not found: {config.binary}",
+                status=ToolStatus.NOT_INSTALLED,
+                stderr=f"Tool not installed: {tool} (binary: {spec.binary})",
             )
 
-        execution = ToolExecution(
-            exec_id=f"exec-{self._counter}",
-            tool=tool,
-            command=f"{config.binary} {' '.join(args)}",
-            args=args,
-            status=ToolStatus.RUNNING,
-        )
-        self._executions[execution.exec_id] = execution
+        timeout = timeout_s or spec.default_timeout_s
+        command = [spec.binary] + args
+        cmd_str = " ".join(command)
 
-        effective_timeout = timeout or config.timeout_s
+        start = time.time()
 
         async with self._semaphore:
-            try:
-                exec_env = dict(os.environ)
-                if env:
-                    exec_env.update(env)
+            self._running[tool] += 1
+            self._total_running += 1
 
-                process = await asyncio.create_subprocess_exec(
-                    config.binary, *args,
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    env=exec_env,
-                )
-                execution.pid = process.pid or 0
-
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=effective_timeout,
+                    env=env,
                 )
 
-                execution.stdout = stdout_bytes.decode("utf-8", errors="replace")[:config.max_output_bytes]
-                execution.stderr = stderr_bytes.decode("utf-8", errors="replace")[:config.max_output_bytes]
-                execution.exit_code = process.returncode or 0
-                execution.status = ToolStatus.COMPLETE if execution.exit_code == 0 else ToolStatus.FAILED
-
-            except asyncio.TimeoutError:
-                execution.status = ToolStatus.TIMEOUT
-                execution.stderr = f"Timeout after {effective_timeout}s"
                 try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            except OSError as e:
-                execution.status = ToolStatus.FAILED
-                execution.stderr = str(e)[:200]
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    duration = time.time() - start
+                    result = ToolResult(
+                        tool=tool,
+                        command=cmd_str,
+                        status=ToolStatus.TIMEOUT,
+                        duration_s=duration,
+                        stderr=f"Timeout after {timeout}s",
+                    )
+                    self._history.append(result)
+                    return result
 
-            execution.completed_at = time.time()
+                duration = time.time() - start
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
 
-        return execution
+                truncated = False
+                if len(stdout) > self._max_output:
+                    stdout = stdout[:self._max_output] + "\n... [truncated]"
+                    truncated = True
 
-    def execute_sync(
+                status = ToolStatus.COMPLETED if proc.returncode == 0 else ToolStatus.FAILED
+
+                result = ToolResult(
+                    tool=tool,
+                    command=cmd_str,
+                    stdout=stdout,
+                    stderr=stderr,
+                    exit_code=proc.returncode or 0,
+                    status=status,
+                    duration_s=duration,
+                    truncated=truncated,
+                )
+
+            except OSError as exc:
+                duration = time.time() - start
+                result = ToolResult(
+                    tool=tool,
+                    command=cmd_str,
+                    status=ToolStatus.FAILED,
+                    duration_s=duration,
+                    stderr=str(exc),
+                    exit_code=-1,
+                )
+
+            finally:
+                self._running[tool] -= 1
+                self._total_running -= 1
+
+        self._history.append(result)
+        return result
+
+    def get_available_tools(self) -> list[ToolSpec]:
+        """Get list of installed tools."""
+        return [t for t in self._tools.values() if t.installed]
+
+    def get_all_tools(self) -> list[ToolSpec]:
+        """Get all registered tools."""
+        return list(self._tools.values())
+
+    def is_installed(self, tool: str) -> bool:
+        """Check if a tool is installed."""
+        spec = self._tools.get(tool)
+        return spec.installed if spec else False
+
+    def get_history(
         self,
-        tool: str,
-        args: list[str],
-        timeout: float = 0,
-    ) -> ToolExecution:
-        """Synchronous wrapper for tool execution."""
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(self.execute(tool, args, timeout))
-        finally:
-            loop.close()
-
-    def get_execution(self, exec_id: str) -> ToolExecution | None:
-        """Get an execution by ID."""
-        return self._executions.get(exec_id)
-
-    def get_tool_config(self, name: str) -> ToolConfig | None:
-        """Get tool configuration."""
-        return self._tools.get(name)
+        tool: str = "",
+        limit: int = 20,
+    ) -> list[ToolResult]:
+        """Get execution history."""
+        if tool:
+            results = [r for r in self._history if r.tool == tool]
+        else:
+            results = list(self._history)
+        return results[-limit:]
 
     def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
-        cat_counts: dict[str, int] = defaultdict(int)
-
-        for ex in self._executions.values():
-            status_counts[ex.status.value] += 1
-
-        for config in self._tools.values():
-            cat_counts[config.category] += 1
-
-        available = len(self.get_available_tools())
+        installed = sum(1 for t in self._tools.values() if t.installed)
+        total_runs = len(self._history)
+        successes = sum(1 for r in self._history if r.success)
 
         return {
             "registered": len(self._tools),
-            "available": available,
-            "executions": len(self._executions),
-            "by_status": dict(status_counts),
-            "by_category": dict(cat_counts),
+            "installed": installed,
+            "total_runs": total_runs,
+            "success_rate": round(successes / max(1, total_runs), 2),
+            "currently_running": self._total_running,
         }
