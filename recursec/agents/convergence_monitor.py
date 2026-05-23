@@ -1,19 +1,18 @@
-"""Convergence monitor — detects assessment stagnation and plateau.
+"""Convergence monitor — detects when assessment has explored enough.
 
 Implements:
-1. Finding rate tracking over time
-2. Diminishing returns detection
-3. Coverage estimation
-4. Strategy exhaustion detection
-5. Automatic phase transition triggers
-6. Time-based stagnation alerts
-7. Cost-effectiveness tracking
+1. Diminishing returns detection (new findings rate)
+2. Coverage tracking (attack surface explored %)
+3. Token efficiency monitoring (findings per token)
+4. Time-based convergence thresholds
+5. Agent productivity tracking
+6. Early stopping recommendations
+7. Convergence prompt for LLM decisions
 """
 
 from __future__ import annotations
 
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -23,297 +22,278 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ConvergenceStatus(str, Enum):
-    ACCELERATING = "accelerating"    # Finding rate increasing
-    STEADY = "steady"                # Stable finding rate
-    DECELERATING = "decelerating"    # Finding rate decreasing
-    PLATEAU = "plateau"              # No new significant findings
-    STAGNANT = "stagnant"            # Extended plateau
-
-
-class ActionRecommendation(str, Enum):
-    CONTINUE = "continue"
-    SWITCH_PHASE = "switch_phase"
-    DEEPEN = "deepen"                # Go deeper on current target
-    BROADEN = "broaden"              # Expand scope
-    ESCALATE = "escalate"            # Use more aggressive tools
-    STOP = "stop"                    # Assessment complete
+class ConvergenceState(str, Enum):
+    EXPLORING = "exploring"           # Still finding new things
+    DIMINISHING = "diminishing"       # Rate of findings dropping
+    CONVERGING = "converging"         # Near-convergence
+    CONVERGED = "converged"           # Stop — diminishing returns
+    FORCED_STOP = "forced_stop"       # Budget/time exhausted
 
 
 @dataclass
-class ConvergenceSnapshot:
-    """A point-in-time convergence measurement."""
-    timestamp: float = field(default_factory=time.time)
-    total_findings: int = 0
-    new_findings_since_last: int = 0
-    unique_categories: int = 0
-    tokens_spent: int = 0
+class ConvergenceWindow:
+    """A time window for measuring convergence."""
+    window_start: float = 0.0
+    window_end: float = 0.0
+    findings_count: int = 0
+    tokens_used: int = 0
+    agents_active: int = 0
     tools_run: int = 0
-    phase: str = ""
-    status: ConvergenceStatus = ConvergenceStatus.STEADY
 
     @property
-    def cost_per_finding(self) -> float:
-        if self.total_findings == 0:
-            return float("inf")
-        return self.tokens_spent / self.total_findings
+    def duration_s(self) -> float:
+        return self.window_end - self.window_start
+
+    @property
+    def finding_rate(self) -> float:
+        """Findings per minute."""
+        d = self.duration_s
+        if d <= 0:
+            return 0.0
+        return (self.findings_count / d) * 60.0
+
+    @property
+    def token_efficiency(self) -> float:
+        """Findings per 1000 tokens."""
+        if self.tokens_used == 0:
+            return 0.0
+        return (self.findings_count / self.tokens_used) * 1000.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "total_findings": self.total_findings,
-            "new": self.new_findings_since_last,
-            "categories": self.unique_categories,
-            "tokens": self.tokens_spent,
-            "status": self.status.value,
+            "findings": self.findings_count,
+            "rate": round(self.finding_rate, 2),
+            "tokens": self.tokens_used,
+            "efficiency": round(self.token_efficiency, 2),
         }
 
 
 @dataclass
-class StrategyTracker:
-    """Tracks which strategies have been tried."""
-    strategy_name: str = ""
-    times_used: int = 0
-    findings_produced: int = 0
-    tokens_consumed: int = 0
-    last_used_at: float = 0.0
-
-    @property
-    def effectiveness(self) -> float:
-        if self.tokens_consumed == 0:
-            return 0.0
-        return self.findings_produced / (self.tokens_consumed / 1000)
+class ConvergenceMetrics:
+    """Overall convergence metrics."""
+    state: ConvergenceState = ConvergenceState.EXPLORING
+    total_findings: int = 0
+    total_tokens: int = 0
+    total_duration_s: float = 0.0
+    unique_targets_tested: int = 0
+    total_targets: int = 0
+    coverage_pct: float = 0.0
+    current_finding_rate: float = 0.0
+    peak_finding_rate: float = 0.0
+    rate_of_change: float = 0.0       # Negative = declining
+    windows: list[ConvergenceWindow] = field(default_factory=list)
+    recommendation: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "strategy": self.strategy_name[:20],
-            "used": self.times_used,
-            "findings": self.findings_produced,
-            "effectiveness": round(self.effectiveness, 2),
+            "state": self.state.value,
+            "findings": self.total_findings,
+            "coverage": f"{self.coverage_pct:.0f}%",
+            "rate": round(self.current_finding_rate, 2),
+            "peak_rate": round(self.peak_finding_rate, 2),
+            "recommendation": self.recommendation[:30],
         }
-
-
-# ── Convergence thresholds ───────────────────────────────────
-
-CONVERGENCE_THRESHOLDS: dict[str, Any] = {
-    "plateau_window": 5,            # Snapshots with no new findings
-    "stagnation_window": 10,        # Extended plateau
-    "deceleration_rate": 0.3,       # Finding rate drop threshold
-    "min_findings_per_phase": 1,    # Minimum findings before phase change
-    "cost_ceiling_multiplier": 5.0, # Max cost relative to avg
-    "max_same_strategy": 3,         # Max uses of same strategy without findings
-}
-
-# ── Strategy definitions ─────────────────────────────────────
-
-AVAILABLE_STRATEGIES: list[str] = [
-    "passive_recon",
-    "active_recon",
-    "port_scanning",
-    "service_enumeration",
-    "web_scanning",
-    "vuln_scanning",
-    "manual_testing",
-    "exploitation",
-    "code_review",
-    "config_review",
-    "fuzz_testing",
-    "auth_testing",
-    "api_testing",
-    "crypto_testing",
-]
 
 
 class ConvergenceMonitor:
     """Monitors assessment convergence.
 
-    Detects when finding rate plateaus,
-    strategies are exhausted, and recommends
-    phase transitions or assessment completion.
+    Tracks finding rates, coverage, and token
+    efficiency to recommend when an assessment
+    has explored enough of the attack surface.
     """
 
-    def __init__(self) -> None:
-        self._snapshots: deque[ConvergenceSnapshot] = deque(maxlen=100)
-        self._strategies: dict[str, StrategyTracker] = {}
-        self._last_total_findings = 0
+    def __init__(
+        self,
+        window_size_s: float = 300.0,    # 5-minute windows
+        min_rate_threshold: float = 0.1,  # Minimum findings/min
+        convergence_windows: int = 3,     # Consecutive low-rate windows
+        max_tokens: int = 1000000,
+        max_duration_s: float = 14400.0,  # 4 hours
+    ) -> None:
+        self._window_size = window_size_s
+        self._min_rate = min_rate_threshold
+        self._convergence_count = convergence_windows
+        self._max_tokens = max_tokens
+        self._max_duration = max_duration_s
+
+        self._metrics = ConvergenceMetrics()
+        self._windows: list[ConvergenceWindow] = []
+        self._current_window: ConvergenceWindow | None = None
+        self._started_at: float = 0.0
+        self._targets_tested: set[str] = set()
+        self._low_rate_streak: int = 0
         self._log = logger.bind(component="convergence_monitor")
 
-        # Initialize strategy trackers
-        for strategy in AVAILABLE_STRATEGIES:
-            self._strategies[strategy] = StrategyTracker(strategy_name=strategy)
+    def start(self, total_targets: int = 0) -> None:
+        """Start convergence monitoring."""
+        self._started_at = time.time()
+        self._metrics.total_targets = total_targets
+        self._start_new_window()
 
-    def record_snapshot(
-        self,
-        total_findings: int,
-        unique_categories: int,
-        tokens_spent: int,
-        tools_run: int,
-        phase: str = "",
-    ) -> ConvergenceSnapshot:
-        """Record a convergence snapshot."""
-        new_findings = total_findings - self._last_total_findings
-        self._last_total_findings = total_findings
+    def record_finding(self, target: str = "") -> None:
+        """Record a new finding."""
+        self._metrics.total_findings += 1
+        if target:
+            self._targets_tested.add(target)
 
-        snapshot = ConvergenceSnapshot(
-            total_findings=total_findings,
-            new_findings_since_last=new_findings,
-            unique_categories=unique_categories,
-            tokens_spent=tokens_spent,
-            tools_run=tools_run,
-            phase=phase,
+        if self._current_window:
+            self._current_window.findings_count += 1
+
+        self._check_window()
+
+    def record_tokens(self, tokens: int) -> None:
+        """Record token usage."""
+        self._metrics.total_tokens += tokens
+        if self._current_window:
+            self._current_window.tokens_used += tokens
+        self._check_window()
+
+    def record_tool_run(self) -> None:
+        """Record a tool execution."""
+        if self._current_window:
+            self._current_window.tools_run += 1
+
+    def check_convergence(self) -> ConvergenceMetrics:
+        """Check current convergence state."""
+        self._check_window()
+        self._update_metrics()
+        return self._metrics
+
+    def should_stop(self) -> bool:
+        """Whether the assessment should stop."""
+        self._check_window()
+        self._update_metrics()
+        return self._metrics.state in (
+            ConvergenceState.CONVERGED,
+            ConvergenceState.FORCED_STOP,
         )
-
-        # Determine status
-        snapshot.status = self._evaluate_status(new_findings)
-        self._snapshots.append(snapshot)
-
-        return snapshot
-
-    def _evaluate_status(self, new_findings: int) -> ConvergenceStatus:
-        """Evaluate convergence status."""
-        if len(self._snapshots) < 2:
-            return ConvergenceStatus.STEADY
-
-        recent = list(self._snapshots)[-5:]
-        recent_new = [s.new_findings_since_last for s in recent]
-
-        # Check for plateau
-        plateau_window = CONVERGENCE_THRESHOLDS["plateau_window"]
-        if len(recent) >= plateau_window:
-            if all(n == 0 for n in recent_new[-plateau_window:]):
-                stag_window = CONVERGENCE_THRESHOLDS["stagnation_window"]
-                if len(self._snapshots) >= stag_window:
-                    extended = list(self._snapshots)[-stag_window:]
-                    if all(s.new_findings_since_last == 0 for s in extended):
-                        return ConvergenceStatus.STAGNANT
-                return ConvergenceStatus.PLATEAU
-
-        # Check acceleration/deceleration
-        if len(recent) >= 3:
-            avg_old = sum(recent_new[:2]) / 2.0 if len(recent_new) >= 2 else 0
-            avg_new = sum(recent_new[-2:]) / 2.0 if len(recent_new) >= 2 else 0
-
-            if avg_new > avg_old * 1.2:
-                return ConvergenceStatus.ACCELERATING
-            if avg_old > 0 and avg_new < avg_old * CONVERGENCE_THRESHOLDS["deceleration_rate"]:
-                return ConvergenceStatus.DECELERATING
-
-        return ConvergenceStatus.STEADY
-
-    def record_strategy_use(
-        self,
-        strategy_name: str,
-        findings_produced: int = 0,
-        tokens_consumed: int = 0,
-    ) -> None:
-        """Record use of a strategy."""
-        tracker = self._strategies.get(strategy_name)
-        if not tracker:
-            tracker = StrategyTracker(strategy_name=strategy_name)
-            self._strategies[strategy_name] = tracker
-
-        tracker.times_used += 1
-        tracker.findings_produced += findings_produced
-        tracker.tokens_consumed += tokens_consumed
-        tracker.last_used_at = time.time()
-
-    def get_recommendation(self) -> ActionRecommendation:
-        """Get recommended action based on convergence."""
-        if not self._snapshots:
-            return ActionRecommendation.CONTINUE
-
-        latest = self._snapshots[-1]
-
-        if latest.status == ConvergenceStatus.STAGNANT:
-            # Check if we've tried everything
-            unused = self._get_unused_strategies()
-            if not unused:
-                return ActionRecommendation.STOP
-            return ActionRecommendation.BROADEN
-
-        if latest.status == ConvergenceStatus.PLATEAU:
-            # Try deeper or switch phase
-            exhausted = self._get_exhausted_strategies()
-            if len(exhausted) > len(self._strategies) * 0.7:
-                return ActionRecommendation.SWITCH_PHASE
-            return ActionRecommendation.DEEPEN
-
-        if latest.status == ConvergenceStatus.DECELERATING:
-            return ActionRecommendation.ESCALATE
-
-        return ActionRecommendation.CONTINUE
-
-    def get_next_strategy(self) -> str | None:
-        """Recommend the next strategy to try."""
-        # Prefer unused strategies
-        unused = self._get_unused_strategies()
-        if unused:
-            return unused[0]
-
-        # Then low-use, high-effectiveness strategies
-        active = [
-            s for s in self._strategies.values()
-            if s.times_used < CONVERGENCE_THRESHOLDS["max_same_strategy"]
-        ]
-        if active:
-            active.sort(key=lambda s: s.effectiveness, reverse=True)
-            return active[0].strategy_name
-
-        return None
-
-    def _get_unused_strategies(self) -> list[str]:
-        """Get strategies not yet used."""
-        return [
-            name for name, tracker in self._strategies.items()
-            if tracker.times_used == 0
-        ]
-
-    def _get_exhausted_strategies(self) -> list[str]:
-        """Get strategies that are exhausted (used max times without findings)."""
-        return [
-            name for name, tracker in self._strategies.items()
-            if (
-                tracker.times_used >= CONVERGENCE_THRESHOLDS["max_same_strategy"]
-                and tracker.findings_produced == 0
-            )
-        ]
 
     def build_convergence_prompt(self) -> str:
         """Build convergence context for LLM."""
-        lines = ["## Assessment Convergence\n"]
+        m = self.check_convergence()
+        lines = ["## Convergence Status\n"]
 
-        if self._snapshots:
-            latest = self._snapshots[-1]
-            lines.append(f"Status: {latest.status.value}")
-            lines.append(f"Total findings: {latest.total_findings}")
-            lines.append(f"Tokens spent: {latest.tokens_spent}")
-            lines.append(f"Cost per finding: {latest.cost_per_finding:.0f} tokens")
-            lines.append("")
+        lines.append(
+            f"State: {m.state.value} | "
+            f"Findings: {m.total_findings} | "
+            f"Coverage: {m.coverage_pct:.0f}%"
+        )
+        lines.append(
+            f"Finding rate: {m.current_finding_rate:.1f}/min "
+            f"(peak: {m.peak_finding_rate:.1f}/min)"
+        )
+        lines.append(
+            f"Tokens: {m.total_tokens:,} / {self._max_tokens:,} "
+            f"({m.total_tokens / self._max_tokens:.0%})"
+        )
 
-        # Strategy summary
-        recommendation = self.get_recommendation()
-        lines.append(f"Recommendation: {recommendation.value}")
+        elapsed = time.time() - self._started_at if self._started_at else 0
+        lines.append(
+            f"Time: {elapsed:.0f}s / {self._max_duration:.0f}s "
+            f"({elapsed / self._max_duration:.0%})"
+        )
 
-        next_strategy = self.get_next_strategy()
-        if next_strategy:
-            lines.append(f"Suggested next: {next_strategy}")
+        if m.recommendation:
+            lines.append(f"\nRecommendation: {m.recommendation}")
 
-        # Top strategies by effectiveness
-        effective = sorted(
-            [s for s in self._strategies.values() if s.times_used > 0],
-            key=lambda s: s.effectiveness,
-            reverse=True,
-        )[:3]
-        if effective:
-            lines.append("\nMost effective strategies:")
-            for s in effective:
-                lines.append(f"  - {s.strategy_name}: {s.effectiveness:.2f} findings/K tokens")
+        # Recent window trend
+        if len(self._windows) >= 2:
+            lines.append("\nRecent windows:")
+            for w in self._windows[-3:]:
+                lines.append(
+                    f"  rate={w.finding_rate:.1f}/min "
+                    f"eff={w.token_efficiency:.2f}f/1Kt "
+                    f"tools={w.tools_run}"
+                )
 
         return "\n".join(lines)
 
+    def _start_new_window(self) -> None:
+        """Start a new measurement window."""
+        if self._current_window:
+            self._current_window.window_end = time.time()
+            self._windows.append(self._current_window)
+
+        self._current_window = ConvergenceWindow(
+            window_start=time.time(),
+        )
+
+    def _check_window(self) -> None:
+        """Check if current window should be closed."""
+        if not self._current_window:
+            return
+
+        elapsed = time.time() - self._current_window.window_start
+        if elapsed >= self._window_size:
+            self._start_new_window()
+
+    def _update_metrics(self) -> None:
+        """Update convergence metrics."""
+        m = self._metrics
+
+        # Coverage
+        m.unique_targets_tested = len(self._targets_tested)
+        if m.total_targets > 0:
+            m.coverage_pct = (m.unique_targets_tested / m.total_targets) * 100.0
+
+        # Duration
+        if self._started_at:
+            m.total_duration_s = time.time() - self._started_at
+
+        # Current and peak finding rate
+        if self._windows:
+            latest = self._windows[-1]
+            m.current_finding_rate = latest.finding_rate
+            m.peak_finding_rate = max(w.finding_rate for w in self._windows)
+
+            # Rate of change
+            if len(self._windows) >= 2:
+                prev = self._windows[-2]
+                m.rate_of_change = latest.finding_rate - prev.finding_rate
+
+        # Convergence detection
+        self._detect_convergence()
+
+    def _detect_convergence(self) -> None:
+        """Detect convergence state."""
+        m = self._metrics
+
+        # Hard limits
+        if m.total_tokens >= self._max_tokens:
+            m.state = ConvergenceState.FORCED_STOP
+            m.recommendation = "Token budget exhausted. Stop assessment."
+            return
+
+        if m.total_duration_s >= self._max_duration:
+            m.state = ConvergenceState.FORCED_STOP
+            m.recommendation = "Time limit reached. Stop assessment."
+            return
+
+        # Rate-based convergence
+        if self._windows:
+            recent_low = sum(
+                1 for w in self._windows[-self._convergence_count:]
+                if w.finding_rate < self._min_rate
+            )
+
+            if recent_low >= self._convergence_count:
+                m.state = ConvergenceState.CONVERGED
+                m.recommendation = (
+                    f"Finding rate below {self._min_rate}/min for "
+                    f"{self._convergence_count} consecutive windows. "
+                    "Consider stopping or pivoting strategy."
+                )
+            elif recent_low >= 1:
+                m.state = ConvergenceState.DIMINISHING
+                m.recommendation = "Finding rate declining. Consider new strategies."
+            elif m.rate_of_change < -0.5:
+                m.state = ConvergenceState.CONVERGING
+                m.recommendation = "Finding rate decreasing rapidly."
+            else:
+                m.state = ConvergenceState.EXPLORING
+                m.recommendation = "Still discovering. Continue current approach."
+
     def get_stats(self) -> dict[str, Any]:
-        return {
-            "snapshots": len(self._snapshots),
-            "strategies_used": sum(1 for s in self._strategies.values() if s.times_used > 0),
-            "total_strategies": len(self._strategies),
-            "current_status": self._snapshots[-1].status.value if self._snapshots else "none",
-        }
+        m = self.check_convergence()
+        return m.to_dict()
