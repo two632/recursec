@@ -1,11 +1,11 @@
 """Mobile security knowledge base.
 
-Deep knowledge about mobile app security:
-1. Android application testing
-2. iOS application testing
-3. Mobile API interception
-4. Mobile malware analysis
-5. Mobile device management bypass
+Deep knowledge about mobile security:
+1. Android security testing
+2. iOS security testing
+3. Mobile API security
+4. Mobile app reverse engineering
+5. Mobile network attacks
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ class MobilePattern:
     pattern_id: str = ""
     name: str = ""
     category: str = ""
-    platform: str = ""
     severity: str = "high"
     description: str = ""
     detection_strategy: str = ""
@@ -34,197 +33,216 @@ class MobilePattern:
         return {
             "id": self.pattern_id,
             "name": self.name[:25],
-            "platform": self.platform[:8],
+            "category": self.category[:12],
         }
 
 
 MOBILE_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "mob-001", "name": "Android Application Analysis",
-        "category": "static", "platform": "android", "severity": "high",
-        "desc": "Static and dynamic analysis of Android applications.",
+        "id": "mob-001", "name": "Android Security Testing",
+        "category": "android", "severity": "high",
+        "desc": "Android application security testing.",
         "detection": (
-            "ANDROID APP ANALYSIS:\n"
+            "ANDROID SECURITY TESTING:\n"
             "STATIC ANALYSIS:\n"
-            "  # Decompile APK\n"
-            "  apktool d app.apk -o output/  # Resources + smali\n"
-            "  jadx app.apk -d output/  # Java source code\n"
-            "  # Automated scanning\n"
-            "  mobsf  # Mobile Security Framework (web UI)\n"
-            "  # Manual checks:\n"
-            "  - AndroidManifest.xml:\n"
-            "    android:debuggable=\"true\"  # Debug enabled\n"
-            "    android:allowBackup=\"true\"  # Data backup\n"
-            "    android:exported=\"true\"  # Exposed components\n"
-            "    android:usesCleartextTraffic=\"true\"  # HTTP allowed\n"
-            "  - Hardcoded secrets in source/resources\n"
-            "  - Weak crypto: ECB mode, MD5/SHA1 for passwords\n"
-            "  - WebView: setJavaScriptEnabled + addJavascriptInterface\n"
+            "  # APK decompilation\n"
+            "  apktool d app.apk  # Decode resources + smali\n"
+            "  jadx -d output/ app.apk  # Java source\n"
+            "  unzip app.apk -d extracted/  # Raw extraction\n"
+            "  # Check AndroidManifest.xml:\n"
+            "  - exported=true components\n"
+            "  - android:debuggable=true\n"
+            "  - android:allowBackup=true\n"
+            "  - Custom permissions\n"
+            "  - Intent filters (deeplinks)\n"
+            "  # Check for:\n"
+            "  - Hardcoded secrets (API keys, tokens)\n"
+            "  - Insecure SharedPreferences\n"
+            "  - WebView vulnerabilities (JS interface)\n"
             "  - SQL injection in ContentProviders\n"
+            "  - Path traversal in FileProviders\n"
+            "  - Root detection bypass\n"
             "DYNAMIC ANALYSIS:\n"
             "  # Frida (runtime instrumentation)\n"
-            "  frida -U -f com.target.app -l hook.js\n"
-            "  # Common hooks:\n"
-            "  - SSL pinning bypass\n"
-            "  - Root detection bypass\n"
-            "  - Encryption key extraction\n"
-            "  - Function return value modification\n"
-            "  # Drozer (component testing)\n"
-            "  drozer console connect\n"
-            "  run app.package.info -a com.target\n"
-            "  run app.activity.info -a com.target"
+            "  frida -U -l script.js com.target.app\n"
+            "  # SSL pinning bypass\n"
+            "  frida -U --codeshare pcipolloni/universal-android-ssl-pinning-bypass-with-frida\n"
+            "  # Objection (Frida wrapper)\n"
+            "  objection --gadget com.target.app explore\n"
+            "  > android sslpinning disable\n"
+            "  > android root disable\n"
+            "NETWORK:\n"
+            "  # Proxy through Burp\n"
+            "  # Install Burp CA certificate as system cert\n"
+            "  # Check: cert pinning, cleartext traffic\n"
+            "TOOLS:\n"
+            "  MobSF (automated), drozer, frida, objection, apktool, jadx"
         ),
-        "tools": ["apktool", "jadx", "frida", "mobsf"],
+        "tools": ["mobsf", "frida", "jadx"],
     },
     {
-        "id": "mob-002", "name": "iOS Application Analysis",
-        "category": "static", "platform": "ios", "severity": "high",
-        "desc": "Static and dynamic analysis of iOS applications.",
+        "id": "mob-002", "name": "iOS Security Testing",
+        "category": "ios", "severity": "high",
+        "desc": "iOS application security testing.",
         "detection": (
-            "IOS APP ANALYSIS:\n"
+            "iOS SECURITY TESTING:\n"
             "STATIC ANALYSIS:\n"
-            "  # Decrypt IPA (if from App Store)\n"
-            "  # On jailbroken device:\n"
-            "  flexdecrypt /var/containers/Bundle/Application/<uuid>/app\n"
-            "  # Or: frida-ios-dump\n"
-            "  dump.py com.target.app\n"
-            "  # Analyze binary\n"
-            "  class-dump app_binary  # Objective-C headers\n"
-            "  otool -L app_binary  # Linked libraries\n"
-            "  strings app_binary | grep -i 'api\\|key\\|secret\\|password'\n"
-            "  # Hopper/IDA for disassembly\n"
-            "PLIST AND DATA:\n"
-            "  - Info.plist: App Transport Security settings\n"
-            "  - NSAppTransportSecurity → NSAllowsArbitraryLoads\n"
-            "  - Keychain items (keychain-dumper)\n"
-            "  - NSUserDefaults for sensitive data\n"
-            "  - SQLite databases in app sandbox\n"
-            "  - Core Data stores\n"
+            "  # IPA extraction (jailbroken)\n"
+            "  frida-ios-dump -b com.target.app\n"
+            "  # Class-dump headers\n"
+            "  class-dump -H app.decrypted\n"
+            "  # Check Info.plist:\n"
+            "  - App Transport Security settings\n"
+            "  - URL schemes\n"
+            "  - Custom permissions\n"
+            "  # Binary analysis:\n"
+            "  otool -l app  # Load commands\n"
+            "  # Check PIE, Stack Canaries, ARC\n"
+            "  # Search for hardcoded strings\n"
+            "  strings app | grep -i 'key\\|secret\\|password'\n"
+            "DATA STORAGE:\n"
+            "  # Keychain: keychain-dumper\n"
+            "  # NSUserDefaults (plist files)\n"
+            "  # Core Data (SQLite)\n"
+            "  # Check: /var/mobile/Containers/Data/Application/<UUID>/\n"
             "DYNAMIC ANALYSIS:\n"
-            "  # Frida on iOS\n"
-            "  frida -U com.target.app -l bypass_ssl.js\n"
-            "  # objection (Frida-based)\n"
-            "  objection -g com.target.app explore\n"
-            "  ios sslpinning disable\n"
-            "  ios keychain dump\n"
-            "  ios nsuserdefaults get\n"
-            "  ios hooking search classes target"
+            "  # Frida\n"
+            "  frida -U -l script.js com.target.app\n"
+            "  # Objection\n"
+            "  objection --gadget com.target.app explore\n"
+            "  > ios sslpinning disable\n"
+            "  > ios jailbreak disable\n"
+            "  # Cycript (runtime manipulation)\n"
+            "  cycript -p <pid>\n"
+            "RUNTIME:\n"
+            "  - Method swizzling\n"
+            "  - Jailbreak detection bypass\n"
+            "  - Biometric bypass\n"
+            "TOOLS:\n"
+            "  MobSF, Frida, objection, Hopper, class-dump"
         ),
-        "tools": ["frida", "objection", "class-dump"],
+        "tools": ["mobsf", "frida", "objection"],
     },
     {
-        "id": "mob-003", "name": "Mobile Traffic Interception",
-        "category": "network", "platform": "both", "severity": "high",
-        "desc": "Intercepting and analyzing mobile app network traffic.",
+        "id": "mob-003", "name": "Mobile API Security",
+        "category": "api", "severity": "high",
+        "desc": "Mobile API security testing.",
         "detection": (
-            "MOBILE TRAFFIC INTERCEPTION:\n"
-            "PROXY SETUP:\n"
-            "  # Burp Suite proxy\n"
-            "  - Set proxy on device: <attacker_ip>:8080\n"
-            "  - Install Burp CA certificate on device\n"
-            "  # mitmproxy\n"
-            "  mitmproxy --mode regular --listen-port 8080\n"
-            "  # For HTTPS:\n"
-            "  - Install mitmproxy CA on device\n"
-            "SSL PINNING BYPASS:\n"
-            "  # Frida universal bypass\n"
-            "  frida -U -f com.target -l ssl_bypass.js --no-pause\n"
-            "  # objection\n"
-            "  objection -g com.target explore\n"
-            "  android sslpinning disable\n"
-            "  ios sslpinning disable\n"
-            "  # Android: Override network_security_config.xml\n"
-            "  # Magisk module: TrustUserCerts\n"
-            "CERTIFICATE TRANSPARENCY:\n"
-            "  - Check for cert pinning in code\n"
-            "  - TrustManager implementation\n"
-            "  - OkHttp CertificatePinner\n"
-            "  - NSURLSessionDelegate (iOS)\n"
-            "WHAT TO LOOK FOR:\n"
-            "  - API keys in headers\n"
-            "  - Authentication tokens\n"
-            "  - Sensitive data in plaintext\n"
-            "  - Hidden API endpoints\n"
-            "  - Debug/admin endpoints\n"
-            "  - GraphQL introspection enabled"
+            "MOBILE API SECURITY:\n"
+            "INTERCEPT:\n"
+            "  # Set proxy on device/emulator\n"
+            "  # Burp Suite / mitmproxy\n"
+            "  # Bypass SSL pinning first\n"
+            "  # For certificate transparency: patch binary\n"
+            "COMMON VULNS:\n"
+            "  - Broken authentication (weak tokens)\n"
+            "  - IDOR via user_id/object_id\n"
+            "  - Excessive data exposure (full user object)\n"
+            "  - Missing rate limiting\n"
+            "  - Broken function-level auth\n"
+            "  - Mass assignment\n"
+            "  - GraphQL over-fetching\n"
+            "API KEY EXTRACTION:\n"
+            "  # Decompile → search strings\n"
+            "  # Network intercept → capture API calls\n"
+            "  # Firebase misconfig: /.json\n"
+            "  # Check API key restrictions\n"
+            "TOKEN ATTACKS:\n"
+            "  - JWT manipulation\n"
+            "  - Token prediction\n"
+            "  - Refresh token abuse\n"
+            "  - OAuth misconfiguration\n"
+            "  - Deep link token interception\n"
+            "TESTING:\n"
+            "  1. Map all API endpoints\n"
+            "  2. Test auth on every endpoint\n"
+            "  3. Test IDOR on every object reference\n"
+            "  4. Test input validation\n"
+            "  5. Test rate limiting\n"
+            "  6. Check for debug endpoints"
         ),
-        "tools": ["burp", "mitmproxy", "frida"],
+        "tools": ["burpsuite", "mitmproxy"],
     },
     {
-        "id": "mob-004", "name": "Android Root and Integrity Bypass",
-        "category": "bypass", "platform": "android", "severity": "medium",
-        "desc": "Bypassing root detection and integrity checks.",
+        "id": "mob-004", "name": "Mobile Reverse Engineering",
+        "category": "reversing", "severity": "medium",
+        "desc": "Mobile app reverse engineering techniques.",
         "detection": (
-            "ROOT AND INTEGRITY BYPASS:\n"
-            "ROOT DETECTION METHODS:\n"
-            "  - Check for su binary: /system/xbin/su, /system/bin/su\n"
-            "  - Check for Magisk/SuperSU files\n"
-            "  - SafetyNet/Play Integrity API\n"
-            "  - Check build tags: test-keys\n"
-            "  - Check for busybox\n"
-            "  - Mounting check (/system read-write)\n"
-            "BYPASS TECHNIQUES:\n"
-            "  # Magisk (root with hiding)\n"
-            "  - MagiskHide / Zygisk DenyList\n"
-            "  - Shamiko module (advanced hiding)\n"
-            "  # Frida hooks\n"
-            "  - Hook File.exists() → return false for su paths\n"
-            "  - Hook System.getProperty() → return release-keys\n"
-            "  - Hook PackageManager → hide root apps\n"
-            "  # LSPosed + custom modules\n"
-            "INTEGRITY CHECKS:\n"
-            "  - APK signature verification\n"
-            "  - Checksum of native libraries\n"
-            "  - Certificate pinning\n"
-            "  - Emulator detection\n"
-            "  - Debugging detection (android.os.Debug)\n"
-            "  - Hooking framework detection (Frida, Xposed)\n"
-            "BYPASS TOOLS:\n"
-            "  - apk-mitm: Automated cert bypass\n"
-            "  - Objection: Runtime manipulation\n"
-            "  - Medusa: Extensible framework"
-        ),
-        "tools": ["frida", "magisk", "objection"],
-    },
-    {
-        "id": "mob-005", "name": "Mobile Data Storage Security",
-        "category": "storage", "platform": "both", "severity": "high",
-        "desc": "Analyzing insecure data storage on mobile devices.",
-        "detection": (
-            "MOBILE DATA STORAGE:\n"
+            "MOBILE REVERSE ENGINEERING:\n"
             "ANDROID:\n"
-            "  # Shared Preferences (plaintext XML)\n"
-            "  /data/data/<package>/shared_prefs/*.xml\n"
-            "  # SQLite databases\n"
-            "  /data/data/<package>/databases/*.db\n"
-            "  sqlite3 *.db '.tables'  # List tables\n"
-            "  sqlite3 *.db 'SELECT * FROM credentials;'\n"
-            "  # Internal storage files\n"
-            "  /data/data/<package>/files/\n"
-            "  # External storage (world-readable!)\n"
-            "  /sdcard/Android/data/<package>/\n"
-            "  # Backup extraction\n"
-            "  adb backup -f backup.ab <package>\n"
-            "  abe unpack backup.ab backup.tar\n"
-            "IOS:\n"
-            "  # Keychain (should be encrypted)\n"
-            "  keychain-dumper  # On jailbroken device\n"
-            "  # NSUserDefaults\n"
-            "  /var/mobile/Containers/Data/Application/<uuid>/Library/Preferences/\n"
-            "  # SQLite databases\n"
-            "  /var/mobile/Containers/Data/Application/<uuid>/Documents/\n"
-            "  # Core Data\n"
-            "  # Cookies (Cookies.binarycookies)\n"
-            "  # Cache (URLCache)\n"
-            "  # Pasteboard data\n"
-            "COMMON ISSUES:\n"
-            "  - Credentials in SharedPreferences/NSUserDefaults\n"
-            "  - Unencrypted SQLite databases\n"
-            "  - API keys in app binary\n"
-            "  - Session tokens in logs\n"
-            "  - Screenshots in app switcher"
+            "  # APK → Smali → Java\n"
+            "  apktool d app.apk  # Resources + Smali\n"
+            "  jadx app.apk  # Decompile to Java\n"
+            "  dex2jar app.apk  # DEX → JAR\n"
+            "  # Native libs (JNI)\n"
+            "  # .so files in lib/ directory\n"
+            "  # IDA Pro / Ghidra for native analysis\n"
+            "  # Check for obfuscation (ProGuard, R8)\n"
+            "iOS:\n"
+            "  # Decryption required for AppStore apps\n"
+            "  # frida-ios-dump or CrackerXI\n"
+            "  # Hopper / IDA Pro for disassembly\n"
+            "  # class-dump for Objective-C headers\n"
+            "  # Swift demangling: swift-demangle\n"
+            "PATCHING:\n"
+            "  # Android: Smali modification → rebuild\n"
+            "  apktool d app.apk\n"
+            "  # Modify smali code\n"
+            "  apktool b app/ -o patched.apk\n"
+            "  jarsigner -keystore key.jks patched.apk alias\n"
+            "  # iOS: Binary patching with Hopper\n"
+            "RUNTIME:\n"
+            "  # Frida scripting (both platforms)\n"
+            "  # Hook functions, modify parameters\n"
+            "  # Bypass checks (root, jailbreak, debugger)\n"
+            "  # Dump encryption keys at runtime\n"
+            "  # Trace function calls\n"
+            "OBFUSCATION:\n"
+            "  - Name obfuscation (ProGuard/R8/SwiftShield)\n"
+            "  - Control flow obfuscation\n"
+            "  - String encryption\n"
+            "  - Native code protection"
         ),
-        "tools": ["adb", "frida", "keychain-dumper"],
+        "tools": ["jadx", "frida", "ghidra"],
+    },
+    {
+        "id": "mob-005", "name": "Mobile Network Attacks",
+        "category": "network", "severity": "critical",
+        "desc": "Mobile-specific network attacks.",
+        "detection": (
+            "MOBILE NETWORK ATTACKS:\n"
+            "ROGUE AP:\n"
+            "  # Evil twin attack\n"
+            "  # Captive portal phishing\n"
+            "  # WiFi-Pumpkin / hostapd\n"
+            "  # Intercept all traffic\n"
+            "SSL/TLS:\n"
+            "  # Downgrade attacks\n"
+            "  # Self-signed cert acceptance\n"
+            "  # Missing cert pinning\n"
+            "  # Expired cert handling\n"
+            "  # SSLStrip (HTTPS → HTTP)\n"
+            "BLUETOOTH:\n"
+            "  # BlueSmack (L2CAP flood)\n"
+            "  # BlueBorne (CVE-2017-0781)\n"
+            "  # BLE sniffing (Ubertooth)\n"
+            "  # BLE GATT service enumeration\n"
+            "  # KNOB attack\n"
+            "NFC:\n"
+            "  # Tag cloning\n"
+            "  # Relay attacks\n"
+            "  # NDEF message manipulation\n"
+            "  # EMV contactless attacks\n"
+            "SMS/SS7:\n"
+            "  # SMS interception (SS7 vuln)\n"
+            "  # SIM swapping\n"
+            "  # IMSI catchers (Stingray)\n"
+            "  # Silent SMS\n"
+            "  # Binary SMS exploitation\n"
+            "TOOLS:\n"
+            "  hostapd, bettercap, ubertooth, nfc-tools"
+        ),
+        "tools": ["bettercap", "hostapd"],
     },
 ]
 
@@ -232,7 +250,7 @@ MOBILE_PATTERNS: list[dict[str, Any]] = [
 class MobileSecurityKB:
     """Mobile security knowledge base.
 
-    Provides mobile app security patterns
+    Provides mobile security patterns
     injected into agent prompts.
     """
 
@@ -248,7 +266,6 @@ class MobileSecurityKB:
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
-                platform=data.get("platform", ""),
                 severity=data.get("severity", "high"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
@@ -256,37 +273,37 @@ class MobileSecurityKB:
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_platform(self, platform: str) -> list[MobilePattern]:
-        """Get patterns by platform."""
+    def get_by_category(self, category: str) -> list[MobilePattern]:
+        """Get patterns by category."""
         return [
             p for p in self._patterns.values()
-            if p.platform.lower() == platform.lower()
+            if p.category.lower() == category.lower()
         ]
 
     def build_mobile_prompt(
         self,
-        platforms: list[str] | None = None,
+        categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
         """Build mobile security prompt."""
         lines = ["## Mobile Security Patterns\n"]
         count = 0
         for pattern in self._patterns.values():
-            if platforms and pattern.platform.lower() not in [p.lower() for p in platforms]:
+            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
                 continue
             if count >= max_patterns:
                 break
-            lines.append(f"### {pattern.name} [{pattern.platform.upper()}]")
+            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
             lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        plat_counts: dict[str, int] = {}
+        cat_counts: dict[str, int] = {}
         for p in self._patterns.values():
-            plat_counts[p.platform] = plat_counts.get(p.platform, 0) + 1
+            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
         return {
             "patterns": len(self._patterns),
-            "by_platform": plat_counts,
+            "by_category": cat_counts,
         }

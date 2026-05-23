@@ -1,26 +1,20 @@
-"""Agent memory — persistent memory with semantic search.
+"""Agent memory manager — episodic, semantic, and working memory.
 
-Implements a hierarchical memory system:
-1. Working memory: Current task context (short-lived)
-2. Episodic memory: Past assessment experiences
-3. Semantic memory: Knowledge about targets, vulns, tools
-4. Procedural memory: Learned skills and strategies
-5. Memory consolidation: Promote important memories
-6. Memory decay: Reduce relevance over time
-7. Similarity search: Find relevant past experiences
-
-Uses the Nomic-Embed model for embedding-based search
-when available, with keyword fallback.
+Implements:
+1. Working memory (current task context, limited capacity)
+2. Episodic memory (past experiences, indexed by similarity)
+3. Semantic memory (facts, relationships, knowledge)
+4. Memory consolidation (working → episodic → semantic)
+5. Retrieval with relevance scoring
+6. Memory decay and forgetting
+7. Memory prompt for LLM context
 """
 
 from __future__ import annotations
 
-import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -29,410 +23,294 @@ logger = structlog.get_logger()
 
 
 class MemoryType(str, Enum):
-    WORKING = "working"
-    EPISODIC = "episodic"
-    SEMANTIC = "semantic"
-    PROCEDURAL = "procedural"
+    WORKING = "working"        # Current task context
+    EPISODIC = "episodic"      # Past experiences
+    SEMANTIC = "semantic"      # Facts and knowledge
 
 
-class MemoryPriority(str, Enum):
+class MemoryImportance(str, Enum):
     CRITICAL = "critical"
     HIGH = "high"
-    NORMAL = "normal"
+    MEDIUM = "medium"
     LOW = "low"
 
 
 @dataclass
-class MemoryEntry:
-    """A single memory entry."""
+class MemoryItem:
+    """A single memory item."""
     memory_id: str = ""
     memory_type: MemoryType = MemoryType.WORKING
-    priority: MemoryPriority = MemoryPriority.NORMAL
+    importance: MemoryImportance = MemoryImportance.MEDIUM
     content: str = ""
+    context: str = ""          # What was happening when this was stored
     tags: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    embedding: list[float] = field(default_factory=list)
+    source: str = ""           # Agent/tool that created this
     access_count: int = 0
-    created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
-    expires_at: float = 0.0          # 0 = never
-    source: str = ""                  # agent_id, tool, user
+    created_at: float = field(default_factory=time.time)
+    decay_rate: float = 0.01   # How fast this memory fades
+
+    @property
+    def age_s(self) -> float:
+        return time.time() - self.created_at
 
     @property
     def relevance_score(self) -> float:
-        """Score based on recency, access, and priority."""
-        age_hours = (time.time() - self.created_at) / 3600
-        recency = max(0.0, 1.0 - age_hours / 168)  # Decay over 1 week
+        """Calculate relevance based on importance, recency, access."""
+        imp_scores = {"critical": 1.0, "high": 0.7, "medium": 0.4, "low": 0.2}
+        base = imp_scores.get(self.importance.value, 0.4)
 
-        priority_weights = {
-            MemoryPriority.CRITICAL: 1.0,
-            MemoryPriority.HIGH: 0.8,
-            MemoryPriority.NORMAL: 0.5,
-            MemoryPriority.LOW: 0.3,
-        }
-        priority_w = priority_weights.get(self.priority, 0.5)
+        # Recency boost (decays over hours)
+        hours = self.age_s / 3600
+        recency = max(0.0, 1.0 - (hours * self.decay_rate))
 
-        access_w = min(1.0, self.access_count / 10)
+        # Access frequency boost
+        access_boost = min(0.3, self.access_count * 0.05)
 
-        return (recency * 0.3 + priority_w * 0.4 + access_w * 0.3)
-
-    @property
-    def is_expired(self) -> bool:
-        return self.expires_at > 0 and time.time() > self.expires_at
+        return min(1.0, base * recency + access_boost)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.memory_id,
-            "type": self.memory_type.value,
-            "priority": self.priority.value,
-            "content": self.content[:100],
-            "tags": self.tags[:5],
+            "id": self.memory_id[:10],
+            "type": self.memory_type.value[:4],
+            "importance": self.importance.value[:4],
+            "content": self.content[:25],
             "relevance": round(self.relevance_score, 2),
             "accesses": self.access_count,
         }
 
 
 class AgentMemory:
-    """Hierarchical memory system for agents.
+    """Multi-tier memory system for agents.
 
-    Provides working, episodic, semantic, and procedural
-    memory with keyword and embedding-based search.
+    Manages working memory (limited, current task),
+    episodic memory (past experiences), and semantic
+    memory (facts/knowledge). Supports consolidation,
+    retrieval, and decay.
     """
 
     def __init__(
         self,
-        max_working: int = 50,
-        max_episodic: int = 500,
-        max_semantic: int = 1000,
-        max_procedural: int = 200,
-        persistence_dir: str = "data/memory",
+        working_capacity: int = 10,
+        episodic_capacity: int = 500,
+        semantic_capacity: int = 200,
     ) -> None:
-        self._limits = {
-            MemoryType.WORKING: max_working,
-            MemoryType.EPISODIC: max_episodic,
-            MemoryType.SEMANTIC: max_semantic,
-            MemoryType.PROCEDURAL: max_procedural,
-        }
-
-        self._memories: dict[str, MemoryEntry] = {}
-        self._by_type: dict[str, list[str]] = defaultdict(list)
-        self._by_tag: dict[str, list[str]] = defaultdict(list)
+        self._working: dict[str, MemoryItem] = {}
+        self._episodic: dict[str, MemoryItem] = {}
+        self._semantic: dict[str, MemoryItem] = {}
+        self._working_cap = working_capacity
+        self._episodic_cap = episodic_capacity
+        self._semantic_cap = semantic_capacity
         self._counter = 0
-        self._persistence_dir = Path(persistence_dir)
-        self._persistence_dir.mkdir(parents=True, exist_ok=True)
         self._log = logger.bind(component="agent_memory")
-
-        # Load persisted memories
-        self._load()
 
     def store(
         self,
         content: str,
         memory_type: MemoryType = MemoryType.WORKING,
-        priority: MemoryPriority = MemoryPriority.NORMAL,
+        importance: MemoryImportance = MemoryImportance.MEDIUM,
+        context: str = "",
         tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
         source: str = "",
-        ttl_s: float = 0,
-    ) -> str:
-        """Store a new memory."""
+    ) -> MemoryItem:
+        """Store a memory item."""
         self._counter += 1
-        mem_id = f"mem-{self._counter}"
-
-        entry = MemoryEntry(
-            memory_id=mem_id,
+        item = MemoryItem(
+            memory_id=f"mem-{self._counter}",
             memory_type=memory_type,
-            priority=priority,
+            importance=importance,
             content=content,
+            context=context,
             tags=tags or [],
-            metadata=metadata or {},
             source=source,
-            expires_at=time.time() + ttl_s if ttl_s > 0 else 0,
         )
 
-        self._memories[mem_id] = entry
-        self._by_type[memory_type.value].append(mem_id)
+        store = self._get_store(memory_type)
+        cap = self._get_capacity(memory_type)
 
-        for tag in entry.tags:
-            self._by_tag[tag].append(mem_id)
+        # Evict lowest relevance if over capacity
+        while len(store) >= cap:
+            lowest = min(store.values(), key=lambda m: m.relevance_score)
+            del store[lowest.memory_id]
 
-        # Enforce limits
-        self._enforce_limits(memory_type)
+        store[item.memory_id] = item
+        return item
 
-        return mem_id
-
-    def recall(self, memory_id: str) -> MemoryEntry | None:
-        """Recall a specific memory."""
-        entry = self._memories.get(memory_id)
-        if entry and not entry.is_expired:
-            entry.access_count += 1
-            entry.last_accessed = time.time()
-            return entry
-        return None
-
-    def search(
+    def recall(
         self,
-        query: str,
+        query_tags: list[str] | None = None,
         memory_type: MemoryType | None = None,
-        tags: list[str] | None = None,
-        limit: int = 10,
-    ) -> list[MemoryEntry]:
-        """Search memories by keyword and tags."""
-        candidates = list(self._memories.values())
+        max_items: int = 5,
+        min_relevance: float = 0.0,
+    ) -> list[MemoryItem]:
+        """Recall memories matching criteria."""
+        candidates: list[MemoryItem] = []
 
-        # Filter expired
-        candidates = [m for m in candidates if not m.is_expired]
+        stores = (
+            [self._get_store(memory_type)]
+            if memory_type
+            else [self._working, self._episodic, self._semantic]
+        )
 
-        # Filter by type
-        if memory_type:
-            candidates = [m for m in candidates if m.memory_type == memory_type]
+        for store in stores:
+            for item in store.values():
+                if item.relevance_score < min_relevance:
+                    continue
+                if query_tags:
+                    tag_overlap = len(set(query_tags) & set(item.tags))
+                    if tag_overlap == 0:
+                        continue
+                candidates.append(item)
 
-        # Filter by tags
-        if tags:
-            tag_set = set(tags)
-            candidates = [m for m in candidates if tag_set & set(m.tags)]
-
-        # Keyword scoring
-        query_lower = query.lower()
-        query_terms = query_lower.split()
-
-        scored = []
-        for mem in candidates:
-            content_lower = mem.content.lower()
-            keyword_score = sum(
-                1.0 for term in query_terms if term in content_lower
-            )
-            tag_score = sum(
-                0.5 for term in query_terms if any(term in t for t in mem.tags)
-            )
-
-            total_score = (keyword_score + tag_score) * mem.relevance_score
-            if total_score > 0:
-                scored.append((mem, total_score))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-
-        results = [mem for mem, _ in scored[:limit]]
+        # Sort by relevance
+        candidates.sort(key=lambda m: m.relevance_score, reverse=True)
 
         # Update access counts
-        for mem in results:
-            mem.access_count += 1
-            mem.last_accessed = time.time()
+        results = candidates[:max_items]
+        for item in results:
+            item.access_count += 1
+            item.last_accessed = time.time()
 
         return results
 
-    def get_by_type(
-        self,
-        memory_type: MemoryType,
-        limit: int = 20,
-    ) -> list[MemoryEntry]:
-        """Get all memories of a type, sorted by relevance."""
-        ids = self._by_type.get(memory_type.value, [])
-        memories = [
-            self._memories[mid] for mid in ids
-            if mid in self._memories and not self._memories[mid].is_expired
-        ]
-        memories.sort(key=lambda m: m.relevance_score, reverse=True)
-        return memories[:limit]
-
-    def get_by_tag(self, tag: str, limit: int = 20) -> list[MemoryEntry]:
-        """Get memories with a specific tag."""
-        ids = self._by_tag.get(tag, [])
-        memories = [
-            self._memories[mid] for mid in ids
-            if mid in self._memories and not self._memories[mid].is_expired
-        ]
-        memories.sort(key=lambda m: m.relevance_score, reverse=True)
-        return memories[:limit]
-
     def consolidate(self) -> int:
-        """Consolidate memories — promote, decay, cleanup."""
-        removed = 0
+        """Consolidate working memory → episodic memory.
 
-        ids_to_remove = []
-        for mem_id, mem in self._memories.items():
-            # Remove expired
-            if mem.is_expired:
-                ids_to_remove.append(mem_id)
-                continue
+        Returns number of items consolidated.
+        """
+        consolidated = 0
+        to_remove: list[str] = []
 
-            # Auto-promote frequently accessed working memories
-            if (
-                mem.memory_type == MemoryType.WORKING
-                and mem.access_count >= 5
-                and mem.priority != MemoryPriority.LOW
-            ):
-                mem.memory_type = MemoryType.EPISODIC
-                self._by_type[MemoryType.WORKING.value] = [
-                    mid for mid in self._by_type[MemoryType.WORKING.value]
-                    if mid != mem_id
-                ]
-                self._by_type[MemoryType.EPISODIC.value].append(mem_id)
-
-        for mem_id in ids_to_remove:
-            self._remove(mem_id)
-            removed += 1
-
-        return removed
-
-    def store_finding(self, finding: dict[str, Any]) -> str:
-        """Store a vulnerability finding as a memory."""
-        title = finding.get("title", "Unknown")
-        severity = finding.get("severity", "info")
-        target = finding.get("target", "")
-        tool = finding.get("tool", "")
-
-        content = f"[{severity.upper()}] {title} on {target} (found by {tool})"
-
-        priority = {
-            "critical": MemoryPriority.CRITICAL,
-            "high": MemoryPriority.HIGH,
-            "medium": MemoryPriority.NORMAL,
-            "low": MemoryPriority.LOW,
-        }.get(severity, MemoryPriority.NORMAL)
-
-        return self.store(
-            content=content,
-            memory_type=MemoryType.EPISODIC,
-            priority=priority,
-            tags=[severity, tool, "finding"],
-            metadata=finding,
-            source=tool,
-        )
-
-    def store_strategy(
-        self,
-        strategy: str,
-        outcome: str,
-        target_type: str = "",
-    ) -> str:
-        """Store a strategy outcome as procedural memory."""
-        content = f"Strategy '{strategy}' on {target_type}: {outcome}"
-        return self.store(
-            content=content,
-            memory_type=MemoryType.PROCEDURAL,
-            tags=[strategy, target_type, "strategy"],
-            metadata={"strategy": strategy, "outcome": outcome},
-        )
-
-    def store_knowledge(
-        self,
-        knowledge: str,
-        tags: list[str] | None = None,
-    ) -> str:
-        """Store general security knowledge."""
-        return self.store(
-            content=knowledge,
-            memory_type=MemoryType.SEMANTIC,
-            priority=MemoryPriority.HIGH,
-            tags=tags or ["knowledge"],
-        )
-
-    def _enforce_limits(self, memory_type: MemoryType) -> None:
-        """Remove lowest-relevance memories when over limit."""
-        limit = self._limits.get(memory_type, 500)
-        ids = self._by_type.get(memory_type.value, [])
-
-        if len(ids) <= limit:
-            return
-
-        memories = [
-            (mid, self._memories.get(mid))
-            for mid in ids if mid in self._memories
-        ]
-        memories.sort(key=lambda x: x[1].relevance_score if x[1] else 0)
-
-        to_remove = len(ids) - limit
-        for mid, _ in memories[:to_remove]:
-            self._remove(mid)
-
-    def _remove(self, memory_id: str) -> None:
-        """Remove a memory entry."""
-        entry = self._memories.pop(memory_id, None)
-        if not entry:
-            return
-
-        type_list = self._by_type.get(entry.memory_type.value, [])
-        if memory_id in type_list:
-            type_list.remove(memory_id)
-
-        for tag in entry.tags:
-            tag_list = self._by_tag.get(tag, [])
-            if memory_id in tag_list:
-                tag_list.remove(memory_id)
-
-    def save(self) -> None:
-        """Persist memories to disk."""
-        data = []
-        for mem in self._memories.values():
-            data.append({
-                "id": mem.memory_id,
-                "type": mem.memory_type.value,
-                "priority": mem.priority.value,
-                "content": mem.content,
-                "tags": mem.tags,
-                "metadata": mem.metadata,
-                "access_count": mem.access_count,
-                "created_at": mem.created_at,
-                "last_accessed": mem.last_accessed,
-                "expires_at": mem.expires_at,
-                "source": mem.source,
-            })
-
-        path = self._persistence_dir / "memories.json"
-        try:
-            path.write_text(json.dumps(data))
-        except OSError:
-            pass
-
-    def _load(self) -> None:
-        """Load persisted memories."""
-        path = self._persistence_dir / "memories.json"
-        if not path.exists():
-            return
-
-        try:
-            data = json.loads(path.read_text())
-            for entry_data in data:
-                try:
-                    mem_type = MemoryType(entry_data.get("type", "working"))
-                except ValueError:
-                    mem_type = MemoryType.WORKING
-
-                try:
-                    priority = MemoryPriority(entry_data.get("priority", "normal"))
-                except ValueError:
-                    priority = MemoryPriority.NORMAL
-
-                self._counter += 1
-                mem_id = entry_data.get("id", f"mem-{self._counter}")
-
-                entry = MemoryEntry(
-                    memory_id=mem_id,
-                    memory_type=mem_type,
-                    priority=priority,
-                    content=entry_data.get("content", ""),
-                    tags=entry_data.get("tags", []),
-                    metadata=entry_data.get("metadata", {}),
-                    access_count=entry_data.get("access_count", 0),
-                    created_at=entry_data.get("created_at", time.time()),
-                    last_accessed=entry_data.get("last_accessed", time.time()),
-                    expires_at=entry_data.get("expires_at", 0),
-                    source=entry_data.get("source", ""),
+        for mid, item in self._working.items():
+            # Only consolidate if item has been accessed and is important
+            if item.access_count >= 2 or item.importance.value in ("critical", "high"):
+                # Move to episodic
+                new_item = MemoryItem(
+                    memory_id=item.memory_id,
+                    memory_type=MemoryType.EPISODIC,
+                    importance=item.importance,
+                    content=item.content,
+                    context=item.context,
+                    tags=item.tags,
+                    source=item.source,
+                    access_count=item.access_count,
+                    created_at=item.created_at,
                 )
 
-                self._memories[mem_id] = entry
-                self._by_type[mem_type.value].append(mem_id)
-                for tag in entry.tags:
-                    self._by_tag[tag].append(mem_id)
+                while len(self._episodic) >= self._episodic_cap:
+                    lowest = min(self._episodic.values(), key=lambda m: m.relevance_score)
+                    del self._episodic[lowest.memory_id]
 
-        except (json.JSONDecodeError, OSError):
-            pass
+                self._episodic[new_item.memory_id] = new_item
+                to_remove.append(mid)
+                consolidated += 1
+
+        for mid in to_remove:
+            del self._working[mid]
+
+        return consolidated
+
+    def generalize(self) -> int:
+        """Generalize episodic → semantic memory.
+
+        Extracts common patterns from episodic memories
+        and stores as semantic facts.
+        Returns number of facts created.
+        """
+        # Group episodic memories by tags
+        tag_groups: dict[str, list[MemoryItem]] = {}
+        for item in self._episodic.values():
+            for tag in item.tags:
+                tag_groups.setdefault(tag, []).append(item)
+
+        facts_created = 0
+        for tag, items in tag_groups.items():
+            if len(items) < 3:  # Need multiple experiences to generalize
+                continue
+
+            # Create semantic summary
+            summary = f"Pattern ({tag}): observed {len(items)} times"
+            self.store(
+                content=summary,
+                memory_type=MemoryType.SEMANTIC,
+                importance=MemoryImportance.HIGH,
+                tags=[tag, "generalized"],
+                source="consolidation",
+            )
+            facts_created += 1
+
+        return facts_created
+
+    def clear_working(self) -> None:
+        """Clear working memory."""
+        self._working.clear()
+
+    def build_memory_prompt(
+        self,
+        task_tags: list[str] | None = None,
+        max_items: int = 8,
+    ) -> str:
+        """Build memory context for LLM."""
+        lines = ["## Agent Memory\n"]
+
+        lines.append(
+            f"Working: {len(self._working)}/{self._working_cap} | "
+            f"Episodic: {len(self._episodic)}/{self._episodic_cap} | "
+            f"Semantic: {len(self._semantic)}/{self._semantic_cap}"
+        )
+
+        # Working memory (always include)
+        if self._working:
+            lines.append("\nWorking memory:")
+            for item in sorted(
+                self._working.values(),
+                key=lambda m: m.relevance_score,
+                reverse=True,
+            )[:max_items]:
+                lines.append(f"  [{item.importance.value[0].upper()}] {item.content[:35]}")
+
+        # Relevant episodic memories
+        if task_tags:
+            relevant = self.recall(
+                query_tags=task_tags,
+                memory_type=MemoryType.EPISODIC,
+                max_items=3,
+            )
+            if relevant:
+                lines.append("\nRelevant past experiences:")
+                for item in relevant:
+                    lines.append(f"  {item.content[:35]} (rel={item.relevance_score:.0%})")
+
+        # Semantic facts
+        if self._semantic:
+            lines.append(f"\nKnown facts: {len(self._semantic)}")
+            for item in list(self._semantic.values())[:3]:
+                lines.append(f"  {item.content[:35]}")
+
+        return "\n".join(lines)
+
+    def _get_store(self, memory_type: MemoryType) -> dict[str, MemoryItem]:
+        """Get the store for a memory type."""
+        if memory_type == MemoryType.WORKING:
+            return self._working
+        elif memory_type == MemoryType.EPISODIC:
+            return self._episodic
+        else:
+            return self._semantic
+
+    def _get_capacity(self, memory_type: MemoryType) -> int:
+        """Get the capacity for a memory type."""
+        if memory_type == MemoryType.WORKING:
+            return self._working_cap
+        elif memory_type == MemoryType.EPISODIC:
+            return self._episodic_cap
+        else:
+            return self._semantic_cap
 
     def get_stats(self) -> dict[str, Any]:
-        by_type = {t: len(ids) for t, ids in self._by_type.items()}
         return {
-            "total": len(self._memories),
-            "by_type": by_type,
-            "tags": len(self._by_tag),
+            "working": len(self._working),
+            "episodic": len(self._episodic),
+            "semantic": len(self._semantic),
+            "total": len(self._working) + len(self._episodic) + len(self._semantic),
         }
