@@ -1,16 +1,11 @@
-"""API security knowledge base — REST, GraphQL, gRPC attack patterns.
+"""API security knowledge base.
 
-Deep knowledge about API vulnerabilities:
-1. BOLA/IDOR (Broken Object Level Authorization)
-2. Broken Authentication
-3. Excessive Data Exposure
-4. Rate Limiting bypass
-5. BFLA (Broken Function Level Authorization)
-6. Mass Assignment
-7. SSRF via API
-8. GraphQL-specific attacks
-9. gRPC-specific attacks
-10. API versioning attacks
+Deep knowledge about API security testing:
+1. REST API security
+2. GraphQL security
+3. gRPC security
+4. WebSocket security
+5. API authentication attacks
 """
 
 from __future__ import annotations
@@ -26,290 +21,201 @@ logger = structlog.get_logger()
 
 @dataclass
 class APIVulnPattern:
-    """An API vulnerability pattern with methodology."""
+    """An API vulnerability pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
     severity: str = "high"
-    owasp_api: str = ""           # OWASP API Security Top 10
+    owasp_api: str = ""          # OWASP API Security Top 10
     description: str = ""
     testing_methodology: str = ""
-    detection_indicators: list[str] = field(default_factory=list)
-    api_types: list[str] = field(default_factory=list)   # rest, graphql, grpc, soap
+    tools: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.pattern_id,
             "name": self.name[:30],
-            "category": self.category[:15],
-            "owasp": self.owasp_api[:10],
+            "owasp": self.owasp_api[:8],
         }
 
 
 API_VULN_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "api-001", "name": "BOLA / IDOR",
-        "category": "authorization", "severity": "critical",
-        "owasp_api": "API1:2023",
-        "api_types": ["rest", "graphql"],
-        "desc": "Broken Object Level Authorization — accessing other users' resources by changing IDs.",
+        "id": "api-001", "name": "REST API Security Testing",
+        "category": "rest", "severity": "high",
+        "owasp_api": "API1-API10",
+        "desc": "REST API security assessment.",
         "testing": (
-            "BOLA/IDOR TESTING METHODOLOGY:\n"
-            "1. IDENTIFY OBJECT REFERENCES:\n"
-            "   - URL path: /api/users/{id}/profile, /api/orders/{id}\n"
-            "   - Query params: ?user_id=123, ?order_id=456\n"
-            "   - Request body: {\"user_id\": 123}\n"
-            "   - Headers: X-User-ID, X-Account-ID\n"
-            "2. TEST HORIZONTAL ESCALATION:\n"
-            "   - Create two accounts (A and B)\n"
-            "   - Use A's token to access B's resources by changing ID\n"
-            "   - Test all CRUD operations: GET, POST, PUT, PATCH, DELETE\n"
-            "3. ID ENUMERATION:\n"
-            "   - Sequential IDs: Try id-1, id+1, id+2...\n"
-            "   - UUID guessing: Check if UUIDs are time-based (v1) → predictable\n"
-            "   - Leaked IDs: Check if IDs appear in other API responses\n"
-            "4. ADVANCED TECHNIQUES:\n"
-            "   - Parameter pollution: ?id=1&id=2 (which one is used?)\n"
-            "   - Type juggling: id=1 vs id=\"1\" vs id=true\n"
-            "   - Nested objects: /api/orgs/{org_id}/users/{user_id}\n"
-            "   - Bulk operations: /api/users?ids=1,2,3,4,5\n"
-            "5. GraphQL BOLA:\n"
-            "   query { user(id: \"OTHER_USER_ID\") { email, address } }\n"
-            "   mutation { updateUser(id: \"OTHER_USER_ID\", data: {...}) }"
+            "REST API SECURITY TESTING:\n"
+            "1. AUTHENTICATION (API2:2023 Broken Auth):\n"
+            "   - JWT testing:\n"
+            "     * Decode: echo {token} | base64 -d\n"
+            "     * Check algorithm: none, HS256 vs RS256 confusion\n"
+            "     * Crack weak secrets: hashcat -m 16500 jwt.txt wordlist\n"
+            "     * Expired token reuse\n"
+            "     * Token in URL parameter (logged in server logs)\n"
+            "     * Missing signature validation\n"
+            "   - API key testing:\n"
+            "     * Key in URL vs header\n"
+            "     * Key enumeration/brute force\n"
+            "     * Leaked keys in client-side code\n"
+            "   - OAuth2 testing:\n"
+            "     * Open redirect in redirect_uri\n"
+            "     * CSRF on authorization endpoint\n"
+            "     * Token theft via referrer\n"
+            "     * Scope escalation\n"
+            "2. AUTHORIZATION (API1:2023 BOLA):\n"
+            "   - IDOR testing:\n"
+            "     * Change numeric IDs: /api/users/1 → /api/users/2\n"
+            "     * Change UUID: Try other users' UUIDs\n"
+            "     * Change resource references in request body\n"
+            "   - BFLA (Broken Function Level Authorization):\n"
+            "     * Access admin endpoints as regular user\n"
+            "     * Change HTTP method: GET → PUT/DELETE\n"
+            "     * Add admin parameters: ?admin=true, ?role=admin\n"
+            "3. INJECTION (API8:2023):\n"
+            "   - SQL injection in query parameters and JSON body\n"
+            "   - NoSQL injection:\n"
+            "     * MongoDB: {\"$gt\": \"\"}, {\"$ne\": \"\"}\n"
+            "     * {\"username\": {\"$regex\": \"admin\"}, \"password\": {\"$ne\": \"\"}}\n"
+            "   - Server-Side Request Forgery (SSRF):\n"
+            "     * URL parameters: ?url=http://169.254.169.254/\n"
+            "     * Webhook endpoints: POST body with internal URLs\n"
+            "4. RATE LIMITING (API4:2023):\n"
+            "   - Check for rate limits:\n"
+            "     for i in $(seq 1 100); do curl -s -o /dev/null -w '%{http_code}' {url}; done\n"
+            "   - Check different endpoints\n"
+            "   - IP rotation bypass\n"
+            "   - User-Agent rotation\n"
+            "5. MASS ASSIGNMENT (API3:2023):\n"
+            "   - Add extra fields to request body:\n"
+            "     {\"name\": \"user\", \"role\": \"admin\", \"verified\": true}\n"
+            "   - Check if server accepts and processes unexpected fields\n"
+            "6. DOCUMENTATION:\n"
+            "   - Swagger/OpenAPI: /swagger.json, /api-docs, /openapi.json\n"
+            "   - Postman collections leak\n"
+            "   - GraphQL introspection"
         ),
-        "indicators": ["API", "REST", "object ID", "user_id", "resource access"],
+        "tools": ["Burp Suite", "jwt_tool", "Postman", "ffuf"],
     },
     {
-        "id": "api-002", "name": "Broken Authentication",
-        "category": "authentication", "severity": "critical",
-        "owasp_api": "API2:2023",
-        "api_types": ["rest", "graphql", "grpc"],
-        "desc": "Weak or flawed API authentication mechanisms.",
+        "id": "api-002", "name": "GraphQL Security Testing",
+        "category": "graphql", "severity": "high",
+        "owasp_api": "API1,API3,API5",
+        "desc": "GraphQL-specific security testing.",
         "testing": (
-            "API AUTHENTICATION TESTING:\n"
-            "1. TOKEN ANALYSIS:\n"
-            "   - JWT: Decode header/payload (base64), check algorithm\n"
-            "   - alg:none attack: Set algorithm to 'none', remove signature\n"
-            "   - RS256→HS256: Change from RSA to HMAC, sign with public key\n"
-            "   - Weak secret: Brute-force JWT secret (hashcat mode 16500)\n"
-            "   - KID injection: {\"kid\": \"../../dev/null\"} → empty key\n"
-            "2. API KEY TESTING:\n"
-            "   - Check if API key is in URL (leaked in logs, referrer)\n"
-            "   - Test key revocation: Does revoking actually invalidate?\n"
-            "   - Rate limiting per key vs per IP\n"
-            "   - Key scope: Does one key work across all endpoints?\n"
-            "3. OAUTH FLAWS:\n"
-            "   - Missing state parameter → CSRF on OAuth flow\n"
-            "   - Open redirect in redirect_uri → token theft\n"
-            "   - Token in URL fragment → leaked in referrer\n"
-            "   - Refresh token rotation: Is old refresh token invalidated?\n"
-            "4. SESSION MANAGEMENT:\n"
-            "   - Session fixation: Can attacker set session ID?\n"
-            "   - Concurrent sessions: Login from multiple devices\n"
-            "   - Logout: Does session actually get invalidated?\n"
-            "5. PASSWORD RESET:\n"
-            "   - Token predictability (sequential, time-based)\n"
-            "   - Token reuse: Can same token be used twice?\n"
-            "   - Host header injection in reset email"
+            "GRAPHQL SECURITY TESTING:\n"
+            "1. DISCOVERY:\n"
+            "   - Common endpoints:\n"
+            "     /graphql, /graphiql, /graphql/console, /v1/graphql\n"
+            "     /playground, /altair, /api/graphql\n"
+            "   - Detect GraphQL: POST with {\"query\": \"{__typename}\"}\n"
+            "2. INTROSPECTION:\n"
+            "   - Full schema dump:\n"
+            "     {\"query\": \"{__schema{types{name fields{name type{name}}}}\"}\n"
+            "   - IntrospectionQuery (full):\n"
+            "     Use graphql-voyager to visualize schema\n"
+            "   - If introspection disabled:\n"
+            "     * Field suggestions in error messages\n"
+            "     * Clairvoyance: Brute force field/type names\n"
+            "3. AUTHORIZATION:\n"
+            "   - Query depth attacks:\n"
+            "     {user{posts{comments{author{posts{comments{...}}}}}}}\n"
+            "   - Batch query attacks:\n"
+            "     [{\"query\": \"...\"}, {\"query\": \"...\"}, ...] (100+ queries)\n"
+            "   - Alias-based attacks:\n"
+            "     {a: user(id: 1) {...}, b: user(id: 2) {...}, ...}\n"
+            "   - Field-level authorization:\n"
+            "     Can user A query user B's private fields?\n"
+            "4. INJECTION:\n"
+            "   - SQL injection in arguments:\n"
+            "     {user(id: \"1' OR '1'='1\") {name}}\n"
+            "   - SSRF in arguments:\n"
+            "     mutation{importData(url: \"http://internal-service/\")}\n"
+            "5. DENIAL OF SERVICE:\n"
+            "   - Deeply nested queries (no depth limit)\n"
+            "   - Circular fragment references\n"
+            "   - Large result sets (no pagination limit)\n"
+            "   - Aliases amplification\n"
+            "6. MUTATIONS:\n"
+            "   - Test all mutations for authorization\n"
+            "   - Mass assignment via mutations\n"
+            "   - File upload via multipart GraphQL\n"
+            "TOOLS: graphql-voyager, Clairvoyance, InQL (Burp extension)"
         ),
-        "indicators": ["JWT", "API key", "OAuth", "Bearer token", "authentication"],
+        "tools": ["InQL", "graphql-voyager", "Clairvoyance", "Burp Suite"],
     },
     {
-        "id": "api-003", "name": "Excessive Data Exposure",
-        "category": "data_exposure", "severity": "high",
-        "owasp_api": "API3:2023",
-        "api_types": ["rest", "graphql"],
-        "desc": "API returns more data than necessary, relying on client-side filtering.",
+        "id": "api-003", "name": "gRPC Security Testing",
+        "category": "grpc", "severity": "high",
+        "owasp_api": "API2,API8",
+        "desc": "gRPC-specific security testing.",
         "testing": (
-            "EXCESSIVE DATA EXPOSURE TESTING:\n"
-            "1. RESPONSE ANALYSIS:\n"
-            "   - Compare API response fields with what UI actually displays\n"
-            "   - Look for: password hashes, tokens, internal IDs, PII, admin flags\n"
-            "   - Check /api/users/me → does it return other users' data?\n"
-            "2. DEBUG/VERBOSE MODES:\n"
-            "   - Add ?debug=true, ?verbose=1, ?format=debug\n"
-            "   - Check for stack traces, SQL queries in error responses\n"
-            "   - X-Debug: 1 header\n"
-            "3. CONTENT TYPE MANIPULATION:\n"
-            "   - Request Accept: application/xml (may expose more fields)\n"
-            "   - Request different API versions: /v1/ vs /v2/ vs /v3/\n"
-            "4. GraphQL SPECIFIC:\n"
-            "   - Introspection query: {__schema{types{name,fields{name}}}}\n"
-            "   - Request ALL fields on a type\n"
-            "   - Nested queries to reach hidden relationships\n"
-            "5. BATCH REQUESTS:\n"
-            "   - /api/users?limit=10000 (return all users)\n"
-            "   - Pagination abuse: Follow all pages to enumerate"
+            "GRPC SECURITY TESTING:\n"
+            "1. DISCOVERY:\n"
+            "   - gRPC reflection:\n"
+            "     grpcurl -plaintext {host}:{port} list\n"
+            "     grpcurl -plaintext {host}:{port} describe {service}\n"
+            "   - Proto file extraction:\n"
+            "     grpcurl -plaintext {host}:{port} describe | protoc --decode_raw\n"
+            "   - Common ports: 50051, 443 (with TLS)\n"
+            "2. AUTHENTICATION:\n"
+            "   - No auth: Try calling methods without credentials\n"
+            "   - Token in metadata:\n"
+            "     grpcurl -H 'authorization: Bearer {token}' ...\n"
+            "   - mTLS: Check if client cert is required\n"
+            "3. AUTHORIZATION:\n"
+            "   - Call privileged methods as unprivileged user\n"
+            "   - IDOR in request messages\n"
+            "   - Horizontal privilege escalation\n"
+            "4. INJECTION:\n"
+            "   - Protobuf field injection\n"
+            "   - Unknown field handling\n"
+            "   - Large message DoS\n"
+            "5. TLS:\n"
+            "   - Plaintext gRPC (no TLS)\n"
+            "   - Certificate validation disabled\n"
+            "   - Weak TLS configuration\n"
+            "TOOLS: grpcurl, ghz (load testing), grpc-web-devtools"
         ),
-        "indicators": ["API response", "JSON", "user profile", "list endpoint"],
+        "tools": ["grpcurl", "ghz", "grpc-web-devtools"],
     },
     {
-        "id": "api-004", "name": "Rate Limiting Bypass",
-        "category": "availability", "severity": "medium",
-        "owasp_api": "API4:2023",
-        "api_types": ["rest", "graphql", "grpc"],
-        "desc": "Circumventing API rate limits to abuse functionality.",
+        "id": "api-004", "name": "WebSocket Security Testing",
+        "category": "websocket", "severity": "high",
+        "owasp_api": "API2,API8",
+        "desc": "WebSocket-specific security testing.",
         "testing": (
-            "RATE LIMITING BYPASS TESTING:\n"
-            "1. IDENTIFY LIMITS:\n"
-            "   - Send rapid requests, note when throttled\n"
-            "   - Check headers: X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After\n"
-            "2. BYPASS TECHNIQUES:\n"
-            "   - IP rotation: Use different source IPs\n"
-            "   - Header spoofing: X-Forwarded-For: 1.2.3.4 (new IP each request)\n"
-            "   - X-Real-IP, X-Originating-IP, X-Client-IP headers\n"
-            "   - API key rotation: Use different API keys\n"
-            "   - Endpoint variation: /api/login vs /API/LOGIN vs /api/login/\n"
-            "   - HTTP method change: POST vs PUT (same endpoint, different counter)\n"
-            "3. RACE CONDITION:\n"
-            "   - Send requests simultaneously to bypass per-second limits\n"
-            "   - Multiple connections in parallel\n"
-            "4. GraphQL SPECIFIC:\n"
-            "   - Batch queries: [{query1}, {query2}, ..., {query100}] in single request\n"
-            "   - Aliases: { a: user(id:1), b: user(id:2), ... } → many queries in one\n"
-            "5. IMPACT:\n"
-            "   - Brute force credentials\n"
-            "   - SMS/email bombing\n"
-            "   - Resource exhaustion (DoS)"
+            "WEBSOCKET SECURITY TESTING:\n"
+            "1. DISCOVERY:\n"
+            "   - WebSocket upgrade in HTTP response headers:\n"
+            "     Upgrade: websocket, Connection: Upgrade\n"
+            "   - Common endpoints: /ws, /socket, /websocket, /realtime\n"
+            "   - Socket.IO: /socket.io/?EIO=4&transport=polling\n"
+            "2. AUTHENTICATION:\n"
+            "   - Token in URL: ws://host/ws?token=xxx (logged!)\n"
+            "   - No auth after upgrade (HTTP auth only)\n"
+            "   - Session fixation via WebSocket\n"
+            "   - Cross-Site WebSocket Hijacking (CSWSH):\n"
+            "     * Check Origin header validation\n"
+            "     * If no Origin check → any page can connect\n"
+            "3. MESSAGE INJECTION:\n"
+            "   - XSS in WebSocket messages (reflected in UI)\n"
+            "   - SQL injection in message parameters\n"
+            "   - Command injection in message processing\n"
+            "   - JSON message manipulation\n"
+            "4. DENIAL OF SERVICE:\n"
+            "   - Connection flooding: Open thousands of connections\n"
+            "   - Large message: Send multi-MB messages\n"
+            "   - Slow read: Accept data very slowly\n"
+            "   - Ping/pong abuse\n"
+            "5. DATA EXPOSURE:\n"
+            "   - Subscribe to privileged channels\n"
+            "   - Broadcast message interception\n"
+            "   - Unencrypted ws:// (not wss://)\n"
+            "TOOLS: wscat, websocat, Burp Suite WebSocket tab"
         ),
-        "indicators": ["rate limit", "throttle", "too many requests", "429"],
-    },
-    {
-        "id": "api-005", "name": "BFLA (Broken Function Level Auth)",
-        "category": "authorization", "severity": "critical",
-        "owasp_api": "API5:2023",
-        "api_types": ["rest", "graphql", "grpc"],
-        "desc": "Accessing admin/privileged functions without proper authorization.",
-        "testing": (
-            "BFLA TESTING METHODOLOGY:\n"
-            "1. DISCOVER ADMIN ENDPOINTS:\n"
-            "   - Fuzz for: /api/admin/, /api/internal/, /api/management/\n"
-            "   - Check JavaScript/mobile app for hidden API calls\n"
-            "   - OpenAPI/Swagger docs: /swagger.json, /openapi.yaml\n"
-            "   - Check for different HTTP methods: GET vs POST vs PUT vs DELETE\n"
-            "2. PRIVILEGE ESCALATION:\n"
-            "   - Use regular user token to access admin endpoints\n"
-            "   - Change role in request: {\"role\": \"admin\"}\n"
-            "   - Access admin UI endpoints from API\n"
-            "3. FUNCTION-LEVEL TESTING:\n"
-            "   - Regular user → try: create/delete users, change config\n"
-            "   - Test each HTTP method separately (GET allowed, DELETE should be denied)\n"
-            "   - Test batch operations: Can regular user batch-delete?\n"
-            "4. HIDDEN FUNCTIONS:\n"
-            "   - GraphQL: Check mutations available to all users\n"
-            "   - gRPC: List all available services/methods via reflection\n"
-            "   - SOAP: Read WSDL for all available operations\n"
-            "5. RBAC BYPASS:\n"
-            "   - Test with different roles: viewer, editor, admin, super-admin\n"
-            "   - Test role hierarchy: can editor do admin things?"
-        ),
-        "indicators": ["admin API", "role-based", "authorization", "privilege"],
-    },
-    {
-        "id": "api-006", "name": "Mass Assignment",
-        "category": "injection", "severity": "high",
-        "owasp_api": "API6:2023",
-        "api_types": ["rest", "graphql"],
-        "desc": "Modifying object properties that should not be client-modifiable.",
-        "testing": (
-            "MASS ASSIGNMENT TESTING:\n"
-            "1. IDENTIFY WRITABLE ENDPOINTS:\n"
-            "   - POST /api/users (create user)\n"
-            "   - PUT /api/users/{id} (update user)\n"
-            "   - PATCH /api/users/{id} (partial update)\n"
-            "2. ADD EXTRA FIELDS:\n"
-            "   Normal: {\"name\": \"John\", \"email\": \"john@example.com\"}\n"
-            "   Attack: {\"name\": \"John\", \"email\": \"john@example.com\", "
-            "\"role\": \"admin\", \"is_admin\": true, \"credits\": 99999}\n"
-            "3. COMMON TARGET FIELDS:\n"
-            "   - role, is_admin, admin, privilege, permissions\n"
-            "   - credits, balance, points, plan, tier\n"
-            "   - verified, email_verified, approved, active\n"
-            "   - password, password_hash (set known password)\n"
-            "   - created_at, updated_at (backdate)\n"
-            "   - user_id, owner_id (change ownership)\n"
-            "4. GraphQL SPECIFIC:\n"
-            "   mutation { updateUser(input: {id: 1, role: \"admin\"}) }\n"
-            "   Check which fields are accepted in mutation input types\n"
-            "5. DETECTION:\n"
-            "   - Compare GET response fields with PUT/PATCH accepted fields\n"
-            "   - Any field returned by GET that changes behavior = test target"
-        ),
-        "indicators": ["update endpoint", "PUT", "PATCH", "user profile edit"],
-    },
-    {
-        "id": "api-007", "name": "GraphQL Deep Query DoS",
-        "category": "availability", "severity": "high",
-        "owasp_api": "API4:2023",
-        "api_types": ["graphql"],
-        "desc": "Deeply nested or circular GraphQL queries causing resource exhaustion.",
-        "testing": (
-            "GraphQL DoS TESTING:\n"
-            "1. DEEP NESTING:\n"
-            "   query {\n"
-            "     users {\n"
-            "       posts {\n"
-            "         comments {\n"
-            "           author {\n"
-            "             posts {\n"
-            "               comments { ... }\n"
-            "             }\n"
-            "           }\n"
-            "         }\n"
-            "       }\n"
-            "     }\n"
-            "   }\n"
-            "   Increase depth until server times out or errors\n"
-            "2. FIELD DUPLICATION:\n"
-            "   query { users { name name name name name ... (1000 times) } }\n"
-            "3. BATCH QUERIES:\n"
-            "   Send array of 1000+ queries in single request\n"
-            "4. ALIAS ABUSE:\n"
-            "   query { a: users { name } b: users { name } c: users { name } ... }\n"
-            "   Each alias is a separate database query\n"
-            "5. INTROSPECTION ABUSE:\n"
-            "   Full schema introspection on large schemas = expensive\n"
-            "6. FRAGMENT CYCLES:\n"
-            "   fragment A on User { ...B } fragment B on User { ...A }\n"
-            "7. MITIGATIONS TO CHECK:\n"
-            "   - Query depth limit\n"
-            "   - Query complexity analysis\n"
-            "   - Timeout per query\n"
-            "   - Rate limiting"
-        ),
-        "indicators": ["GraphQL", "graphql endpoint", "/graphql"],
-    },
-    {
-        "id": "api-008", "name": "API Schema Discovery",
-        "category": "recon", "severity": "medium",
-        "owasp_api": "API9:2023",
-        "api_types": ["rest", "graphql", "grpc", "soap"],
-        "desc": "Discovering undocumented API endpoints and schemas.",
-        "testing": (
-            "API SCHEMA DISCOVERY:\n"
-            "1. DOCUMENTATION ENDPOINTS:\n"
-            "   - /swagger.json, /swagger.yaml, /swagger-ui/\n"
-            "   - /openapi.json, /openapi.yaml, /api-docs\n"
-            "   - /graphql (introspection enabled by default)\n"
-            "   - /grpc/reflection/v1alpha/ServerReflection\n"
-            "   - ?wsdl (SOAP)\n"
-            "2. COMMON API PATHS:\n"
-            "   - /api/v1/, /api/v2/, /api/v3/ (version enumeration)\n"
-            "   - /api/internal/, /api/admin/, /api/debug/\n"
-            "   - /_api/, /rest/, /service/, /ws/\n"
-            "3. SOURCE CODE ANALYSIS:\n"
-            "   - JavaScript bundles contain API routes\n"
-            "   - Mobile app decompilation reveals API endpoints\n"
-            "   - .map files contain original source\n"
-            "4. HISTORICAL:\n"
-            "   - Wayback Machine: web.archive.org for old API docs\n"
-            "   - Search GitHub for company's API references\n"
-            "5. FUZZING:\n"
-            "   - Fuzz endpoint names with SecLists API wordlists\n"
-            "   - Fuzz HTTP methods on known endpoints\n"
-            "   - Fuzz content types: JSON, XML, form, multipart"
-        ),
-        "indicators": ["API", "REST", "JSON", "swagger", "openapi"],
+        "tools": ["wscat", "websocat", "Burp Suite"],
     },
 ]
 
@@ -317,8 +223,8 @@ API_VULN_PATTERNS: list[dict[str, Any]] = [
 class APISecurityKB:
     """API security knowledge base.
 
-    Provides deep API attack methodology that gets injected
-    into agent prompts for comprehensive API assessment.
+    Provides API-specific security testing methodology
+    injected into agent prompts.
     """
 
     def __init__(self) -> None:
@@ -337,65 +243,39 @@ class APISecurityKB:
                 owasp_api=data.get("owasp_api", ""),
                 description=data.get("desc", ""),
                 testing_methodology=data.get("testing", ""),
-                detection_indicators=data.get("indicators", []),
-                api_types=data.get("api_types", ["rest"]),
+                tools=data.get("tools", []),
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_patterns_for_api_type(
+    def get_patterns_for_category(
         self,
-        api_type: str,
+        category: str,
     ) -> list[APIVulnPattern]:
-        """Get patterns for a specific API type."""
+        """Get patterns by category."""
         return [
             p for p in self._patterns.values()
-            if api_type.lower() in p.api_types
+            if p.category == category
         ]
 
-    def get_testing_prompts(
+    def build_api_prompt(
         self,
-        api_types: list[str] | None = None,
-        max_patterns: int = 5,
-    ) -> list[str]:
-        """Get testing prompts for agent context injection."""
-        prompts = []
-        for pattern in self._patterns.values():
-            if api_types:
-                if not any(t in pattern.api_types for t in api_types):
-                    continue
-            if pattern.testing_methodology:
-                prompts.append(pattern.testing_methodology)
-            if len(prompts) >= max_patterns:
-                break
-        return prompts
-
-    def detect_api_indicators(self, text: str) -> list[APIVulnPattern]:
-        """Detect which API patterns are relevant."""
-        text_lower = text.lower()
-        relevant = []
-        for pattern in self._patterns.values():
-            for indicator in pattern.detection_indicators:
-                if indicator.lower() in text_lower:
-                    relevant.append(pattern)
-                    break
-        return relevant
-
-    def build_api_testing_prompt(
-        self,
-        api_type: str = "rest",
+        categories: list[str] | None = None,
         max_patterns: int = 3,
     ) -> str:
-        """Build comprehensive API testing prompt."""
-        relevant = self.get_patterns_for_api_type(api_type)
-
-        lines = [f"## API Security Testing ({api_type.upper()})\n"]
-        for pattern in relevant[:max_patterns]:
+        """Build API security prompt."""
+        lines = ["## API Security Testing\n"]
+        count = 0
+        for pattern in self._patterns.values():
+            if categories and pattern.category not in categories:
+                continue
+            if count >= max_patterns:
+                break
             lines.append(f"### {pattern.name} [{pattern.severity.upper()}]")
             if pattern.owasp_api:
                 lines.append(f"OWASP API: {pattern.owasp_api}")
             lines.append(pattern.testing_methodology)
             lines.append("")
-
+            count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
