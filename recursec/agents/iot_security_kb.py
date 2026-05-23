@@ -1,11 +1,11 @@
 """IoT security knowledge base.
 
-Deep knowledge about IoT device attacks:
-1. Firmware extraction and analysis
-2. UART/JTAG debug interface exploitation
-3. Protocol fuzzing (MQTT, CoAP, AMQP)
-4. Default credential attacks
-5. OTA update hijacking
+Deep knowledge about IoT vulnerabilities:
+1. Firmware analysis and extraction
+2. Hardware interface exploitation
+3. MQTT/CoAP protocol attacks
+4. SCADA/ICS security
+5. Smart home device exploitation
 """
 
 from __future__ import annotations
@@ -39,169 +39,175 @@ class IoTPattern:
 
 IOT_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "iot-001", "name": "Firmware Extraction and Analysis",
+        "id": "iot-001", "name": "Firmware Analysis and Extraction",
         "category": "firmware", "severity": "high",
         "desc": "Extracting and analyzing IoT device firmware.",
         "detection": (
             "FIRMWARE ANALYSIS:\n"
+            "ACQUISITION:\n"
+            "  - Download from vendor website (update packages)\n"
+            "  - Extract from device via UART/JTAG/SWD\n"
+            "  - Sniff OTA update traffic\n"
+            "  - Read flash chip directly (SPI/I2C/NAND)\n"
+            "    flashrom -p ft2232_spi:type=2232H -r firmware.bin\n"
             "EXTRACTION:\n"
-            "  Physical:\n"
-            "    - UART serial console: Find TX/RX pins, connect at common baud rates\n"
-            "    - SPI flash dump: flashrom, Bus Pirate\n"
-            "    - JTAG/SWD: OpenOCD, JLink\n"
-            "    - Chip-off: Desolder flash, read with programmer\n"
-            "  Software:\n"
-            "    - Download from vendor update site\n"
-            "    - Capture OTA update (MITM proxy)\n"
-            "    - Extract from mobile app (APK/IPA)\n"
+            "  # binwalk — firmware extraction tool\n"
+            "  binwalk -e firmware.bin  # Auto-extract\n"
+            "  binwalk -Me firmware.bin  # Recursive extraction\n"
+            "  # Entropy analysis (find encrypted/compressed sections)\n"
+            "  binwalk -E firmware.bin\n"
+            "  # Filesystem extraction\n"
+            "  unsquashfs squashfs-root.img  # SquashFS\n"
+            "  jefferson image.jffs2  # JFFS2\n"
+            "  ubi_reader image.ubi  # UBIFS\n"
             "ANALYSIS:\n"
-            "  binwalk -e <firmware.bin>  # Extract embedded filesystems\n"
-            "  binwalk -A <firmware.bin>  # CPU architecture detection\n"
-            "  firmware-mod-kit  # Unpack/repack firmware\n"
-            "  jefferson  # JFFS2 filesystem extraction\n"
-            "  ubi_reader  # UBI/UBIFS extraction\n"
-            "TARGETS:\n"
-            "  - /etc/passwd, /etc/shadow  # Credentials\n"
-            "  - SSL certificates and private keys\n"
-            "  - Configuration files with secrets\n"
-            "  - Hardcoded API endpoints and keys\n"
-            "  - Custom binaries (reverse engineer with Ghidra/radare2)\n"
-            "  - Web server files (admin panels, hidden endpoints)\n"
-            "  - Init scripts (startup services, debug modes)"
+            "  # Search for secrets\n"
+            "  grep -r 'password\\|secret\\|key\\|token' extracted/\n"
+            "  # Find hardcoded credentials\n"
+            "  strings firmware.bin | grep -i 'admin\\|root\\|pass'\n"
+            "  # Analyze startup scripts\n"
+            "  cat extracted/etc/init.d/*\n"
+            "  cat extracted/etc/shadow  # Password hashes\n"
+            "  # Emulate firmware\n"
+            "  firmadyne  # Automated emulation framework\n"
+            "  FAT (Firmware Analysis Toolkit)"
         ),
-        "tools": ["binwalk", "firmware-mod-kit", "ghidra"],
+        "tools": ["binwalk", "firmadyne", "flashrom"],
     },
     {
-        "id": "iot-002", "name": "UART/JTAG Debug Interface",
+        "id": "iot-002", "name": "Hardware Interface Exploitation",
         "category": "hardware", "severity": "critical",
         "desc": "Exploiting hardware debug interfaces.",
         "detection": (
-            "HARDWARE DEBUG INTERFACES:\n"
-            "UART:\n"
-            "  Finding pins:\n"
-            "    - Visual inspection: 3-4 pin headers/test points\n"
-            "    - Multimeter: Measure voltage (VCC=3.3V, GND=0V)\n"
-            "    - JTAGulator / Bus Pirate for auto-detection\n"
-            "    - Common baud rates: 9600, 19200, 38400, 57600, 115200\n"
-            "  Connection:\n"
-            "    screen /dev/ttyUSB0 115200\n"
-            "    minicom -D /dev/ttyUSB0 -b 115200\n"
-            "  Exploitation:\n"
-            "    - Boot console → interrupt boot (press Enter during startup)\n"
-            "    - U-Boot shell → modify boot args, enable debug\n"
-            "    - Root shell (many devices drop to root UART shell)\n"
-            "    - Dump flash from U-Boot: md.b <address> <length>\n"
+            "HARDWARE INTERFACE EXPLOITATION:\n"
+            "UART (Serial Console):\n"
+            "  - Find UART pins on PCB (TX, RX, GND, VCC)\n"
+            "  - Use multimeter to identify (3.3V typically)\n"
+            "  - Connect with USB-to-UART adapter\n"
+            "  screen /dev/ttyUSB0 115200\n"
+            "  minicom -D /dev/ttyUSB0 -b 115200\n"
+            "  # Often gives root shell or bootloader access\n"
+            "  # Try common baud rates: 9600, 19200, 38400, 57600, 115200\n"
             "JTAG/SWD:\n"
-            "  Finding pins:\n"
-            "    - 10/20 pin standard headers\n"
-            "    - JTAGulator for auto-detection\n"
-            "  Tools:\n"
-            "    - OpenOCD: Open On-Chip Debugger\n"
-            "    - JLink: Segger debug probe\n"
-            "  Exploitation:\n"
-            "    - Read/write memory\n"
-            "    - Dump entire flash contents\n"
-            "    - Bypass secure boot (halt CPU, modify registers)\n"
-            "    - Debug running firmware (breakpoints, memory inspection)"
+            "  - Debug interface for ARM/MIPS processors\n"
+            "  - Read/write flash memory\n"
+            "  - Halt CPU and inspect registers\n"
+            "  - Tools: OpenOCD, JLink, Bus Pirate\n"
+            "  openocd -f interface/jlink.cfg -f target/stm32f1x.cfg\n"
+            "  # Dump firmware\n"
+            "  flash read_image firmware.bin 0x08000000 0x100000\n"
+            "SPI FLASH:\n"
+            "  - Direct flash chip read\n"
+            "  - Use SOIC clip or desolder chip\n"
+            "  flashrom -p buspirate_spi -r dump.bin\n"
+            "  # Modify and reflash\n"
+            "  flashrom -p buspirate_spi -w modified.bin\n"
+            "I2C/EEPROM:\n"
+            "  - Often stores configuration/credentials\n"
+            "  i2cdetect -y 1  # Detect I2C devices\n"
+            "  i2cdump -y 1 0x50  # Dump EEPROM contents"
         ),
-        "tools": ["jtagulator", "openocd", "bus-pirate"],
+        "tools": ["openocd", "flashrom", "buspirate"],
     },
     {
-        "id": "iot-003", "name": "IoT Protocol Attacks",
+        "id": "iot-003", "name": "MQTT and CoAP Protocol Attacks",
         "category": "protocol", "severity": "high",
-        "desc": "Attacking IoT-specific protocols.",
+        "desc": "Attacking IoT messaging protocols.",
         "detection": (
-            "IOT PROTOCOL ATTACKS:\n"
-            "MQTT (Message Queuing Telemetry Transport):\n"
-            "  - Default port: 1883 (plain), 8883 (TLS)\n"
-            "  - Anonymous access: mosquitto_sub -h <host> -t '#' -v\n"
-            "  - Subscribe to all topics: # wildcard\n"
-            "  - Common topics: /home/+/temperature, /device/+/command\n"
-            "  - Publish commands: mosquitto_pub -h <host> -t <topic> -m <payload>\n"
-            "  - Credential brute force: ncrack mqtt://<host>\n"
-            "CoAP (Constrained Application Protocol):\n"
-            "  - Default port: 5683 (UDP)\n"
-            "  - Discovery: coap-client -m get coap://<host>/.well-known/core\n"
-            "  - No authentication by default\n"
-            "  - Observe resources for data leakage\n"
-            "UPnP/SSDP:\n"
-            "  - Discovery: nmap --script upnp-info <subnet>\n"
-            "  - SSDP amplification (DDoS)\n"
-            "  - XML service descriptions may leak device info\n"
-            "  - Unauthorized control: Send SOAP actions\n"
-            "mDNS/DNS-SD:\n"
-            "  - Discovery: avahi-browse -a\n"
-            "  - Enumerate services on local network\n"
-            "  - Find hidden management interfaces"
+            "MQTT AND CoAP ATTACKS:\n"
+            "MQTT ENUMERATION:\n"
+            "  # Default port: 1883 (plaintext), 8883 (TLS)\n"
+            "  nmap -p 1883,8883 <target>\n"
+            "  # Anonymous connection\n"
+            "  mosquitto_sub -h <broker> -t '#' -v  # Subscribe to ALL topics\n"
+            "  mosquitto_sub -h <broker> -t '$SYS/#' -v  # System info\n"
+            "  # MQTT Explorer (GUI tool)\n"
+            "MQTT ATTACKS:\n"
+            "  - Anonymous access (no auth required)\n"
+            "  - Wildcard subscription (# topic)\n"
+            "  - Message injection\n"
+            "  mosquitto_pub -h <broker> -t 'device/control' -m '{\"cmd\": \"unlock\"}'\n"
+            "  - Topic enumeration\n"
+            "  - Credential brute force\n"
+            "  - TLS downgrade\n"
+            "  - Retained message poisoning\n"
+            "CoAP:\n"
+            "  # Default port: 5683 (UDP)\n"
+            "  coap-client -m get coap://<target>/.well-known/core\n"
+            "  # Resource discovery\n"
+            "  coap-client -m get coap://<target>/sensor/temp\n"
+            "  # PUT/POST to modify\n"
+            "  coap-client -m put coap://<target>/actuator -e '{\"state\":\"on\"}'\n"
+            "  # No authentication by default"
         ),
         "tools": ["mosquitto", "coap-client", "nmap"],
     },
     {
-        "id": "iot-004", "name": "Default Credentials and Weak Auth",
-        "category": "auth", "severity": "critical",
-        "desc": "Default and weak authentication in IoT devices.",
+        "id": "iot-004", "name": "SCADA/ICS Security",
+        "category": "scada", "severity": "critical",
+        "desc": "Attacking industrial control systems.",
         "detection": (
-            "IOT DEFAULT CREDENTIALS:\n"
-            "COMMON DEFAULTS:\n"
-            "  Routers: admin/admin, admin/password, admin/<blank>\n"
-            "  IP Cameras: admin/admin, root/root, admin/12345\n"
-            "  Printers: admin/<blank>, admin/admin\n"
-            "  Smart Home: often setup-dependent, check manufacturer\n"
-            "DATABASES:\n"
-            "  - https://cirt.net/passwords  # Default password DB\n"
-            "  - https://default-password.info/\n"
-            "  - datarecovery.com/rd/default-passwords/\n"
-            "SCANNING:\n"
-            "  # Scan for common IoT services\n"
-            "  nmap -sV -p 80,443,8080,8443,1883,5683,23,22 <subnet>\n"
-            "  # Brute force\n"
-            "  hydra -L users.txt -P passwords.txt <host> http-get /\n"
-            "  medusa -h <host> -U users.txt -P passwords.txt -M http\n"
-            "TELNET (still common in IoT):\n"
-            "  - Many IoT devices still expose Telnet\n"
-            "  - Default credentials widely known (Mirai botnet used this)\n"
-            "  - nmap -p 23 --script telnet-brute <subnet>\n"
-            "WEB INTERFACES:\n"
-            "  - Hidden admin pages (/admin, /management, /debug)\n"
-            "  - API endpoints without authentication\n"
-            "  - Firmware update without auth verification"
+            "SCADA/ICS SECURITY:\n"
+            "PROTOCOL SCANNING:\n"
+            "  # Modbus (port 502)\n"
+            "  nmap -p 502 --script modbus-discover <target>\n"
+            "  # Read holding registers\n"
+            "  modbus-cli read <target> 0 100\n"
+            "  # Write registers (DANGEROUS in production!)\n"
+            "  modbus-cli write <target> 0 0xFF\n"
+            "  # DNP3 (port 20000)\n"
+            "  nmap -p 20000 <target>\n"
+            "  # BACnet (port 47808/UDP)\n"
+            "  nmap -sU -p 47808 --script bacnet-info <target>\n"
+            "  # EtherNet/IP (port 44818)\n"
+            "  nmap -p 44818 --script enip-info <target>\n"
+            "COMMON ISSUES:\n"
+            "  - No authentication on industrial protocols\n"
+            "  - Plaintext communication (no encryption)\n"
+            "  - Default credentials on HMIs\n"
+            "  - Windows XP/7 embedded (unpatched)\n"
+            "  - Flat network (IT/OT not segmented)\n"
+            "  - Remote access without VPN\n"
+            "TOOLS:\n"
+            "  - PLCScan: PLC discovery and fingerprinting\n"
+            "  - s7scan: Siemens S7 scanner\n"
+            "  - ISF (Industrial exploitation framework)\n"
+            "  - GRFICSv2: ICS simulation for testing"
         ),
-        "tools": ["hydra", "nmap", "medusa"],
+        "tools": ["nmap", "modbus-cli", "plcscan"],
     },
     {
-        "id": "iot-005", "name": "OTA Update Hijacking",
-        "category": "update", "severity": "critical",
-        "desc": "Hijacking over-the-air firmware updates.",
+        "id": "iot-005", "name": "UPnP and SSDP Exploitation",
+        "category": "upnp", "severity": "high",
+        "desc": "Exploiting Universal Plug and Play services.",
         "detection": (
-            "OTA UPDATE HIJACKING:\n"
-            "INTERCEPTION:\n"
-            "  - MITM the update channel:\n"
-            "    bettercap + custom caplet for IoT protocols\n"
-            "  - ARP spoofing to redirect device traffic\n"
-            "  - DNS spoofing to redirect update server\n"
-            "  - If HTTP (not HTTPS): Direct modification\n"
-            "VULNERABILITIES:\n"
-            "  No TLS:\n"
-            "    - Update downloaded over HTTP → modify in transit\n"
-            "    - Inject malicious firmware\n"
-            "  No Signature Verification:\n"
-            "    - Device accepts any firmware file\n"
-            "    - Replace with backdoored firmware\n"
-            "  Weak Signature:\n"
-            "    - CRC32 or MD5 checksum only (not cryptographic)\n"
-            "    - Collide or strip check\n"
-            "  Rollback Attack:\n"
-            "    - No anti-rollback protection\n"
-            "    - Force update to older vulnerable version\n"
-            "TESTING:\n"
-            "  1. Trigger firmware update on device\n"
-            "  2. Capture update traffic (Wireshark/tcpdump)\n"
-            "  3. Analyze update protocol (HTTP? HTTPS? Custom?)\n"
-            "  4. Check for certificate validation\n"
-            "  5. Check for firmware signature verification\n"
-            "  6. Attempt to serve modified firmware"
+            "UPnP/SSDP EXPLOITATION:\n"
+            "DISCOVERY:\n"
+            "  # SSDP discovery (port 1900/UDP)\n"
+            "  gssdp-discover  # GNOME SSDP tool\n"
+            "  upnp-inspector  # GUI UPnP browser\n"
+            "  miranda  # UPnP pentesting tool\n"
+            "  # Manual discovery\n"
+            "  echo -e 'M-SEARCH * HTTP/1.1\\r\\nHOST:239.255.255.250:1900\\r\\n\"\n"
+            "  \"ST:upnp:rootdevice\\r\\nMAN:\\\"ssdp:discover\\\"\\r\\nMX:2\\r\\n\\r\\n' |\n"
+            "  socat - UDP4-DATAGRAM:239.255.255.250:1900\n"
+            "ATTACKS:\n"
+            "  - Port mapping injection\n"
+            "    # Add port forwarding rule\n"
+            "    # Forward internal services to internet\n"
+            "  - SOAP command injection\n"
+            "    # Inject commands via SOAP action parameters\n"
+            "  - Information disclosure\n"
+            "    # Device description XML reveals internals\n"
+            "  - Firmware update manipulation\n"
+            "    # If UPnP manages firmware → inject malicious update\n"
+            "CallStranger (CVE-2020-12695):\n"
+            "  - SUBSCRIBE callback to internal IP\n"
+            "  - SSRF via UPnP\n"
+            "  - Data exfiltration via callback\n"
+            "  - DDoS amplification"
         ),
-        "tools": ["bettercap", "wireshark", "mitmproxy"],
+        "tools": ["miranda", "gssdp-discover", "nmap"],
     },
 ]
 
@@ -209,8 +215,8 @@ IOT_PATTERNS: list[dict[str, Any]] = [
 class IoTSecurityKB:
     """IoT security knowledge base.
 
-    Provides IoT attack patterns injected
-    into agent prompts.
+    Provides IoT vulnerability patterns
+    injected into agent prompts.
     """
 
     def __init__(self) -> None:
