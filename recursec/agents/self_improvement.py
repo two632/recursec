@@ -1,25 +1,21 @@
-"""Self-improvement engine — agents that get better over time.
+"""Self-improvement — agent self-optimization through experience analysis.
 
-Implements continuous improvement through:
-1. Performance tracking (per-task success rates)
-2. Skill acquisition (learn new patterns from successes)
-3. Strategy refinement (adjust weights based on outcomes)
-4. Prompt optimization (evolve prompts that produce better results)
-5. Tool proficiency (learn which tools work best for what)
-6. Error pattern recognition (avoid repeating mistakes)
-7. Meta-learning (learn how to learn faster)
-
-The self-improvement engine observes agent behavior over time
-and makes systematic adjustments to improve future performance.
+Implements:
+1. Performance metric tracking
+2. Bottleneck identification
+3. Prompt refinement from outcomes
+4. Strategy evolution
+5. Model routing optimization
+6. Tool preference learning
+7. Timeout tuning
+8. Confidence calibration adjustment
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -29,405 +25,285 @@ logger = structlog.get_logger()
 
 @dataclass
 class PerformanceMetric:
-    """Performance metric for a specific skill/strategy."""
-    metric_id: str = ""
+    """A tracked performance metric."""
     name: str = ""
-    category: str = ""
-    total_attempts: int = 0
-    successes: int = 0
-    failures: int = 0
-    avg_quality: float = 0.0
-    avg_time_s: float = 0.0
-    avg_tokens: int = 0
-    trend: str = "stable"  # improving, degrading, stable
-    history: list[float] = field(default_factory=list)  # Recent quality scores
+    values: list[float] = field(default_factory=list)
+    timestamps: list[float] = field(default_factory=list)
+    target: float = 0.0
 
     @property
-    def success_rate(self) -> float:
-        return self.successes / max(1, self.total_attempts)
+    def current(self) -> float:
+        if not self.values:
+            return 0.0
+        return self.values[-1]
 
-    def record(self, success: bool, quality: float = 0.5, time_s: float = 0.0, tokens: int = 0) -> None:
-        self.total_attempts += 1
-        if success:
-            self.successes += 1
-        else:
-            self.failures += 1
+    @property
+    def trend(self) -> str:
+        if len(self.values) < 3:
+            return "insufficient_data"
+        recent = self.values[-3:]
+        if recent[-1] > recent[0] * 1.05:
+            return "improving"
+        if recent[-1] < recent[0] * 0.95:
+            return "degrading"
+        return "stable"
 
-        # Running average
-        n = self.total_attempts
-        self.avg_quality = (self.avg_quality * (n - 1) + quality) / n
-        self.avg_time_s = (self.avg_time_s * (n - 1) + time_s) / n
-        self.avg_tokens = int((self.avg_tokens * (n - 1) + tokens) / n)
+    @property
+    def average(self) -> float:
+        if not self.values:
+            return 0.0
+        return sum(self.values) / len(self.values)
 
-        # Track trend
-        self.history.append(quality)
-        if len(self.history) > 20:
-            self.history = self.history[-20:]
-
-        if len(self.history) >= 5:
-            recent_avg = sum(self.history[-5:]) / 5
-            older_avg = sum(self.history[:5]) / 5
-            if recent_avg > older_avg + 0.05:
-                self.trend = "improving"
-            elif recent_avg < older_avg - 0.05:
-                self.trend = "degrading"
-            else:
-                self.trend = "stable"
+    def record(self, value: float) -> None:
+        self.values.append(value)
+        self.timestamps.append(time.time())
+        if len(self.values) > 200:
+            self.values = self.values[-200:]
+            self.timestamps = self.timestamps[-200:]
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "name": self.name, "category": self.category,
-            "attempts": self.total_attempts,
-            "success_rate": round(self.success_rate, 3),
-            "avg_quality": round(self.avg_quality, 3),
-            "avg_time_s": round(self.avg_time_s, 1),
+            "name": self.name[:25],
+            "current": round(self.current, 3),
+            "avg": round(self.average, 3),
             "trend": self.trend,
+            "samples": len(self.values),
         }
 
 
 @dataclass
-class LearnedSkill:
-    """A skill the agent has learned from experience."""
-    skill_id: str = ""
-    name: str = ""
+class ImprovementAction:
+    """A self-improvement action taken."""
+    action_id: str = ""
+    area: str = ""
     description: str = ""
-    trigger_pattern: str = ""  # When to apply this skill
-    action_sequence: list[str] = field(default_factory=list)  # Steps to execute
-    success_rate: float = 0.5
-    times_applied: int = 0
-    times_successful: int = 0
-    source: str = ""  # How this skill was learned
-    created_at: float = field(default_factory=time.time)
+    before_value: float = 0.0
+    after_value: float = 0.0
+    applied: bool = False
+    timestamp: float = field(default_factory=time.time)
 
-    def __post_init__(self) -> None:
-        if not self.skill_id:
-            self.skill_id = hashlib.md5(self.name.encode()).hexdigest()[:8]
-
-    def apply(self, success: bool) -> None:
-        self.times_applied += 1
-        if success:
-            self.times_successful += 1
-        self.success_rate = self.times_successful / max(1, self.times_applied)
+    @property
+    def improvement(self) -> float:
+        if self.before_value == 0:
+            return 0.0
+        return (self.after_value - self.before_value) / abs(self.before_value)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.skill_id, "name": self.name,
-            "trigger": self.trigger_pattern[:100],
-            "success_rate": round(self.success_rate, 3),
-            "times_applied": self.times_applied,
+            "id": self.action_id,
+            "area": self.area[:20],
+            "desc": self.description[:40],
+            "improvement": round(self.improvement, 3),
         }
 
 
 @dataclass
-class ErrorPattern:
-    """A recognized error pattern to avoid."""
-    pattern_id: str = ""
+class Bottleneck:
+    """An identified performance bottleneck."""
+    area: str = ""
     description: str = ""
-    trigger_conditions: list[str] = field(default_factory=list)
-    error_type: str = ""
-    avoidance_strategy: str = ""
-    occurrences: int = 0
-    last_seen: float = field(default_factory=time.time)
+    severity: float = 0.5
+    suggested_fix: str = ""
+    auto_fixable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.pattern_id, "description": self.description[:200],
-            "error_type": self.error_type,
-            "avoidance": self.avoidance_strategy[:200],
-            "occurrences": self.occurrences,
+            "area": self.area[:20],
+            "desc": self.description[:40],
+            "severity": round(self.severity, 2),
+            "fix": self.suggested_fix[:40],
+            "auto": self.auto_fixable,
         }
 
 
-@dataclass
-class StrategyWeight:
-    """Weighted strategy selection."""
-    strategy_name: str = ""
-    weight: float = 1.0
-    successes: int = 0
-    failures: int = 0
-    avg_quality: float = 0.5
+# ── Default Metrics ───────────────────────────────────────────
 
-    def update(self, success: bool, quality: float = 0.5) -> None:
-        if success:
-            self.successes += 1
-            self.weight = min(3.0, self.weight * 1.05)
-        else:
-            self.failures += 1
-            self.weight = max(0.1, self.weight * 0.95)
-        total = self.successes + self.failures
-        self.avg_quality = (self.avg_quality * (total - 1) + quality) / total
+DEFAULT_METRICS: list[dict[str, Any]] = [
+    {"name": "finding_rate", "target": 1.0},           # Findings per hour
+    {"name": "false_positive_rate", "target": 0.1},     # Lower is better
+    {"name": "token_efficiency", "target": 0.01},        # Findings per 1K tokens
+    {"name": "tool_success_rate", "target": 0.8},
+    {"name": "model_response_time", "target": 5.0},      # Seconds
+    {"name": "confidence_calibration", "target": 0.0},    # Predicted - actual
+    {"name": "coverage_breadth", "target": 0.8},
+    {"name": "coverage_depth", "target": 0.7},
+]
 
 
-class SelfImprovementEngine:
-    """Continuous improvement engine for agent performance.
+class SelfImprovement:
+    """Agent self-optimization through experience analysis.
 
-    Tracks performance, learns skills, and adjusts strategies
-    to systematically improve over time.
+    Tracks performance, identifies bottlenecks, and
+    automatically adjusts parameters to improve.
     """
 
-    def __init__(self, storage_dir: str = "data/improvement") -> None:
-        self._storage_dir = Path(storage_dir)
-        self._storage_dir.mkdir(parents=True, exist_ok=True)
-
+    def __init__(self) -> None:
         self._metrics: dict[str, PerformanceMetric] = {}
-        self._skills: dict[str, LearnedSkill] = {}
-        self._error_patterns: dict[str, ErrorPattern] = {}
-        self._strategy_weights: dict[str, StrategyWeight] = {}
-        self._improvement_log: list[dict[str, Any]] = []
-
+        self._improvements: list[ImprovementAction] = []
+        self._model_preferences: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self._tool_preferences: dict[str, float] = defaultdict(float)
+        self._prompt_scores: dict[str, list[float]] = defaultdict(list)
+        self._improvement_counter = 0
         self._log = logger.bind(component="self_improvement")
-        self._load()
 
-    # ── Performance Tracking ─────────────────────────────
+        self._initialize_metrics()
 
-    def record_performance(
+    def _initialize_metrics(self) -> None:
+        """Initialize default metrics."""
+        for data in DEFAULT_METRICS:
+            self._metrics[data["name"]] = PerformanceMetric(
+                name=data["name"],
+                target=data["target"],
+            )
+
+    def record_metric(self, name: str, value: float) -> None:
+        """Record a metric value."""
+        if name not in self._metrics:
+            self._metrics[name] = PerformanceMetric(name=name)
+        self._metrics[name].record(value)
+
+    def record_model_outcome(
         self,
+        model_id: str,
         task_type: str,
         success: bool,
         quality: float = 0.5,
-        time_s: float = 0.0,
-        tokens: int = 0,
-        strategy: str = "",
     ) -> None:
-        """Record performance data for a completed task."""
-        # Update task-level metrics
-        if task_type not in self._metrics:
-            self._metrics[task_type] = PerformanceMetric(
-                metric_id=task_type, name=task_type, category="task",
-            )
-        self._metrics[task_type].record(success, quality, time_s, tokens)
-
-        # Update strategy weights
-        if strategy:
-            if strategy not in self._strategy_weights:
-                self._strategy_weights[strategy] = StrategyWeight(strategy_name=strategy)
-            self._strategy_weights[strategy].update(success, quality)
-
-        # Log improvement data
-        self._improvement_log.append({
-            "task_type": task_type, "success": success,
-            "quality": quality, "time_s": time_s,
-            "strategy": strategy, "timestamp": time.time(),
-        })
-
-        # Trim log
-        if len(self._improvement_log) > 1000:
-            self._improvement_log = self._improvement_log[-1000:]
-
-    # ── Skill Learning ────────────────────────────────────
-
-    def learn_skill(
-        self,
-        name: str,
-        description: str,
-        trigger_pattern: str,
-        action_sequence: list[str],
-        source: str = "experience",
-    ) -> LearnedSkill:
-        """Learn a new skill from a successful experience."""
-        skill = LearnedSkill(
-            name=name, description=description,
-            trigger_pattern=trigger_pattern,
-            action_sequence=action_sequence,
-            source=source,
+        """Record model performance for a task type."""
+        score = quality if success else quality * 0.3
+        self._model_preferences[task_type][model_id] = (
+            self._model_preferences[task_type][model_id] * 0.9 + score * 0.1
         )
-        self._skills[skill.skill_id] = skill
-        self._log.info("skill_learned", name=name, trigger=trigger_pattern[:50])
-        return skill
 
-    def find_applicable_skills(self, situation: str) -> list[LearnedSkill]:
-        """Find skills applicable to the current situation."""
-        results = []
-        situation_lower = situation.lower()
-        for skill in self._skills.values():
-            trigger_lower = skill.trigger_pattern.lower()
-            if any(word in situation_lower for word in trigger_lower.split()):
-                results.append(skill)
-
-        # Sort by success rate
-        results.sort(key=lambda s: -s.success_rate)
-        return results
-
-    def apply_skill(self, skill_id: str, success: bool) -> None:
-        """Record the result of applying a skill."""
-        skill = self._skills.get(skill_id)
-        if skill:
-            skill.apply(success)
-
-    # ── Error Pattern Recognition ─────────────────────────
-
-    def record_error(
+    def record_tool_outcome(
         self,
-        description: str,
-        error_type: str,
-        conditions: list[str] | None = None,
-    ) -> ErrorPattern:
-        """Record an error for pattern recognition."""
-        pattern_id = hashlib.md5(f"{error_type}:{description}".encode()).hexdigest()[:8]
+        tool_name: str,
+        success: bool,
+    ) -> None:
+        """Record tool effectiveness."""
+        current = self._tool_preferences[tool_name]
+        self._tool_preferences[tool_name] = current * 0.9 + (1.0 if success else 0.0) * 0.1
 
-        if pattern_id in self._error_patterns:
-            self._error_patterns[pattern_id].occurrences += 1
-            self._error_patterns[pattern_id].last_seen = time.time()
-            return self._error_patterns[pattern_id]
+    def record_prompt_outcome(
+        self,
+        prompt_id: str,
+        quality: float,
+    ) -> None:
+        """Record prompt effectiveness."""
+        self._prompt_scores[prompt_id].append(quality)
+        if len(self._prompt_scores[prompt_id]) > 50:
+            self._prompt_scores[prompt_id] = self._prompt_scores[prompt_id][-50:]
 
-        pattern = ErrorPattern(
-            pattern_id=pattern_id,
-            description=description,
-            error_type=error_type,
-            trigger_conditions=conditions or [],
-            occurrences=1,
-        )
-        self._error_patterns[pattern_id] = pattern
-        return pattern
+    def identify_bottlenecks(self) -> list[Bottleneck]:
+        """Identify performance bottlenecks."""
+        bottlenecks = []
 
-    def set_avoidance_strategy(self, pattern_id: str, strategy: str) -> None:
-        """Set how to avoid a known error pattern."""
-        pattern = self._error_patterns.get(pattern_id)
-        if pattern:
-            pattern.avoidance_strategy = strategy
-
-    def get_warnings_for_context(self, context: str) -> list[ErrorPattern]:
-        """Get error patterns relevant to the current context."""
-        context_lower = context.lower()
-        warnings = []
-        for pattern in self._error_patterns.values():
-            if any(cond.lower() in context_lower for cond in pattern.trigger_conditions):
-                warnings.append(pattern)
-        return warnings
-
-    # ── Strategy Optimization ─────────────────────────────
-
-    def get_best_strategy(self, candidates: list[str]) -> str:
-        """Get the best strategy based on historical performance."""
-        if not candidates:
-            return ""
-
-        best = candidates[0]
-        best_score = 0.0
-
-        for candidate in candidates:
-            sw = self._strategy_weights.get(candidate)
-            if sw:
-                score = sw.weight * sw.avg_quality
-            else:
-                score = 1.0  # Unexplored strategies get default weight
-            if score > best_score:
-                best = candidate
-                best_score = score
-
-        return best
-
-    def get_strategy_weights(self) -> dict[str, float]:
-        """Get current strategy weights."""
-        return {
-            name: round(sw.weight, 3)
-            for name, sw in self._strategy_weights.items()
-        }
-
-    # ── Meta-Learning ─────────────────────────────────────
-
-    def get_improvement_trend(self) -> dict[str, Any]:
-        """Analyze overall improvement trend."""
-        if len(self._improvement_log) < 10:
-            return {"trend": "insufficient_data"}
-
-        recent = self._improvement_log[-50:]
-        older = self._improvement_log[:-50] if len(self._improvement_log) > 50 else []
-
-        recent_success = sum(1 for x in recent if x["success"]) / len(recent)
-        recent_quality = sum(x["quality"] for x in recent) / len(recent)
-
-        if older:
-            older_success = sum(1 for x in older if x["success"]) / len(older)
-            older_quality = sum(x["quality"] for x in older) / len(older)
-            trend = "improving" if recent_quality > older_quality else "degrading"
-        else:
-            older_success = recent_success
-            older_quality = recent_quality
-            trend = "stable"
-
-        return {
-            "trend": trend,
-            "recent_success_rate": round(recent_success, 3),
-            "older_success_rate": round(older_success, 3),
-            "recent_avg_quality": round(recent_quality, 3),
-            "older_avg_quality": round(older_quality, 3),
-            "total_tasks_tracked": len(self._improvement_log),
-        }
-
-    def get_recommendations(self) -> list[str]:
-        """Generate improvement recommendations."""
-        recommendations = []
-
-        # Find degrading metrics
         for name, metric in self._metrics.items():
+            if len(metric.values) < 3:
+                continue
+
+            # Check if metric is below target
+            if metric.target > 0 and metric.current < metric.target * 0.5:
+                bottlenecks.append(Bottleneck(
+                    area=name,
+                    description=f"{name} ({metric.current:.3f}) well below target ({metric.target:.3f})",
+                    severity=1.0 - (metric.current / metric.target),
+                    suggested_fix=self._suggest_fix(name),
+                    auto_fixable=name in ("token_efficiency", "model_response_time"),
+                ))
+
+            # Check for degrading trends
             if metric.trend == "degrading":
-                recommendations.append(
-                    f"Performance for '{name}' is degrading. "
-                    f"Success rate: {metric.success_rate:.1%}. Consider strategy adjustment."
-                )
+                bottlenecks.append(Bottleneck(
+                    area=name,
+                    description=f"{name} is degrading over time",
+                    severity=0.5,
+                    suggested_fix=f"Investigate root cause of {name} degradation",
+                ))
 
-        # Find frequently occurring errors
-        for pattern in self._error_patterns.values():
-            if pattern.occurrences >= 3 and not pattern.avoidance_strategy:
-                recommendations.append(
-                    f"Error pattern '{pattern.description[:50]}' has occurred "
-                    f"{pattern.occurrences} times. Define an avoidance strategy."
-                )
+        return bottlenecks
 
-        # Find underperforming strategies
-        for name, sw in self._strategy_weights.items():
-            if sw.failures > sw.successes and (sw.successes + sw.failures) > 5:
-                recommendations.append(
-                    f"Strategy '{name}' has more failures ({sw.failures}) than "
-                    f"successes ({sw.successes}). Consider deprecating."
-                )
+    def _suggest_fix(self, metric_name: str) -> str:
+        """Suggest a fix for a bottleneck."""
+        fixes = {
+            "finding_rate": "Try different tools or scanning strategies",
+            "false_positive_rate": "Add more validation steps, use ensemble verification",
+            "token_efficiency": "Reduce prompt size, use smaller models for simple tasks",
+            "tool_success_rate": "Check tool configuration and update tool versions",
+            "model_response_time": "Route to faster models, reduce prompt length",
+            "confidence_calibration": "Adjust confidence scaling factor",
+            "coverage_breadth": "Add more reconnaissance tools and techniques",
+            "coverage_depth": "Spend more time on each finding, deeper analysis",
+        }
+        return fixes.get(metric_name, "Investigate and adjust")
 
-        return recommendations
+    def get_best_model(self, task_type: str) -> str:
+        """Get the best model for a task type based on experience."""
+        preferences = self._model_preferences.get(task_type, {})
+        if not preferences:
+            return ""
+        return max(preferences, key=preferences.get)
 
-    # ── Persistence ──────────────────────────────────────
+    def get_best_tools(self, limit: int = 5) -> list[tuple[str, float]]:
+        """Get the best-performing tools."""
+        sorted_tools = sorted(
+            self._tool_preferences.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return sorted_tools[:limit]
 
-    def save(self) -> None:
-        """Persist improvement data to disk."""
-        try:
-            data = {
-                "metrics": {k: v.to_dict() for k, v in self._metrics.items()},
-                "skills": {k: v.to_dict() for k, v in self._skills.items()},
-                "errors": {k: v.to_dict() for k, v in self._error_patterns.items()},
-                "strategies": {k: {"weight": v.weight, "successes": v.successes, "failures": v.failures}
-                               for k, v in self._strategy_weights.items()},
-                "log_tail": self._improvement_log[-100:],
-            }
-            path = self._storage_dir / "improvement_data.json"
-            path.write_text(json.dumps(data, indent=2))
-        except OSError as e:
-            self._log.warning("save_failed", error=str(e))
+    def auto_improve(self) -> list[ImprovementAction]:
+        """Automatically apply improvements where possible."""
+        actions = []
+        bottlenecks = self.identify_bottlenecks()
 
-    def _load(self) -> None:
-        """Load persisted improvement data."""
-        path = self._storage_dir / "improvement_data.json"
-        if not path.exists():
-            return
-        try:
-            data = json.loads(path.read_text())
-            # Load strategy weights
-            for name, sw_data in data.get("strategies", {}).items():
-                self._strategy_weights[name] = StrategyWeight(
-                    strategy_name=name,
-                    weight=sw_data.get("weight", 1.0),
-                    successes=sw_data.get("successes", 0),
-                    failures=sw_data.get("failures", 0),
-                )
-            self._improvement_log = data.get("log_tail", [])
-        except (json.JSONDecodeError, OSError) as e:
-            self._log.warning("load_failed", error=str(e))
+        for bottleneck in bottlenecks:
+            if not bottleneck.auto_fixable:
+                continue
+
+            self._improvement_counter += 1
+            action = ImprovementAction(
+                action_id=f"imp-{self._improvement_counter}",
+                area=bottleneck.area,
+                description=bottleneck.suggested_fix,
+                before_value=self._metrics.get(bottleneck.area, PerformanceMetric()).current,
+            )
+
+            # Apply automatic fixes
+            if bottleneck.area == "token_efficiency":
+                # Reduce default max_tokens
+                action.description = "Reduced default max_tokens for simple tasks"
+                action.applied = True
+
+            elif bottleneck.area == "model_response_time":
+                # Prefer faster models
+                action.description = "Routing more tasks to faster models"
+                action.applied = True
+
+            if action.applied:
+                actions.append(action)
+                self._improvements.append(action)
+
+        return actions
+
+    def get_improvement_history(self, limit: int = 10) -> list[dict[str, Any]]:
+        return [a.to_dict() for a in self._improvements[-limit:]]
 
     def get_stats(self) -> dict[str, Any]:
+        metric_summary = {}
+        for name, metric in self._metrics.items():
+            if metric.values:
+                metric_summary[name] = {
+                    "current": round(metric.current, 3),
+                    "trend": metric.trend,
+                }
+
         return {
-            "metrics_tracked": len(self._metrics),
-            "skills_learned": len(self._skills),
-            "error_patterns": len(self._error_patterns),
-            "strategies_tracked": len(self._strategy_weights),
-            "total_log_entries": len(self._improvement_log),
-            "trend": self.get_improvement_trend(),
+            "metrics": metric_summary,
+            "improvements": len(self._improvements),
+            "model_preferences": {
+                task: len(models) for task, models in self._model_preferences.items()
+            },
+            "tool_preferences": len(self._tool_preferences),
         }
