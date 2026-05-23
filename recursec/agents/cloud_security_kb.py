@@ -1,11 +1,11 @@
 """Cloud security knowledge base.
 
-Deep knowledge about cloud vulnerabilities:
-1. AWS security misconfigurations
-2. Azure and Entra ID attacks
-3. GCP privilege escalation
-4. Multi-cloud metadata attacks
-5. Serverless security issues
+Deep knowledge about cloud platform security:
+1. AWS attack techniques
+2. Azure attack techniques
+3. GCP attack techniques
+4. Multi-cloud misconfigurations
+5. Cloud identity and access management
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class CloudPattern:
     pattern_id: str = ""
     name: str = ""
     category: str = ""
-    severity: str = "high"
+    severity: str = "critical"
     description: str = ""
     detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
@@ -39,182 +39,210 @@ class CloudPattern:
 
 CLOUD_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "cloud-001", "name": "AWS Security Misconfigurations",
+        "id": "cloud-001", "name": "AWS Attack Techniques",
         "category": "aws", "severity": "critical",
-        "desc": "Common AWS security misconfigurations.",
+        "desc": "AWS-specific attack and misconfig patterns.",
         "detection": (
-            "AWS SECURITY MISCONFIGURATIONS:\n"
-            "S3 BUCKET:\n"
-            "  # Check public access\n"
-            "  aws s3api get-bucket-acl --bucket <name>\n"
-            "  aws s3api get-bucket-policy --bucket <name>\n"
-            "  aws s3api get-public-access-block --bucket <name>\n"
-            "  # Enumerate buckets\n"
-            "  aws s3 ls s3://<bucket> --no-sign-request\n"
-            "  # Common names: <company>-dev, <company>-backup, <company>-logs\n"
-            "IAM:\n"
-            "  # Enumerate permissions\n"
-            "  aws iam get-user\n"
-            "  aws iam list-attached-user-policies --user-name <user>\n"
-            "  aws iam list-user-policies --user-name <user>\n"
-            "  # Check for iam:PassRole + lambda/ec2 = escalation\n"
-            "  # Check for sts:AssumeRole to higher-priv roles\n"
-            "  # Dangerous policies: AdministratorAccess, IAMFullAccess\n"
-            "EC2:\n"
-            "  # Metadata service\n"
+            "AWS ATTACK TECHNIQUES:\n"
+            "CREDENTIAL DISCOVERY:\n"
+            "  # Instance metadata (IMDS)\n"
             "  curl http://169.254.169.254/latest/meta-data/iam/security-credentials/\n"
-            "  # IMDSv2 check\n"
-            "  TOKEN=$(curl -X PUT http://169.254.169.254/latest/api/token \\\n"
-            "    -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\n"
-            "  # Security groups: Check 0.0.0.0/0 ingress\n"
+            "  # IMDSv2 (requires token)\n"
+            "  TOKEN=$(curl -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)\n"
+            "  curl -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/\n"
+            "  # Environment variables (Lambda)\n"
+            "  # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN\n"
+            "S3 BUCKET:\n"
+            "  aws s3 ls s3://bucket-name --no-sign-request  # Public bucket\n"
+            "  # Bucket policies, ACLs, Block Public Access\n"
+            "  # Object-level permissions vs bucket-level\n"
+            "  # Presigned URL abuse\n"
+            "IAM EXPLOITATION:\n"
+            "  # Enumerate permissions\n"
+            "  aws iam list-attached-user-policies --user-name <user>\n"
+            "  aws iam get-policy-version --policy-arn <arn> --version-id v1\n"
+            "  # Privilege escalation paths:\n"
+            "  - iam:PassRole + lambda:CreateFunction → exec as any role\n"
+            "  - iam:CreatePolicyVersion → escalate own permissions\n"
+            "  - sts:AssumeRole → pivot to other roles\n"
+            "  - ec2:RunInstances + iam:PassRole → instance with privileged role\n"
+            "LAMBDA:\n"
+            "  # Code injection via event data\n"
+            "  # Environment variable exfiltration\n"
+            "  # Layer poisoning\n"
+            "  # Timeout/concurrency abuse\n"
             "TOOLS:\n"
-            "  prowler  # AWS security audit\n"
-            "  ScoutSuite  # Multi-cloud audit\n"
             "  pacu  # AWS exploitation framework\n"
-            "  enumerate-iam  # Enumerate IAM permissions"
+            "  prowler  # AWS security assessment\n"
+            "  ScoutSuite  # Multi-cloud auditing\n"
+            "  enumerate-iam  # IAM permission enumeration"
         ),
-        "tools": ["prowler", "scoutsuite", "pacu"],
+        "tools": ["pacu", "prowler", "scoutsuite"],
     },
     {
-        "id": "cloud-002", "name": "Azure and Entra ID Attacks",
+        "id": "cloud-002", "name": "Azure Attack Techniques",
         "category": "azure", "severity": "critical",
-        "desc": "Azure and Microsoft Entra ID vulnerability assessment.",
+        "desc": "Azure-specific attack and misconfig patterns.",
         "detection": (
-            "AZURE / ENTRA ID ATTACKS:\n"
+            "AZURE ATTACK TECHNIQUES:\n"
             "ENTRA ID (Azure AD):\n"
-            "  # Enumerate users\n"
-            "  az ad user list --query '[].{UPN:userPrincipalName}'\n"
-            "  # Enumerate groups\n"
-            "  az ad group list --query '[].{Name:displayName}'\n"
-            "  # Check app registrations\n"
-            "  az ad app list --query '[].{Name:displayName,AppId:appId}'\n"
-            "  # Service principal secrets\n"
-            "  az ad app credential list --id <app-id>\n"
-            "COMMON ATTACKS:\n"
-            "  - Consent phishing (illicit consent grant)\n"
-            "  - Application proxy abuse\n"
-            "  - PRT (Primary Refresh Token) theft\n"
-            "  - Device code phishing\n"
-            "  - Password spray against AzureAD\n"
-            "MANAGED IDENTITIES:\n"
-            "  # From Azure VM, get managed identity token\n"
-            "  curl 'http://169.254.169.254/metadata/identity/oauth2/token'\\\n"
-            "    '?api-version=2018-02-01&resource=https://management.azure.com/'\\\n"
-            "    -H Metadata:true\n"
+            "  # Enumerate users and groups\n"
+            "  az ad user list\n"
+            "  az ad group list\n"
+            "  # Password spray\n"
+            "  # Token theft from az cli profile (~/.azure/)\n"
+            "  # Application consent phishing (illicit consent grant)\n"
+            "MANAGED IDENTITY:\n"
+            "  # Instance metadata\n"
+            "  curl -H 'Metadata: true' http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/\n"
+            "  # System-assigned and user-assigned\n"
+            "  # Access tokens for Azure services\n"
+            "STORAGE:\n"
+            "  # Blob storage misconfigurations\n"
+            "  # Public containers\n"
+            "  # SAS token abuse (overly permissive)\n"
+            "  # Storage account key exposure\n"
+            "RBAC:\n"
+            "  # Overly permissive custom roles\n"
+            "  # Contributor → can reset admin passwords\n"
+            "  # User Access Administrator → assign any role\n"
+            "  # Classic admins (legacy)\n"
+            "RESOURCE MANAGER:\n"
+            "  # ARM template injection\n"
+            "  # Deployment history (may contain secrets)\n"
+            "  az deployment group list -g <resource-group>\n"
+            "  # Key Vault access policies\n"
             "TOOLS:\n"
             "  ROADtools  # Azure AD enumeration\n"
-            "  AzureHound  # BloodHound for Azure\n"
-            "  MicroBurst  # Azure security toolkit\n"
-            "  TokenTactics  # Azure token manipulation"
+            "  AADInternals  # Azure AD exploitation\n"
+            "  MicroBurst  # Azure enumeration\n"
+            "  AzureHound  # BloodHound for Azure"
         ),
-        "tools": ["roadtools", "azurehound"],
+        "tools": ["roadtools", "azurehound", "scoutsuite"],
     },
     {
-        "id": "cloud-003", "name": "GCP Privilege Escalation",
+        "id": "cloud-003", "name": "GCP Attack Techniques",
         "category": "gcp", "severity": "critical",
-        "desc": "GCP-specific privilege escalation techniques.",
+        "desc": "GCP-specific attack and misconfig patterns.",
         "detection": (
-            "GCP PRIVILEGE ESCALATION:\n"
-            "SERVICE ACCOUNT:\n"
-            "  # List service accounts\n"
-            "  gcloud iam service-accounts list\n"
-            "  # Get service account keys\n"
-            "  gcloud iam service-accounts keys list --iam-account=<sa>\n"
-            "  # Check IAM bindings\n"
-            "  gcloud projects get-iam-policy <project>\n"
-            "ESCALATION PATHS:\n"
-            "  - iam.serviceAccountKeys.create → Create SA key\n"
-            "  - iam.serviceAccounts.actAs + compute.instances.create → Spawn VM as SA\n"
-            "  - deploymentmanager.deployments.create → Deploy as project editor\n"
-            "  - cloudfunctions.functions.create + iam.serviceAccounts.actAs\n"
-            "  - run.services.create + iam.serviceAccounts.actAs\n"
-            "  - composer.environments.create → Airflow as SA\n"
+            "GCP ATTACK TECHNIQUES:\n"
             "METADATA:\n"
-            "  # GCP metadata service\n"
-            "  curl -H 'Metadata-Flavor: Google' \\\n"
-            "    http://169.254.169.254/computeMetadata/v1/instance/service-accounts/\n"
-            "  curl -H 'Metadata-Flavor: Google' \\\n"
-            "    http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token\n"
+            "  # Instance metadata\n"
+            "  curl -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/\n"
+            "  # Service account token\n"
+            "  curl -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token\n"
+            "  # Project metadata, SSH keys\n"
+            "STORAGE:\n"
+            "  # Public GCS buckets\n"
+            "  gsutil ls gs://bucket-name\n"
+            "  # Uniform vs fine-grained ACLs\n"
+            "  # Signed URLs\n"
+            "IAM:\n"
+            "  # Overly permissive bindings\n"
+            "  gcloud projects get-iam-policy <project>\n"
+            "  # Service account key leaks\n"
+            "  # Workload identity federation\n"
+            "  # Cross-project access\n"
+            "  # Custom roles with dangerous perms\n"
+            "COMPUTE:\n"
+            "  # Startup script injection\n"
+            "  # Serial console access\n"
+            "  # oslogin SSH key injection\n"
+            "  # Snapshot/disk export\n"
+            "CLOUD FUNCTIONS:\n"
+            "  # Code injection\n"
+            "  # Environment variable exfiltration\n"
+            "  # Pub/Sub message poisoning\n"
             "TOOLS:\n"
-            "  gcp-iam-collector  # Enumerate permissions\n"
-            "  ScoutSuite --provider gcp"
+            "  ScoutSuite  # Multi-cloud auditing\n"
+            "  gcp_enum  # GCP enumeration\n"
+            "  Cartography  # Infrastructure mapping"
         ),
-        "tools": ["scoutsuite", "gcloud"],
+        "tools": ["scoutsuite", "cartography"],
     },
     {
-        "id": "cloud-004", "name": "Serverless Security",
-        "category": "serverless", "severity": "high",
-        "desc": "Serverless function security issues.",
+        "id": "cloud-004", "name": "Multi-Cloud Misconfigurations",
+        "category": "misconfig", "severity": "high",
+        "desc": "Common cloud misconfigurations across providers.",
         "detection": (
-            "SERVERLESS SECURITY:\n"
-            "AWS LAMBDA:\n"
-            "  # Environment variable exposure\n"
-            "  aws lambda get-function-configuration --function-name <name>\n"
-            "  # Layer inspection\n"
-            "  aws lambda get-layer-version --layer-name <name> --version-number 1\n"
-            "  # Invoke with injection payload\n"
-            "  aws lambda invoke --function-name <name> \\\n"
-            "    --payload '{\"cmd\":\"id\"}' output.json\n"
-            "COMMON ISSUES:\n"
-            "  - Secrets in environment variables\n"
-            "  - Over-permissive IAM execution role\n"
-            "  - Event injection (untrusted event data)\n"
-            "  - Dependency confusion in layers\n"
-            "  - Cold start timing attacks\n"
-            "  - /tmp persistence between invocations\n"
-            "  - Shared execution environment\n"
-            "AZURE FUNCTIONS:\n"
-            "  - Function keys in URL (Kudu exposure)\n"
-            "  - Managed identity token theft\n"
-            "  - Storage account key exposure\n"
-            "GCP CLOUD FUNCTIONS:\n"
-            "  - Environment variable enumeration\n"
-            "  - Service account token from metadata\n"
-            "TESTING:\n"
-            "  - Check function URL authentication\n"
-            "  - Test event data sanitization\n"
-            "  - Review execution role permissions\n"
-            "  - Check for hardcoded secrets"
+            "MULTI-CLOUD MISCONFIGURATIONS:\n"
+            "STORAGE:\n"
+            "  - Public buckets/blobs/objects\n"
+            "  - Overly permissive ACLs\n"
+            "  - Unencrypted data at rest\n"
+            "  - No versioning (ransomware risk)\n"
+            "  - Cross-account access\n"
+            "NETWORKING:\n"
+            "  - Security groups with 0.0.0.0/0 ingress\n"
+            "  - No network segmentation (flat VPC)\n"
+            "  - Publicly exposed management ports (22, 3389)\n"
+            "  - Missing VPC flow logs\n"
+            "  - DNS zone transfer enabled\n"
+            "COMPUTE:\n"
+            "  - Instance metadata v1 (no hop limit)\n"
+            "  - Overprivileged instance roles\n"
+            "  - Unpatched AMIs/images\n"
+            "  - User data scripts with secrets\n"
+            "  - Missing disk encryption\n"
+            "IDENTITY:\n"
+            "  - Long-lived access keys\n"
+            "  - No MFA enforcement\n"
+            "  - Overprivileged service accounts\n"
+            "  - Cross-account trust abuse\n"
+            "  - Inactive/orphaned accounts\n"
+            "LOGGING:\n"
+            "  - CloudTrail/Activity Log disabled\n"
+            "  - No log monitoring/alerting\n"
+            "  - Log tampering (delete trail)\n"
+            "  - Missing S3 access logging\n"
+            "TOOLS:\n"
+            "  prowler  # AWS security\n"
+            "  ScoutSuite  # Multi-cloud\n"
+            "  cloudsploit  # Multi-cloud\n"
+            "  checkov  # IaC scanning"
         ),
-        "tools": ["prowler", "scoutsuite"],
+        "tools": ["prowler", "scoutsuite", "checkov"],
     },
     {
-        "id": "cloud-005", "name": "Terraform and IaC Misconfigs",
-        "category": "iac", "severity": "high",
-        "desc": "Infrastructure as Code security misconfigurations.",
+        "id": "cloud-005", "name": "Cloud IAM Attacks",
+        "category": "iam", "severity": "critical",
+        "desc": "Cloud identity and access management attacks.",
         "detection": (
-            "TERRAFORM / IaC MISCONFIGURATIONS:\n"
-            "STATE FILE:\n"
-            "  # Terraform state contains ALL secrets\n"
-            "  # Check for exposed state files\n"
-            "  # S3 bucket: company-terraform-state\n"
-            "  # Azure blob: tfstate container\n"
-            "  # HTTP backend without auth\n"
-            "COMMON MISCONFIGS:\n"
-            "  - Public S3/blob for state storage\n"
-            "  - No state file encryption\n"
-            "  - Secrets in terraform.tfvars committed to git\n"
-            "  - Hardcoded credentials in provider blocks\n"
-            "  - Overly permissive security groups\n"
-            "  - Public RDS/database instances\n"
-            "  - Disabled logging/monitoring\n"
-            "  - Missing encryption at rest\n"
-            "SCANNING:\n"
-            "  # tfsec (Terraform)\n"
-            "  tfsec ./terraform/\n"
-            "  # checkov (multi-IaC)\n"
-            "  checkov -d ./terraform/\n"
-            "  # terrascan\n"
-            "  terrascan scan -t aws -d ./terraform/\n"
-            "  # kics (Checkmarx)\n"
-            "  kics scan -p ./\n"
+            "CLOUD IAM ATTACKS:\n"
+            "CREDENTIAL THEFT:\n"
+            "  - Exposed access keys in code repos\n"
+            "  - Environment variables in CI/CD\n"
+            "  - Instance metadata SSRF\n"
+            "  - Stolen browser tokens (Azure/GCP portal)\n"
+            "  - Container credential exposure\n"
+            "PRIVILEGE ESCALATION:\n"
+            "  - Self-service policy modification\n"
+            "  - Role chaining (assume → assume → assume)\n"
+            "  - Service account impersonation\n"
+            "  - Resource policy modification\n"
+            "  - Cross-service privilege escalation\n"
+            "PERSISTENCE:\n"
+            "  - Create additional access keys\n"
+            "  - Create new IAM user/service account\n"
+            "  - Modify trust policies\n"
+            "  - Add SSH keys to instances\n"
+            "  - Create OAuth applications\n"
+            "LATERAL MOVEMENT:\n"
+            "  - Cross-account role assumption\n"
+            "  - Service account key usage\n"
+            "  - Shared VPC/VNet access\n"
+            "  - Database IAM authentication\n"
+            "DETECTION EVASION:\n"
+            "  - Use legitimate service accounts\n"
+            "  - API calls through VPC endpoints\n"
+            "  - CloudTrail bypass (data events)\n"
+            "  - Regions without logging\n"
             "TOOLS:\n"
-            "  tfsec  # Terraform security scanner\n"
-            "  checkov  # Multi-framework IaC scanner\n"
-            "  terrascan  # OPA-based IaC scanner\n"
-            "  trivy config ./  # Trivy IaC scanning"
+            "  cloudfox  # Cloud attack surface\n"
+            "  PMapper  # IAM privilege escalation\n"
+            "  Rhino Security Labs tools"
         ),
-        "tools": ["tfsec", "checkov", "trivy"],
+        "tools": ["cloudfox", "pmapper"],
     },
 ]
 
@@ -222,7 +250,7 @@ CLOUD_PATTERNS: list[dict[str, Any]] = [
 class CloudSecurityKB:
     """Cloud security knowledge base.
 
-    Provides cloud vulnerability patterns
+    Provides cloud security patterns
     injected into agent prompts.
     """
 
@@ -238,7 +266,7 @@ class CloudSecurityKB:
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
-                severity=data.get("severity", "high"),
+                severity=data.get("severity", "critical"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
