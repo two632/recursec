@@ -1,19 +1,17 @@
-"""Experience replay — episodic memory for agent learning.
+"""Experience replay — learn from past assessments.
 
 Implements:
-1. Episode recording (full assessment sequences)
-2. Experience retrieval by similarity
-3. Success pattern extraction
-4. Failure pattern analysis
-5. Strategy replay for similar targets
-6. Compressed episode storage
-7. Priority-based experience sampling
+1. Episode recording (actions, observations, rewards)
+2. Experience storage and retrieval
+3. Strategy effectiveness scoring
+4. Tool effectiveness tracking
+5. Replay buffer for learning
+6. Cross-assessment pattern extraction
+7. Adaptive strategy optimization
 """
 
 from __future__ import annotations
 
-import json
-import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -25,7 +23,15 @@ import structlog
 logger = structlog.get_logger()
 
 
-class EpisodeOutcome(str, Enum):
+class ActionType(str, Enum):
+    TOOL_CALL = "tool_call"
+    LLM_QUERY = "llm_query"
+    AGENT_SPAWN = "agent_spawn"
+    STRATEGY_CHANGE = "strategy_change"
+    FINDING_REPORT = "finding_report"
+
+
+class Outcome(str, Enum):
     SUCCESS = "success"
     PARTIAL = "partial"
     FAILURE = "failure"
@@ -33,407 +39,320 @@ class EpisodeOutcome(str, Enum):
     ERROR = "error"
 
 
-class StepType(str, Enum):
-    OBSERVATION = "observation"
-    DECISION = "decision"
-    TOOL_USE = "tool_use"
-    LLM_QUERY = "llm_query"
-    FINDING = "finding"
-    ERROR = "error"
-    PIVOT = "pivot"
-
-
 @dataclass
-class EpisodeStep:
-    """A single step in an episode."""
-    step_num: int = 0
-    step_type: StepType = StepType.OBSERVATION
+class Experience:
+    """A single experience tuple (state, action, reward, next_state)."""
+    experience_id: str = ""
+    target: str = ""
+    phase: str = ""
+    action_type: ActionType = ActionType.TOOL_CALL
     action: str = ""
     tool: str = ""
     model: str = ""
-    input_summary: str = ""
-    output_summary: str = ""
+    outcome: Outcome = Outcome.SUCCESS
+    reward: float = 0.0
+    findings_produced: int = 0
     tokens_used: int = 0
-    duration_s: float = 0.0
-    success: bool = True
-    finding_severity: str = ""
+    time_taken_s: float = 0.0
+    context_tags: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "step": self.step_num,
-            "type": self.step_type.value,
-            "action": self.action[:25],
-            "tool": self.tool[:10],
-            "tokens": self.tokens_used,
-            "ok": self.success,
+            "id": self.experience_id[:10],
+            "action": self.action[:20],
+            "outcome": self.outcome.value,
+            "reward": round(self.reward, 2),
+            "findings": self.findings_produced,
         }
 
 
 @dataclass
-class Episode:
-    """A complete assessment episode."""
-    episode_id: str = ""
-    target_type: str = ""        # web, network, api, code, cloud
-    target_tech: list[str] = field(default_factory=list)   # nginx, django, mysql
-    strategy: str = ""
-    steps: list[EpisodeStep] = field(default_factory=list)
-    findings_count: int = 0
-    critical_count: int = 0
-    high_count: int = 0
-    total_tokens: int = 0
-    total_tools: int = 0
-    outcome: EpisodeOutcome = EpisodeOutcome.SUCCESS
-    started_at: float = field(default_factory=time.time)
-    completed_at: float = 0.0
-    priority: float = 0.5       # For prioritized replay
-
-    @property
-    def duration_s(self) -> float:
-        if self.completed_at > 0:
-            return self.completed_at - self.started_at
-        return time.time() - self.started_at
-
-    @property
-    def efficiency(self) -> float:
-        """Findings per 1000 tokens."""
-        return self.findings_count * 1000 / max(1, self.total_tokens)
+class ToolEffectiveness:
+    """Tracked effectiveness of a tool."""
+    tool: str = ""
+    total_uses: int = 0
+    successful_uses: int = 0
+    findings_produced: int = 0
+    avg_time_s: float = 0.0
+    avg_findings_per_use: float = 0.0
 
     @property
     def success_rate(self) -> float:
-        """Rate of successful steps."""
-        if not self.steps:
+        if self.total_uses == 0:
             return 0.0
-        return sum(1 for s in self.steps if s.success) / len(self.steps)
+        return self.successful_uses / self.total_uses
+
+    @property
+    def effectiveness_score(self) -> float:
+        return self.success_rate * 0.3 + min(1.0, self.avg_findings_per_use / 3) * 0.7
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.episode_id[:10],
-            "target_type": self.target_type[:8],
-            "strategy": self.strategy[:15],
-            "steps": len(self.steps),
-            "findings": self.findings_count,
-            "outcome": self.outcome.value,
-            "efficiency": round(self.efficiency, 2),
+            "tool": self.tool[:15],
+            "uses": self.total_uses,
+            "success_rate": round(self.success_rate, 2),
+            "effectiveness": round(self.effectiveness_score, 2),
         }
 
 
 @dataclass
-class StrategyPattern:
-    """An extracted strategy pattern from episodes."""
-    pattern_id: str = ""
+class StrategyRecord:
+    """Record of a strategy's effectiveness."""
+    strategy: str = ""
     target_type: str = ""
-    target_tech: list[str] = field(default_factory=list)
-    tool_sequence: list[str] = field(default_factory=list)
-    model_preferences: list[str] = field(default_factory=list)
-    avg_findings: float = 0.0
-    avg_efficiency: float = 0.0
-    episode_count: int = 0
-    success_rate: float = 0.0
+    total_uses: int = 0
+    findings_produced: int = 0
+    avg_reward: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.pattern_id[:10],
-            "target": self.target_type[:8],
-            "tools": self.tool_sequence[:5],
-            "avg_findings": round(self.avg_findings, 1),
-            "episodes": self.episode_count,
+            "strategy": self.strategy[:20],
+            "target": self.target_type[:10],
+            "uses": self.total_uses,
+            "avg_reward": round(self.avg_reward, 2),
         }
 
 
-class ExperienceReplayBuffer:
-    """Episodic memory for agent learning.
+# ── Reward calculation ───────────────────────────────────────
 
-    Records complete assessment episodes and extracts
-    patterns for improving future assessments.
+REWARD_TABLE: dict[str, float] = {
+    "finding_critical": 10.0,
+    "finding_high": 5.0,
+    "finding_medium": 2.0,
+    "finding_low": 1.0,
+    "finding_info": 0.5,
+    "new_attack_surface": 3.0,
+    "tool_success": 1.0,
+    "tool_failure": -0.5,
+    "tool_timeout": -1.0,
+    "false_positive": -2.0,
+    "duplicate_finding": -0.5,
+    "coverage_increase": 2.0,
+}
+
+
+class ExperienceReplay:
+    """Learns from past assessment experiences.
+
+    Records experiences, tracks tool/strategy
+    effectiveness, and provides optimized
+    recommendations based on historical data.
     """
 
-    def __init__(
-        self,
-        max_episodes: int = 1000,
-        data_dir: str = "",
-    ) -> None:
-        self._episodes: list[Episode] = []
-        self._max_episodes = max_episodes
+    def __init__(self, max_buffer: int = 10_000) -> None:
+        self._experiences: list[Experience] = []
+        self._tool_stats: dict[str, ToolEffectiveness] = {}
+        self._strategy_stats: dict[str, StrategyRecord] = {}
         self._counter = 0
-        self._data_dir = data_dir or os.path.expanduser("~/.recursec/episodes")
+        self._max_buffer = max_buffer
         self._log = logger.bind(component="experience_replay")
 
-    def start_episode(
+    def record(
         self,
-        target_type: str,
-        target_tech: list[str] | None = None,
-        strategy: str = "",
-    ) -> Episode:
-        """Start recording a new episode."""
-        self._counter += 1
-        episode = Episode(
-            episode_id=f"ep-{self._counter}",
-            target_type=target_type,
-            target_tech=target_tech or [],
-            strategy=strategy,
-        )
-        self._episodes.append(episode)
-
-        # Evict oldest if over limit
-        if len(self._episodes) > self._max_episodes:
-            # Keep high-priority episodes
-            self._episodes.sort(key=lambda e: e.priority, reverse=True)
-            self._episodes = self._episodes[:self._max_episodes]
-
-        return episode
-
-    def record_step(
-        self,
-        episode_id: str,
-        step_type: StepType,
         action: str,
+        action_type: ActionType = ActionType.TOOL_CALL,
         tool: str = "",
         model: str = "",
-        input_summary: str = "",
-        output_summary: str = "",
+        outcome: Outcome = Outcome.SUCCESS,
+        findings_produced: int = 0,
         tokens_used: int = 0,
-        duration_s: float = 0.0,
-        success: bool = True,
-        finding_severity: str = "",
-    ) -> EpisodeStep | None:
-        """Record a step in an episode."""
-        episode = self._find_episode(episode_id)
-        if not episode:
-            return None
+        time_taken_s: float = 0.0,
+        target: str = "",
+        phase: str = "",
+        context_tags: list[str] | None = None,
+    ) -> Experience:
+        """Record an experience."""
+        self._counter += 1
 
-        step = EpisodeStep(
-            step_num=len(episode.steps) + 1,
-            step_type=step_type,
+        reward = self._calculate_reward(outcome, findings_produced)
+
+        exp = Experience(
+            experience_id=f"exp-{self._counter}",
+            target=target,
+            phase=phase,
+            action_type=action_type,
             action=action,
             tool=tool,
             model=model,
-            input_summary=input_summary,
-            output_summary=output_summary,
+            outcome=outcome,
+            reward=reward,
+            findings_produced=findings_produced,
             tokens_used=tokens_used,
-            duration_s=duration_s,
-            success=success,
-            finding_severity=finding_severity,
+            time_taken_s=time_taken_s,
+            context_tags=context_tags or [],
         )
-        episode.steps.append(step)
 
-        # Update episode totals
-        episode.total_tokens += tokens_used
+        self._experiences.append(exp)
+
+        # Trim buffer
+        if len(self._experiences) > self._max_buffer:
+            self._experiences = self._experiences[-self._max_buffer:]
+
+        # Update tool stats
         if tool:
-            episode.total_tools += 1
-        if finding_severity:
-            episode.findings_count += 1
-            if finding_severity == "critical":
-                episode.critical_count += 1
-            elif finding_severity == "high":
-                episode.high_count += 1
+            self._update_tool_stats(tool, exp)
 
-        return step
+        return exp
 
-    def complete_episode(
+    def _calculate_reward(
         self,
-        episode_id: str,
-        outcome: EpisodeOutcome = EpisodeOutcome.SUCCESS,
-    ) -> Episode | None:
-        """Complete an episode."""
-        episode = self._find_episode(episode_id)
-        if not episode:
-            return None
+        outcome: Outcome,
+        findings: int,
+    ) -> float:
+        """Calculate reward for an experience."""
+        reward = 0.0
 
-        episode.completed_at = time.time()
-        episode.outcome = outcome
+        if outcome == Outcome.SUCCESS:
+            reward += REWARD_TABLE["tool_success"]
+        elif outcome == Outcome.FAILURE:
+            reward += REWARD_TABLE["tool_failure"]
+        elif outcome == Outcome.TIMEOUT:
+            reward += REWARD_TABLE["tool_timeout"]
 
-        # Calculate priority for replay
-        episode.priority = self._calculate_priority(episode)
+        reward += findings * REWARD_TABLE["finding_medium"]
 
-        return episode
+        return reward
 
-    def _calculate_priority(self, episode: Episode) -> float:
-        """Calculate replay priority for an episode.
-
-        Higher priority for:
-        - More findings (especially critical/high)
-        - Better efficiency
-        - Successful outcomes
-        - Recent episodes
-        """
-        finding_score = (
-            episode.critical_count * 4
-            + episode.high_count * 2
-            + episode.findings_count
-        ) / 10.0
-
-        efficiency_score = min(1.0, episode.efficiency / 5.0)
-
-        outcome_scores = {
-            EpisodeOutcome.SUCCESS: 1.0,
-            EpisodeOutcome.PARTIAL: 0.6,
-            EpisodeOutcome.FAILURE: 0.3,
-            EpisodeOutcome.TIMEOUT: 0.2,
-            EpisodeOutcome.ERROR: 0.1,
-        }
-        outcome_score = outcome_scores.get(episode.outcome, 0.3)
-
-        # Recency bias
-        age_hours = (time.time() - episode.started_at) / 3600
-        recency_score = 1.0 / (1.0 + age_hours / 24)
-
-        return min(1.0, (
-            finding_score * 0.4
-            + efficiency_score * 0.2
-            + outcome_score * 0.2
-            + recency_score * 0.2
-        ))
-
-    def get_similar_episodes(
+    def _update_tool_stats(
         self,
+        tool: str,
+        exp: Experience,
+    ) -> None:
+        """Update tool effectiveness stats."""
+        if tool not in self._tool_stats:
+            self._tool_stats[tool] = ToolEffectiveness(tool=tool)
+
+        stats = self._tool_stats[tool]
+        stats.total_uses += 1
+
+        if exp.outcome == Outcome.SUCCESS:
+            stats.successful_uses += 1
+
+        stats.findings_produced += exp.findings_produced
+
+        # Running average
+        total = stats.total_uses
+        stats.avg_time_s = (stats.avg_time_s * (total - 1) + exp.time_taken_s) / total
+        stats.avg_findings_per_use = stats.findings_produced / total
+
+    def record_strategy(
+        self,
+        strategy: str,
         target_type: str,
-        target_tech: list[str] | None = None,
-        limit: int = 5,
-    ) -> list[Episode]:
-        """Get episodes similar to a given target."""
-        scored: list[tuple[float, Episode]] = []
-
-        for episode in self._episodes:
-            if not episode.completed_at:
-                continue
-
-            score = 0.0
-
-            # Target type match
-            if episode.target_type == target_type:
-                score += 1.0
-
-            # Tech stack overlap
-            if target_tech:
-                overlap = len(set(episode.target_tech) & set(target_tech))
-                if overlap > 0:
-                    score += overlap / max(len(target_tech), 1)
-
-            # Outcome bonus
-            if episode.outcome == EpisodeOutcome.SUCCESS:
-                score += 0.5
-            elif episode.outcome == EpisodeOutcome.PARTIAL:
-                score += 0.2
-
-            scored.append((score, episode))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [ep for _, ep in scored[:limit]]
-
-    def extract_strategy_patterns(self) -> list[StrategyPattern]:
-        """Extract successful strategy patterns from episodes."""
-        # Group by target type + strategy
-        groups: dict[str, list[Episode]] = defaultdict(list)
-        for episode in self._episodes:
-            if episode.outcome in (EpisodeOutcome.SUCCESS, EpisodeOutcome.PARTIAL):
-                key = f"{episode.target_type}:{episode.strategy}"
-                groups[key].append(episode)
-
-        patterns = []
-        for key, episodes in groups.items():
-            if len(episodes) < 2:
-                continue
-
-            # Extract common tool sequences
-            tool_counts: dict[str, int] = defaultdict(int)
-            model_counts: dict[str, int] = defaultdict(int)
-            tech_counts: dict[str, int] = defaultdict(int)
-
-            for ep in episodes:
-                for step in ep.steps:
-                    if step.tool:
-                        tool_counts[step.tool] += 1
-                    if step.model:
-                        model_counts[step.model] += 1
-                for tech in ep.target_tech:
-                    tech_counts[tech] += 1
-
-            top_tools = sorted(tool_counts, key=tool_counts.get, reverse=True)[:5]
-            top_models = sorted(model_counts, key=model_counts.get, reverse=True)[:3]
-            top_tech = sorted(tech_counts, key=tech_counts.get, reverse=True)[:5]
-
-            target_type, strategy = key.split(":", 1)
-
-            self._counter += 1
-            pattern = StrategyPattern(
-                pattern_id=f"pat-{self._counter}",
+        reward: float,
+        findings: int = 0,
+    ) -> None:
+        """Record strategy effectiveness."""
+        key = f"{strategy}:{target_type}"
+        if key not in self._strategy_stats:
+            self._strategy_stats[key] = StrategyRecord(
+                strategy=strategy,
                 target_type=target_type,
-                target_tech=top_tech,
-                tool_sequence=top_tools,
-                model_preferences=top_models,
-                avg_findings=sum(ep.findings_count for ep in episodes) / len(episodes),
-                avg_efficiency=sum(ep.efficiency for ep in episodes) / len(episodes),
-                episode_count=len(episodes),
-                success_rate=sum(1 for ep in episodes if ep.outcome == EpisodeOutcome.SUCCESS) / len(episodes),
             )
-            patterns.append(pattern)
 
-        return patterns
+        record = self._strategy_stats[key]
+        record.total_uses += 1
+        record.findings_produced += findings
+        record.avg_reward = (
+            record.avg_reward * (record.total_uses - 1) + reward
+        ) / record.total_uses
 
-    def build_replay_prompt(
+    def get_best_tools(
         self,
-        target_type: str,
-        target_tech: list[str] | None = None,
-        max_episodes: int = 3,
+        phase: str = "",
+        limit: int = 5,
+    ) -> list[ToolEffectiveness]:
+        """Get the most effective tools."""
+        tools = list(self._tool_stats.values())
+
+        if phase:
+            phase_tools = set()
+            for exp in self._experiences:
+                if exp.phase == phase and exp.tool:
+                    phase_tools.add(exp.tool)
+            tools = [t for t in tools if t.tool in phase_tools]
+
+        tools.sort(key=lambda t: t.effectiveness_score, reverse=True)
+        return tools[:limit]
+
+    def get_best_strategies(
+        self,
+        target_type: str = "",
+        limit: int = 5,
+    ) -> list[StrategyRecord]:
+        """Get the most effective strategies."""
+        records = list(self._strategy_stats.values())
+
+        if target_type:
+            records = [r for r in records if r.target_type == target_type]
+
+        records.sort(key=lambda r: r.avg_reward, reverse=True)
+        return records[:limit]
+
+    def get_similar_experiences(
+        self,
+        target_type: str = "",
+        phase: str = "",
+        tool: str = "",
+        limit: int = 10,
+    ) -> list[Experience]:
+        """Get similar past experiences."""
+        matches = []
+        for exp in reversed(self._experiences):
+            score = 0
+            if target_type and target_type in exp.context_tags:
+                score += 1
+            if phase and exp.phase == phase:
+                score += 1
+            if tool and exp.tool == tool:
+                score += 1
+
+            if score > 0:
+                matches.append((score, exp))
+
+        matches.sort(key=lambda x: x[0], reverse=True)
+        return [exp for _, exp in matches[:limit]]
+
+    def build_experience_prompt(
+        self,
+        phase: str = "",
+        target_type: str = "",
     ) -> str:
-        """Build a prompt from past experiences."""
-        similar = self.get_similar_episodes(target_type, target_tech, limit=max_episodes)
-        if not similar:
-            return ""
-
+        """Build a prompt from experience data."""
         lines = ["## Past Experience\n"]
-        for ep in similar:
-            lines.append(f"### Episode: {ep.target_type} ({ep.strategy})")
-            lines.append(f"Outcome: {ep.outcome.value}, Findings: {ep.findings_count}")
-            lines.append(f"Tech: {', '.join(ep.target_tech[:3])}")
 
-            # Show key steps
-            finding_steps = [s for s in ep.steps if s.finding_severity]
-            tool_steps = [s for s in ep.steps if s.step_type == StepType.TOOL_USE]
+        # Best tools
+        best_tools = self.get_best_tools(phase=phase, limit=3)
+        if best_tools:
+            lines.append("### Most Effective Tools")
+            for tool in best_tools:
+                lines.append(
+                    f"- {tool.tool}: {tool.success_rate:.0%} success, "
+                    f"{tool.avg_findings_per_use:.1f} findings/use"
+                )
 
-            if tool_steps:
-                lines.append("Tools used: " + ", ".join(
-                    s.tool for s in tool_steps[:5] if s.tool
-                ))
-            if finding_steps:
-                lines.append("Findings from: " + ", ".join(
-                    f"{s.tool}({s.finding_severity})" for s in finding_steps[:5]
-                ))
-            lines.append("")
+        # Best strategies
+        best_strats = self.get_best_strategies(target_type=target_type, limit=3)
+        if best_strats:
+            lines.append("\n### Most Effective Strategies")
+            for strat in best_strats:
+                lines.append(
+                    f"- {strat.strategy}: avg reward {strat.avg_reward:.1f}, "
+                    f"{strat.findings_produced} findings"
+                )
 
         return "\n".join(lines)
 
-    def save(self) -> bool:
-        """Save episodes to disk."""
-        try:
-            os.makedirs(self._data_dir, exist_ok=True)
-            path = os.path.join(self._data_dir, "episodes.jsonl")
-            with open(path, "w") as f:
-                for ep in self._episodes:
-                    f.write(json.dumps(ep.to_dict()) + "\n")
-            return True
-        except OSError:
-            return False
-
-    def _find_episode(self, episode_id: str) -> Episode | None:
-        """Find an episode by ID."""
-        for ep in self._episodes:
-            if ep.episode_id == episode_id:
-                return ep
-        return None
-
     def get_stats(self) -> dict[str, Any]:
-        type_counts: dict[str, int] = defaultdict(int)
         outcome_counts: dict[str, int] = defaultdict(int)
-        for ep in self._episodes:
-            type_counts[ep.target_type] += 1
-            outcome_counts[ep.outcome.value] += 1
+        for exp in self._experiences:
+            outcome_counts[exp.outcome.value] += 1
 
         return {
-            "episodes": len(self._episodes),
-            "total_findings": sum(ep.findings_count for ep in self._episodes),
-            "total_tokens": sum(ep.total_tokens for ep in self._episodes),
-            "by_type": dict(type_counts),
+            "total_experiences": len(self._experiences),
+            "tools_tracked": len(self._tool_stats),
+            "strategies_tracked": len(self._strategy_stats),
+            "total_reward": round(sum(e.reward for e in self._experiences), 1),
             "by_outcome": dict(outcome_counts),
         }
