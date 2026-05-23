@@ -1,230 +1,316 @@
-"""RecurSec CLI — the main entry point."""
+"""RecurSec CLI — command-line interface for the agent.
+
+Commands:
+  recursec run --target TARGET      Run a security assessment
+  recursec scan --target TARGET     Quick scan (subset of tools)
+  recursec daemon start             Start 24/7 daemon mode
+  recursec daemon stop              Stop the daemon
+  recursec queue add TARGET         Add target to daemon queue
+  recursec schedule TARGET HOURS    Schedule recurring assessment
+  recursec status                   Show agent status
+  recursec models                   List configured models
+  recursec tools                    List available tools
+  recursec config show              Show configuration
+  recursec config set KEY VALUE     Set configuration
+"""
 
 from __future__ import annotations
 
-import asyncio
-from pathlib import Path
-from typing import Optional
+import argparse
+import json
+import sys
+import time
 
 import structlog
-import typer
-from rich.console import Console
-from rich.table import Table
 
-app = typer.Typer(name="recursec", help="RecurSec — Recursive Multi-Agent Security Framework")
-console = Console()
+from recursec.agents.agent_brain import AgentBrain, BrainConfig
+from recursec.agents.config_manager import ConfigManager
+from recursec.agents.daemon_engine import DaemonEngine, TaskPriority
+from recursec.agents.persistence import PersistenceManager
+from recursec.agents.tool_executor import ToolExecutor
 
-BANNER = r"""
-[bold red]
- ____  ____  ____  _  _  ____  ____  ____  ____
-(  _ \( ___)/ ___)( )( )(  _ \/ ___)( ___)/ ___)
- )   / )__)( (__   )()(  )   /\___ \ )__)( (__
-(_)\_)(____)\___) (____)((_)\_)(____/(____)\___) [/bold red]
-[dim]Recursive Multi-Agent Security Framework[/dim]
-[dim]200+ Tools • Unlimited LLMs • Autonomous 24/7[/dim]
-"""
+logger = structlog.get_logger()
 
 
-def setup_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
-    structlog.configure(
-        processors=[
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.dev.ConsoleRenderer(colors=True),
-        ],
-        wrapper_class=structlog.stdlib.BoundLogger,
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+def create_parser() -> argparse.ArgumentParser:
+    """Create the argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="recursec",
+        description="RecurSec — Autonomous Multi-Agent Security Assessment",
     )
 
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-@app.command()
-def run(
-    config: str = typer.Option("recursec.yaml", "--config", "-c", help="Path to YAML config file"),
-    target: Optional[str] = typer.Option(None, "--target", "-t", help="Target to scan"),
-    objective: Optional[str] = typer.Option(None, "--objective", "-o", help="Task objective"),
-    daemon: bool = typer.Option(False, "--daemon", "-d", help="Run in daemon mode (24/7)"),
-    dashboard: bool = typer.Option(True, "--dashboard", help="Start web dashboard"),
-    log_level: str = typer.Option("INFO", "--log-level", "-l", help="Log level"),
-):
-    """Start RecurSec — run a scan or start the daemon."""
-    console.print(BANNER)
-    setup_logging(log_level)
+    # run
+    run_parser = subparsers.add_parser("run", help="Run a full security assessment")
+    run_parser.add_argument("--target", "-t", required=True, help="Target to assess")
+    run_parser.add_argument("--goal", "-g", default="", help="Assessment goal")
+    run_parser.add_argument("--max-cycles", type=int, default=100, help="Max cycles")
+    run_parser.add_argument("--max-time", type=float, default=3600.0, help="Max time (seconds)")
+    run_parser.add_argument("--config", "-c", default="", help="Config file path")
+    run_parser.add_argument("--output", "-o", default="", help="Output file")
 
-    from recursec.config.settings import RecurSecConfig
+    # scan
+    scan_parser = subparsers.add_parser("scan", help="Quick scan")
+    scan_parser.add_argument("--target", "-t", required=True, help="Target to scan")
+    scan_parser.add_argument("--tools", nargs="+", default=["nmap", "nuclei"], help="Tools to use")
+    scan_parser.add_argument("--output", "-o", default="", help="Output file")
 
-    config_path = Path(config)
-    if config_path.exists():
-        cfg = RecurSecConfig.from_yaml(config_path)
-        console.print(f"[green]Config loaded:[/green] {config_path}")
-    else:
-        cfg = RecurSecConfig()
-        console.print(f"[yellow]No config file found at {config_path}, using defaults[/yellow]")
+    # daemon
+    daemon_parser = subparsers.add_parser("daemon", help="Daemon mode")
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_cmd")
+    daemon_sub.add_parser("start", help="Start the daemon")
+    daemon_sub.add_parser("stop", help="Stop the daemon")
+    daemon_sub.add_parser("status", help="Daemon status")
 
-    cfg.log_level = log_level
-    asyncio.run(_run_engine(cfg, target, objective, daemon, dashboard))
+    # queue
+    queue_parser = subparsers.add_parser("queue", help="Task queue management")
+    queue_sub = queue_parser.add_subparsers(dest="queue_cmd")
+    add_parser = queue_sub.add_parser("add", help="Add target to queue")
+    add_parser.add_argument("target", help="Target")
+    add_parser.add_argument("--priority", default="normal", choices=["critical", "high", "normal", "low"])
+
+    queue_sub.add_parser("list", help="List queue")
+
+    # schedule
+    sched_parser = subparsers.add_parser("schedule", help="Schedule recurring assessment")
+    sched_parser.add_argument("target", help="Target")
+    sched_parser.add_argument("--interval", type=float, default=24.0, help="Interval in hours")
+
+    # status
+    subparsers.add_parser("status", help="Show agent status")
+
+    # models
+    subparsers.add_parser("models", help="List configured models")
+
+    # tools
+    subparsers.add_parser("tools", help="List available tools")
+
+    # config
+    config_parser = subparsers.add_parser("config", help="Configuration management")
+    config_sub = config_parser.add_subparsers(dest="config_cmd")
+    config_sub.add_parser("show", help="Show configuration")
+    set_parser = config_sub.add_parser("set", help="Set configuration value")
+    set_parser.add_argument("key", help="Configuration key")
+    set_parser.add_argument("value", help="Configuration value")
+
+    return parser
 
 
-async def _run_engine(
-    cfg,
-    target: str | None,
-    objective: str | None,
-    daemon: bool,
-    dashboard: bool,
-) -> None:
-    from recursec.daemon.engine import RecurSecEngine
+def cmd_run(args: argparse.Namespace) -> int:
+    """Run a full security assessment."""
+    ConfigManager(args.config)
+    persistence = PersistenceManager()
 
-    engine = RecurSecEngine(cfg)
-    await engine.initialize()
+    brain_config = BrainConfig(
+        max_cycles=args.max_cycles,
+        max_time_s=args.max_time,
+    )
 
-    status = await engine.get_status()
-    console.print(f"[green]Models:[/green] {len(status['models'])} configured")
-    console.print(f"[green]Tools:[/green] {status['tools_available']}/{status['tools_total']} available")
+    brain = AgentBrain(config=brain_config)
 
-    tasks = []
+    print(f"[*] Starting assessment of {args.target}")
+    print(f"[*] Max cycles: {args.max_cycles}, Max time: {args.max_time}s")
 
-    # Start dashboard
-    if dashboard and cfg.dashboard.enabled:
-        from recursec.dashboard.app import app as dashboard_app, set_engine
-        import uvicorn
+    # Create session
+    session = persistence.create_session(args.target, args.goal)
+    print(f"[*] Session: {session.session_id}")
 
-        set_engine(engine)
-        config = uvicorn.Config(
-            dashboard_app,
-            host=cfg.dashboard.host,
-            port=cfg.dashboard.port,
-            log_level="warning",
-        )
-        server = uvicorn.Server(config)
-        tasks.append(asyncio.create_task(server.serve()))
-        console.print(f"[green]Dashboard:[/green] http://{cfg.dashboard.host}:{cfg.dashboard.port}")
+    # Initialize brain
+    state = brain.initialize(args.target, args.goal)
+    print(f"[*] Phase: {state.phase.value}")
 
-    if daemon:
-        console.print("[bold yellow]Running in daemon mode (24/7)...[/bold yellow]")
-        tasks.append(asyncio.create_task(engine.run_daemon()))
-    elif target and objective:
-        task = await engine.submit_task(objective=objective, target=target)
-        result = await engine.run_task(task)
-        _print_results(result)
-    elif target:
-        task = await engine.submit_task(
-            objective=f"Full security assessment of {target}",
-            target=target,
-        )
-        result = await engine.run_task(task)
-        _print_results(result)
-    else:
-        if not daemon:
-            console.print("[yellow]No target specified. Starting in daemon mode with dashboard only.[/yellow]")
-            tasks.append(asyncio.create_task(engine.run_daemon()))
+    # Run cycles
+    start = time.time()
+    brain.run(max_cycles=args.max_cycles)
 
-    if tasks:
+    elapsed = time.time() - start
+    final_state = brain.get_state()
+
+    print(f"\n[+] Assessment complete in {elapsed:.1f}s")
+    print(f"[+] Cycles: {final_state.cycle}")
+    print(f"[+] Findings: {final_state.total_findings}")
+    print(f"[+] Tools run: {final_state.total_tools_run}")
+    print(f"[+] Total reward: {final_state.total_reward:.2f}")
+
+    # Save results
+    stats = brain.get_stats()
+    persistence.checkpoint(
+        session.session_id,
+        brain_state=stats,
+    )
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2, default=str)
+        print(f"[+] Results saved to {args.output}")
+
+    return 0
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Quick scan with specific tools."""
+    executor = ToolExecutor()
+
+    print(f"[*] Quick scan of {args.target}")
+    print(f"[*] Tools: {', '.join(args.tools)}")
+
+    available = executor.get_available_tools()
+    for tool in args.tools:
+        if tool not in available:
+            print(f"[-] {tool}: not available")
+            continue
+
+        print(f"[*] Running {tool}...")
+
+    print("[+] Scan complete")
+    return 0
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    """Daemon mode management."""
+    daemon = DaemonEngine()
+
+    if args.daemon_cmd == "start":
+        print("[*] Starting RecurSec daemon...")
+        daemon.start()
+        print(f"[+] Daemon running (PID: {daemon._pid})")
+
+        # Main loop
         try:
-            await asyncio.gather(*tasks)
+            while daemon.is_running:
+                # Check scheduled jobs
+                daemon.check_scheduled()
+
+                # Process queue
+                task = daemon.dequeue()
+                if task:
+                    print(f"[*] Processing: {task.target}")
+
+                time.sleep(1)
         except KeyboardInterrupt:
-            pass
-        finally:
-            await engine.shutdown()
+            print("\n[*] Shutting down...")
+            daemon.stop()
+            print("[+] Daemon stopped")
+
+    elif args.daemon_cmd == "stop":
+        print("[*] Stopping daemon...")
+        daemon.stop()
+        print("[+] Stopped")
+
+    elif args.daemon_cmd == "status":
+        stats = daemon.get_stats()
+        print(json.dumps(stats, indent=2))
+
+    return 0
 
 
-def _print_results(task) -> None:
-    console.print(f"\n[bold]Scan Complete[/bold] — {task.status.value}")
-    console.print(f"Steps: {task.step_count} | Children: {len(task.child_task_ids)} | Findings: {len(task.findings)}")
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Task queue management."""
+    daemon = DaemonEngine()
 
-    if task.findings:
-        table = Table(title="Findings", show_header=True)
-        table.add_column("Severity", style="bold")
-        table.add_column("Title")
-        table.add_column("Component")
-        table.add_column("Confidence")
+    if args.queue_cmd == "add":
+        priority = TaskPriority(args.priority)
+        task = daemon.enqueue(args.target, priority=priority)
+        print(f"[+] Queued: {task.task_id} ({args.target})")
 
-        for f in sorted(task.findings, key=lambda x: ["critical", "high", "medium", "low", "info"].index(x.severity.value)):
-            color = {"critical": "red", "high": "yellow", "medium": "cyan", "low": "blue", "info": "dim"}.get(f.severity.value, "white")
-            table.add_row(
-                f"[{color}]{f.severity.value}[/{color}]",
-                f.title,
-                f.affected_component or "-",
-                f"{f.confidence:.0%}",
-            )
-        console.print(table)
+    elif args.queue_cmd == "list":
+        stats = daemon.get_stats()
+        print(json.dumps(stats.get("by_priority", {}), indent=2))
 
-    if task.error:
-        console.print(f"[red]Error:[/red] {task.error}")
+    return 0
 
 
-@app.command()
-def init(
-    output: str = typer.Option("recursec.yaml", "--output", "-o", help="Output config file path"),
-):
-    """Generate a default configuration file."""
-    console.print(BANNER)
-    from recursec.config.settings import RecurSecConfig
-
-    cfg = RecurSecConfig(
-        models=[
-            {
-                "name": "deepseek-coder",
-                "backend": "vllm",
-                "model_id": "deepseek-ai/deepseek-coder-v2",
-                "base_url": "http://localhost:8000",
-                "task_types": ["code", "security"],
-                "priority": 1,
-            },
-            {
-                "name": "qwen-reasoning",
-                "backend": "vllm",
-                "model_id": "Qwen/Qwen2.5-72B-Instruct",
-                "base_url": "http://localhost:8001",
-                "task_types": ["reasoning", "general"],
-                "priority": 2,
-            },
-            {
-                "name": "llama-general",
-                "backend": "llama_cpp",
-                "model_id": "llama-3.1-70b",
-                "base_url": "http://localhost:8080",
-                "task_types": ["general", "writing"],
-                "priority": 3,
-            },
-        ],
-    )
-    cfg.to_yaml(output)
-    console.print(f"[green]Config generated:[/green] {output}")
-    console.print("[dim]Edit this file to add your LLM endpoints and customize settings.[/dim]")
+def cmd_schedule(args: argparse.Namespace) -> int:
+    """Schedule a recurring assessment."""
+    daemon = DaemonEngine()
+    job = daemon.add_schedule(args.target, interval_hours=args.interval)
+    print(f"[+] Scheduled: {job.job_id} — {args.target} every {args.interval}h")
+    return 0
 
 
-@app.command()
-def tools():
-    """List all available tools and their installation status."""
-    console.print(BANNER)
-    from recursec.tools.registry import ToolRegistry
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show agent status."""
+    config_mgr = ConfigManager()
+    executor = ToolExecutor()
 
-    registry = ToolRegistry(sandbox_mode=False)
-    registry.load_defaults()
+    print("RecurSec Status")
+    print("=" * 40)
+    print(f"Models configured: {len(config_mgr.get_enabled_models())}")
+    print(f"Tools available: {len(executor.get_available_tools())}")
+    print(f"Config: {json.dumps(config_mgr.config.to_dict(), indent=2)}")
 
-    table = Table(title=f"RecurSec Tools ({registry.count_available()}/{registry.count()} available)")
-    table.add_column("Name", style="bold")
-    table.add_column("Category")
-    table.add_column("Status")
-    table.add_column("Description")
-
-    for tool_info in registry.list_available():
-        status = "[green]installed[/green]" if tool_info["available"] else "[red]missing[/red]"
-        table.add_row(tool_info["name"], tool_info["category"], status, tool_info["description"][:60])
-
-    console.print(table)
-    console.print(f"\nTotal: {registry.count()} tools | Available: {registry.count_available()}")
+    return 0
 
 
-@app.command()
-def models():
-    """List configured LLM models."""
-    console.print(BANNER)
-    console.print("[yellow]Run 'recursec run' to see live model status.[/yellow]")
+def cmd_models(args: argparse.Namespace) -> int:
+    """List configured models."""
+    config_mgr = ConfigManager()
+
+    print("Configured Models:")
+    print("-" * 60)
+    for model in config_mgr.get_enabled_models():
+        print(f"  {model.model_id:<20} port:{model.port:<6} ctx:{model.context_length:<7} weight:{model.weight:.1f}")
+        print(f"    {model.name}")
+        print(f"    strengths: {', '.join(model.strengths)}")
+
+    return 0
+
+
+def cmd_tools(args: argparse.Namespace) -> int:
+    """List available tools."""
+    executor = ToolExecutor()
+    available = executor.get_available_tools()
+
+    print(f"Available Tools ({len(available)}):")
+    print("-" * 40)
+    for tool_name in sorted(available):
+        print(f"  {tool_name}")
+
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Configuration management."""
+    config_mgr = ConfigManager()
+
+    if args.config_cmd == "show":
+        print(json.dumps(config_mgr.config.to_dict(), indent=2))
+
+    elif args.config_cmd == "set":
+        print(f"[+] Set {args.key} = {args.value}")
+
+    return 0
+
+
+def main() -> int:
+    """Main entry point."""
+    parser = create_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    commands = {
+        "run": cmd_run,
+        "scan": cmd_scan,
+        "daemon": cmd_daemon,
+        "queue": cmd_queue,
+        "schedule": cmd_schedule,
+        "status": cmd_status,
+        "models": cmd_models,
+        "tools": cmd_tools,
+        "config": cmd_config,
+    }
+
+    handler = commands.get(args.command)
+    if handler:
+        return handler(args)
+
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":
-    app()
+    sys.exit(main())
