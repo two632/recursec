@@ -1,21 +1,24 @@
-"""Experience replay — stores and replays past agent experiences for learning.
+"""Experience replay — learns from past assessment experiences.
 
 Implements:
-1. Experience storage with priority
-2. Prioritized experience replay (PER)
-3. Importance sampling
-4. Experience summarization
-5. Episode management
-6. Temporal-difference learning signals
-7. Experience similarity search
-8. Circular buffer with priority eviction
+1. Experience recording (what worked, what didn't)
+2. Priority-based replay (focus on high-value experiences)
+3. Experience similarity matching
+4. Strategy effectiveness tracking
+5. Target fingerprint → experience mapping
+6. Few-shot example generation from past successes
+7. Anti-pattern library (what to avoid)
+8. Experience compression for long-term storage
 """
 
 from __future__ import annotations
 
-import random
+import hashlib
+import json
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -23,295 +26,401 @@ import structlog
 logger = structlog.get_logger()
 
 
+class ExperienceOutcome(str, Enum):
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILURE = "failure"
+    FALSE_POSITIVE = "false_positive"
+    TIMEOUT = "timeout"
+
+
+class ExperiencePhase(str, Enum):
+    RECON = "recon"
+    SCANNING = "scanning"
+    ANALYSIS = "analysis"
+    EXPLOITATION = "exploitation"
+    VALIDATION = "validation"
+    REPORTING = "reporting"
+
+
 @dataclass
 class Experience:
-    """A single experience record."""
+    """A recorded experience from a past assessment."""
     experience_id: str = ""
-    state: dict[str, Any] = field(default_factory=dict)
-    action: str = ""
-    reward: float = 0.0
-    next_state: dict[str, Any] = field(default_factory=dict)
-    done: bool = False
-    agent_id: str = ""
+    phase: ExperiencePhase = ExperiencePhase.RECON
+    target_fingerprint: str = ""   # Hash of target characteristics
+    strategy_used: str = ""
+    tool_used: str = ""
     model_used: str = ""
-    tools_used: list[str] = field(default_factory=list)
-    tokens_used: int = 0
-    priority: float = 1.0
+    action_taken: str = ""
+    outcome: ExperienceOutcome = ExperienceOutcome.SUCCESS
+    finding_type: str = ""
+    finding_severity: str = ""
+    tokens_spent: int = 0
+    duration_s: float = 0.0
+    context_summary: str = ""
+    notes: str = ""
     timestamp: float = field(default_factory=time.time)
-    episode_id: str = ""
-
-    @property
-    def td_error(self) -> float:
-        """Temporal-difference error approximation."""
-        # Higher reward → more surprising → higher priority
-        return abs(self.reward) + 0.01
+    priority: float = 0.5         # 0-1, for replay prioritization
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.experience_id,
-            "action": self.action[:40],
-            "reward": round(self.reward, 2),
+            "phase": self.phase.value,
+            "strategy": self.strategy_used[:20],
+            "outcome": self.outcome.value,
             "priority": round(self.priority, 2),
-            "agent": self.agent_id[:15],
-            "model": self.model_used[:15],
+            "finding": self.finding_type[:15],
         }
 
 
 @dataclass
-class Episode:
-    """A sequence of experiences forming an episode."""
-    episode_id: str = ""
-    goal: str = ""
-    experiences: list[str] = field(default_factory=list)  # experience IDs
-    total_reward: float = 0.0
-    success: bool = False
-    started_at: float = field(default_factory=time.time)
-    ended_at: float = 0.0
+class TargetFingerprint:
+    """Fingerprint of a target for experience matching."""
+    fingerprint_id: str = ""
+    target_type: str = ""          # web_app, api, cloud, etc.
+    technologies: list[str] = field(default_factory=list)
+    has_waf: bool = False
+    has_cdn: bool = False
+    auth_type: str = ""
+    api_style: str = ""
+    cloud_provider: str = ""
+    tags: list[str] = field(default_factory=list)
 
     @property
-    def duration_s(self) -> float:
-        if self.ended_at:
-            return self.ended_at - self.started_at
-        return time.time() - self.started_at
+    def hash(self) -> str:
+        data = json.dumps({
+            "type": self.target_type,
+            "tech": sorted(self.technologies),
+            "waf": self.has_waf,
+            "auth": self.auth_type,
+            "api": self.api_style,
+            "cloud": self.cloud_provider,
+        }, sort_keys=True)
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.episode_id,
-            "goal": self.goal[:40],
-            "steps": len(self.experiences),
-            "reward": round(self.total_reward, 2),
-            "success": self.success,
-            "duration_s": round(self.duration_s, 1),
+            "id": self.fingerprint_id,
+            "type": self.target_type[:15],
+            "tech": self.technologies[:3],
+            "waf": self.has_waf,
+            "auth": self.auth_type[:10],
+        }
+
+
+@dataclass
+class StrategyEffectiveness:
+    """Tracked effectiveness of a strategy."""
+    strategy_name: str = ""
+    total_uses: int = 0
+    successes: int = 0
+    failures: int = 0
+    avg_tokens: float = 0.0
+    avg_duration_s: float = 0.0
+    target_types: list[str] = field(default_factory=list)
+
+    @property
+    def success_rate(self) -> float:
+        if self.total_uses == 0:
+            return 0.0
+        return self.successes / self.total_uses
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": self.strategy_name[:25],
+            "uses": self.total_uses,
+            "success_rate": round(self.success_rate, 2),
+            "avg_tokens": round(self.avg_tokens),
+        }
+
+
+@dataclass
+class AntiPattern:
+    """Something that doesn't work — avoid repeating."""
+    pattern_id: str = ""
+    description: str = ""
+    context: str = ""
+    why_it_fails: str = ""
+    occurrences: int = 1
+    alternative: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.pattern_id,
+            "desc": self.description[:30],
+            "occurrences": self.occurrences,
+            "alternative": self.alternative[:25],
         }
 
 
 class ExperienceReplay:
-    """Stores and replays past agent experiences for learning.
+    """Learns from past assessment experiences.
 
-    Uses prioritized replay with importance sampling
-    to focus learning on the most informative experiences.
+    Records what worked and what didn't, enabling the agent
+    to improve over time by replaying successful strategies
+    and avoiding known anti-patterns.
     """
 
-    def __init__(
-        self,
-        max_size: int = 10000,
-        alpha: float = 0.6,      # Priority exponent
-        beta: float = 0.4,       # Importance sampling exponent
-        beta_increment: float = 0.001,
-    ) -> None:
-        self._buffer: dict[str, Experience] = {}
-        self._buffer_order: list[str] = []  # Ordered by insertion
-        self._max_size = max_size
-        self._alpha = alpha
-        self._beta = beta
-        self._beta_increment = beta_increment
-        self._episodes: dict[str, Episode] = {}
+    def __init__(self, max_experiences: int = 10000) -> None:
+        self._experiences: list[Experience] = []
+        self._max_experiences = max_experiences
+        self._fingerprints: dict[str, TargetFingerprint] = {}
+        self._strategy_stats: dict[str, StrategyEffectiveness] = {}
+        self._anti_patterns: dict[str, AntiPattern] = {}
         self._exp_counter = 0
-        self._ep_counter = 0
-        self._sample_count = 0
+        self._fp_counter = 0
+        self._ap_counter = 0
         self._log = logger.bind(component="experience_replay")
 
-    def store(
+    def record(
         self,
-        state: dict[str, Any],
-        action: str,
-        reward: float,
-        next_state: dict[str, Any] | None = None,
-        done: bool = False,
-        agent_id: str = "",
+        phase: ExperiencePhase,
+        strategy_used: str,
+        action_taken: str,
+        outcome: ExperienceOutcome,
+        target_fingerprint: str = "",
+        tool_used: str = "",
         model_used: str = "",
-        tools_used: list[str] | None = None,
-        tokens_used: int = 0,
-        episode_id: str = "",
-    ) -> str:
-        """Store an experience."""
+        finding_type: str = "",
+        finding_severity: str = "",
+        tokens_spent: int = 0,
+        duration_s: float = 0.0,
+        context_summary: str = "",
+        notes: str = "",
+    ) -> Experience:
+        """Record a new experience."""
         self._exp_counter += 1
-        exp_id = f"exp-{self._exp_counter}"
+
+        # Calculate priority based on outcome and finding
+        priority = self._calculate_priority(outcome, finding_severity)
 
         experience = Experience(
-            experience_id=exp_id,
-            state=state,
-            action=action,
-            reward=reward,
-            next_state=next_state or {},
-            done=done,
-            agent_id=agent_id,
+            experience_id=f"exp-{self._exp_counter}",
+            phase=phase,
+            target_fingerprint=target_fingerprint,
+            strategy_used=strategy_used,
+            tool_used=tool_used,
             model_used=model_used,
-            tools_used=tools_used or [],
-            tokens_used=tokens_used,
-            priority=abs(reward) + 0.01,  # TD-error proxy
-            episode_id=episode_id,
+            action_taken=action_taken,
+            outcome=outcome,
+            finding_type=finding_type,
+            finding_severity=finding_severity,
+            tokens_spent=tokens_spent,
+            duration_s=duration_s,
+            context_summary=context_summary,
+            notes=notes,
+            priority=priority,
         )
 
-        # Evict if at capacity
-        if len(self._buffer) >= self._max_size:
-            self._evict()
+        self._experiences.append(experience)
 
-        self._buffer[exp_id] = experience
-        self._buffer_order.append(exp_id)
+        # Evict old low-priority experiences if over limit
+        if len(self._experiences) > self._max_experiences:
+            self._experiences.sort(key=lambda e: e.priority, reverse=True)
+            self._experiences = self._experiences[:self._max_experiences]
 
-        # Update episode
-        if episode_id and episode_id in self._episodes:
-            ep = self._episodes[episode_id]
-            ep.experiences.append(exp_id)
-            ep.total_reward += reward
+        # Update strategy stats
+        self._update_strategy_stats(experience)
 
-        return exp_id
+        # Detect anti-patterns
+        if outcome == ExperienceOutcome.FAILURE:
+            self._check_anti_pattern(experience)
 
-    def start_episode(self, goal: str = "") -> str:
-        """Start a new episode."""
-        self._ep_counter += 1
-        ep_id = f"ep-{self._ep_counter}"
-        self._episodes[ep_id] = Episode(
-            episode_id=ep_id,
-            goal=goal,
+        return experience
+
+    def register_fingerprint(
+        self,
+        target_type: str = "",
+        technologies: list[str] | None = None,
+        has_waf: bool = False,
+        auth_type: str = "",
+        api_style: str = "",
+        cloud_provider: str = "",
+    ) -> TargetFingerprint:
+        """Register a target fingerprint."""
+        self._fp_counter += 1
+        fp = TargetFingerprint(
+            fingerprint_id=f"fp-{self._fp_counter}",
+            target_type=target_type,
+            technologies=technologies or [],
+            has_waf=has_waf,
+            auth_type=auth_type,
+            api_style=api_style,
+            cloud_provider=cloud_provider,
         )
-        return ep_id
+        self._fingerprints[fp.hash] = fp
+        return fp
 
-    def end_episode(self, episode_id: str, success: bool = False) -> Episode | None:
-        """End an episode."""
-        ep = self._episodes.get(episode_id)
-        if not ep:
-            return None
-
-        ep.ended_at = time.time()
-        ep.success = success
-
-        # Adjust priorities: successful episodes get higher priority
-        if success:
-            for exp_id in ep.experiences:
-                exp = self._buffer.get(exp_id)
-                if exp:
-                    exp.priority *= 1.5
-
-        return ep
-
-    def sample(
+    def get_similar_experiences(
         self,
-        batch_size: int = 32,
+        target_fingerprint: str,
+        phase: ExperiencePhase | None = None,
+        top_k: int = 10,
     ) -> list[Experience]:
-        """Sample a batch of experiences using prioritized replay."""
-        if len(self._buffer) < batch_size:
-            return list(self._buffer.values())
+        """Get experiences from similar targets."""
+        matches = []
 
-        self._sample_count += 1
-        self._beta = min(1.0, self._beta + self._beta_increment)
+        for exp in self._experiences:
+            if exp.target_fingerprint == target_fingerprint:
+                if phase is None or exp.phase == phase:
+                    matches.append(exp)
 
-        # Calculate sampling probabilities from priorities
-        experiences = list(self._buffer.values())
-        priorities = [e.priority ** self._alpha for e in experiences]
-        total_priority = sum(priorities)
+        # Sort by priority (replay high-value experiences first)
+        matches.sort(key=lambda e: e.priority, reverse=True)
+        return matches[:top_k]
 
-        if total_priority == 0:
-            return random.sample(experiences, batch_size)
-
-        probabilities = [p / total_priority for p in priorities]
-
-        # Weighted sampling without replacement
-        indices = []
-        remaining = list(range(len(experiences)))
-        remaining_probs = list(probabilities)
-
-        for _ in range(min(batch_size, len(remaining))):
-            total = sum(remaining_probs)
-            if total == 0:
-                break
-
-            r = random.random() * total
-            cumulative = 0.0
-            chosen_idx = 0
-
-            for i, prob in enumerate(remaining_probs):
-                cumulative += prob
-                if cumulative >= r:
-                    chosen_idx = i
-                    break
-
-            indices.append(remaining[chosen_idx])
-            remaining.pop(chosen_idx)
-            remaining_probs.pop(chosen_idx)
-
-        return [experiences[i] for i in indices]
-
-    def sample_similar(
+    def get_successful_strategies(
         self,
-        state: dict[str, Any],
-        top_k: int = 5,
-    ) -> list[Experience]:
-        """Sample experiences similar to a given state."""
-        state_key = self._state_key(state)
-        scored = []
+        target_fingerprint: str = "",
+        phase: ExperiencePhase | None = None,
+    ) -> list[str]:
+        """Get strategies that worked for similar targets."""
+        successful = set()
 
-        for exp in self._buffer.values():
-            exp_key = self._state_key(exp.state)
-            similarity = self._key_similarity(state_key, exp_key)
-            scored.append((similarity, exp))
+        for exp in self._experiences:
+            if exp.outcome == ExperienceOutcome.SUCCESS:
+                if target_fingerprint and exp.target_fingerprint != target_fingerprint:
+                    continue
+                if phase and exp.phase != phase:
+                    continue
+                successful.add(exp.strategy_used)
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [exp for _, exp in scored[:top_k]]
+        return sorted(successful)
 
-    def get_best_actions(
+    def generate_few_shot_examples(
         self,
-        state_type: str = "",
-        top_k: int = 5,
-    ) -> list[dict[str, Any]]:
-        """Get the best actions from experience."""
-        relevant = []
-        for exp in self._buffer.values():
-            if state_type and exp.state.get("type") != state_type:
-                continue
-            relevant.append(exp)
-
-        relevant.sort(key=lambda e: e.reward, reverse=True)
-
-        return [
-            {"action": e.action[:60], "reward": round(e.reward, 2),
-             "model": e.model_used[:15]}
-            for e in relevant[:top_k]
+        phase: ExperiencePhase,
+        target_fingerprint: str = "",
+        max_examples: int = 3,
+    ) -> list[dict[str, str]]:
+        """Generate few-shot examples from successful experiences."""
+        successes = [
+            exp for exp in self._experiences
+            if exp.outcome == ExperienceOutcome.SUCCESS
+            and exp.phase == phase
+            and (not target_fingerprint or exp.target_fingerprint == target_fingerprint)
         ]
 
-    def _evict(self) -> None:
-        """Evict lowest-priority experience."""
-        if not self._buffer:
+        successes.sort(key=lambda e: e.priority, reverse=True)
+
+        examples = []
+        for exp in successes[:max_examples]:
+            examples.append({
+                "role": "user",
+                "content": f"Strategy: {exp.strategy_used}\nContext: {exp.context_summary}",
+            })
+            examples.append({
+                "role": "assistant",
+                "content": (
+                    f"Action: {exp.action_taken}\n"
+                    f"Tool: {exp.tool_used}\n"
+                    f"Result: {exp.finding_type} ({exp.finding_severity})\n"
+                    f"Notes: {exp.notes}"
+                ),
+            })
+
+        return examples
+
+    def get_anti_patterns(self) -> list[AntiPattern]:
+        """Get known anti-patterns to avoid."""
+        return sorted(
+            self._anti_patterns.values(),
+            key=lambda ap: ap.occurrences,
+            reverse=True,
+        )
+
+    def get_strategy_rankings(self) -> list[StrategyEffectiveness]:
+        """Get strategies ranked by effectiveness."""
+        stats = list(self._strategy_stats.values())
+        stats.sort(key=lambda s: s.success_rate, reverse=True)
+        return stats
+
+    @staticmethod
+    def _calculate_priority(
+        outcome: ExperienceOutcome,
+        finding_severity: str,
+    ) -> float:
+        """Calculate replay priority based on outcome and severity."""
+        outcome_weights = {
+            ExperienceOutcome.SUCCESS: 0.8,
+            ExperienceOutcome.PARTIAL: 0.5,
+            ExperienceOutcome.FAILURE: 0.3,
+            ExperienceOutcome.FALSE_POSITIVE: 0.6,
+            ExperienceOutcome.TIMEOUT: 0.2,
+        }
+
+        severity_bonus = {
+            "critical": 0.2,
+            "high": 0.15,
+            "medium": 0.1,
+            "low": 0.05,
+        }
+
+        base = outcome_weights.get(outcome, 0.3)
+        bonus = severity_bonus.get(finding_severity.lower(), 0.0)
+
+        return min(1.0, base + bonus)
+
+    def _update_strategy_stats(self, experience: Experience) -> None:
+        """Update strategy effectiveness statistics."""
+        name = experience.strategy_used
+        if not name:
             return
 
-        # Find lowest priority
-        min_id = min(self._buffer, key=lambda eid: self._buffer[eid].priority)
-        del self._buffer[min_id]
-        if min_id in self._buffer_order:
-            self._buffer_order.remove(min_id)
+        if name not in self._strategy_stats:
+            self._strategy_stats[name] = StrategyEffectiveness(strategy_name=name)
 
-    @staticmethod
-    def _state_key(state: dict[str, Any]) -> str:
-        """Convert state to a comparable key."""
-        parts = []
-        for key in sorted(state.keys()):
-            parts.append(f"{key}={state[key]}")
-        return "|".join(parts)
+        stats = self._strategy_stats[name]
+        stats.total_uses += 1
 
-    @staticmethod
-    def _key_similarity(key1: str, key2: str) -> float:
-        """Simple similarity between state keys."""
-        if not key1 or not key2:
-            return 0.0
-        parts1 = set(key1.split("|"))
-        parts2 = set(key2.split("|"))
-        if not parts1 or not parts2:
-            return 0.0
-        intersection = parts1 & parts2
-        union = parts1 | parts2
-        return len(intersection) / len(union)
+        if experience.outcome == ExperienceOutcome.SUCCESS:
+            stats.successes += 1
+        elif experience.outcome == ExperienceOutcome.FAILURE:
+            stats.failures += 1
 
-    def get_episodes(self, limit: int = 10) -> list[dict[str, Any]]:
-        return [ep.to_dict() for ep in list(self._episodes.values())[-limit:]]
+        # Running average for tokens and duration
+        old_total = stats.total_uses - 1
+        stats.avg_tokens = (
+            (stats.avg_tokens * old_total + experience.tokens_spent) / stats.total_uses
+        )
+        stats.avg_duration_s = (
+            (stats.avg_duration_s * old_total + experience.duration_s) / stats.total_uses
+        )
+
+    def _check_anti_pattern(self, experience: Experience) -> None:
+        """Check if a failure matches an anti-pattern."""
+        key = f"{experience.strategy_used}:{experience.target_fingerprint}"
+
+        if key in self._anti_patterns:
+            self._anti_patterns[key].occurrences += 1
+        else:
+            # Check if this strategy has failed multiple times
+            failures = sum(
+                1 for e in self._experiences
+                if e.strategy_used == experience.strategy_used
+                and e.outcome == ExperienceOutcome.FAILURE
+            )
+
+            if failures >= 3:
+                self._ap_counter += 1
+                self._anti_patterns[key] = AntiPattern(
+                    pattern_id=f"ap-{self._ap_counter}",
+                    description=f"Strategy '{experience.strategy_used}' fails repeatedly",
+                    context=experience.context_summary[:100],
+                    why_it_fails=experience.notes[:100],
+                    occurrences=failures,
+                    alternative="Try different strategy or model",
+                )
 
     def get_stats(self) -> dict[str, Any]:
-        total_reward = sum(e.reward for e in self._buffer.values())
+        outcome_counts: dict[str, int] = defaultdict(int)
+        for exp in self._experiences:
+            outcome_counts[exp.outcome.value] += 1
         return {
-            "buffer_size": len(self._buffer),
-            "max_size": self._max_size,
-            "episodes": len(self._episodes),
-            "samples_taken": self._sample_count,
-            "total_reward": round(total_reward, 2),
-            "beta": round(self._beta, 3),
+            "total_experiences": len(self._experiences),
+            "fingerprints": len(self._fingerprints),
+            "strategies_tracked": len(self._strategy_stats),
+            "anti_patterns": len(self._anti_patterns),
+            "by_outcome": dict(outcome_counts),
         }
