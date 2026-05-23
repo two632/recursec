@@ -1,11 +1,11 @@
 """Incident response knowledge base.
 
-Playbooks for incident response scenarios:
-1. Ransomware response
-2. Data breach investigation
-3. Insider threat detection
-4. DDoS mitigation
-5. Compromise assessment (post-breach)
+Deep knowledge about incident response:
+1. IR lifecycle and frameworks
+2. Containment strategies
+3. Evidence collection and preservation
+4. Post-incident analysis
+5. Recovery and lessons learned
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class IRPattern:
     category: str = ""
     severity: str = "critical"
     description: str = ""
-    playbook: str = ""
+    detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -39,190 +39,212 @@ class IRPattern:
 
 IR_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "ir-001", "name": "Ransomware Response",
-        "category": "ransomware", "severity": "critical",
-        "desc": "Ransomware incident response playbook.",
-        "playbook": (
-            "RANSOMWARE RESPONSE:\n"
-            "IMMEDIATE ACTIONS:\n"
-            "  1. Isolate affected systems (network disconnect)\n"
-            "  2. Do NOT power off encrypted systems (volatile memory)\n"
-            "  3. Capture memory dump: winpmem/LiME\n"
-            "  4. Image affected disks before containment\n"
-            "IDENTIFICATION:\n"
-            "  # Identify ransomware family\n"
-            "  - File extension analysis (.locked, .encrypted, etc.)\n"
-            "  - Ransom note analysis\n"
-            "  - https://id-ransomware.malwarehunterteam.com/\n"
-            "  - Check for known decryptors: nomoreransom.org\n"
-            "FORENSICS:\n"
-            "  # Timeline analysis\n"
-            "  - Windows: Event logs (Security, System, PowerShell)\n"
-            "  - Check scheduled tasks and services\n"
-            "  - MFT analysis for file modification timeline\n"
-            "  - Prefetch analysis for execution history\n"
-            "  # Lateral movement indicators\n"
-            "  - RDP connections (Event ID 4624 Type 10)\n"
-            "  - PsExec artifacts\n"
-            "  - WMI event subscriptions\n"
-            "  - PowerShell remoting (WinRM)\n"
-            "RECOVERY:\n"
-            "  - Restore from clean backups\n"
-            "  - Rebuild from gold images\n"
-            "  - Patch the initial access vector\n"
-            "  - Reset ALL credentials (assume compromised)"
+        "id": "ir-001", "name": "IR Lifecycle",
+        "category": "lifecycle", "severity": "critical",
+        "desc": "NIST SP 800-61 incident response lifecycle.",
+        "detection": (
+            "IR LIFECYCLE (NIST SP 800-61):\n"
+            "PHASE 1: PREPARATION\n"
+            "  - IR plan and playbooks\n"
+            "  - Communication plans (internal, external, legal)\n"
+            "  - Tool readiness (forensics kit, jump bag)\n"
+            "  - Contact lists (CIRT, legal, PR, vendors)\n"
+            "  - Tabletop exercises\n"
+            "  - Baseline documentation\n"
+            "PHASE 2: DETECTION & ANALYSIS\n"
+            "  - Alert triage and validation\n"
+            "  - Indicator correlation\n"
+            "  - Scope determination\n"
+            "  - Timeline construction\n"
+            "  - Initial classification:\n"
+            "    P1: Critical (active data breach)\n"
+            "    P2: High (ransomware, active intrusion)\n"
+            "    P3: Medium (malware, policy violation)\n"
+            "    P4: Low (scanning, recon attempts)\n"
+            "PHASE 3: CONTAINMENT, ERADICATION, RECOVERY\n"
+            "  - Short-term containment (isolate)\n"
+            "  - Evidence preservation\n"
+            "  - Long-term containment (patch, harden)\n"
+            "  - Eradication (remove threat)\n"
+            "  - Recovery (restore, monitor)\n"
+            "PHASE 4: POST-INCIDENT\n"
+            "  - Lessons learned meeting\n"
+            "  - Report writing\n"
+            "  - Metrics tracking (MTTD, MTTR)\n"
+            "  - Process improvements"
         ),
-        "tools": ["volatility3", "autopsy", "plaso"],
+        "tools": [],
     },
     {
-        "id": "ir-002", "name": "Data Breach Investigation",
-        "category": "breach", "severity": "critical",
-        "desc": "Data breach investigation and containment.",
-        "playbook": (
-            "DATA BREACH INVESTIGATION:\n"
-            "SCOPE ASSESSMENT:\n"
-            "  1. Identify data types exposed (PII, PHI, PCI, credentials)\n"
-            "  2. Determine volume of records affected\n"
-            "  3. Identify access methods (external/insider)\n"
-            "  4. Timeline of unauthorized access\n"
-            "LOG ANALYSIS:\n"
-            "  # Web server logs\n"
-            "  - Unusual query patterns (mass downloads)\n"
-            "  - SQL injection indicators in URIs\n"
-            "  - Unusual user agents\n"
-            "  # Database audit logs\n"
-            "  - Large SELECT queries\n"
-            "  - Bulk data export\n"
-            "  - Schema enumeration queries\n"
-            "  # Network logs\n"
-            "  - Large outbound transfers\n"
-            "  - Connections to known bad IPs\n"
-            "  - DNS tunneling indicators\n"
-            "CONTAINMENT:\n"
-            "  - Block exfiltration channels\n"
-            "  - Revoke compromised credentials\n"
-            "  - Patch exploited vulnerability\n"
-            "  - Enable additional monitoring\n"
-            "NOTIFICATION:\n"
-            "  - Legal/compliance team\n"
-            "  - Regulatory bodies (GDPR: 72 hours)\n"
-            "  - Affected individuals\n"
-            "  - Law enforcement if applicable"
+        "id": "ir-002", "name": "Containment Strategies",
+        "category": "containment", "severity": "critical",
+        "desc": "Incident containment strategies.",
+        "detection": (
+            "CONTAINMENT STRATEGIES:\n"
+            "NETWORK:\n"
+            "  - VLAN isolation (quarantine VLAN)\n"
+            "  - Firewall rules (block C2, lateral)\n"
+            "  - DNS sinkhole (redirect C2 domains)\n"
+            "  - Network segment isolation\n"
+            "  - VPN access revocation\n"
+            "  - BGP blackhole (DDoS)\n"
+            "HOST:\n"
+            "  - Endpoint isolation (EDR containment)\n"
+            "  - Disable compromised accounts\n"
+            "  - Disable remote services (RDP, SSH)\n"
+            "  - Block malicious hashes (AppLocker)\n"
+            "  - Remove persistence mechanisms\n"
+            "  - Memory dump before shutdown\n"
+            "IDENTITY:\n"
+            "  - Password reset (compromised accounts)\n"
+            "  - Revoke OAuth/API tokens\n"
+            "  - Disable service accounts\n"
+            "  - Force MFA re-enrollment\n"
+            "  - Revoke certificates\n"
+            "  - Conditional access policies\n"
+            "CLOUD:\n"
+            "  - Revoke IAM credentials\n"
+            "  - Security group lockdown\n"
+            "  - Snapshot compromised instances\n"
+            "  - Disable API keys\n"
+            "  - CloudTrail review\n"
+            "  - S3 bucket policy lockdown\n"
+            "DECISION:\n"
+            "  - Business impact vs threat containment\n"
+            "  - Evidence preservation vs immediate action\n"
+            "  - Alert tipping (will attacker notice?)"
         ),
-        "tools": ["splunk", "elasticsearch", "velociraptor"],
+        "tools": [],
     },
     {
-        "id": "ir-003", "name": "Insider Threat Detection",
-        "category": "insider", "severity": "high",
-        "desc": "Insider threat indicators and investigation.",
-        "playbook": (
-            "INSIDER THREAT DETECTION:\n"
-            "BEHAVIORAL INDICATORS:\n"
-            "  - Accessing data outside normal role\n"
-            "  - Large file downloads/copies\n"
-            "  - After-hours access patterns\n"
-            "  - USB device usage spikes\n"
-            "  - Cloud storage uploads\n"
-            "  - Email to personal accounts\n"
-            "TECHNICAL INDICATORS:\n"
-            "  # Windows\n"
-            "  - Event ID 4663: File access auditing\n"
-            "  - Event ID 4688: Process creation\n"
-            "  - Event ID 4648: Explicit credential logon\n"
-            "  - USB: Event ID 6416 (device connect)\n"
+        "id": "ir-003", "name": "Evidence Collection",
+        "category": "evidence", "severity": "high",
+        "desc": "Digital evidence collection and preservation.",
+        "detection": (
+            "EVIDENCE COLLECTION:\n"
+            "ORDER OF VOLATILITY:\n"
+            "  1. Registers, cache\n"
+            "  2. Memory (RAM)\n"
+            "  3. Network state (connections, ARP)\n"
+            "  4. Running processes\n"
+            "  5. Disk (filesystem, swap)\n"
+            "  6. Remote logging (SIEM)\n"
+            "  7. Physical config\n"
+            "  8. Archival media\n"
+            "MEMORY:\n"
             "  # Linux\n"
-            "  - auditd rules for file access\n"
-            "  - Command history analysis\n"
-            "  - SSH key usage patterns\n"
-            "INVESTIGATION:\n"
-            "  # User activity timeline\n"
-            "  - Correlate login times with file access\n"
-            "  - Network traffic analysis per user\n"
-            "  - Email analysis (DLP)\n"
-            "  - Endpoint forensics\n"
-            "DLP MONITORING:\n"
-            "  - Sensitive data classification\n"
-            "  - Egress monitoring\n"
-            "  - Cloud access security broker (CASB)\n"
-            "  - Endpoint detection and response (EDR)"
-        ),
-        "tools": ["velociraptor", "osquery", "sysmon"],
-    },
-    {
-        "id": "ir-004", "name": "DDoS Mitigation",
-        "category": "ddos", "severity": "high",
-        "desc": "DDoS attack identification and mitigation.",
-        "playbook": (
-            "DDoS MITIGATION:\n"
-            "IDENTIFICATION:\n"
-            "  # Determine attack type\n"
-            "  - Volumetric: UDP flood, ICMP flood, DNS amplification\n"
-            "  - Protocol: SYN flood, ACK flood, fragmentation\n"
-            "  - Application: HTTP flood, slowloris, RUDY\n"
-            "  # Indicators\n"
-            "  - Bandwidth utilization spike\n"
-            "  - Connection count spike\n"
-            "  - Request rate anomaly\n"
-            "  - Geographic distribution of sources\n"
-            "IMMEDIATE RESPONSE:\n"
-            "  - Enable rate limiting\n"
-            "  - Block attack source ranges\n"
-            "  - Enable GeoIP blocking if applicable\n"
-            "  - Activate upstream DDoS protection\n"
-            "  - Increase server resources (auto-scale)\n"
-            "NETWORK LEVEL:\n"
-            "  # iptables rate limiting\n"
-            "  iptables -A INPUT -p tcp --dport 80 -m limit \\\n"
-            "    --limit 50/s --limit-burst 100 -j ACCEPT\n"
-            "  # SYN flood protection\n"
-            "  sysctl -w net.ipv4.tcp_syncookies=1\n"
-            "  sysctl -w net.ipv4.tcp_max_syn_backlog=4096\n"
-            "APPLICATION LEVEL:\n"
-            "  - CAPTCHA for suspicious requests\n"
-            "  - JavaScript challenges\n"
-            "  - Request signature analysis\n"
-            "  - Behavioral analysis (bot detection)"
-        ),
-        "tools": ["tcpdump", "nftables"],
-    },
-    {
-        "id": "ir-005", "name": "Compromise Assessment",
-        "category": "compromise", "severity": "critical",
-        "desc": "Post-breach compromise assessment.",
-        "playbook": (
-            "COMPROMISE ASSESSMENT:\n"
-            "IOC COLLECTION:\n"
-            "  # File-based IOCs\n"
-            "  - Hash suspicious files (MD5, SHA256)\n"
-            "  - Check against VirusTotal, MISP\n"
-            "  - YARA rule scanning\n"
-            "  yara -r rules/ /path/to/scan/\n"
-            "  # Network IOCs\n"
-            "  - DNS query logs for C2 domains\n"
-            "  - Netflow for beaconing patterns\n"
-            "  - TLS certificate analysis\n"
-            "PERSISTENCE MECHANISMS:\n"
+            "  insmod lime.ko 'path=/evidence/mem.raw format=raw'\n"
             "  # Windows\n"
-            "  - Scheduled tasks: schtasks /query /fo LIST\n"
-            "  - Services: sc query type=all state=all\n"
-            "  - Registry run keys\n"
-            "  - WMI event subscriptions\n"
-            "  - DLL search order hijacking\n"
-            "  - COM object hijacking\n"
-            "  # Linux\n"
-            "  - Crontabs: crontab -l; ls /etc/cron.*\n"
-            "  - Systemd services: systemctl list-units\n"
-            "  - SSH authorized_keys\n"
-            "  - LD_PRELOAD hijacking\n"
-            "  - Modified binaries (debsums/rpm -V)\n"
-            "MEMORY ANALYSIS:\n"
-            "  # Volatility 3\n"
-            "  vol3 -f memory.dmp windows.pslist\n"
-            "  vol3 -f memory.dmp windows.malfind\n"
-            "  vol3 -f memory.dmp windows.netscan\n"
-            "  vol3 -f memory.dmp windows.cmdline"
+            "  winpmem_mini.exe evidence\\mem.raw\n"
+            "  # Analysis: Volatility 3\n"
+            "  vol3 -f mem.raw windows.pslist\n"
+            "  vol3 -f mem.raw windows.netscan\n"
+            "DISK:\n"
+            "  # Full disk image\n"
+            "  dc3dd if=/dev/sda of=disk.raw hash=sha256 log=disk.log\n"
+            "  # Verify integrity\n"
+            "  sha256sum disk.raw\n"
+            "  # Mount read-only\n"
+            "  mount -o ro,loop disk.raw /mnt/evidence\n"
+            "NETWORK:\n"
+            "  # Capture current connections\n"
+            "  netstat -anob > connections.txt  # Windows\n"
+            "  ss -tunap > connections.txt  # Linux\n"
+            "  # Full packet capture\n"
+            "  tcpdump -i eth0 -w capture.pcap\n"
+            "LOGS:\n"
+            "  - Export SIEM data for timeframe\n"
+            "  - Windows Event Logs (evtx)\n"
+            "  - Linux syslog, auth.log, journald\n"
+            "  - Cloud audit logs (CloudTrail, Activity Log)\n"
+            "CHAIN OF CUSTODY:\n"
+            "  - Document who, what, when, where\n"
+            "  - Hash all evidence (SHA-256)\n"
+            "  - Secure storage (encrypted, access-controlled)"
         ),
-        "tools": ["volatility3", "yara", "velociraptor"],
+        "tools": ["volatility3", "dc3dd"],
+    },
+    {
+        "id": "ir-004", "name": "Post-Incident Analysis",
+        "category": "post_incident", "severity": "medium",
+        "desc": "Post-incident analysis and reporting.",
+        "detection": (
+            "POST-INCIDENT ANALYSIS:\n"
+            "TIMELINE RECONSTRUCTION:\n"
+            "  - Correlate all evidence sources\n"
+            "  - Build unified timeline\n"
+            "  - Identify initial access vector\n"
+            "  - Map lateral movement\n"
+            "  - Document data accessed/exfiltrated\n"
+            "  - Determine dwell time\n"
+            "ROOT CAUSE ANALYSIS:\n"
+            "  - What vulnerability was exploited?\n"
+            "  - Why wasn't it detected sooner?\n"
+            "  - What controls failed?\n"
+            "  - 5 Whys technique\n"
+            "  - Fishbone diagram (Ishikawa)\n"
+            "METRICS:\n"
+            "  MTTD: Mean Time to Detect\n"
+            "  MTTR: Mean Time to Respond\n"
+            "  MTTC: Mean Time to Contain\n"
+            "  MTTRE: Mean Time to Remediate\n"
+            "  Cost: Financial impact\n"
+            "  Scope: Systems/data affected\n"
+            "REPORT:\n"
+            "  - Executive summary\n"
+            "  - Incident timeline\n"
+            "  - Technical details\n"
+            "  - Impact assessment\n"
+            "  - Root cause\n"
+            "  - Recommendations\n"
+            "  - Indicators of Compromise\n"
+            "LESSONS LEARNED:\n"
+            "  - What worked well?\n"
+            "  - What didn't work?\n"
+            "  - Process improvements\n"
+            "  - Tool gaps\n"
+            "  - Training needs"
+        ),
+        "tools": [],
+    },
+    {
+        "id": "ir-005", "name": "Recovery Procedures",
+        "category": "recovery", "severity": "high",
+        "desc": "System recovery and restoration.",
+        "detection": (
+            "RECOVERY PROCEDURES:\n"
+            "PRIORITIZATION:\n"
+            "  - Critical business services first\n"
+            "  - Dependencies mapping\n"
+            "  - Recovery Time Objective (RTO)\n"
+            "  - Recovery Point Objective (RPO)\n"
+            "REBUILD:\n"
+            "  - Clean OS install from known-good media\n"
+            "  - Patch to current before connecting to network\n"
+            "  - Restore data from verified clean backups\n"
+            "  - Change all credentials\n"
+            "  - Review and harden configurations\n"
+            "  - Verify no persistence remains\n"
+            "RANSOMWARE:\n"
+            "  - Check NoMoreRansom.org for decryptors\n"
+            "  - Assess backup integrity\n"
+            "  - Negotiate if no backups (last resort)\n"
+            "  - Report to law enforcement (FBI IC3)\n"
+            "  - Rebuild from clean state preferred\n"
+            "VALIDATION:\n"
+            "  - Verify clean state (AV/EDR scan)\n"
+            "  - Monitor for re-compromise (30-90 days)\n"
+            "  - Enhanced logging post-recovery\n"
+            "  - Verify all IOCs absent\n"
+            "  - User validation testing\n"
+            "BUSINESS CONTINUITY:\n"
+            "  - Activate BCP if needed\n"
+            "  - Communication to stakeholders\n"
+            "  - Regulatory notifications (GDPR 72hr)\n"
+            "  - Insurance claims\n"
+            "  - Customer notification if data breach"
+        ),
+        "tools": [],
     },
 ]
 
@@ -230,7 +252,7 @@ IR_PATTERNS: list[dict[str, Any]] = [
 class IncidentResponseKB:
     """Incident response knowledge base.
 
-    Provides IR playbooks and patterns
+    Provides IR methodology patterns
     injected into agent prompts.
     """
 
@@ -248,7 +270,7 @@ class IncidentResponseKB:
                 category=data.get("category", ""),
                 severity=data.get("severity", "critical"),
                 description=data.get("desc", ""),
-                playbook=data.get("playbook", ""),
+                detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
             )
             self._patterns[pattern.pattern_id] = pattern
@@ -266,7 +288,7 @@ class IncidentResponseKB:
         max_patterns: int = 4,
     ) -> str:
         """Build incident response prompt."""
-        lines = ["## Incident Response Playbooks\n"]
+        lines = ["## Incident Response\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
@@ -274,7 +296,7 @@ class IncidentResponseKB:
             if count >= max_patterns:
                 break
             lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
-            lines.append(pattern.playbook)
+            lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
