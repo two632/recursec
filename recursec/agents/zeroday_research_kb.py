@@ -1,11 +1,11 @@
 """Zero-day research knowledge base.
 
-Advanced techniques for discovering novel vulnerabilities:
-1. Fuzzing strategies (coverage-guided, grammar-based)
-2. Variant analysis and root cause patterns
-3. Binary reverse engineering approaches
-4. Source-to-sink dataflow analysis
-5. Race condition and timing attack discovery
+Deep knowledge about zero-day vulnerability research:
+1. Fuzzing strategies for 0-day discovery
+2. Variant analysis techniques
+3. Root cause analysis
+4. Vulnerability classes and patterns
+5. Responsible disclosure
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class ZeroDayPattern:
     category: str = ""
     severity: str = "critical"
     description: str = ""
-    research_strategy: str = ""
+    detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -39,189 +39,206 @@ class ZeroDayPattern:
 
 ZERODAY_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "zd-001", "name": "Coverage-Guided Fuzzing",
+        "id": "zd-001", "name": "Fuzzing Strategies",
         "category": "fuzzing", "severity": "critical",
-        "desc": "Advanced fuzzing strategies for discovering memory corruption bugs.",
-        "strategy": (
-            "COVERAGE-GUIDED FUZZING:\n"
-            "AFL++ WORKFLOW:\n"
-            "  # Compile with instrumentation\n"
-            "  CC=afl-clang-fast ./configure\n"
-            "  make\n"
-            "  # Create seed corpus\n"
-            "  mkdir seeds && echo 'test' > seeds/seed1\n"
-            "  # Run fuzzer\n"
-            "  afl-fuzz -i seeds -o output -m none -- ./target @@\n"
-            "  # Persistent mode (10x faster)\n"
-            "  afl-fuzz -i seeds -o output -- ./target_persistent\n"
-            "LIBFUZZER:\n"
-            "  # Compile with libFuzzer\n"
-            "  clang -fsanitize=fuzzer,address target_fuzz.c -o target_fuzz\n"
-            "  # Run with corpus\n"
-            "  ./target_fuzz corpus/ -max_len=4096 -jobs=4\n"
-            "SANITIZERS:\n"
-            "  AddressSanitizer (ASan): heap-overflow, use-after-free, stack-overflow\n"
-            "  UBSan: integer overflow, null deref, alignment\n"
-            "  MSan: uninitialized memory reads\n"
-            "  TSan: data races, deadlocks\n"
-            "STRATEGY:\n"
-            "  1. Identify attack surface (parsers, deserializers, protocol handlers)\n"
-            "  2. Build minimal harness wrapping target function\n"
-            "  3. Collect diverse seed corpus from test suites/real data\n"
-            "  4. Enable multiple sanitizers\n"
-            "  5. Run 24-72 hours minimum\n"
-            "  6. Triage crashes: unique stack traces, severity\n"
-            "  7. Minimize test cases: afl-tmin"
+        "desc": "Fuzzing strategies for vulnerability discovery.",
+        "detection": (
+            "FUZZING STRATEGIES:\n"
+            "COVERAGE-GUIDED:\n"
+            "  # AFL++ (American Fuzzy Lop)\n"
+            "  afl-fuzz -i input/ -o output/ -- ./target @@\n"
+            "  # Instrument binary for coverage feedback\n"
+            "  afl-clang-fast++ -o target target.cpp\n"
+            "  # Corpus minimization\n"
+            "  afl-cmin -i input/ -o min/ -- ./target @@\n"
+            "MUTATION-BASED:\n"
+            "  # Mutate existing inputs\n"
+            "  # Bit flips, byte insertion, arithmetic\n"
+            "  # Dictionary-guided mutations\n"
+            "  # Radamsa (generic mutator)\n"
+            "  radamsa sample.pdf > fuzz.pdf\n"
+            "GENERATION-BASED:\n"
+            "  # Protocol-aware fuzzing\n"
+            "  # Grammar-based input generation\n"
+            "  # Peach Fuzzer (protocol fuzzing)\n"
+            "  # boofuzz (network protocol fuzzing)\n"
+            "HYBRID:\n"
+            "  # Combine fuzzing + symbolic execution\n"
+            "  # QSYM, Driller, SymCC\n"
+            "  # Increase coverage beyond fuzzing alone\n"
+            "TARGETS:\n"
+            "  - File parsers (PDF, image, video)\n"
+            "  - Network protocols (HTTP, DNS, TLS)\n"
+            "  - System calls (syzkaller for kernel)\n"
+            "  - Browser engines (Domato for DOM)\n"
+            "  - API endpoints (RESTler)\n"
+            "TOOLS:\n"
+            "  AFL++, libFuzzer, honggfuzz, syzkaller, boofuzz"
         ),
-        "tools": ["afl++", "libfuzzer"],
+        "tools": ["afl++", "honggfuzz", "boofuzz"],
     },
     {
         "id": "zd-002", "name": "Variant Analysis",
         "category": "variant", "severity": "critical",
-        "desc": "Finding variants of known vulnerabilities in codebases.",
-        "strategy": (
+        "desc": "Variant analysis for finding related bugs.",
+        "detection": (
             "VARIANT ANALYSIS:\n"
-            "APPROACH:\n"
-            "  1. Study known CVE root cause deeply\n"
-            "  2. Abstract the vulnerability pattern\n"
-            "  3. Search for similar patterns across codebase\n"
-            "  4. Check related components and forks\n"
-            "PATTERN ABSTRACTION:\n"
-            "  CVE example → Pattern:\n"
-            "  - Buffer overflow in parser → All parsers using same pattern\n"
-            "  - Type confusion in handler → All handlers with same signature\n"
-            "  - Missing bounds check → All array accesses without validation\n"
-            "CODEQL:\n"
-            "  # Create database\n"
-            "  codeql database create db --language=cpp --source-root=./src\n"
-            "  # Run custom query\n"
-            "  codeql query run query.ql --database=db\n"
-            "  # Example: Find unchecked malloc\n"
-            "  from FunctionCall call\n"
-            "  where call.getTarget().getName() = 'malloc'\n"
-            "  and not exists(IfStmt check | check.getCondition().getAChild*() = call)\n"
-            "  select call, 'Unchecked malloc return value'\n"
-            "SEMGREP:\n"
-            "  # Custom pattern\n"
-            "  semgrep --pattern 'memcpy($DST, $SRC, $SIZE)' \\\n"
-            "    --lang c --config auto ./src\n"
-            "STRATEGY:\n"
-            "  1. CVE database → root cause analysis\n"
-            "  2. Build CodeQL/Semgrep query for pattern\n"
-            "  3. Run against target codebase\n"
-            "  4. Manual review of results\n"
-            "  5. Check patched vs unpatched branches"
+            "CONCEPT:\n"
+            "  - Given a known bug, find similar bugs\n"
+            "  - Same root cause, different trigger\n"
+            "  - Same pattern, different location\n"
+            "  - Historical: 1 bug → dozens of variants\n"
+            "TECHNIQUES:\n"
+            "  CODE PATTERN:\n"
+            "    - Identify vulnerable pattern\n"
+            "    - Search for same pattern elsewhere\n"
+            "    - Tools: Semgrep, CodeQL, Joern\n"
+            "  DATA FLOW:\n"
+            "    - Trace user input to sink\n"
+            "    - Find all paths: source → sanitizer? → sink\n"
+            "    - CodeQL: taint tracking queries\n"
+            "  DIFF ANALYSIS:\n"
+            "    - Analyze security patches\n"
+            "    - Identify what was fixed\n"
+            "    - Check if fix is complete\n"
+            "    - Look for similar unfixed code\n"
+            "  REGRESSION:\n"
+            "    - Bugs that were fixed then reintroduced\n"
+            "    - Check old CVE fixes still apply\n"
+            "    - Refactoring may undo security fixes\n"
+            "CodeQL EXAMPLE:\n"
+            "  from DataFlow::PathNode source, sink\n"
+            "  where source.isUserInput() and sink.isSqlSink()\n"
+            "  select source, sink, \"SQL injection\"\n"
+            "TOOLS:\n"
+            "  CodeQL, Semgrep, Joern, Weggli"
         ),
-        "tools": ["codeql", "semgrep"],
+        "tools": ["codeql", "semgrep", "joern"],
     },
     {
-        "id": "zd-003", "name": "Binary Reverse Engineering",
-        "category": "reversing", "severity": "critical",
-        "desc": "Binary analysis for vulnerability discovery.",
-        "strategy": (
-            "BINARY REVERSE ENGINEERING:\n"
-            "STATIC ANALYSIS:\n"
-            "  # Ghidra headless analysis\n"
-            "  analyzeHeadless /tmp/project projectName \\\n"
-            "    -import target.bin -postScript decompile.py\n"
-            "  # Radare2\n"
-            "  r2 -A target.bin\n"
-            "  afl  # List functions\n"
-            "  pdf @ main  # Disassemble main\n"
-            "  VV @ main  # Visual graph\n"
-            "DYNAMIC ANALYSIS:\n"
-            "  # GDB with GEF\n"
-            "  gdb -q ./target\n"
-            "  gef> checksec  # Check mitigations\n"
-            "  gef> pattern create 200\n"
-            "  gef> run < pattern\n"
-            "  gef> pattern search $rsp  # Find offset\n"
-            "  # Frida (dynamic instrumentation)\n"
-            "  frida -U -f com.target.app -l hook.js --no-pause\n"
+        "id": "zd-003", "name": "Root Cause Analysis",
+        "category": "rca", "severity": "high",
+        "desc": "Root cause analysis of vulnerabilities.",
+        "detection": (
+            "ROOT CAUSE ANALYSIS:\n"
+            "CRASH ANALYSIS:\n"
+            "  # Triage crashes from fuzzing\n"
+            "  # Deduplicate by stack trace\n"
+            "  # Determine exploitability\n"
+            "  # AddressSanitizer (ASAN)\n"
+            "  clang -fsanitize=address -o target target.c\n"
+            "  # MemorySanitizer (MSAN) — uninit memory\n"
+            "  # UBSan — undefined behavior\n"
+            "  # ThreadSanitizer (TSAN) — data races\n"
+            "DEBUGGING:\n"
+            "  # GDB with PEDA/GEF/pwndbg\n"
+            "  gdb ./target core\n"
+            "  # Reverse debugging (rr)\n"
+            "  rr record ./target\n"
+            "  rr replay\n"
+            "  # Time travel debugging\n"
+            "  # Set breakpoint at crash, work backwards\n"
+            "ANALYSIS:\n"
+            "  1. Identify crash point\n"
+            "  2. Determine controlled inputs\n"
+            "  3. Trace data flow backwards\n"
+            "  4. Find missing check/validation\n"
+            "  5. Determine vulnerability class\n"
+            "  6. Assess exploitability\n"
+            "EXPLOITABILITY:\n"
+            "  # CERT BFF triage (exploitable plugin)\n"
+            "  # Criteria:\n"
+            "  - Controlled EIP/RIP → exploitable\n"
+            "  - Controlled write → exploitable\n"
+            "  - Read AV → info leak potential\n"
+            "  - Stack corruption → likely exploitable"
+        ),
+        "tools": ["gdb", "rr"],
+    },
+    {
+        "id": "zd-004", "name": "Vulnerability Classes",
+        "category": "vuln_class", "severity": "critical",
+        "desc": "Common vulnerability classes and patterns.",
+        "detection": (
             "VULNERABILITY CLASSES:\n"
-            "  - Stack buffer overflow: Check fixed-size buffers with unbounded copies\n"
-            "  - Heap overflow: Allocations followed by unbounded writes\n"
-            "  - Use-after-free: Free then use patterns\n"
-            "  - Format string: User-controlled printf arguments\n"
-            "  - Integer overflow: Arithmetic used for allocation size\n"
-            "  - Double free: Multiple free() on same pointer\n"
-            "TOOLS:\n"
-            "  checksec --file=target  # Security mitigations\n"
-            "  ropper --file target --search 'pop rdi'  # ROP gadgets\n"
-            "  one_gadget /lib/x86_64-linux-gnu/libc.so.6  # One-shot"
+            "MEMORY SAFETY:\n"
+            "  - Buffer overflow (stack, heap)\n"
+            "  - Use-after-free\n"
+            "  - Double free\n"
+            "  - Integer overflow/underflow\n"
+            "  - Type confusion\n"
+            "  - Uninitialized memory\n"
+            "  - Out-of-bounds read/write\n"
+            "LOGIC:\n"
+            "  - Authentication bypass\n"
+            "  - Authorization failure\n"
+            "  - Race condition (TOCTOU)\n"
+            "  - State confusion\n"
+            "  - Improper error handling\n"
+            "INJECTION:\n"
+            "  - SQL injection\n"
+            "  - Command injection\n"
+            "  - LDAP injection\n"
+            "  - XPath injection\n"
+            "  - Template injection (SSTI)\n"
+            "  - Header injection\n"
+            "CRYPTO:\n"
+            "  - Weak algorithms (MD5, DES, RC4)\n"
+            "  - ECB mode usage\n"
+            "  - Missing MAC/HMAC\n"
+            "  - Predictable IV/nonce\n"
+            "  - Padding oracle\n"
+            "  - Timing side-channel\n"
+            "DESIGN:\n"
+            "  - Insecure defaults\n"
+            "  - Insufficient logging\n"
+            "  - Missing rate limiting\n"
+            "  - Unsafe deserialization\n"
+            "  - SSRF / open redirect"
         ),
-        "tools": ["ghidra", "r2", "gdb"],
+        "tools": [],
     },
     {
-        "id": "zd-004", "name": "Source-to-Sink Dataflow",
-        "category": "dataflow", "severity": "critical",
-        "desc": "Tracking user input from source to dangerous sink.",
-        "strategy": (
-            "SOURCE-TO-SINK DATAFLOW:\n"
-            "SOURCES (user input entry points):\n"
-            "  Web: request.params, request.body, request.headers, cookies\n"
-            "  Network: recv(), read(), fread(), socket input\n"
-            "  File: file uploads, config files, env vars\n"
-            "  API: JSON body, query params, path params\n"
-            "SINKS (dangerous operations):\n"
-            "  SQL: execute(), query(), raw SQL concatenation\n"
-            "  Command: exec(), system(), popen(), subprocess\n"
-            "  File: open(), write(), unlink(), rename()\n"
-            "  XSS: innerHTML, document.write(), eval()\n"
-            "  Deserialize: pickle.loads(), yaml.load(), JSON.parse()\n"
-            "  SSRF: requests.get(), urllib.urlopen(), fetch()\n"
-            "  LDAP: ldap_search(), ldap_bind()\n"
-            "  Template: render(), render_template_string()\n"
-            "ANALYSIS PROCESS:\n"
-            "  1. Map all sources in the application\n"
-            "  2. Map all dangerous sinks\n"
-            "  3. Trace data flow from each source\n"
-            "  4. Check for sanitization/validation at each step\n"
-            "  5. Identify bypasses in validation\n"
-            "TOOLS:\n"
-            "  semgrep --config p/owasp-top-ten ./src\n"
-            "  semgrep --config p/injection ./src\n"
-            "  bandit -r ./src  # Python\n"
-            "  brakeman ./  # Ruby on Rails\n"
-            "  snyk code test  # Multi-language"
+        "id": "zd-005", "name": "Responsible Disclosure",
+        "category": "disclosure", "severity": "medium",
+        "desc": "Responsible disclosure process.",
+        "detection": (
+            "RESPONSIBLE DISCLOSURE:\n"
+            "PROCESS:\n"
+            "  1. Discover vulnerability\n"
+            "  2. Verify and document (PoC)\n"
+            "  3. Contact vendor (security@, PSIRT)\n"
+            "  4. Report with details:\n"
+            "     - Affected product/version\n"
+            "     - Steps to reproduce\n"
+            "     - Impact assessment\n"
+            "     - Suggested fix\n"
+            "  5. Coordinate timeline (typically 90 days)\n"
+            "  6. Publish advisory after fix\n"
+            "PLATFORMS:\n"
+            "  - HackerOne (bug bounty)\n"
+            "  - Bugcrowd (bug bounty)\n"
+            "  - vendor security@ email\n"
+            "  - CERT/CC coordination\n"
+            "  - Full Disclosure mailing list\n"
+            "  - MITRE CVE request\n"
+            "CVE PROCESS:\n"
+            "  - Request CVE ID from CNA\n"
+            "  - MITRE web form or CNA portal\n"
+            "  - Include: product, version, vuln type\n"
+            "  - CVSS scoring\n"
+            "  - CWE classification\n"
+            "ADVISORY WRITING:\n"
+            "  - Title: [Product] [Vuln Type] in [Component]\n"
+            "  - Affected versions\n"
+            "  - CVSS score and vector\n"
+            "  - Technical description\n"
+            "  - PoC (after patch available)\n"
+            "  - Remediation\n"
+            "  - Timeline\n"
+            "  - Credits"
         ),
-        "tools": ["semgrep", "bandit", "codeql"],
-    },
-    {
-        "id": "zd-005", "name": "Race Conditions and Timing",
-        "category": "race", "severity": "high",
-        "desc": "Discovering race conditions and timing vulnerabilities.",
-        "strategy": (
-            "RACE CONDITIONS AND TIMING ATTACKS:\n"
-            "TOCTOU (Time-of-Check-to-Time-of-Use):\n"
-            "  - File system: Check permission then open\n"
-            "  - Database: Check balance then deduct\n"
-            "  - Auth: Validate token then use\n"
-            "  - Testing: Send concurrent requests in tight window\n"
-            "TESTING TECHNIQUES:\n"
-            "  # Turbo Intruder (Burp)\n"
-            "  # Single-packet attack: Multiple requests in one TCP packet\n"
-            "  # HTTP/2 stream bundling\n"
-            "  # Last-byte sync: Hold requests, release simultaneously\n"
-            "COMMON RACE CONDITIONS:\n"
-            "  - Double spending in payment systems\n"
-            "  - Coupon/voucher reuse\n"
-            "  - Follow/unfollow race (double count)\n"
-            "  - File upload + access race\n"
-            "  - Account registration race (duplicate)\n"
-            "  - Rate limit bypass via parallelism\n"
-            "TIMING SIDE-CHANNELS:\n"
-            "  - Password comparison timing\n"
-            "  - Token comparison timing\n"
-            "  - Cache-based timing (hit vs miss)\n"
-            "  - Database query timing (boolean blind)\n"
-            "TESTING:\n"
-            "  # Python concurrent requests\n"
-            "  # asyncio.gather(*[send_request() for _ in range(100)])\n"
-            "  # Use race-the-web, racepwn tools\n"
-            "  # Monitor response time differences"
-        ),
-        "tools": ["burpsuite", "racepwn"],
+        "tools": [],
     },
 ]
 
@@ -229,7 +246,7 @@ ZERODAY_PATTERNS: list[dict[str, Any]] = [
 class ZeroDayResearchKB:
     """Zero-day research knowledge base.
 
-    Provides advanced vulnerability research patterns
+    Provides 0-day research patterns
     injected into agent prompts.
     """
 
@@ -247,7 +264,7 @@ class ZeroDayResearchKB:
                 category=data.get("category", ""),
                 severity=data.get("severity", "critical"),
                 description=data.get("desc", ""),
-                research_strategy=data.get("strategy", ""),
+                detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
             )
             self._patterns[pattern.pattern_id] = pattern
@@ -265,7 +282,7 @@ class ZeroDayResearchKB:
         max_patterns: int = 4,
     ) -> str:
         """Build zero-day research prompt."""
-        lines = ["## Zero-Day Research Patterns\n"]
+        lines = ["## Zero-Day Research\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
@@ -273,7 +290,7 @@ class ZeroDayResearchKB:
             if count >= max_patterns:
                 break
             lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
-            lines.append(pattern.research_strategy)
+            lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
