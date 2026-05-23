@@ -1,14 +1,14 @@
-"""Task decomposer — breaks complex tasks into executable sub-tasks.
+"""Task decomposer — recursive goal decomposition.
 
 Implements:
-1. Recursive task decomposition
-2. Dependency graph between sub-tasks
-3. Topological sort for execution order
-4. Parallel task identification
-5. Task estimation (tokens, time, complexity)
-6. Template-based decomposition for common patterns
-7. LLM-assisted decomposition for novel tasks
-8. Budget allocation across sub-tasks
+1. Goal → sub-goal decomposition
+2. Dependency graph construction
+3. Task estimation (time, tokens, tools)
+4. Critical path analysis
+5. Task merging for efficiency
+6. Dynamic re-decomposition
+7. Task templates for common patterns
+8. Complexity estimation
 """
 
 from __future__ import annotations
@@ -24,353 +24,356 @@ import structlog
 logger = structlog.get_logger()
 
 
+class TaskComplexity(str, Enum):
+    TRIVIAL = "trivial"       # Single tool call
+    SIMPLE = "simple"         # Few steps, linear
+    MODERATE = "moderate"     # Multiple tools, some branching
+    COMPLEX = "complex"       # Multi-agent, deep analysis
+    EXTREME = "extreme"       # Recursive, multi-phase
+
+
 class TaskStatus(str, Enum):
-    PENDING = "pending"
-    READY = "ready"        # All dependencies met
-    RUNNING = "running"
+    PLANNED = "planned"
+    READY = "ready"
+    EXECUTING = "executing"
     COMPLETE = "complete"
     FAILED = "failed"
-    SKIPPED = "skipped"
     BLOCKED = "blocked"
-
-
-class TaskPriority(str, Enum):
-    CRITICAL = "critical"
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
 
 
 @dataclass
 class SubTask:
-    """A sub-task in the decomposition."""
+    """A decomposed sub-task."""
     task_id: str = ""
     name: str = ""
     description: str = ""
-    status: TaskStatus = TaskStatus.PENDING
-    priority: TaskPriority = TaskPriority.MEDIUM
-    depends_on: list[str] = field(default_factory=list)
-    tool: str = ""
-    model: str = ""
-    strategy: str = ""
-    target: str = ""
-    estimated_tokens: int = 1000
-    estimated_time_s: float = 60.0
-    actual_tokens: int = 0
-    actual_time_s: float = 0.0
-    result: dict[str, Any] = field(default_factory=dict)
-    depth: int = 0
+    complexity: TaskComplexity = TaskComplexity.SIMPLE
+    status: TaskStatus = TaskStatus.PLANNED
     parent_id: str = ""
+    dependencies: list[str] = field(default_factory=list)
+    tools_required: list[str] = field(default_factory=list)
+    models_preferred: list[str] = field(default_factory=list)
+    estimated_time_s: float = 60.0
+    estimated_tokens: int = 1000
+    actual_time_s: float = 0.0
+    actual_tokens: int = 0
+    result: dict[str, Any] = field(default_factory=dict)
     children: list[str] = field(default_factory=list)
-    started_at: float = 0.0
-    completed_at: float = 0.0
+    depth: int = 0
+    can_parallel: bool = False
 
     @property
-    def is_ready(self) -> bool:
-        return self.status in (TaskStatus.PENDING, TaskStatus.READY)
+    def is_leaf(self) -> bool:
+        return len(self.children) == 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.task_id,
-            "name": self.name[:30],
+            "id": self.task_id[:10],
+            "name": self.name[:25],
+            "complexity": self.complexity.value,
             "status": self.status.value,
-            "priority": self.priority.value,
-            "deps": len(self.depends_on),
-            "children": len(self.children),
             "depth": self.depth,
+            "children": len(self.children),
+            "tools": len(self.tools_required),
+            "est_time": round(self.estimated_time_s, 0),
         }
 
 
 @dataclass
-class TaskPlan:
+class DecompositionPlan:
     """A complete task decomposition plan."""
     plan_id: str = ""
-    objective: str = ""
-    tasks: list[SubTask] = field(default_factory=list)
-    execution_order: list[list[str]] = field(default_factory=list)  # Batches of parallel tasks
-    total_estimated_tokens: int = 0
-    total_estimated_time_s: float = 0.0
+    goal: str = ""
+    target: str = ""
+    tasks: dict[str, SubTask] = field(default_factory=dict)
+    root_task_id: str = ""
     created_at: float = field(default_factory=time.time)
+    total_estimated_time_s: float = 0.0
+    total_estimated_tokens: int = 0
+    max_depth: int = 0
+
+    @property
+    def total_tasks(self) -> int:
+        return len(self.tasks)
+
+    @property
+    def completed_tasks(self) -> int:
+        return sum(1 for t in self.tasks.values() if t.status == TaskStatus.COMPLETE)
+
+    @property
+    def progress(self) -> float:
+        if not self.tasks:
+            return 0.0
+        return self.completed_tasks / self.total_tasks
 
     def to_dict(self) -> dict[str, Any]:
+        status_counts: dict[str, int] = defaultdict(int)
+        for t in self.tasks.values():
+            status_counts[t.status.value] += 1
         return {
-            "id": self.plan_id,
-            "objective": self.objective[:40],
-            "tasks": len(self.tasks),
-            "batches": len(self.execution_order),
-            "est_tokens": self.total_estimated_tokens,
+            "id": self.plan_id[:10],
+            "goal": self.goal[:30],
+            "tasks": self.total_tasks,
+            "progress": round(self.progress, 2),
+            "max_depth": self.max_depth,
+            "by_status": dict(status_counts),
         }
 
 
-# ── Decomposition Templates ──────────────────────────────────
+# ── Task templates ───────────────────────────────────────────
 
-DECOMPOSITION_TEMPLATES: dict[str, list[dict[str, Any]]] = {
-    "full_assessment": [
-        {"name": "dns_recon", "tool": "subfinder", "priority": "high", "deps": [], "tokens": 500, "time": 30},
-        {"name": "port_scan", "tool": "nmap", "priority": "high", "deps": [], "tokens": 1000, "time": 60},
-        {"name": "tech_detect", "tool": "httpx", "priority": "high", "deps": ["dns_recon"], "tokens": 500, "time": 30},
-        {"name": "dir_scan", "tool": "gobuster", "priority": "medium", "deps": ["tech_detect"], "tokens": 500, "time": 120},
-        {"name": "vuln_scan", "tool": "nuclei", "priority": "high", "deps": ["tech_detect"], "tokens": 2000, "time": 180},
-        {"name": "tls_check", "tool": "testssl", "priority": "medium", "deps": ["port_scan"], "tokens": 500, "time": 30},
-        {"name": "web_vuln_check", "strategy": "business_logic_analysis", "priority": "high", "deps": ["dir_scan", "vuln_scan"], "tokens": 5000, "time": 300},
-        {"name": "analyze_results", "model": "qwen-coder-14b", "priority": "high", "deps": ["web_vuln_check", "tls_check"], "tokens": 3000, "time": 60},
-        {"name": "validate_findings", "model": "deepseek-r1", "priority": "critical", "deps": ["analyze_results"], "tokens": 2000, "time": 60},
+TASK_TEMPLATES: dict[str, list[dict[str, Any]]] = {
+    "web_assessment": [
+        {"name": "Technology Detection", "tools": ["httpx", "wafw00f"], "complexity": "simple", "time": 30},
+        {"name": "Subdomain Enumeration", "tools": ["subfinder", "amass"], "complexity": "simple", "time": 120},
+        {"name": "Directory Discovery", "tools": ["gobuster", "ffuf"], "complexity": "simple", "time": 300},
+        {"name": "Vulnerability Scanning", "tools": ["nuclei", "nikto"], "complexity": "moderate", "time": 600},
+        {"name": "SQL Injection Testing", "tools": ["sqlmap"], "complexity": "moderate", "time": 300},
+        {"name": "XSS Testing", "tools": ["dalfox"], "complexity": "moderate", "time": 300},
+        {"name": "Authentication Testing", "tools": ["hydra"], "complexity": "complex", "time": 600},
+        {"name": "Vulnerability Analysis", "tools": [], "models": ["whiterabbitneo", "qwen-coder-14b"], "complexity": "complex", "time": 120},
+        {"name": "Report Generation", "tools": [], "complexity": "simple", "time": 30},
     ],
-    "web_app_scan": [
-        {"name": "tech_fingerprint", "tool": "httpx", "priority": "high", "deps": [], "tokens": 500, "time": 20},
-        {"name": "dir_brute", "tool": "gobuster", "priority": "medium", "deps": ["tech_fingerprint"], "tokens": 500, "time": 120},
-        {"name": "api_discovery", "tool": "ffuf", "priority": "medium", "deps": ["tech_fingerprint"], "tokens": 500, "time": 120},
-        {"name": "vuln_scan", "tool": "nuclei", "priority": "high", "deps": ["tech_fingerprint"], "tokens": 2000, "time": 120},
-        {"name": "sqli_check", "tool": "sqlmap", "priority": "high", "deps": ["dir_brute", "api_discovery"], "tokens": 2000, "time": 300},
-        {"name": "xss_check", "strategy": "classic_vuln_scanning", "priority": "medium", "deps": ["dir_brute"], "tokens": 1000, "time": 120},
-        {"name": "business_logic", "strategy": "business_logic_analysis", "priority": "high", "deps": ["vuln_scan"], "tokens": 5000, "time": 300},
-    ],
-    "network_scan": [
-        {"name": "host_discovery", "tool": "nmap", "priority": "critical", "deps": [], "tokens": 500, "time": 60},
-        {"name": "port_scan_tcp", "tool": "nmap", "priority": "high", "deps": ["host_discovery"], "tokens": 1000, "time": 120},
-        {"name": "port_scan_udp", "tool": "nmap", "priority": "medium", "deps": ["host_discovery"], "tokens": 1000, "time": 300},
-        {"name": "service_enum", "tool": "nmap", "priority": "high", "deps": ["port_scan_tcp"], "tokens": 1000, "time": 120},
-        {"name": "vuln_scan", "tool": "nuclei", "priority": "high", "deps": ["service_enum"], "tokens": 2000, "time": 180},
-        {"name": "brute_force", "tool": "hydra", "priority": "medium", "deps": ["service_enum"], "tokens": 500, "time": 600},
-        {"name": "smb_enum", "tool": "crackmapexec", "priority": "medium", "deps": ["service_enum"], "tokens": 500, "time": 60},
+    "network_assessment": [
+        {"name": "Host Discovery", "tools": ["nmap"], "complexity": "simple", "time": 60},
+        {"name": "Port Scanning", "tools": ["nmap", "masscan"], "complexity": "simple", "time": 300},
+        {"name": "Service Enumeration", "tools": ["nmap"], "complexity": "moderate", "time": 300},
+        {"name": "SMB Assessment", "tools": ["crackmapexec", "enum4linux"], "complexity": "moderate", "time": 120},
+        {"name": "SNMP Assessment", "tools": ["onesixtyone", "snmpwalk"], "complexity": "simple", "time": 60},
+        {"name": "Vulnerability Scanning", "tools": ["nuclei"], "complexity": "moderate", "time": 300},
+        {"name": "Vulnerability Analysis", "tools": [], "models": ["hermes-14b"], "complexity": "complex", "time": 120},
     ],
     "api_assessment": [
-        {"name": "schema_discovery", "strategy": "hidden_attack_surface_discovery", "priority": "high", "deps": [], "tokens": 2000, "time": 60},
-        {"name": "auth_test", "strategy": "business_logic_analysis", "priority": "critical", "deps": ["schema_discovery"], "tokens": 3000, "time": 120},
-        {"name": "injection_test", "tool": "sqlmap", "priority": "high", "deps": ["schema_discovery"], "tokens": 2000, "time": 180},
-        {"name": "rate_limit_test", "strategy": "timing_race_condition_testing", "priority": "medium", "deps": ["schema_discovery"], "tokens": 1000, "time": 60},
-        {"name": "bola_idor_test", "strategy": "business_logic_analysis", "priority": "critical", "deps": ["auth_test"], "tokens": 3000, "time": 120},
+        {"name": "API Discovery", "tools": ["ffuf", "curl"], "complexity": "simple", "time": 120},
+        {"name": "Endpoint Mapping", "tools": ["httpx"], "complexity": "simple", "time": 60},
+        {"name": "Authentication Testing", "tools": [], "complexity": "moderate", "time": 180},
+        {"name": "IDOR Testing", "tools": [], "complexity": "moderate", "time": 300},
+        {"name": "Injection Testing", "tools": ["sqlmap"], "complexity": "moderate", "time": 300},
+        {"name": "Rate Limit Testing", "tools": [], "complexity": "simple", "time": 60},
+        {"name": "Analysis", "tools": [], "models": ["qwen-coder-14b"], "complexity": "complex", "time": 120},
+    ],
+    "code_review": [
+        {"name": "Static Analysis", "tools": ["semgrep", "bandit"], "complexity": "simple", "time": 120},
+        {"name": "Secret Detection", "tools": ["trufflehog", "gitleaks"], "complexity": "simple", "time": 60},
+        {"name": "Dependency Audit", "tools": ["trivy", "grype"], "complexity": "simple", "time": 60},
+        {"name": "Deep Code Review", "tools": [], "models": ["qwen-coder-14b", "yi-9b-200k"], "complexity": "complex", "time": 600},
+        {"name": "Vulnerability Mapping", "tools": [], "models": ["whiterabbitneo"], "complexity": "complex", "time": 120},
     ],
 }
 
 
 class TaskDecomposer:
-    """Decomposes complex tasks into executable sub-tasks.
+    """Recursive goal decomposition engine.
 
-    Uses templates for common patterns and generates dependency
-    graphs for parallel execution.
+    Breaks high-level security assessment goals into
+    executable sub-tasks with dependency tracking,
+    resource estimation, and critical path analysis.
     """
 
-    def __init__(self) -> None:
-        self._plans: dict[str, TaskPlan] = {}
-        self._tasks: dict[str, SubTask] = {}
-        self._plan_counter = 0
-        self._task_counter = 0
+    def __init__(self, max_depth: int = 5) -> None:
+        self._plans: dict[str, DecompositionPlan] = {}
+        self._counter = 0
+        self._max_depth = max_depth
         self._log = logger.bind(component="task_decomposer")
 
     def decompose(
         self,
-        objective: str,
+        goal: str,
+        target: str,
         template: str = "",
-        target: str = "",
-        token_budget: int = 50000,
-    ) -> TaskPlan:
-        """Decompose an objective into sub-tasks."""
-        self._plan_counter += 1
-
-        # Select template
-        if not template:
-            template = self._match_template(objective)
-
-        template_data = DECOMPOSITION_TEMPLATES.get(
-            template, DECOMPOSITION_TEMPLATES["full_assessment"]
+    ) -> DecompositionPlan:
+        """Decompose a goal into sub-tasks."""
+        self._counter += 1
+        plan = DecompositionPlan(
+            plan_id=f"plan-{self._counter}",
+            goal=goal,
+            target=target,
         )
 
-        # Create tasks from template
-        tasks = []
-        task_id_map: dict[str, str] = {}
-
-        for t in template_data:
-            self._task_counter += 1
-            task_id = f"task-{self._task_counter}"
-            task_id_map[t["name"]] = task_id
-
-            task = SubTask(
-                task_id=task_id,
-                name=t["name"],
-                description=f"{t['name']} for {objective}",
-                priority=TaskPriority(t.get("priority", "medium")),
-                tool=t.get("tool", ""),
-                model=t.get("model", ""),
-                strategy=t.get("strategy", ""),
-                target=target,
-                estimated_tokens=t.get("tokens", 1000),
-                estimated_time_s=t.get("time", 60),
-            )
-            tasks.append(task)
-            self._tasks[task_id] = task
-
-        # Resolve dependencies
-        for i, t in enumerate(template_data):
-            task = tasks[i]
-            for dep_name in t.get("deps", []):
-                dep_id = task_id_map.get(dep_name, "")
-                if dep_id:
-                    task.depends_on.append(dep_id)
-
-        # Topological sort for execution order
-        execution_order = self._topological_sort(tasks)
-
-        # Scale token estimates to budget
-        total_est = sum(t.estimated_tokens for t in tasks)
-        if total_est > token_budget:
-            scale = token_budget / total_est
-            for task in tasks:
-                task.estimated_tokens = int(task.estimated_tokens * scale)
-
-        plan = TaskPlan(
-            plan_id=f"plan-{self._plan_counter}",
-            objective=objective,
-            tasks=tasks,
-            execution_order=execution_order,
-            total_estimated_tokens=sum(t.estimated_tokens for t in tasks),
-            total_estimated_time_s=sum(t.estimated_time_s for t in tasks),
+        # Create root task
+        root = SubTask(
+            task_id=f"task-{self._counter}-root",
+            name=goal[:50],
+            description=goal,
+            complexity=TaskComplexity.COMPLEX,
+            depth=0,
         )
+        plan.tasks[root.task_id] = root
+        plan.root_task_id = root.task_id
+
+        # Apply template if available
+        tmpl = self._select_template(goal, template)
+        if tmpl:
+            self._apply_template(plan, root, tmpl)
+        else:
+            self._auto_decompose(plan, root, goal, target)
+
+        # Calculate estimates
+        self._calculate_estimates(plan)
+
         self._plans[plan.plan_id] = plan
-
         return plan
 
+    def _select_template(
+        self,
+        goal: str,
+        template: str,
+    ) -> list[dict[str, Any]] | None:
+        """Select the best template for a goal."""
+        if template and template in TASK_TEMPLATES:
+            return TASK_TEMPLATES[template]
+
+        goal_lower = goal.lower()
+        if any(w in goal_lower for w in ("web", "website", "http", "url")):
+            return TASK_TEMPLATES["web_assessment"]
+        if any(w in goal_lower for w in ("network", "port", "host", "subnet")):
+            return TASK_TEMPLATES["network_assessment"]
+        if any(w in goal_lower for w in ("api", "endpoint", "rest", "graphql")):
+            return TASK_TEMPLATES["api_assessment"]
+        if any(w in goal_lower for w in ("code", "source", "review", "audit")):
+            return TASK_TEMPLATES["code_review"]
+
+        return None
+
+    def _apply_template(
+        self,
+        plan: DecompositionPlan,
+        parent: SubTask,
+        template: list[dict[str, Any]],
+    ) -> None:
+        """Apply a template to create sub-tasks."""
+        prev_id = ""
+        for i, step in enumerate(template):
+            self._counter += 1
+            task = SubTask(
+                task_id=f"task-{self._counter}",
+                name=step["name"],
+                complexity=TaskComplexity(step.get("complexity", "simple")),
+                parent_id=parent.task_id,
+                tools_required=step.get("tools", []),
+                models_preferred=step.get("models", []),
+                estimated_time_s=step.get("time", 60),
+                depth=parent.depth + 1,
+                can_parallel=step.get("parallel", False),
+            )
+
+            # Add sequential dependency
+            if prev_id and not task.can_parallel:
+                task.dependencies.append(prev_id)
+
+            plan.tasks[task.task_id] = task
+            parent.children.append(task.task_id)
+            prev_id = task.task_id
+
+    def _auto_decompose(
+        self,
+        plan: DecompositionPlan,
+        parent: SubTask,
+        goal: str,
+        target: str,
+    ) -> None:
+        """Auto-decompose when no template matches."""
+        default_phases = [
+            {"name": "Reconnaissance", "tools": ["nmap", "subfinder"], "time": 180},
+            {"name": "Scanning", "tools": ["nuclei"], "time": 300},
+            {"name": "Analysis", "tools": [], "time": 120},
+            {"name": "Exploitation", "tools": [], "time": 600},
+            {"name": "Reporting", "tools": [], "time": 30},
+        ]
+        self._apply_template(plan, parent, default_phases)
+
+    def _calculate_estimates(self, plan: DecompositionPlan) -> None:
+        """Calculate total plan estimates."""
+        total_time = 0
+        total_tokens = 0
+        max_depth = 0
+
+        for task in plan.tasks.values():
+            total_time += task.estimated_time_s
+            total_tokens += task.estimated_tokens
+            max_depth = max(max_depth, task.depth)
+
+        plan.total_estimated_time_s = total_time
+        plan.total_estimated_tokens = total_tokens
+        plan.max_depth = max_depth
+
     def get_ready_tasks(self, plan_id: str) -> list[SubTask]:
-        """Get tasks that are ready to execute (all deps complete)."""
+        """Get tasks ready for execution."""
         plan = self._plans.get(plan_id)
         if not plan:
             return []
 
         ready = []
-        for task in plan.tasks:
-            if task.status != TaskStatus.PENDING:
+        for task in plan.tasks.values():
+            if task.status != TaskStatus.PLANNED:
+                continue
+            if not task.is_leaf:
                 continue
 
             deps_met = all(
-                self._tasks.get(dep, SubTask()).status == TaskStatus.COMPLETE
-                for dep in task.depends_on
+                plan.tasks.get(dep, SubTask()).status == TaskStatus.COMPLETE
+                for dep in task.dependencies
             )
             if deps_met:
-                task.status = TaskStatus.READY
                 ready.append(task)
 
         return ready
 
-    def start_task(self, task_id: str) -> SubTask | None:
-        """Mark a task as running."""
-        task = self._tasks.get(task_id)
-        if not task:
-            return None
-        task.status = TaskStatus.RUNNING
-        task.started_at = time.time()
-        return task
-
     def complete_task(
         self,
+        plan_id: str,
         task_id: str,
         result: dict[str, Any] | None = None,
-        tokens_used: int = 0,
-    ) -> SubTask | None:
+        success: bool = True,
+        actual_time_s: float = 0.0,
+        actual_tokens: int = 0,
+    ) -> bool:
         """Mark a task as complete."""
-        task = self._tasks.get(task_id)
+        plan = self._plans.get(plan_id)
+        if not plan:
+            return False
+        task = plan.tasks.get(task_id)
         if not task:
-            return None
-        task.status = TaskStatus.COMPLETE
-        task.completed_at = time.time()
-        task.actual_time_s = task.completed_at - task.started_at
-        task.actual_tokens = tokens_used
+            return False
+
+        task.status = TaskStatus.COMPLETE if success else TaskStatus.FAILED
         task.result = result or {}
-        return task
+        task.actual_time_s = actual_time_s
+        task.actual_tokens = actual_tokens
 
-    def fail_task(
-        self,
-        task_id: str,
-        error: str = "",
-    ) -> SubTask | None:
-        """Mark a task as failed."""
-        task = self._tasks.get(task_id)
-        if not task:
-            return None
-        task.status = TaskStatus.FAILED
-        task.completed_at = time.time()
-        task.result = {"error": error}
-        return task
+        return True
 
-    @staticmethod
-    def _topological_sort(tasks: list[SubTask]) -> list[list[str]]:
-        """Sort tasks into batches respecting dependencies."""
-        # Build dependency graph
-        in_degree: dict[str, int] = {}
-        dependents: dict[str, list[str]] = defaultdict(list)
+    def get_critical_path(self, plan_id: str) -> list[SubTask]:
+        """Get the critical path (longest dependency chain)."""
+        plan = self._plans.get(plan_id)
+        if not plan:
+            return []
 
-        for task in tasks:
-            in_degree[task.task_id] = len(task.depends_on)
-            for dep in task.depends_on:
-                dependents[dep].append(task.task_id)
-
-        # BFS by layers (each layer = parallel batch)
-        batches: list[list[str]] = []
-        queue: deque[str] = deque(
-            tid for tid, deg in in_degree.items() if deg == 0
-        )
+        # BFS from root, tracking longest path
+        longest_path: list[SubTask] = []
+        queue: deque[tuple[str, list[SubTask]]] = deque()
+        queue.append((plan.root_task_id, []))
 
         while queue:
-            batch = []
-            next_queue: deque[str] = deque()
+            task_id, path = queue.popleft()
+            task = plan.tasks.get(task_id)
+            if not task:
+                continue
 
-            while queue:
-                tid = queue.popleft()
-                batch.append(tid)
+            current_path = path + [task]
+            if not task.children:
+                if len(current_path) > len(longest_path):
+                    longest_path = current_path
+            else:
+                for child_id in task.children:
+                    queue.append((child_id, current_path))
 
-                for dep_tid in dependents.get(tid, []):
-                    in_degree[dep_tid] -= 1
-                    if in_degree[dep_tid] == 0:
-                        next_queue.append(dep_tid)
-
-            if batch:
-                batches.append(batch)
-            queue = next_queue
-
-        return batches
-
-    @staticmethod
-    def _match_template(objective: str) -> str:
-        """Match an objective to the best template."""
-        obj_lower = objective.lower()
-
-        if any(kw in obj_lower for kw in ("api", "graphql", "grpc", "rest")):
-            return "api_assessment"
-        if any(kw in obj_lower for kw in ("web", "webapp", "website", "http")):
-            return "web_app_scan"
-        if any(kw in obj_lower for kw in ("network", "subnet", "cidr", "ip range")):
-            return "network_scan"
-
-        return "full_assessment"
-
-    def generate_decomposition_prompt(
-        self,
-        objective: str,
-        context: str = "",
-    ) -> str:
-        """Generate a prompt for LLM-assisted task decomposition."""
-        return (
-            f"Decompose this security assessment objective into sub-tasks:\n"
-            f"Objective: {objective}\n"
-            f"{f'Context: {context}' if context else ''}\n\n"
-            f"For each sub-task, specify:\n"
-            f"1. Name (short identifier)\n"
-            f"2. Tool to use (nmap, nuclei, sqlmap, etc.) or 'llm' for analysis\n"
-            f"3. Dependencies (which tasks must complete first)\n"
-            f"4. Priority (critical/high/medium/low)\n"
-            f"5. Estimated time (seconds)\n\n"
-            f"Consider: recon → scanning → analysis → exploitation → validation\n"
-            f"Maximize parallelism where possible.\n"
-        )
-
-    def get_plan(self, plan_id: str) -> TaskPlan | None:
-        return self._plans.get(plan_id)
+        return longest_path
 
     def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
-        for task in self._tasks.values():
-            status_counts[task.status.value] += 1
         return {
             "plans": len(self._plans),
-            "tasks": len(self._tasks),
-            "by_status": dict(status_counts),
+            "plan_details": {
+                pid: p.to_dict() for pid, p in self._plans.items()
+            },
         }
