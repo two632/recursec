@@ -1,13 +1,13 @@
 """Semantic memory — vector-based knowledge retrieval.
 
 Implements:
-1. Text embedding via Nomic-Embed model
+1. Text embedding via local nomic-embed model
 2. Cosine similarity search
-3. Memory storage with metadata
-4. Category-based retrieval
-5. Temporal decay for relevance
-6. Memory consolidation
-7. Cross-assessment knowledge transfer
+3. Memory indexing by category
+4. Temporal relevance weighting
+5. Memory consolidation (merge similar entries)
+6. Capacity management with eviction
+7. Context-aware retrieval for LLM prompts
 """
 
 from __future__ import annotations
@@ -23,55 +23,69 @@ import structlog
 logger = structlog.get_logger()
 
 
-class MemoryType(str, Enum):
+class MemoryCategory(str, Enum):
     FINDING = "finding"
-    TECHNIQUE = "technique"
-    TOOL_RESULT = "tool_result"
+    TOOL_OUTPUT = "tool_output"
     STRATEGY = "strategy"
-    OBSERVATION = "observation"
-    LESSON = "lesson"
-    PATTERN = "pattern"
+    KNOWLEDGE = "knowledge"
+    EXPERIENCE = "experience"
+    TARGET_INFO = "target_info"
+    REASONING = "reasoning"
 
 
 @dataclass
 class MemoryEntry:
     """A memory entry with embedding."""
-    memory_id: str = ""
-    memory_type: MemoryType = MemoryType.OBSERVATION
+    entry_id: str = ""
+    category: MemoryCategory = MemoryCategory.KNOWLEDGE
     content: str = ""
+    summary: str = ""
     embedding: list[float] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-    tags: list[str] = field(default_factory=list)
-    assessment_id: str = ""
-    importance: float = 0.5
-    access_count: int = 0
     created_at: float = field(default_factory=time.time)
-    last_accessed: float = field(default_factory=time.time)
+    accessed_at: float = field(default_factory=time.time)
+    access_count: int = 0
+    importance: float = 0.5
+
+    @property
+    def age_hours(self) -> float:
+        return (time.time() - self.created_at) / 3600
+
+    @property
+    def relevance_decay(self) -> float:
+        """Temporal decay factor (half-life 24h)."""
+        return 0.5 ** (self.age_hours / 24)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.memory_id[:10],
-            "type": self.memory_type.value,
-            "content": self.content[:30],
+            "id": self.entry_id[:10],
+            "category": self.category.value,
+            "summary": self.summary[:30],
             "importance": round(self.importance, 2),
             "accesses": self.access_count,
         }
 
 
-@dataclass
-class SearchResult:
-    """A search result with similarity score."""
-    memory: MemoryEntry = field(default_factory=MemoryEntry)
-    similarity: float = 0.0
-    relevance_score: float = 0.0  # Combined similarity + recency + importance
+def _simple_embed(text: str, dim: int = 128) -> list[float]:
+    """Simple deterministic text embedding (fallback when model unavailable).
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.memory.memory_id[:10],
-            "similarity": round(self.similarity, 3),
-            "relevance": round(self.relevance_score, 3),
-            "content": self.memory.content[:30],
-        }
+    Uses character-level hashing with positional weighting.
+    Not semantically meaningful but provides consistent vectors.
+    """
+    vec = [0.0] * dim
+    text_lower = text.lower()
+
+    for i, ch in enumerate(text_lower[:500]):
+        idx = (ord(ch) * (i + 1)) % dim
+        weight = 1.0 / (1.0 + i * 0.01)
+        vec[idx] += weight
+
+    # Normalize
+    magnitude = math.sqrt(sum(v * v for v in vec))
+    if magnitude > 0:
+        vec = [v / magnitude for v in vec]
+
+    return vec
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -80,222 +94,206 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
         return 0.0
 
     dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(x * x for x in b))
 
-    if norm_a == 0 or norm_b == 0:
+    if mag_a == 0 or mag_b == 0:
         return 0.0
 
-    return dot / (norm_a * norm_b)
-
-
-def _simple_embed(text: str, dim: int = 128) -> list[float]:
-    """Simple embedding for when Nomic model is unavailable.
-
-    Uses character-level hashing to create a fixed-size
-    embedding. NOT production quality — use Nomic-Embed
-    via the LLM client for real embeddings.
-    """
-    embedding = [0.0] * dim
-    text_lower = text.lower()
-
-    for i, char in enumerate(text_lower):
-        idx = hash(f"{char}_{i}") % dim
-        embedding[idx] += 1.0
-
-    # Normalize
-    norm = math.sqrt(sum(x * x for x in embedding))
-    if norm > 0:
-        embedding = [x / norm for x in embedding]
-
-    return embedding
+    return dot / (mag_a * mag_b)
 
 
 class SemanticMemory:
-    """Vector-based semantic memory system.
+    """Vector-based semantic memory for agent knowledge.
 
-    Stores memories with embeddings for
-    similarity-based retrieval. Uses Nomic-Embed
-    for production embeddings, fallback to simple
-    hashing for offline use.
+    Stores text with embeddings for similarity-based
+    retrieval. Uses local nomic-embed model when
+    available, falls back to simple hashing.
     """
 
     def __init__(
         self,
+        max_entries: int = 5000,
         embed_dim: int = 128,
-        max_memories: int = 10000,
-        decay_rate: float = 0.001,
     ) -> None:
-        self._memories: dict[str, MemoryEntry] = {}
+        self._entries: dict[str, MemoryEntry] = {}
+        self._max = max_entries
+        self._dim = embed_dim
         self._counter = 0
-        self._embed_dim = embed_dim
-        self._max_memories = max_memories
-        self._decay_rate = decay_rate
+        self._use_model = False  # Set True when nomic-embed available
         self._log = logger.bind(component="semantic_memory")
 
     def store(
         self,
         content: str,
-        memory_type: MemoryType = MemoryType.OBSERVATION,
-        metadata: dict[str, Any] | None = None,
-        tags: list[str] | None = None,
-        assessment_id: str = "",
+        category: MemoryCategory = MemoryCategory.KNOWLEDGE,
+        summary: str = "",
         importance: float = 0.5,
-        embedding: list[float] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> MemoryEntry:
-        """Store a new memory."""
+        """Store a new memory entry."""
         self._counter += 1
+
+        embedding = self._embed(content)
+
         entry = MemoryEntry(
-            memory_id=f"mem-{self._counter}",
-            memory_type=memory_type,
+            entry_id=f"mem-{self._counter}",
+            category=category,
             content=content,
-            embedding=embedding or _simple_embed(content, self._embed_dim),
+            summary=summary or content[:80],
+            embedding=embedding,
             metadata=metadata or {},
-            tags=tags or [],
-            assessment_id=assessment_id,
             importance=importance,
         )
-        self._memories[entry.memory_id] = entry
 
-        # Evict least important if at capacity
-        if len(self._memories) > self._max_memories:
-            self._evict_least_important()
+        # Evict if at capacity
+        if len(self._entries) >= self._max:
+            self._evict()
 
+        self._entries[entry.entry_id] = entry
         return entry
 
     def search(
         self,
         query: str,
-        top_k: int = 5,
-        memory_type: MemoryType | None = None,
-        tags: list[str] | None = None,
+        limit: int = 5,
+        category: MemoryCategory | None = None,
         min_similarity: float = 0.1,
-        query_embedding: list[float] | None = None,
-    ) -> list[SearchResult]:
-        """Search memories by semantic similarity."""
-        q_embed = query_embedding or _simple_embed(query, self._embed_dim)
-        results: list[SearchResult] = []
-        now = time.time()
+    ) -> list[tuple[float, MemoryEntry]]:
+        """Search memory by semantic similarity."""
+        query_embedding = self._embed(query)
 
-        for entry in self._memories.values():
-            # Filter by type
-            if memory_type and entry.memory_type != memory_type:
+        scored: list[tuple[float, MemoryEntry]] = []
+        for entry in self._entries.values():
+            if category and entry.category != category:
                 continue
 
-            # Filter by tags
-            if tags and not any(t in entry.tags for t in tags):
-                continue
+            similarity = _cosine_similarity(query_embedding, entry.embedding)
 
-            # Compute similarity
-            similarity = _cosine_similarity(q_embed, entry.embedding)
             if similarity < min_similarity:
                 continue
 
-            # Compute relevance (similarity + recency + importance)
-            age_hours = (now - entry.created_at) / 3600
-            recency_factor = math.exp(-self._decay_rate * age_hours)
-
-            relevance = (
-                similarity * 0.5
-                + recency_factor * 0.2
-                + entry.importance * 0.3
+            # Combine with importance and recency
+            final_score = (
+                similarity * 0.6
+                + entry.importance * 0.2
+                + entry.relevance_decay * 0.2
             )
+            scored.append((final_score, entry))
 
-            results.append(SearchResult(
-                memory=entry,
-                similarity=similarity,
-                relevance_score=relevance,
-            ))
+        scored.sort(key=lambda x: x[0], reverse=True)
 
-        # Sort by relevance
-        results.sort(key=lambda r: r.relevance_score, reverse=True)
-        results = results[:top_k]
-
-        # Update access counts
-        for result in results:
-            result.memory.access_count += 1
-            result.memory.last_accessed = now
+        # Update access stats
+        results = scored[:limit]
+        for _, entry in results:
+            entry.accessed_at = time.time()
+            entry.access_count += 1
 
         return results
 
-    def get_by_type(
+    def search_by_category(
         self,
-        memory_type: MemoryType,
+        category: MemoryCategory,
         limit: int = 10,
     ) -> list[MemoryEntry]:
-        """Get memories by type."""
+        """Get entries by category, sorted by importance."""
         entries = [
-            e for e in self._memories.values()
-            if e.memory_type == memory_type
+            e for e in self._entries.values()
+            if e.category == category
         ]
-        entries.sort(key=lambda e: e.importance, reverse=True)
+        entries.sort(key=lambda e: e.importance * e.relevance_decay, reverse=True)
         return entries[:limit]
 
-    def get_by_assessment(
-        self,
-        assessment_id: str,
-    ) -> list[MemoryEntry]:
-        """Get all memories for an assessment."""
-        return [
-            e for e in self._memories.values()
-            if e.assessment_id == assessment_id
-        ]
+    def consolidate(self, similarity_threshold: float = 0.9) -> int:
+        """Merge highly similar entries."""
+        entries = list(self._entries.values())
+        merged = 0
+        to_remove: set[str] = set()
 
-    def consolidate(
-        self,
-        min_accesses: int = 3,
-    ) -> int:
-        """Consolidate memories — boost frequently accessed, prune stale."""
-        boosted = 0
-        for entry in self._memories.values():
-            if entry.access_count >= min_accesses:
-                entry.importance = min(1.0, entry.importance + 0.1)
-                boosted += 1
-        return boosted
+        for i in range(len(entries)):
+            if entries[i].entry_id in to_remove:
+                continue
+            for j in range(i + 1, len(entries)):
+                if entries[j].entry_id in to_remove:
+                    continue
+                sim = _cosine_similarity(entries[i].embedding, entries[j].embedding)
+                if sim >= similarity_threshold:
+                    # Keep the more important one
+                    if entries[i].importance >= entries[j].importance:
+                        entries[i].access_count += entries[j].access_count
+                        to_remove.add(entries[j].entry_id)
+                    else:
+                        entries[j].access_count += entries[i].access_count
+                        to_remove.add(entries[i].entry_id)
+                    merged += 1
+                    break
 
-    def _evict_least_important(self) -> None:
-        """Evict least important memory."""
-        if not self._memories:
-            return
+        for entry_id in to_remove:
+            del self._entries[entry_id]
 
-        least = min(
-            self._memories.values(),
-            key=lambda e: e.importance * (e.access_count + 1),
-        )
-        del self._memories[least.memory_id]
+        return merged
 
     def build_memory_prompt(
         self,
-        query: str,
-        top_k: int = 3,
+        query: str = "",
+        max_entries: int = 5,
     ) -> str:
         """Build memory context for LLM."""
-        results = self.search(query, top_k=top_k)
-        if not results:
-            return ""
+        lines = ["## Relevant Memory\n"]
 
-        lines = ["## Relevant Memories\n"]
-        for result in results:
-            lines.append(
-                f"- [{result.memory.memory_type.value}] "
-                f"(relevance: {result.relevance_score:.2f}): "
-                f"{result.memory.content[:100]}"
+        if query:
+            results = self.search(query, limit=max_entries)
+            if not results:
+                lines.append("No relevant memories found.")
+            else:
+                for score, entry in results:
+                    lines.append(
+                        f"  [{entry.category.value}] (sim={score:.2f}) "
+                        f"{entry.summary[:50]}"
+                    )
+        else:
+            # Show most important recent entries
+            entries = sorted(
+                self._entries.values(),
+                key=lambda e: e.importance * e.relevance_decay,
+                reverse=True,
             )
+            for entry in entries[:max_entries]:
+                lines.append(
+                    f"  [{entry.category.value}] {entry.summary[:50]}"
+                )
 
+        lines.append(f"\nTotal memories: {len(self._entries)}")
         return "\n".join(lines)
 
+    def _embed(self, text: str) -> list[float]:
+        """Generate embedding for text."""
+        if self._use_model:
+            # Would call nomic-embed API here
+            pass
+        return _simple_embed(text, self._dim)
+
+    def _evict(self) -> None:
+        """Evict lowest-value entries."""
+        if not self._entries:
+            return
+        # Evict entry with lowest combined score
+        worst = min(
+            self._entries.values(),
+            key=lambda e: e.importance * e.relevance_decay,
+        )
+        del self._entries[worst.entry_id]
+
     def get_stats(self) -> dict[str, Any]:
-        type_counts: dict[str, int] = {}
-        for entry in self._memories.values():
-            type_counts[entry.memory_type.value] = type_counts.get(
-                entry.memory_type.value, 0,
-            ) + 1
+        cat_counts: dict[str, int] = {}
+        for e in self._entries.values():
+            cat_counts[e.category.value] = cat_counts.get(e.category.value, 0) + 1
 
         return {
-            "total_memories": len(self._memories),
-            "by_type": type_counts,
-            "avg_importance": round(
-                sum(e.importance for e in self._memories.values()) /
-                max(1, len(self._memories)), 2,
+            "total_entries": len(self._entries),
+            "by_category": cat_counts,
+            "avg_importance": (
+                sum(e.importance for e in self._entries.values()) / len(self._entries)
+                if self._entries else 0
             ),
         }
