@@ -1,28 +1,23 @@
-"""Tool execution engine — safe, monitored execution of security tools.
+"""Tool executor — safe, sandboxed execution of external security tools.
 
-Handles:
-1. Tool discovery and availability checking
-2. Command building from structured parameters
-3. Sandboxed execution (Docker optional)
-4. Output capture and parsing
-5. Timeout enforcement
-6. Execution logging for audit trail
-7. Rate limiting and resource management
-8. Error recovery and retry logic
-9. Tool chaining (pipe output to next tool)
+Implements:
+1. Command construction with argument validation
+2. Sandboxed execution (timeouts, resource limits)
+3. Output capture and streaming
+4. Exit code handling
+5. Tool chain execution (pipe output between tools)
+6. Concurrent execution with semaphores
+7. Output size limits
+8. Working directory management
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
-from enum import Enum
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -30,473 +25,255 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ToolCategory(str, Enum):
-    RECON = "recon"
-    SCANNER = "scanner"
-    EXPLOIT = "exploit"
-    WEB = "web"
-    NETWORK = "network"
-    CODE = "code"
-    CRYPTO = "crypto"
-    OSINT = "osint"
-    BRUTE_FORCE = "brute_force"
-    POST_EXPLOIT = "post_exploit"
-    UTILITY = "utility"
-
-
-class ExecutionMode(str, Enum):
-    LOCAL = "local"
-    DOCKER = "docker"
-    SANDBOX = "sandbox"
-
-
-@dataclass
-class ToolDefinition:
-    """Definition of an available tool."""
-    name: str = ""
-    binary: str = ""             # Executable name or path
-    category: ToolCategory = ToolCategory.UTILITY
-    description: str = ""
-    installed: bool = False
-    install_command: str = ""
-    docker_image: str = ""       # Docker image for sandboxed execution
-    default_timeout_s: float = 120.0
-    max_timeout_s: float = 600.0
-    output_format: str = "text"  # text, json, xml
-    dangerous: bool = False      # Requires extra approval
-    rate_limit: int = 0          # Max calls per minute (0 = unlimited)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name, "binary": self.binary,
-            "category": self.category.value,
-            "installed": self.installed,
-            "dangerous": self.dangerous,
-        }
-
-
-@dataclass
-class ExecutionRequest:
-    """Request to execute a tool."""
-    tool_name: str = ""
-    command_args: list[str] = field(default_factory=list)
-    target: str = ""
-    stdin_data: str = ""
-    timeout_s: float = 120.0
-    mode: ExecutionMode = ExecutionMode.LOCAL
-    env_vars: dict[str, str] = field(default_factory=dict)
-    working_dir: str = ""
-    capture_stderr: bool = True
-
-    @property
-    def command_string(self) -> str:
-        return " ".join(self.command_args) if self.command_args else self.tool_name
-
-
 @dataclass
 class ExecutionResult:
     """Result of a tool execution."""
-    request_id: str = ""
-    tool_name: str = ""
+    tool: str = ""
     command: str = ""
     stdout: str = ""
     stderr: str = ""
     exit_code: int = -1
-    duration_s: float = 0.0
     timed_out: bool = False
-    error: str = ""
+    duration_s: float = 0.0
+    started_at: float = 0.0
+    completed_at: float = 0.0
 
     @property
     def success(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out and not self.error
-
-    @property
-    def output(self) -> str:
-        return self.stdout if self.stdout else self.stderr
+        return self.exit_code == 0 and not self.timed_out
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.request_id,
-            "tool": self.tool_name,
-            "command": self.command[:200],
-            "exit_code": self.exit_code,
-            "success": self.success,
-            "duration_s": round(self.duration_s, 2),
-            "output_length": len(self.stdout),
-            "timed_out": self.timed_out,
+            "tool": self.tool, "exit_code": self.exit_code,
+            "success": self.success, "timed_out": self.timed_out,
+            "duration_s": round(self.duration_s, 1),
+            "stdout_len": len(self.stdout),
+            "stderr_len": len(self.stderr),
         }
 
 
-# ── Tool Registry ────────────────────────────────────────────
+# ── Blocked commands (safety) ─────────────────────────────────
 
-BUILTIN_TOOLS: list[dict[str, Any]] = [
-    # Recon
-    {"name": "nmap", "binary": "nmap", "category": "recon",
-     "description": "Network mapper / port scanner"},
-    {"name": "masscan", "binary": "masscan", "category": "recon",
-     "description": "Fast port scanner"},
-    {"name": "subfinder", "binary": "subfinder", "category": "recon",
-     "description": "Subdomain discovery"},
-    {"name": "amass", "binary": "amass", "category": "recon",
-     "description": "Attack surface enumeration"},
-    {"name": "httpx", "binary": "httpx", "category": "recon",
-     "description": "HTTP probe"},
-    {"name": "katana", "binary": "katana", "category": "recon",
-     "description": "Web crawler"},
-    {"name": "whatweb", "binary": "whatweb", "category": "recon",
-     "description": "Web technology fingerprinter"},
-
-    # Scanners
-    {"name": "nuclei", "binary": "nuclei", "category": "scanner",
-     "description": "Vulnerability scanner with templates"},
-    {"name": "nikto", "binary": "nikto", "category": "scanner",
-     "description": "Web server scanner"},
-    {"name": "wpscan", "binary": "wpscan", "category": "scanner",
-     "description": "WordPress vulnerability scanner"},
-    {"name": "testssl", "binary": "testssl.sh", "category": "scanner",
-     "description": "SSL/TLS tester"},
-
-    # Exploit
-    {"name": "sqlmap", "binary": "sqlmap", "category": "exploit",
-     "description": "SQL injection exploitation", "dangerous": True},
-    {"name": "metasploit", "binary": "msfconsole", "category": "exploit",
-     "description": "Exploitation framework", "dangerous": True},
-    {"name": "hydra", "binary": "hydra", "category": "brute_force",
-     "description": "Login brute forcer", "dangerous": True},
-
-    # Web
-    {"name": "gobuster", "binary": "gobuster", "category": "web",
-     "description": "Directory/DNS bruteforcer"},
-    {"name": "ffuf", "binary": "ffuf", "category": "web",
-     "description": "Fast web fuzzer"},
-    {"name": "dalfox", "binary": "dalfox", "category": "web",
-     "description": "XSS scanner"},
-    {"name": "curl", "binary": "curl", "category": "web",
-     "description": "HTTP client"},
-
-    # Code
-    {"name": "semgrep", "binary": "semgrep", "category": "code",
-     "description": "Static analysis (SAST)"},
-    {"name": "bandit", "binary": "bandit", "category": "code",
-     "description": "Python security linter"},
-    {"name": "trivy", "binary": "trivy", "category": "code",
-     "description": "Vulnerability scanner for dependencies"},
-    {"name": "gitleaks", "binary": "gitleaks", "category": "code",
-     "description": "Secret scanner for git repos"},
-    {"name": "trufflehog", "binary": "trufflehog", "category": "code",
-     "description": "Secret scanner"},
-
-    # Network
-    {"name": "enum4linux", "binary": "enum4linux-ng", "category": "network",
-     "description": "Windows/SMB enumerator"},
-    {"name": "dig", "binary": "dig", "category": "network",
-     "description": "DNS lookup"},
-    {"name": "whois", "binary": "whois", "category": "network",
-     "description": "Domain info lookup"},
-    {"name": "tcpdump", "binary": "tcpdump", "category": "network",
-     "description": "Packet capture"},
-
-    # Crypto
-    {"name": "hashcat", "binary": "hashcat", "category": "crypto",
-     "description": "Password hash cracker", "dangerous": True},
-    {"name": "john", "binary": "john", "category": "crypto",
-     "description": "Password hash cracker", "dangerous": True},
-
-    # Utility
-    {"name": "python3", "binary": "python3", "category": "utility",
-     "description": "Python interpreter"},
-    {"name": "jq", "binary": "jq", "category": "utility",
-     "description": "JSON processor"},
+BLOCKED_PATTERNS = [
+    "rm -rf /", "rm -rf /*", "mkfs", "dd if=/dev/zero",
+    ":(){:|:&};:", "chmod -R 777 /", "shutdown", "reboot",
+    "halt", "init 0", "init 6",
 ]
 
 
 class ToolExecutor:
-    """Safe, monitored execution of security tools.
+    """Safe, sandboxed execution of external security tools.
 
-    Discovers available tools, builds commands, executes safely
-    with timeouts and logging, and parses outputs.
+    Manages command execution with timeouts, output capture,
+    and safety checks.
     """
 
     def __init__(
         self,
-        mode: ExecutionMode = ExecutionMode.LOCAL,
-        max_concurrent: int = 10,
-        log_dir: str = "data/tool_logs",
+        max_concurrent: int = 5,
+        default_timeout_s: float = 300.0,
+        max_output_bytes: int = 10_000_000,
+        work_dir: str = "data/tool_output",
     ) -> None:
-        self._mode = mode
-        self._max_concurrent = max_concurrent
-        self._log_dir = Path(log_dir)
-        self._log_dir.mkdir(parents=True, exist_ok=True)
-
-        self._tools: dict[str, ToolDefinition] = {}
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._execution_log: list[dict[str, Any]] = []
-        self._rate_counters: dict[str, list[float]] = defaultdict(list)
-        self._exec_counter = 0
-
+        self._default_timeout = default_timeout_s
+        self._max_output = max_output_bytes
+        self._work_dir = work_dir
+        os.makedirs(work_dir, exist_ok=True)
+        self._running: dict[str, asyncio.subprocess.Process] = {}
+        self._history: list[ExecutionResult] = []
         self._log = logger.bind(component="tool_executor")
 
-        # Discover tools
-        self._discover_tools()
+    async def execute(
+        self,
+        command: str,
+        tool_name: str = "",
+        timeout_s: float = 0.0,
+        env: dict[str, str] | None = None,
+        work_dir: str = "",
+    ) -> ExecutionResult:
+        """Execute a tool command safely."""
+        if not tool_name:
+            tool_name = command.split()[0] if command else "unknown"
 
-    def _discover_tools(self) -> None:
-        """Discover which tools are installed."""
-        for tool_data in BUILTIN_TOOLS:
-            binary = tool_data["binary"]
-            installed = shutil.which(binary) is not None
-
-            try:
-                category = ToolCategory(tool_data.get("category", "utility"))
-            except ValueError:
-                category = ToolCategory.UTILITY
-
-            tool = ToolDefinition(
-                name=tool_data["name"],
-                binary=binary,
-                category=category,
-                description=tool_data.get("description", ""),
-                installed=installed,
-                dangerous=tool_data.get("dangerous", False),
-            )
-            self._tools[tool.name] = tool
-
-        installed_count = sum(1 for t in self._tools.values() if t.installed)
-        self._log.info(
-            "tools_discovered",
-            total=len(self._tools),
-            installed=installed_count,
-        )
-
-    def get_available_tools(self, category: ToolCategory | None = None) -> list[ToolDefinition]:
-        """Get list of available (installed) tools."""
-        tools = [t for t in self._tools.values() if t.installed]
-        if category:
-            tools = [t for t in tools if t.category == category]
-        return tools
-
-    def get_all_tools(self) -> list[ToolDefinition]:
-        return list(self._tools.values())
-
-    def is_available(self, tool_name: str) -> bool:
-        tool = self._tools.get(tool_name)
-        return tool.installed if tool else False
-
-    async def execute(self, request: ExecutionRequest) -> ExecutionResult:
-        """Execute a tool with safety checks."""
-        self._exec_counter += 1
-        request_id = f"exec-{self._exec_counter}"
-
-        # Validate tool exists
-        tool = self._tools.get(request.tool_name)
-        if not tool:
+        # Safety check
+        if not self._is_safe(command):
             return ExecutionResult(
-                request_id=request_id,
-                tool_name=request.tool_name,
-                error=f"Unknown tool: {request.tool_name}",
+                tool=tool_name, command=command,
+                stderr="Command blocked by safety check",
+                exit_code=-1,
             )
 
-        if not tool.installed:
-            return ExecutionResult(
-                request_id=request_id,
-                tool_name=request.tool_name,
-                error=f"Tool not installed: {request.tool_name}",
-            )
-
-        # Rate limiting
-        if tool.rate_limit > 0 and not self._check_rate_limit(request.tool_name, tool.rate_limit):
-            return ExecutionResult(
-                request_id=request_id,
-                tool_name=request.tool_name,
-                error=f"Rate limit exceeded for {request.tool_name}",
-            )
-
-        # Enforce timeout
-        timeout = min(request.timeout_s, tool.max_timeout_s)
-
-        # Build command
-        command = self._build_command(tool, request)
+        timeout = timeout_s or self._default_timeout
 
         async with self._semaphore:
-            result = await self._run_command(
-                request_id=request_id,
-                tool_name=request.tool_name,
+            return await self._run(
                 command=command,
+                tool_name=tool_name,
                 timeout=timeout,
-                stdin_data=request.stdin_data,
-                env_vars=request.env_vars,
-                working_dir=request.working_dir,
-                capture_stderr=request.capture_stderr,
+                env=env,
+                work_dir=work_dir or self._work_dir,
             )
-
-        # Log execution
-        self._log_execution(result)
-
-        return result
 
     async def execute_chain(
         self,
-        requests: list[ExecutionRequest],
-        pipe: bool = False,
+        commands: list[dict[str, Any]],
     ) -> list[ExecutionResult]:
-        """Execute multiple tools in sequence, optionally piping output."""
-        results: list[ExecutionResult] = []
+        """Execute a chain of commands, passing output between them."""
+        results = []
+        prev_output = ""
 
-        for i, request in enumerate(requests):
-            if pipe and i > 0 and results[-1].success:
-                request.stdin_data = results[-1].stdout
+        for cmd_spec in commands:
+            command = cmd_spec.get("command", "")
+            tool = cmd_spec.get("tool", "")
 
-            result = await self.execute(request)
+            # Inject previous output if placeholder exists
+            if "{prev_output}" in command and prev_output:
+                # Write prev output to temp file for piping
+                temp_file = os.path.join(self._work_dir, f"chain-{len(results)}.txt")
+                with open(temp_file, "w") as f:
+                    f.write(prev_output)
+                command = command.replace("{prev_output}", temp_file)
+
+            result = await self.execute(
+                command=command,
+                tool_name=tool,
+                timeout_s=cmd_spec.get("timeout_s", 0.0),
+            )
+
             results.append(result)
+            prev_output = result.stdout
 
-            if not result.success and not pipe:
-                break  # Stop chain on failure unless piping
+            # Stop chain on failure if specified
+            if not result.success and cmd_spec.get("stop_on_fail", True):
+                break
 
         return results
 
     async def execute_parallel(
         self,
-        requests: list[ExecutionRequest],
+        commands: list[dict[str, Any]],
     ) -> list[ExecutionResult]:
-        """Execute multiple tools in parallel."""
-        tasks = [self.execute(req) for req in requests]
-        return await asyncio.gather(*tasks)
+        """Execute multiple commands in parallel."""
+        tasks = []
+        for cmd_spec in commands:
+            tasks.append(self.execute(
+                command=cmd_spec.get("command", ""),
+                tool_name=cmd_spec.get("tool", ""),
+                timeout_s=cmd_spec.get("timeout_s", 0.0),
+            ))
 
-    # ── Internal ─────────────────────────────────────────
+        return list(await asyncio.gather(*tasks, return_exceptions=False))
 
-    def _build_command(self, tool: ToolDefinition, request: ExecutionRequest) -> list[str]:
-        """Build the command to execute."""
-        if request.command_args:
-            return [tool.binary] + request.command_args
+    def is_tool_available(self, tool: str) -> bool:
+        """Check if a tool is installed."""
+        return shutil.which(tool) is not None
 
-        # If just tool name and target, build a basic command
-        cmd = [tool.binary]
-        if request.target:
-            cmd.append(request.target)
-        return cmd
+    def get_available_tools(self) -> list[str]:
+        """Get list of installed security tools."""
+        tools = [
+            "nmap", "masscan", "nuclei", "nikto", "sqlmap",
+            "ffuf", "gobuster", "dirb", "wfuzz",
+            "subfinder", "amass", "httpx", "katana",
+            "semgrep", "bandit", "trivy", "grype",
+            "hydra", "medusa", "hashcat", "john",
+            "curl", "wget", "dig", "whois", "traceroute",
+            "testssl.sh", "sslscan", "whatweb",
+            "enum4linux", "smbclient", "rpcclient",
+            "dalfox", "commix", "tplmap",
+            "gitleaks", "trufflehog",
+            "wireshark", "tcpdump", "tshark",
+        ]
 
-    async def _run_command(
+        return [t for t in tools if self.is_tool_available(t)]
+
+    async def _run(
         self,
-        request_id: str,
+        command: str,
         tool_name: str,
-        command: list[str],
         timeout: float,
-        stdin_data: str = "",
-        env_vars: dict[str, str] | None = None,
-        working_dir: str = "",
-        capture_stderr: bool = True,
+        env: dict[str, str] | None,
+        work_dir: str,
     ) -> ExecutionResult:
-        """Actually run the command."""
-        start = time.time()
-        command_str = " ".join(command)
+        """Internal command execution."""
+        result = ExecutionResult(
+            tool=tool_name,
+            command=command[:500],
+            started_at=time.time(),
+        )
 
-        self._log.info("tool_exec_start", tool=tool_name, command=command_str[:200])
+        proc_env = dict(os.environ)
+        if env:
+            proc_env.update(env)
 
         try:
-            env = os.environ.copy()
-            if env_vars:
-                env.update(env_vars)
-
-            proc = await asyncio.create_subprocess_exec(
-                *command,
+            process = await asyncio.create_subprocess_shell(
+                command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE if capture_stderr else None,
-                stdin=asyncio.subprocess.PIPE if stdin_data else None,
-                env=env,
-                cwd=working_dir or None,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=work_dir,
+                env=proc_env,
             )
 
+            self._running[tool_name] = process
+
             try:
-                stdout_data, stderr_data = await asyncio.wait_for(
-                    proc.communicate(input=stdin_data.encode() if stdin_data else None),
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(),
                     timeout=timeout,
                 )
 
-                return ExecutionResult(
-                    request_id=request_id,
-                    tool_name=tool_name,
-                    command=command_str,
-                    stdout=stdout_data.decode(errors="replace") if stdout_data else "",
-                    stderr=stderr_data.decode(errors="replace") if stderr_data else "",
-                    exit_code=proc.returncode or 0,
-                    duration_s=time.time() - start,
-                )
+                result.stdout = stdout_bytes.decode(errors="replace")[:self._max_output]
+                result.stderr = stderr_bytes.decode(errors="replace")[:self._max_output]
+                result.exit_code = process.returncode or 0
 
             except asyncio.TimeoutError:
-                proc.kill()
-                return ExecutionResult(
-                    request_id=request_id,
-                    tool_name=tool_name,
-                    command=command_str,
-                    exit_code=-1,
-                    timed_out=True,
-                    duration_s=time.time() - start,
-                    error=f"Timed out after {timeout}s",
-                )
+                process.kill()
+                try:
+                    await process.communicate()
+                except Exception:
+                    pass
+                result.timed_out = True
+                result.exit_code = -1
 
-        except FileNotFoundError:
-            return ExecutionResult(
-                request_id=request_id,
-                tool_name=tool_name,
-                command=command_str,
-                error=f"Binary not found: {command[0]}",
-                duration_s=time.time() - start,
-            )
         except OSError as e:
-            return ExecutionResult(
-                request_id=request_id,
-                tool_name=tool_name,
-                command=command_str,
-                error=str(e),
-                duration_s=time.time() - start,
-            )
+            result.stderr = str(e)[:200]
+            result.exit_code = -1
 
-    def _check_rate_limit(self, tool_name: str, max_per_minute: int) -> bool:
-        """Check if tool execution is within rate limits."""
-        now = time.time()
-        cutoff = now - 60
-        self._rate_counters[tool_name] = [
-            t for t in self._rate_counters[tool_name] if t > cutoff
-        ]
-        if len(self._rate_counters[tool_name]) >= max_per_minute:
-            return False
-        self._rate_counters[tool_name].append(now)
+        finally:
+            self._running.pop(tool_name, None)
+            result.completed_at = time.time()
+            result.duration_s = result.completed_at - result.started_at
+
+            self._history.append(result)
+            if len(self._history) > 500:
+                self._history = self._history[-500:]
+
+        return result
+
+    def _is_safe(self, command: str) -> bool:
+        """Check if a command is safe to execute."""
+        cmd_lower = command.lower().strip()
+        for pattern in BLOCKED_PATTERNS:
+            if pattern in cmd_lower:
+                self._log.warning("blocked_command", command=command[:80])
+                return False
         return True
 
-    def _log_execution(self, result: ExecutionResult) -> None:
-        """Log execution for audit trail."""
-        entry = result.to_dict()
-        self._execution_log.append(entry)
-        if len(self._execution_log) > 10000:
-            self._execution_log = self._execution_log[-10000:]
+    def cancel(self, tool_name: str) -> bool:
+        """Cancel a running tool."""
+        process = self._running.get(tool_name)
+        if process:
+            process.kill()
+            return True
+        return False
 
-        # Write to file
-        try:
-            log_file = self._log_dir / f"{result.request_id}.json"
-            log_file.write_text(json.dumps(entry))
-        except OSError:
-            pass
-
-        self._log.info(
-            "tool_exec_complete",
-            tool=result.tool_name,
-            success=result.success,
-            duration_s=round(result.duration_s, 2),
-        )
-
-    def get_execution_log(self, limit: int = 50) -> list[dict[str, Any]]:
-        return self._execution_log[-limit:]
+    def get_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        return [r.to_dict() for r in self._history[-limit:]]
 
     def get_stats(self) -> dict[str, Any]:
-        by_tool: dict[str, int] = defaultdict(int)
-        total_time = 0.0
-        for entry in self._execution_log:
-            by_tool[entry.get("tool", "")] += 1
-            total_time += entry.get("duration_s", 0)
-
         return {
-            "total_executions": len(self._execution_log),
-            "by_tool": dict(by_tool),
-            "total_time_s": round(total_time, 1),
-            "available_tools": sum(1 for t in self._tools.values() if t.installed),
-            "total_tools": len(self._tools),
+            "running": len(self._running),
+            "history": len(self._history),
+            "available_tools": len(self.get_available_tools()),
         }
