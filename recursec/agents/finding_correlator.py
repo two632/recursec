@@ -1,400 +1,437 @@
-"""Finding correlator — links related findings and identifies patterns.
+"""Finding correlator — deduplicates, correlates, and enriches findings.
 
-Analyzes findings to:
-1. Deduplicate similar findings
-2. Correlate related findings (same root cause)
-3. Identify vulnerability chains
-4. Detect patterns across targets/services
-5. Group by impact and remediation
-6. Calculate aggregate risk scores
-7. Prioritize based on exploitability
-8. Generate correlation reports
+Implements:
+1. Finding deduplication (same vuln from different tools)
+2. Cross-tool correlation (combine evidence from multiple sources)
+3. Finding enrichment (add CWE, CVSS, MITRE ATT&CK)
+4. Attack chain assembly from correlated findings
+5. Severity re-calculation based on combined evidence
+6. False positive scoring
+7. Finding grouping by target/type/severity
+8. Prompt generation for LLM-based correlation
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
+import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from enum import Enum
+from typing import Any
 
 import structlog
-
-if TYPE_CHECKING:
-    from recursec.llm.router import ModelRouter
 
 logger = structlog.get_logger()
 
 
+class FindingSeverity(str, Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
+
+
+class FindingStatus(str, Enum):
+    NEW = "new"
+    CONFIRMED = "confirmed"
+    FALSE_POSITIVE = "false_positive"
+    DUPLICATE = "duplicate"
+    CHAIN_COMPONENT = "chain_component"
+
+
 @dataclass
-class CorrelationGroup:
-    """A group of correlated findings."""
-    group_id: str = ""
+class RawFinding:
+    """A finding from a single tool."""
+    finding_id: str = ""
     title: str = ""
-    root_cause: str = ""
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    aggregate_severity: str = "medium"
-    aggregate_risk: float = 0.5
-    affected_targets: list[str] = field(default_factory=list)
-    remediation: str = ""
-    chain_description: str = ""
+    description: str = ""
+    severity: FindingSeverity = FindingSeverity.MEDIUM
+    target: str = ""               # host/URL/file affected
+    tool: str = ""
+    evidence: str = ""
+    cwe_id: str = ""
+    cvss_score: float = 0.0
+    confidence: float = 0.5
+    raw_output: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def fingerprint(self) -> str:
+        """Generate a fingerprint for dedup."""
+        data = f"{self.title}:{self.target}:{self.cwe_id}".lower()
+        data = re.sub(r"[^a-z0-9:]+", "", data)
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.finding_id,
+            "title": self.title[:30],
+            "severity": self.severity.value,
+            "target": self.target[:25],
+            "tool": self.tool[:15],
+            "confidence": round(self.confidence, 2),
+            "cwe": self.cwe_id[:10],
+        }
+
+
+@dataclass
+class CorrelatedFinding:
+    """A finding correlated from multiple sources."""
+    correlation_id: str = ""
+    title: str = ""
+    description: str = ""
+    severity: FindingSeverity = FindingSeverity.MEDIUM
+    target: str = ""
+    status: FindingStatus = FindingStatus.NEW
+    sources: list[str] = field(default_factory=list)         # Raw finding IDs
+    tools_confirming: list[str] = field(default_factory=list)
+    combined_evidence: str = ""
+    confidence: float = 0.5
+    false_positive_score: float = 0.0
+    cwe_id: str = ""
+    cvss_score: float = 0.0
+    mitre_techniques: list[str] = field(default_factory=list)
+    chain_with: list[str] = field(default_factory=list)     # Other correlated IDs in chain
+    enrichment: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def num_confirmations(self) -> int:
+        return len(self.tools_confirming)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.correlation_id,
+            "title": self.title[:30],
+            "severity": self.severity.value,
+            "target": self.target[:25],
+            "status": self.status.value,
+            "tools": self.tools_confirming,
+            "confidence": round(self.confidence, 2),
+            "fp_score": round(self.false_positive_score, 2),
+        }
+
+
+@dataclass
+class FindingGroup:
+    """A group of related findings."""
+    group_id: str = ""
+    group_by: str = ""             # target, type, severity
+    key: str = ""
+    finding_ids: list[str] = field(default_factory=list)
+    count: int = 0
+    max_severity: FindingSeverity = FindingSeverity.INFO
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.group_id,
-            "title": self.title[:100],
-            "root_cause": self.root_cause[:100],
-            "findings_count": len(self.findings),
-            "severity": self.aggregate_severity,
-            "risk": round(self.aggregate_risk, 2),
-            "targets": self.affected_targets[:5],
+            "by": self.group_by[:10],
+            "key": self.key[:20],
+            "count": self.count,
+            "max_severity": self.max_severity.value,
         }
 
 
-@dataclass
-class DeduplicationResult:
-    """Result of finding deduplication."""
-    original_count: int = 0
-    deduplicated_count: int = 0
-    duplicates_removed: int = 0
-    unique_findings: list[dict[str, Any]] = field(default_factory=list)
-    duplicate_groups: list[list[dict[str, Any]]] = field(default_factory=list)
+# ── CWE Enrichment Database ──────────────────────────────────
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "original": self.original_count,
-            "unique": self.deduplicated_count,
-            "removed": self.duplicates_removed,
-        }
+CWE_DATABASE: dict[str, dict[str, Any]] = {
+    "CWE-79": {"name": "Cross-site Scripting (XSS)", "category": "injection", "base_cvss": 6.1},
+    "CWE-89": {"name": "SQL Injection", "category": "injection", "base_cvss": 8.6},
+    "CWE-22": {"name": "Path Traversal", "category": "injection", "base_cvss": 7.5},
+    "CWE-78": {"name": "OS Command Injection", "category": "injection", "base_cvss": 9.8},
+    "CWE-918": {"name": "Server-Side Request Forgery (SSRF)", "category": "injection", "base_cvss": 7.5},
+    "CWE-502": {"name": "Deserialization of Untrusted Data", "category": "injection", "base_cvss": 9.8},
+    "CWE-287": {"name": "Improper Authentication", "category": "auth", "base_cvss": 8.0},
+    "CWE-862": {"name": "Missing Authorization", "category": "auth", "base_cvss": 7.5},
+    "CWE-863": {"name": "Incorrect Authorization", "category": "auth", "base_cvss": 7.5},
+    "CWE-352": {"name": "Cross-Site Request Forgery (CSRF)", "category": "auth", "base_cvss": 6.5},
+    "CWE-200": {"name": "Exposure of Sensitive Information", "category": "disclosure", "base_cvss": 5.3},
+    "CWE-311": {"name": "Missing Encryption of Sensitive Data", "category": "crypto", "base_cvss": 7.5},
+    "CWE-327": {"name": "Use of a Broken Crypto Algorithm", "category": "crypto", "base_cvss": 7.5},
+    "CWE-798": {"name": "Use of Hard-coded Credentials", "category": "auth", "base_cvss": 9.8},
+    "CWE-434": {"name": "Unrestricted Upload of Dangerous File Type", "category": "injection", "base_cvss": 9.8},
+    "CWE-611": {"name": "Improper Restriction of XML External Entity", "category": "injection", "base_cvss": 7.5},
+    "CWE-94": {"name": "Improper Control of Code Generation (Code Injection)", "category": "injection", "base_cvss": 9.8},
+    "CWE-1321": {"name": "Improperly Controlled Modification of Object Prototype Attributes", "category": "injection", "base_cvss": 7.3},
+    "CWE-400": {"name": "Uncontrolled Resource Consumption", "category": "dos", "base_cvss": 5.3},
+    "CWE-522": {"name": "Insufficiently Protected Credentials", "category": "auth", "base_cvss": 7.5},
+}
 
+# ── MITRE ATT&CK Mapping ─────────────────────────────────────
 
-@dataclass
-class RiskAssessment:
-    """Aggregate risk assessment."""
-    total_findings: int = 0
-    critical: int = 0
-    high: int = 0
-    medium: int = 0
-    low: int = 0
-    info: int = 0
-    overall_risk: float = 0.0
-    risk_level: str = "medium"
-    top_risks: list[str] = field(default_factory=list)
-    most_affected_targets: list[str] = field(default_factory=list)
+CWE_TO_MITRE: dict[str, list[str]] = {
+    "CWE-89": ["T1190"],  # Exploit Public-Facing Application
+    "CWE-79": ["T1189", "T1059.007"],  # Drive-by Compromise, JavaScript
+    "CWE-78": ["T1059"],  # Command and Scripting Interpreter
+    "CWE-918": ["T1090"],  # Proxy
+    "CWE-502": ["T1190"],
+    "CWE-287": ["T1078"],  # Valid Accounts
+    "CWE-798": ["T1078.001"],  # Default Accounts
+    "CWE-434": ["T1105"],  # Ingress Tool Transfer
+    "CWE-22": ["T1083"],  # File and Directory Discovery
+}
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "total": self.total_findings,
-            "critical": self.critical, "high": self.high,
-            "medium": self.medium, "low": self.low, "info": self.info,
-            "overall_risk": round(self.overall_risk, 2),
-            "risk_level": self.risk_level,
-        }
+# ── False Positive Indicators ─────────────────────────────────
 
+FP_INDICATORS: list[dict[str, Any]] = [
+    {"pattern": r"version\s+disclosure", "fp_score": 0.3, "reason": "Version disclosure is often informational"},
+    {"pattern": r"missing\s+header", "fp_score": 0.25, "reason": "Missing security headers may not be exploitable"},
+    {"pattern": r"cookie\s+without", "fp_score": 0.2, "reason": "Cookie flag issues are often low risk"},
+    {"pattern": r"ssl.*weak", "fp_score": 0.15, "reason": "Weak SSL may be intentional for compatibility"},
+    {"pattern": r"directory\s+listing", "fp_score": 0.1, "reason": "Directory listing may be intentional"},
+]
 
-SEVERITY_SCORES = {"critical": 1.0, "high": 0.8, "medium": 0.5, "low": 0.2, "info": 0.05}
-
-CORRELATE_PROMPT = """Analyze these security findings for correlations and patterns.
-
-Findings:
-{findings_text}
-
-Identify:
-1. Which findings are likely caused by the same root cause?
-2. Which findings can be chained together for greater impact?
-3. What are the top-priority remediation items?
-
-Respond as JSON:
-{{
-  "groups": [
-    {{
-      "title": "group name",
-      "root_cause": "underlying cause",
-      "finding_indices": [0, 1, 2],
-      "severity": "critical|high|medium|low",
-      "chain": "how findings chain together",
-      "remediation": "how to fix"
-    }}
-  ],
-  "top_risks": ["highest priority items"],
-  "patterns": ["observed patterns"]
-}}"""
+SEVERITY_ORDER = [
+    FindingSeverity.CRITICAL,
+    FindingSeverity.HIGH,
+    FindingSeverity.MEDIUM,
+    FindingSeverity.LOW,
+    FindingSeverity.INFO,
+]
 
 
 class FindingCorrelator:
-    """Correlates, deduplicates, and analyzes security findings.
+    """Deduplicates, correlates, and enriches security findings.
 
-    Links related findings, identifies root causes,
-    and generates aggregate risk assessments.
+    Combines findings from multiple tools into correlated
+    results with combined evidence, enriched metadata,
+    and false positive scoring.
     """
 
-    def __init__(self, model_router: ModelRouter | None = None) -> None:
-        self._router = model_router
-        self._groups: list[CorrelationGroup] = []
+    def __init__(self) -> None:
+        self._raw_findings: dict[str, RawFinding] = {}
+        self._correlated: dict[str, CorrelatedFinding] = {}
+        self._fingerprint_map: dict[str, str] = {}   # fingerprint → correlation_id
+        self._groups: dict[str, FindingGroup] = {}
+        self._raw_counter = 0
+        self._corr_counter = 0
         self._group_counter = 0
         self._log = logger.bind(component="finding_correlator")
 
-    def deduplicate(self, findings: list[dict[str, Any]]) -> DeduplicationResult:
-        """Remove duplicate findings."""
-        result = DeduplicationResult(original_count=len(findings))
+    def ingest(self, finding: RawFinding) -> CorrelatedFinding:
+        """Ingest a raw finding, deduplicating and correlating."""
+        self._raw_counter += 1
+        if not finding.finding_id:
+            finding.finding_id = f"raw-{self._raw_counter}"
 
-        seen: dict[str, dict[str, Any]] = {}
-        duplicates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._raw_findings[finding.finding_id] = finding
 
-        for finding in findings:
-            key = self._finding_key(finding)
-            if key in seen:
-                duplicates[key].append(finding)
-            else:
-                seen[key] = finding
+        fp = finding.fingerprint
 
-        result.unique_findings = list(seen.values())
-        result.deduplicated_count = len(result.unique_findings)
-        result.duplicates_removed = result.original_count - result.deduplicated_count
-        result.duplicate_groups = [
-            [seen[k]] + dups for k, dups in duplicates.items()
-        ]
+        # Check for existing correlation
+        if fp in self._fingerprint_map:
+            corr_id = self._fingerprint_map[fp]
+            correlated = self._correlated[corr_id]
 
-        self._log.info(
-            "deduplicated",
-            original=result.original_count,
-            unique=result.deduplicated_count,
+            # Add this as additional evidence
+            correlated.sources.append(finding.finding_id)
+            if finding.tool not in correlated.tools_confirming:
+                correlated.tools_confirming.append(finding.tool)
+
+            # Combine evidence
+            if finding.evidence:
+                correlated.combined_evidence += f"\n[{finding.tool}]: {finding.evidence}"
+
+            # Upgrade severity if this source found higher
+            if SEVERITY_ORDER.index(finding.severity) < SEVERITY_ORDER.index(correlated.severity):
+                correlated.severity = finding.severity
+
+            # Increase confidence with each confirmation
+            correlated.confidence = min(
+                0.99,
+                correlated.confidence + 0.1 * (1 - correlated.confidence),
+            )
+
+            # Mark as confirmed if 2+ tools agree
+            if correlated.num_confirmations >= 2:
+                correlated.status = FindingStatus.CONFIRMED
+
+            return correlated
+
+        # New finding — create correlation
+        self._corr_counter += 1
+        correlated = CorrelatedFinding(
+            correlation_id=f"corr-{self._corr_counter}",
+            title=finding.title,
+            description=finding.description,
+            severity=finding.severity,
+            target=finding.target,
+            sources=[finding.finding_id],
+            tools_confirming=[finding.tool] if finding.tool else [],
+            combined_evidence=f"[{finding.tool}]: {finding.evidence}" if finding.evidence else "",
+            confidence=finding.confidence,
+            cwe_id=finding.cwe_id,
+            cvss_score=finding.cvss_score,
         )
 
-        return result
+        # Enrich
+        self._enrich(correlated)
 
-    async def correlate(
-        self,
-        findings: list[dict[str, Any]],
-    ) -> list[CorrelationGroup]:
-        """Correlate related findings into groups."""
-        # First deduplicate
-        dedup = self.deduplicate(findings)
-        unique = dedup.unique_findings
+        # Calculate FP score
+        correlated.false_positive_score = self._calculate_fp_score(correlated)
 
-        # Heuristic correlation
-        groups = self._heuristic_correlate(unique)
+        self._correlated[correlated.correlation_id] = correlated
+        self._fingerprint_map[fp] = correlated.correlation_id
 
-        # LLM-enhanced correlation
-        if self._router and len(unique) > 1:
-            llm_groups = await self._llm_correlate(unique)
-            groups = self._merge_groups(groups, llm_groups)
+        return correlated
 
-        self._groups.extend(groups)
-        return groups
+    def _enrich(self, finding: CorrelatedFinding) -> None:
+        """Enrich a finding with CWE and MITRE data."""
+        if finding.cwe_id and finding.cwe_id in CWE_DATABASE:
+            cwe_data = CWE_DATABASE[finding.cwe_id]
+            finding.enrichment["cwe_name"] = cwe_data["name"]
+            finding.enrichment["cwe_category"] = cwe_data["category"]
 
-    def assess_risk(self, findings: list[dict[str, Any]]) -> RiskAssessment:
-        """Calculate aggregate risk assessment."""
-        assessment = RiskAssessment(total_findings=len(findings))
+            if finding.cvss_score == 0:
+                finding.cvss_score = cwe_data["base_cvss"]
 
-        severity_counts: dict[str, int] = defaultdict(int)
-        target_counts: dict[str, int] = defaultdict(int)
+        # MITRE ATT&CK mapping
+        if finding.cwe_id in CWE_TO_MITRE:
+            finding.mitre_techniques = CWE_TO_MITRE[finding.cwe_id]
 
-        for finding in findings:
-            severity = finding.get("severity", "medium").lower()
-            severity_counts[severity] += 1
+    @staticmethod
+    def _calculate_fp_score(finding: CorrelatedFinding) -> float:
+        """Calculate false positive probability."""
+        fp_score = 0.0
+        text = f"{finding.title} {finding.description}".lower()
 
-            target = finding.get("target", "unknown")
-            target_counts[target] += 1
+        for indicator in FP_INDICATORS:
+            if re.search(indicator["pattern"], text):
+                fp_score = max(fp_score, indicator["fp_score"])
 
-        assessment.critical = severity_counts.get("critical", 0)
-        assessment.high = severity_counts.get("high", 0)
-        assessment.medium = severity_counts.get("medium", 0)
-        assessment.low = severity_counts.get("low", 0)
-        assessment.info = severity_counts.get("info", 0)
+        # Lower FP score if high confidence
+        fp_score *= (1 - finding.confidence)
 
-        # Calculate overall risk
-        if findings:
-            total_score = sum(
-                SEVERITY_SCORES.get(f.get("severity", "medium").lower(), 0.5)
-                for f in findings
-            )
-            assessment.overall_risk = min(1.0, total_score / max(1, len(findings)) + assessment.critical * 0.1)
-        else:
-            assessment.overall_risk = 0.0
+        # Lower FP score if multiple tools confirm
+        if finding.num_confirmations >= 2:
+            fp_score *= 0.5
 
-        # Determine risk level
-        if assessment.critical > 0 or assessment.overall_risk > 0.8:
-            assessment.risk_level = "critical"
-        elif assessment.high > 2 or assessment.overall_risk > 0.6:
-            assessment.risk_level = "high"
-        elif assessment.medium > 5 or assessment.overall_risk > 0.4:
-            assessment.risk_level = "medium"
-        else:
-            assessment.risk_level = "low"
+        return min(1.0, fp_score)
 
-        # Top affected targets
-        assessment.most_affected_targets = sorted(
-            target_counts.keys(), key=lambda t: -target_counts[t],
-        )[:5]
+    def group_findings(self, group_by: str = "target") -> list[FindingGroup]:
+        """Group findings by target, severity, or type."""
+        groups: dict[str, list[str]] = defaultdict(list)
 
-        return assessment
-
-    # ── Heuristic Correlation ────────────────────────────
-
-    def _heuristic_correlate(
-        self,
-        findings: list[dict[str, Any]],
-    ) -> list[CorrelationGroup]:
-        """Group findings by heuristic rules."""
-        groups: list[CorrelationGroup] = []
-
-        # Group by same target + same vulnerability type
-        by_target_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for finding in findings:
-            target = finding.get("target", "unknown")
-            vuln_type = self._classify_vuln(finding)
-            key = f"{target}:{vuln_type}"
-            by_target_type[key].append(finding)
-
-        for key, group_findings in by_target_type.items():
-            if len(group_findings) < 2:
+        for corr in self._correlated.values():
+            if corr.status == FindingStatus.DUPLICATE:
                 continue
 
-            self._group_counter += 1
-            target, vuln_type = key.split(":", 1)
-
-            # Aggregate severity
-            severities = [f.get("severity", "medium").lower() for f in group_findings]
-            if "critical" in severities:
-                agg_sev = "critical"
-            elif "high" in severities:
-                agg_sev = "high"
-            elif "medium" in severities:
-                agg_sev = "medium"
+            if group_by == "target":
+                key = corr.target
+            elif group_by == "severity":
+                key = corr.severity.value
+            elif group_by == "cwe":
+                key = corr.cwe_id or "unknown"
             else:
-                agg_sev = "low"
+                key = corr.target
 
-            groups.append(CorrelationGroup(
-                group_id=f"corr-{self._group_counter}",
-                title=f"Multiple {vuln_type} findings on {target}",
-                root_cause=f"Likely related {vuln_type} issues",
-                findings=group_findings,
-                aggregate_severity=agg_sev,
-                aggregate_risk=max(
-                    SEVERITY_SCORES.get(s, 0.5) for s in severities
-                ),
-                affected_targets=[target],
-            ))
+            groups[key].append(corr.correlation_id)
 
-        return groups
-
-    async def _llm_correlate(
-        self,
-        findings: list[dict[str, Any]],
-    ) -> list[CorrelationGroup]:
-        """LLM-enhanced correlation."""
-        if not self._router:
-            return []
-
-        findings_text = "\n".join(
-            f"[{i}] [{f.get('severity', 'N/A')}] {f.get('title', 'N/A')} "
-            f"(target: {f.get('target', 'N/A')}, tool: {f.get('tool', 'N/A')})"
-            for i, f in enumerate(findings[:20])
-        )
-
-        prompt = CORRELATE_PROMPT.format(findings_text=findings_text)
-
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="reasoning",
-            temperature=0.2,
-            max_tokens=1024,
-        )
-
-        data = self._parse_json(response)
-        groups = []
-
-        for g_data in data.get("groups", []):
+        result = []
+        for key, ids in groups.items():
             self._group_counter += 1
-            indices = g_data.get("finding_indices", [])
-            group_findings = [
-                findings[i] for i in indices
-                if isinstance(i, int) and 0 <= i < len(findings)
-            ]
+            max_sev = FindingSeverity.INFO
+            for cid in ids:
+                corr = self._correlated.get(cid)
+                if corr:
+                    idx = SEVERITY_ORDER.index(corr.severity)
+                    if idx < SEVERITY_ORDER.index(max_sev):
+                        max_sev = corr.severity
 
-            groups.append(CorrelationGroup(
-                group_id=f"corr-{self._group_counter}",
-                title=g_data.get("title", ""),
-                root_cause=g_data.get("root_cause", ""),
-                findings=group_findings,
-                aggregate_severity=g_data.get("severity", "medium"),
-                chain_description=g_data.get("chain", ""),
-                remediation=g_data.get("remediation", ""),
-            ))
+            group = FindingGroup(
+                group_id=f"grp-{self._group_counter}",
+                group_by=group_by,
+                key=key,
+                finding_ids=ids,
+                count=len(ids),
+                max_severity=max_sev,
+            )
+            result.append(group)
+            self._groups[group.group_id] = group
 
-        return groups
+        result.sort(
+            key=lambda g: SEVERITY_ORDER.index(g.max_severity)
+        )
+        return result
 
-    def _merge_groups(
-        self,
-        groups1: list[CorrelationGroup],
-        groups2: list[CorrelationGroup],
-    ) -> list[CorrelationGroup]:
-        """Merge two sets of correlation groups."""
-        # Simple merge: keep all groups, dedup by finding overlap
-        merged = list(groups1)
-        existing_findings = set()
-        for g in groups1:
-            for f in g.findings:
-                existing_findings.add(self._finding_key(f))
+    def identify_chains(self) -> list[list[str]]:
+        """Identify findings that form attack chains."""
+        chains: list[list[str]] = []
 
-        for g in groups2:
-            new_findings = [
-                f for f in g.findings
-                if self._finding_key(f) not in existing_findings
-            ]
-            if new_findings or not existing_findings:
-                merged.append(g)
+        # Group findings by target
+        by_target: dict[str, list[CorrelatedFinding]] = defaultdict(list)
+        for corr in self._correlated.values():
+            if corr.status != FindingStatus.DUPLICATE:
+                by_target[corr.target].append(corr)
 
-        return merged
+        for target, findings in by_target.items():
+            if len(findings) < 2:
+                continue
 
-    def _finding_key(self, finding: dict[str, Any]) -> str:
-        """Generate a dedup key for a finding."""
-        parts = [
-            finding.get("title", ""),
-            finding.get("target", ""),
-            finding.get("severity", ""),
-            finding.get("type", ""),
-        ]
-        return "|".join(str(p).lower().strip() for p in parts)
+            # Sort by severity (most critical first)
+            findings.sort(
+                key=lambda f: SEVERITY_ORDER.index(f.severity)
+            )
 
-    def _classify_vuln(self, finding: dict[str, Any]) -> str:
-        """Classify a finding into a vulnerability type."""
-        title = finding.get("title", "").lower()
-        vuln_type = finding.get("type", "").lower()
-        combined = f"{title} {vuln_type}"
+            # Look for chain patterns
+            chain: list[str] = []
+            categories_in_chain: set[str] = set()
 
-        classifications = [
-            ("xss", ["xss", "cross-site scripting", "script injection"]),
-            ("sqli", ["sql injection", "sqli", "sql "]),
-            ("ssrf", ["ssrf", "server-side request"]),
-            ("rce", ["rce", "remote code", "command injection", "code execution"]),
-            ("auth", ["authentication", "auth bypass", "brute force", "credential"]),
-            ("misconfig", ["misconfiguration", "misconfig", "default", "exposed"]),
-            ("info_disclosure", ["disclosure", "information leak", "version", "banner"]),
-            ("crypto", ["ssl", "tls", "certificate", "cipher", "crypto"]),
-            ("injection", ["injection", "ldap", "xpath", "template"]),
-            ("access_control", ["access control", "idor", "authorization", "privilege"]),
-        ]
+            for finding in findings:
+                category = finding.enrichment.get("cwe_category", "")
+                if category and category not in categories_in_chain:
+                    chain.append(finding.correlation_id)
+                    categories_in_chain.add(category)
+                    finding.status = FindingStatus.CHAIN_COMPONENT
 
-        for vuln_class, keywords in classifications:
-            if any(kw in combined for kw in keywords):
-                return vuln_class
+            if len(chain) >= 2:
+                chains.append(chain)
+                for cid in chain:
+                    corr = self._correlated.get(cid)
+                    if corr:
+                        corr.chain_with = [c for c in chain if c != cid]
 
-        return "other"
+        return chains
 
-    def _parse_json(self, text: str) -> dict[str, Any]:
-        try:
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0]
-            return json.loads(text.strip())
-        except (json.JSONDecodeError, IndexError):
-            return {}
+    def generate_correlation_prompt(self, finding_ids: list[str]) -> str:
+        """Generate a prompt for LLM-based finding correlation."""
+        findings_text = ""
+        for fid in finding_ids[:10]:
+            corr = self._correlated.get(fid)
+            if not corr:
+                continue
+            findings_text += (
+                f"- {corr.title} [{corr.severity.value}] on {corr.target}\n"
+                f"  Evidence: {corr.combined_evidence[:100]}\n"
+                f"  Tools: {', '.join(corr.tools_confirming)}\n\n"
+            )
+
+        return (
+            f"Analyze these security findings for correlations:\n\n"
+            f"{findings_text}\n"
+            f"Questions:\n"
+            f"1. Which findings are duplicates or related?\n"
+            f"2. Can any findings be chained into an attack path?\n"
+            f"3. Which findings are likely false positives?\n"
+            f"4. What is the combined risk impact?\n"
+        )
 
     def get_stats(self) -> dict[str, Any]:
+        sev_counts: dict[str, int] = defaultdict(int)
+        status_counts: dict[str, int] = defaultdict(int)
+        for corr in self._correlated.values():
+            sev_counts[corr.severity.value] += 1
+            status_counts[corr.status.value] += 1
         return {
-            "correlation_groups": len(self._groups),
-            "total_correlated": sum(len(g.findings) for g in self._groups),
+            "raw_findings": len(self._raw_findings),
+            "correlated": len(self._correlated),
+            "dedup_ratio": round(
+                1 - len(self._correlated) / max(1, len(self._raw_findings)),
+                2,
+            ),
+            "by_severity": dict(sev_counts),
+            "by_status": dict(status_counts),
+            "groups": len(self._groups),
         }
