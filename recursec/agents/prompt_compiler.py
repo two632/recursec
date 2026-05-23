@@ -1,15 +1,14 @@
-"""Prompt compiler — dynamic prompt assembly with knowledge injection.
+"""Prompt compiler — builds optimal prompts for LLM agents.
 
-This is the critical bridge between all knowledge bases and the LLM.
-Compiles a final prompt by:
-1. Selecting the right system prompt for the agent role
-2. Injecting relevant strategy knowledge (web, cloud, API, AI, supply chain)
-3. Adding target-specific context
-4. Including relevant past findings
-5. Adding reasoning chain context
-6. Managing token budget via context window manager
-7. Applying model-specific formatting
-8. Handling multi-turn conversation state
+Implements:
+1. Dynamic system prompt construction
+2. Knowledge base injection into prompts
+3. Context window management
+4. Token budget allocation
+5. Tool documentation injection
+6. Finding context injection
+7. Prompt templating and composition
+8. Model-specific prompt formatting
 """
 
 from __future__ import annotations
@@ -28,385 +27,412 @@ logger = structlog.get_logger()
 class PromptSection(str, Enum):
     SYSTEM = "system"
     ROLE = "role"
-    STRATEGY_KNOWLEDGE = "strategy_knowledge"
-    TARGET_CONTEXT = "target_context"
-    TOOLS_AVAILABLE = "tools_available"
-    PAST_FINDINGS = "past_findings"
-    REASONING_CHAIN = "reasoning_chain"
-    EXPERIENCE_HINTS = "experience_hints"
-    TASK_INSTRUCTION = "task_instruction"
-    CONVERSATION = "conversation"
-    RESPONSE_FORMAT = "response_format"
+    GOAL = "goal"
+    CONTEXT = "context"
+    KNOWLEDGE = "knowledge"
+    TOOLS = "tools"
+    FINDINGS = "findings"
+    CONSTRAINTS = "constraints"
+    EXAMPLES = "examples"
+    HISTORY = "history"
+    OUTPUT_FORMAT = "output_format"
 
 
-class PromptFormat(str, Enum):
-    CHATML = "chatml"             # <|im_start|>system\n...<|im_end|>
-    LLAMA3 = "llama3"            # <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-    MISTRAL = "mistral"          # [INST] ... [/INST]
-    ALPACA = "alpaca"            # ### Instruction:\n...\n### Response:
-    RAW = "raw"                  # Plain text, no formatting
+class ModelFormat(str, Enum):
+    CHATML = "chatml"
+    LLAMA = "llama"
+    MISTRAL = "mistral"
+    ALPACA = "alpaca"
+    VICUNA = "vicuna"
+    PHI = "phi"
+    DEEPSEEK = "deepseek"
+    GENERIC = "generic"
 
 
 @dataclass
-class PromptConfig:
-    """Configuration for prompt compilation."""
-    max_tokens: int = 4096
-    max_knowledge_tokens: int = 1500
-    max_findings_tokens: int = 800
-    max_reasoning_tokens: int = 600
-    max_experience_tokens: int = 400
-    max_conversation_tokens: int = 2000
-    include_strategy_knowledge: bool = True
-    include_past_findings: bool = True
-    include_reasoning_chain: bool = True
-    include_experience_hints: bool = True
+class PromptBlock:
+    """A block of content in a prompt."""
+    section: PromptSection = PromptSection.CONTEXT
+    content: str = ""
+    priority: int = 5            # 1-10, higher = more important
+    token_estimate: int = 0
+    required: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "max_tokens": self.max_tokens,
-            "knowledge": self.max_knowledge_tokens,
-            "findings": self.max_findings_tokens,
+            "section": self.section.value,
+            "priority": self.priority,
+            "tokens": self.token_estimate,
+            "required": self.required,
         }
 
 
 @dataclass
 class CompiledPrompt:
-    """A compiled prompt ready for LLM consumption."""
-    prompt_id: str = ""
+    """A compiled prompt ready for LLM submission."""
+    model: str = ""
     system_prompt: str = ""
     user_prompt: str = ""
-    messages: list[dict[str, str]] = field(default_factory=list)
-    estimated_tokens: int = 0
+    total_tokens_estimate: int = 0
     sections_included: list[str] = field(default_factory=list)
-    knowledge_injected: list[str] = field(default_factory=list)
-    model_format: PromptFormat = PromptFormat.CHATML
+    sections_dropped: list[str] = field(default_factory=list)
     compiled_at: float = field(default_factory=time.time)
-
-    def to_chat_messages(self) -> list[dict[str, str]]:
-        """Convert to chat API format."""
-        msgs = []
-        if self.system_prompt:
-            msgs.append({"role": "system", "content": self.system_prompt})
-        msgs.extend(self.messages)
-        if self.user_prompt:
-            msgs.append({"role": "user", "content": self.user_prompt})
-        return msgs
-
-    def to_completion_text(self) -> str:
-        """Convert to single text prompt."""
-        parts = []
-        if self.system_prompt:
-            parts.append(self.system_prompt)
-        for msg in self.messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            parts.append(f"[{role}]: {content}")
-        if self.user_prompt:
-            parts.append(f"[user]: {self.user_prompt}")
-        return "\n\n".join(parts)
-
-    def to_formatted_text(self) -> str:
-        """Format based on model format."""
-        if self.model_format == PromptFormat.CHATML:
-            return self._format_chatml()
-        if self.model_format == PromptFormat.LLAMA3:
-            return self._format_llama3()
-        if self.model_format == PromptFormat.MISTRAL:
-            return self._format_mistral()
-        if self.model_format == PromptFormat.ALPACA:
-            return self._format_alpaca()
-        return self.to_completion_text()
-
-    def _format_chatml(self) -> str:
-        parts = []
-        if self.system_prompt:
-            parts.append(f"<|im_start|>system\n{self.system_prompt}<|im_end|>")
-        for msg in self.messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-        if self.user_prompt:
-            parts.append(f"<|im_start|>user\n{self.user_prompt}<|im_end|>")
-        parts.append("<|im_start|>assistant\n")
-        return "\n".join(parts)
-
-    def _format_llama3(self) -> str:
-        parts = ["<|begin_of_text|>"]
-        if self.system_prompt:
-            parts.append(f"<|start_header_id|>system<|end_header_id|>\n\n{self.system_prompt}<|eot_id|>")
-        for msg in self.messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            parts.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>")
-        if self.user_prompt:
-            parts.append(f"<|start_header_id|>user<|end_header_id|>\n\n{self.user_prompt}<|eot_id|>")
-        parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
-        return "".join(parts)
-
-    def _format_mistral(self) -> str:
-        parts = []
-        system = self.system_prompt or ""
-        user_parts = []
-        for msg in self.messages:
-            if msg.get("role") == "user":
-                user_parts.append(msg.get("content", ""))
-        if self.user_prompt:
-            user_parts.append(self.user_prompt)
-        instruction = "\n\n".join(user_parts)
-        if system:
-            instruction = f"{system}\n\n{instruction}"
-        parts.append(f"[INST] {instruction} [/INST]")
-        return "\n".join(parts)
-
-    def _format_alpaca(self) -> str:
-        parts = []
-        if self.system_prompt:
-            parts.append(f"### System:\n{self.system_prompt}\n")
-        user_content = self.user_prompt or ""
-        for msg in self.messages:
-            if msg.get("role") == "user":
-                user_content += "\n" + msg.get("content", "")
-        parts.append(f"### Instruction:\n{user_content.strip()}\n")
-        parts.append("### Response:\n")
-        return "\n".join(parts)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.prompt_id[:10],
-            "tokens": self.estimated_tokens,
-            "sections": self.sections_included,
-            "knowledge": len(self.knowledge_injected),
-            "format": self.model_format.value,
+            "model": self.model[:15],
+            "tokens": self.total_tokens_estimate,
+            "included": len(self.sections_included),
+            "dropped": len(self.sections_dropped),
         }
 
 
-# ── Model → Format mapping ──────────────────────────────────
+# ── Model format templates ───────────────────────────────────
 
-MODEL_FORMATS: dict[str, PromptFormat] = {
-    "whiterabbitneo": PromptFormat.CHATML,
-    "qwen-coder-14b": PromptFormat.CHATML,
-    "qwen-coder-7b": PromptFormat.CHATML,
-    "deepseek-r1": PromptFormat.CHATML,
-    "deepseek-math": PromptFormat.CHATML,
-    "hermes-14b": PromptFormat.CHATML,
-    "llama-3.1-8b": PromptFormat.LLAMA3,
-    "dolphin-2.9": PromptFormat.CHATML,
-    "mistral-7b": PromptFormat.MISTRAL,
-    "codellama-13b": PromptFormat.LLAMA3,
-    "codellama-7b": PromptFormat.LLAMA3,
-    "yi-9b-200k": PromptFormat.CHATML,
-    "phi-3.5-mini": PromptFormat.CHATML,
-    "nomic-embed": PromptFormat.RAW,
-    "llama-guard": PromptFormat.LLAMA3,
-    "functiongemma": PromptFormat.RAW,
+FORMAT_TEMPLATES: dict[str, dict[str, str]] = {
+    "chatml": {
+        "system_prefix": "<|im_start|>system\n",
+        "system_suffix": "<|im_end|>\n",
+        "user_prefix": "<|im_start|>user\n",
+        "user_suffix": "<|im_end|>\n",
+        "assistant_prefix": "<|im_start|>assistant\n",
+        "assistant_suffix": "<|im_end|>\n",
+    },
+    "llama": {
+        "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+        "system_suffix": "<|eot_id|>\n",
+        "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+        "user_suffix": "<|eot_id|>\n",
+        "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        "assistant_suffix": "<|eot_id|>\n",
+    },
+    "mistral": {
+        "system_prefix": "[INST] ",
+        "system_suffix": " [/INST]\n",
+        "user_prefix": "[INST] ",
+        "user_suffix": " [/INST]\n",
+        "assistant_prefix": "",
+        "assistant_suffix": "</s>\n",
+    },
+    "phi": {
+        "system_prefix": "<|system|>\n",
+        "system_suffix": "<|end|>\n",
+        "user_prefix": "<|user|>\n",
+        "user_suffix": "<|end|>\n",
+        "assistant_prefix": "<|assistant|>\n",
+        "assistant_suffix": "<|end|>\n",
+    },
+    "deepseek": {
+        "system_prefix": "<|begin▁of▁sentence|>",
+        "system_suffix": "\n",
+        "user_prefix": "User: ",
+        "user_suffix": "\n",
+        "assistant_prefix": "Assistant: ",
+        "assistant_suffix": "\n",
+    },
+    "generic": {
+        "system_prefix": "### System:\n",
+        "system_suffix": "\n",
+        "user_prefix": "### User:\n",
+        "user_suffix": "\n",
+        "assistant_prefix": "### Assistant:\n",
+        "assistant_suffix": "\n",
+    },
 }
 
+# ── Model→Format mapping ─────────────────────────────────────
 
-# ── Role System Prompts ──────────────────────────────────────
-
-ROLE_SYSTEM_PROMPTS: dict[str, str] = {
-    "coordinator": (
-        "You are the COORDINATOR of a recursive multi-agent security assessment system. "
-        "Your role is to decompose complex security goals into sub-tasks, delegate to "
-        "specialist agents, aggregate their results, and make strategic decisions about "
-        "investigation direction. You operate autonomously within your budget constraints."
-    ),
-    "recon": (
-        "You are a RECONNAISSANCE specialist agent. Your role is to map the target's "
-        "attack surface: enumerate subdomains, discover services, identify technologies, "
-        "and catalog assets. Be thorough and methodical. Report all findings to your "
-        "parent coordinator with structured data."
-    ),
-    "scanner": (
-        "You are a VULNERABILITY SCANNER agent. Your role is to identify known "
-        "vulnerabilities, misconfigurations, and security weaknesses in the target. "
-        "Use appropriate scanning tools and interpret their results accurately. "
-        "Flag potential false positives and prioritize findings by severity."
-    ),
-    "analyzer": (
-        "You are a SECURITY ANALYZER agent. Your role is to perform deep analysis "
-        "of code, configurations, and system behavior to identify security issues. "
-        "Look for logic flaws, insecure patterns, and architectural weaknesses "
-        "that automated scanners miss."
-    ),
-    "exploiter": (
-        "You are an EXPLOITATION specialist agent. Your role is to safely validate "
-        "vulnerabilities through proof-of-concept exploitation. Determine actual impact "
-        "and exploitability. Build exploitation chains from individual findings. "
-        "Document evidence for each confirmed vulnerability."
-    ),
-    "validator": (
-        "You are a VALIDATION agent. Your role is to cross-check findings from "
-        "other agents, verify evidence quality, and identify false positives. "
-        "Challenge assumptions and provide confidence assessments. Use different "
-        "tools and approaches to confirm or deny findings."
-    ),
-    "reasoning": (
-        "You are a REASONING agent. Your role is deep analysis: build hypotheses "
-        "about attack vectors, reason about cause-and-effect chains, identify "
-        "non-obvious security implications, and evaluate trade-offs between "
-        "different investigation approaches."
-    ),
+MODEL_FORMATS: dict[str, str] = {
+    "whiterabbitneo-7b": "chatml",
+    "qwen-coder-14b": "chatml",
+    "qwen-coder-7b": "chatml",
+    "deepseek-r1-7b": "deepseek",
+    "deepseek-math-7b": "deepseek",
+    "hermes-14b": "chatml",
+    "llama-3.1-8b": "llama",
+    "dolphin-8b": "chatml",
+    "mistral-7b": "mistral",
+    "codellama-13b": "llama",
+    "codellama-7b": "llama",
+    "yi-9b-200k": "chatml",
+    "phi-3.5-mini": "phi",
+    "llama-guard-3": "llama",
+    "functiongemma": "generic",
+    "nomic-embed": "generic",
 }
 
 
 class PromptCompiler:
-    """Compiles dynamic prompts with knowledge injection.
+    """Builds optimal prompts for LLM agents.
 
-    The critical bridge between all knowledge bases, context,
-    and the LLM. Assembles prompts that give the LLM everything
-    it needs to make intelligent security decisions.
+    Manages prompt construction with:
+    - Knowledge base injection
+    - Context window fitting
+    - Model-specific formatting
+    - Priority-based section dropping
     """
 
-    def __init__(self, config: PromptConfig | None = None) -> None:
-        self._config = config or PromptConfig()
-        self._counter = 0
-        self._compilation_history: list[dict[str, Any]] = []
+    def __init__(self, default_max_tokens: int = 4096) -> None:
+        self._default_max_tokens = default_max_tokens
         self._log = logger.bind(component="prompt_compiler")
+        self._compile_count = 0
 
     def compile(
         self,
-        role: str = "coordinator",
-        model_id: str = "hermes-14b",
-        task_instruction: str = "",
-        target_context: str = "",
-        strategy_knowledge: list[str] | None = None,
-        past_findings: list[str] | None = None,
-        reasoning_chain: str = "",
-        experience_hints: list[str] | None = None,
-        tools_available: list[str] | None = None,
-        conversation_history: list[dict[str, str]] | None = None,
-        response_format: str = "",
+        blocks: list[PromptBlock],
+        model: str = "",
+        max_tokens: int = 0,
     ) -> CompiledPrompt:
-        """Compile a complete prompt."""
-        self._counter += 1
+        """Compile prompt blocks into a formatted prompt."""
+        max_tokens = max_tokens or self._default_max_tokens
+        self._compile_count += 1
 
-        # Get format for model
-        fmt = MODEL_FORMATS.get(model_id, PromptFormat.CHATML)
+        # Estimate tokens for each block (rough: 4 chars per token)
+        for block in blocks:
+            if block.token_estimate == 0:
+                block.token_estimate = len(block.content) // 4
+
+        # Sort by priority (required first, then by priority desc)
+        sorted_blocks = sorted(
+            blocks,
+            key=lambda b: (not b.required, -b.priority),
+        )
+
+        # Fit blocks within token budget
+        included: list[PromptBlock] = []
+        dropped: list[PromptBlock] = []
+        remaining_tokens = max_tokens
+
+        for block in sorted_blocks:
+            if block.token_estimate <= remaining_tokens:
+                included.append(block)
+                remaining_tokens -= block.token_estimate
+            elif block.required:
+                # Truncate required blocks to fit
+                available_chars = remaining_tokens * 4
+                block.content = block.content[:available_chars]
+                block.token_estimate = remaining_tokens
+                included.append(block)
+                remaining_tokens = 0
+            else:
+                dropped.append(block)
+
+        # Group by section
+        section_content: dict[PromptSection, list[str]] = defaultdict(list)
+        for block in included:
+            section_content[block.section].append(block.content)
 
         # Build system prompt
         system_parts = []
-        sections = []
-
-        # 1. Role prompt
-        role_prompt = ROLE_SYSTEM_PROMPTS.get(role, "")
-        if role_prompt:
-            system_parts.append(role_prompt)
-            sections.append("role")
-
-        # 2. Strategy knowledge
-        knowledge_injected = []
-        if self._config.include_strategy_knowledge and strategy_knowledge:
-            budget = self._config.max_knowledge_tokens
-            knowledge_text = self._truncate_to_tokens(
-                "\n\n".join(strategy_knowledge), budget
-            )
-            if knowledge_text:
-                system_parts.append(
-                    "## Attack Strategies & Testing Methodology\n" + knowledge_text
-                )
-                knowledge_injected = [f"strategy_{i}" for i in range(len(strategy_knowledge))]
-                sections.append("strategy_knowledge")
-
-        # 3. Target context
-        if target_context:
-            system_parts.append(f"## Target Information\n{target_context}")
-            sections.append("target_context")
-
-        # 4. Tools available
-        if tools_available:
-            tools_text = "## Available Tools\n" + ", ".join(tools_available)
-            system_parts.append(tools_text)
-            sections.append("tools_available")
-
-        # 5. Past findings
-        if self._config.include_past_findings and past_findings:
-            findings_text = self._truncate_to_tokens(
-                "\n".join(f"- {f}" for f in past_findings),
-                self._config.max_findings_tokens,
-            )
-            if findings_text:
-                system_parts.append(f"## Findings So Far\n{findings_text}")
-                sections.append("past_findings")
-
-        # 6. Reasoning chain
-        if self._config.include_reasoning_chain and reasoning_chain:
-            reason_text = self._truncate_to_tokens(
-                reasoning_chain, self._config.max_reasoning_tokens
-            )
-            if reason_text:
-                system_parts.append(f"## Reasoning Chain\n{reason_text}")
-                sections.append("reasoning_chain")
-
-        # 7. Experience hints
-        if self._config.include_experience_hints and experience_hints:
-            hints_text = self._truncate_to_tokens(
-                "\n".join(f"- {h}" for h in experience_hints),
-                self._config.max_experience_tokens,
-            )
-            if hints_text:
-                system_parts.append(f"## Experience Hints\n{hints_text}")
-                sections.append("experience_hints")
-
-        # 8. Response format
-        if response_format:
-            system_parts.append(f"## Response Format\n{response_format}")
-            sections.append("response_format")
-
-        system_prompt = "\n\n".join(system_parts)
+        for section in [PromptSection.SYSTEM, PromptSection.ROLE,
+                        PromptSection.CONSTRAINTS, PromptSection.TOOLS,
+                        PromptSection.OUTPUT_FORMAT]:
+            if section in section_content:
+                system_parts.extend(section_content[section])
 
         # Build user prompt
-        user_prompt = task_instruction
+        user_parts = []
+        for section in [PromptSection.GOAL, PromptSection.CONTEXT,
+                        PromptSection.KNOWLEDGE, PromptSection.FINDINGS,
+                        PromptSection.EXAMPLES, PromptSection.HISTORY]:
+            if section in section_content:
+                user_parts.extend(section_content[section])
 
-        # Conversation history
-        messages = []
-        if conversation_history:
-            budget = self._config.max_conversation_tokens
-            token_count = 0
-            for msg in reversed(conversation_history):
-                msg_tokens = len(msg.get("content", "")) // 4
-                if token_count + msg_tokens > budget:
-                    break
-                messages.insert(0, msg)
-                token_count += msg_tokens
-            sections.append("conversation")
+        # Apply model format
+        system_prompt = "\n\n".join(system_parts)
+        user_prompt = "\n\n".join(user_parts)
 
-        # Estimate total tokens
-        total_text = system_prompt + user_prompt + "".join(
-            m.get("content", "") for m in messages
-        )
-        estimated_tokens = len(total_text) // 4
+        if model:
+            fmt_name = MODEL_FORMATS.get(model, "generic")
+            fmt = FORMAT_TEMPLATES.get(fmt_name, FORMAT_TEMPLATES["generic"])
+            system_prompt = fmt["system_prefix"] + system_prompt + fmt["system_suffix"]
+            user_prompt = fmt["user_prefix"] + user_prompt + fmt["user_suffix"]
 
-        prompt = CompiledPrompt(
-            prompt_id=f"prompt-{self._counter}",
+        return CompiledPrompt(
+            model=model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            messages=messages,
-            estimated_tokens=estimated_tokens,
-            sections_included=sections,
-            knowledge_injected=knowledge_injected,
-            model_format=fmt,
+            total_tokens_estimate=max_tokens - remaining_tokens,
+            sections_included=[b.section.value for b in included],
+            sections_dropped=[b.section.value for b in dropped],
         )
 
-        self._compilation_history.append(prompt.to_dict())
+    def build_security_prompt(
+        self,
+        role: str,
+        goal: str,
+        target: str,
+        tools: list[str],
+        findings: list[dict[str, Any]] | None = None,
+        knowledge: str = "",
+        history: str = "",
+        model: str = "",
+        max_tokens: int = 0,
+    ) -> CompiledPrompt:
+        """Build a complete security assessment prompt."""
+        blocks = [
+            PromptBlock(
+                section=PromptSection.SYSTEM,
+                content="You are a security assessment agent. Follow instructions precisely. Output structured findings.",
+                priority=10,
+                required=True,
+            ),
+            PromptBlock(
+                section=PromptSection.ROLE,
+                content=f"Role: {role}",
+                priority=9,
+                required=True,
+            ),
+            PromptBlock(
+                section=PromptSection.GOAL,
+                content=f"Goal: {goal}\nTarget: {target}",
+                priority=9,
+                required=True,
+            ),
+            PromptBlock(
+                section=PromptSection.CONSTRAINTS,
+                content=(
+                    "Constraints:\n"
+                    "- Only test authorized targets\n"
+                    "- Minimize destructive actions\n"
+                    "- Validate findings before reporting\n"
+                    "- Use structured JSON output for findings"
+                ),
+                priority=8,
+                required=True,
+            ),
+        ]
 
-        return prompt
+        # Tools
+        if tools:
+            tool_doc = "Available tools:\n" + "\n".join(f"- {t}" for t in tools)
+            blocks.append(PromptBlock(
+                section=PromptSection.TOOLS,
+                content=tool_doc,
+                priority=7,
+            ))
 
-    @staticmethod
-    def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-        """Truncate text to approximate token budget."""
-        max_chars = max_tokens * 4
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars] + "\n[...truncated]"
+        # Knowledge injection
+        if knowledge:
+            blocks.append(PromptBlock(
+                section=PromptSection.KNOWLEDGE,
+                content=knowledge,
+                priority=6,
+            ))
+
+        # Existing findings
+        if findings:
+            finding_text = "Current findings:\n"
+            for f in findings[:10]:
+                finding_text += f"- [{f.get('severity', 'unknown')}] {f.get('title', '')}\n"
+            blocks.append(PromptBlock(
+                section=PromptSection.FINDINGS,
+                content=finding_text,
+                priority=5,
+            ))
+
+        # History
+        if history:
+            blocks.append(PromptBlock(
+                section=PromptSection.HISTORY,
+                content=history,
+                priority=3,
+            ))
+
+        # Output format
+        blocks.append(PromptBlock(
+            section=PromptSection.OUTPUT_FORMAT,
+            content=(
+                "Output format:\n"
+                "1. ANALYSIS: Brief analysis of current state\n"
+                "2. NEXT_ACTION: What tool/command to run next\n"
+                "3. RATIONALE: Why this action\n"
+                "4. FINDINGS: Any new findings in JSON"
+            ),
+            priority=8,
+        ))
+
+        return self.compile(blocks, model=model, max_tokens=max_tokens)
+
+    def build_reasoning_prompt(
+        self,
+        question: str,
+        evidence: list[str],
+        model: str = "",
+        max_tokens: int = 0,
+    ) -> CompiledPrompt:
+        """Build a reasoning/chain-of-thought prompt."""
+        blocks = [
+            PromptBlock(
+                section=PromptSection.SYSTEM,
+                content=(
+                    "You are a security reasoning engine. Think step by step.\n"
+                    "For each step:\n"
+                    "1. State what you observe\n"
+                    "2. Form a hypothesis\n"
+                    "3. Consider evidence for and against\n"
+                    "4. Draw a conclusion with confidence level"
+                ),
+                priority=10,
+                required=True,
+            ),
+            PromptBlock(
+                section=PromptSection.GOAL,
+                content=f"Question: {question}",
+                priority=9,
+                required=True,
+            ),
+        ]
+
+        if evidence:
+            ev_text = "Evidence:\n" + "\n".join(f"- {e}" for e in evidence)
+            blocks.append(PromptBlock(
+                section=PromptSection.CONTEXT,
+                content=ev_text,
+                priority=7,
+            ))
+
+        return self.compile(blocks, model=model, max_tokens=max_tokens)
+
+    def build_validation_prompt(
+        self,
+        finding: dict[str, Any],
+        model: str = "",
+        max_tokens: int = 0,
+    ) -> CompiledPrompt:
+        """Build a finding validation prompt."""
+        blocks = [
+            PromptBlock(
+                section=PromptSection.SYSTEM,
+                content=(
+                    "You are a security finding validator. Your job is to:\n"
+                    "1. Assess if the finding is a true positive or false positive\n"
+                    "2. Suggest verification steps\n"
+                    "3. Rate confidence (0.0 to 1.0)\n"
+                    "4. Suggest remediation if confirmed"
+                ),
+                priority=10,
+                required=True,
+            ),
+            PromptBlock(
+                section=PromptSection.GOAL,
+                content=(
+                    f"Finding to validate:\n"
+                    f"Title: {finding.get('title', '')}\n"
+                    f"Severity: {finding.get('severity', '')}\n"
+                    f"Description: {finding.get('description', '')}\n"
+                    f"Evidence: {finding.get('evidence', '')}"
+                ),
+                priority=9,
+                required=True,
+            ),
+        ]
+
+        return self.compile(blocks, model=model, max_tokens=max_tokens)
 
     def get_stats(self) -> dict[str, Any]:
-        section_counts: dict[str, int] = defaultdict(int)
-        for hist in self._compilation_history:
-            for sec in hist.get("sections", []):
-                section_counts[sec] += 1
-
         return {
-            "compiled": len(self._compilation_history),
-            "sections_used": dict(section_counts),
+            "compiles": self._compile_count,
+            "supported_formats": list(FORMAT_TEMPLATES.keys()),
+            "model_mappings": len(MODEL_FORMATS),
         }
