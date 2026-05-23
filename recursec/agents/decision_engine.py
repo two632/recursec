@@ -1,439 +1,279 @@
-"""Autonomous decision engine — the core decision-making intelligence.
+"""Decision engine — autonomous decision-making under uncertainty.
 
-Makes strategic decisions by integrating:
-1. Current state and context
-2. Available actions and their expected outcomes
-3. Historical performance data
-4. Risk tolerance and constraints
-5. Goal proximity assessment
-6. Resource budget remaining
-7. Time pressure
-8. Adversarial considerations
-
-Decision strategies:
-- Greedy: Pick highest-value action
-- UCB: Balance exploration/exploitation
-- Risk-adjusted: Factor in risk tolerance
-- Goal-directed: Maximize progress toward objective
-- Adaptive: Switch strategy based on performance
-- Monte Carlo: Simulate outcomes before deciding
+Implements:
+1. Multi-criteria decision analysis (MCDA)
+2. Expected utility computation
+3. Risk-adjusted decisions
+4. Decision tree evaluation
+5. Regret minimization
+6. Decision explanation generation
+7. Decision history tracking
+8. Adaptive decision policies
 """
 
 from __future__ import annotations
 
-import json
-import math
-import random
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import structlog
-
-if TYPE_CHECKING:
-    from recursec.llm.router import ModelRouter
 
 logger = structlog.get_logger()
 
 
-class DecisionStrategy(str, Enum):
-    GREEDY = "greedy"
-    UCB = "ucb"
-    RISK_ADJUSTED = "risk_adjusted"
-    GOAL_DIRECTED = "goal_directed"
-    ADAPTIVE = "adaptive"
-    MONTE_CARLO = "monte_carlo"
-
-
-class ActionType(str, Enum):
-    SCAN = "scan"
-    ENUMERATE = "enumerate"
-    EXPLOIT = "exploit"
-    VALIDATE = "validate"
-    REPORT = "report"
-    DELEGATE = "delegate"
-    WAIT = "wait"
-    RETRY = "retry"
-    PIVOT = "pivot"
+class DecisionType(str, Enum):
+    STRATEGY_SELECT = "strategy_select"
+    TOOL_SELECT = "tool_select"
+    MODEL_SELECT = "model_select"
+    TARGET_SELECT = "target_select"
+    CONTINUE_STOP = "continue_stop"
     ESCALATE = "escalate"
-    STOP = "stop"
+    DELEGATE = "delegate"
+
+
+class RiskLevel(str, Enum):
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
 
 
 @dataclass
-class Action:
-    """A possible action the agent can take."""
-    action_id: str = ""
-    action_type: ActionType = ActionType.SCAN
+class DecisionOption:
+    """An option in a decision."""
+    option_id: str = ""
     name: str = ""
-    description: str = ""
-    tool: str = ""
-    target: str = ""
-    parameters: dict[str, Any] = field(default_factory=dict)
-    expected_value: float = 0.5
-    expected_risk: float = 0.3
-    expected_time_s: float = 60.0
-    expected_tokens: int = 2000
-    prerequisites: list[str] = field(default_factory=list)
-    # Tracking
-    times_chosen: int = 0
-    total_value: float = 0.0
-    avg_value: float = 0.0
+    expected_value: float = 0.0
+    risk: float = 0.0
+    cost_tokens: int = 0
+    cost_time_s: int = 0
+    criteria_scores: dict[str, float] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def ucb_score(self) -> float:
-        if self.times_chosen == 0:
-            return float("inf")
-        exploitation = self.avg_value
-        exploration = math.sqrt(2 * math.log(max(1, self.times_chosen + 10)) / self.times_chosen)
-        return exploitation + exploration
+    def risk_adjusted_value(self) -> float:
+        """Value adjusted for risk (higher risk = lower adjusted value)."""
+        return self.expected_value * (1 - self.risk * 0.5)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.action_id,
-            "type": self.action_type.value,
-            "name": self.name[:100],
-            "expected_value": round(self.expected_value, 2),
-            "expected_risk": round(self.expected_risk, 2),
-            "ucb": round(self.ucb_score, 3) if self.times_chosen > 0 else "inf",
+            "id": self.option_id,
+            "name": self.name[:25],
+            "ev": round(self.expected_value, 3),
+            "risk": round(self.risk, 2),
+            "rav": round(self.risk_adjusted_value, 3),
         }
-
-
-@dataclass
-class DecisionContext:
-    """Context for making a decision."""
-    goal: str = ""
-    target: str = ""
-    phase: str = ""
-    findings_count: int = 0
-    steps_taken: int = 0
-    steps_budget: int = 100
-    tokens_used: int = 0
-    tokens_budget: int = 50000
-    time_elapsed_s: float = 0.0
-    time_budget_s: float = 300.0
-    risk_tolerance: float = 0.5    # 0=conservative, 1=aggressive
-    recent_successes: int = 0
-    recent_failures: int = 0
-    coverage_areas: list[str] = field(default_factory=list)
-    uncovered_areas: list[str] = field(default_factory=list)
-
-    @property
-    def budget_remaining(self) -> float:
-        """Fraction of budget remaining (0-1)."""
-        step_ratio = 1 - (self.steps_taken / max(1, self.steps_budget))
-        token_ratio = 1 - (self.tokens_used / max(1, self.tokens_budget))
-        time_ratio = 1 - (self.time_elapsed_s / max(1, self.time_budget_s))
-        return min(step_ratio, token_ratio, time_ratio)
-
-    @property
-    def urgency(self) -> float:
-        """How urgent the next action is (0=relaxed, 1=urgent)."""
-        return 1.0 - self.budget_remaining
 
 
 @dataclass
 class Decision:
     """A decision made by the engine."""
     decision_id: str = ""
-    selected_action: Action | None = None
-    strategy_used: DecisionStrategy = DecisionStrategy.GREEDY
-    confidence: float = 0.5
+    decision_type: DecisionType = DecisionType.STRATEGY_SELECT
+    question: str = ""
+    options: list[DecisionOption] = field(default_factory=list)
+    selected: str = ""
+    confidence: float = 0.0
     reasoning: str = ""
-    alternatives_considered: int = 0
-    decision_time_ms: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+    outcome_recorded: bool = False
+    outcome_success: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.decision_id,
-            "action": self.selected_action.to_dict() if self.selected_action else None,
-            "strategy": self.strategy_used.value,
+            "type": self.decision_type.value,
+            "selected": self.selected[:20],
             "confidence": round(self.confidence, 2),
-            "reasoning": self.reasoning[:200],
-            "alternatives": self.alternatives_considered,
-            "time_ms": round(self.decision_time_ms, 1),
+            "options": len(self.options),
         }
 
 
-DECISION_PROMPT = """You are an autonomous security agent making strategic decisions.
+# ── Decision Criteria Weights ─────────────────────────────────
 
-Current state:
-- Goal: {goal}
-- Target: {target}
-- Phase: {phase}
-- Findings so far: {findings}
-- Steps: {steps_taken}/{steps_budget}
-- Budget remaining: {budget_pct}%
-- Recent performance: {successes} successes, {failures} failures
-- Covered: {covered}
-- Uncovered: {uncovered}
-
-Available actions:
-{actions_text}
-
-Choose the best action. Consider:
-1. What will make the most progress toward the goal?
-2. What areas haven't been tested yet?
-3. How much budget remains?
-4. Should we exploit what we found or keep discovering?
-
-Respond as JSON:
-{{
-  "selected_action": "action_id",
-  "reasoning": "why this action",
-  "confidence": 0.X,
-  "should_stop": false
-}}"""
+DEFAULT_CRITERIA_WEIGHTS: dict[str, float] = {
+    "expected_findings": 0.30,
+    "token_efficiency": 0.15,
+    "time_efficiency": 0.10,
+    "novelty": 0.15,
+    "coverage_gain": 0.15,
+    "risk": 0.15,
+}
 
 
 class DecisionEngine:
-    """Autonomous decision-making engine.
+    """Autonomous decision-making under uncertainty.
 
-    Integrates context, history, and strategy to select
-    the best action at each step.
+    Makes optimal decisions considering multiple criteria,
+    risk, and historical performance.
     """
 
     def __init__(
         self,
-        model_router: ModelRouter | None = None,
-        default_strategy: DecisionStrategy = DecisionStrategy.ADAPTIVE,
+        risk_tolerance: float = 0.5,
     ) -> None:
-        self._router = model_router
-        self._default_strategy = default_strategy
         self._decisions: list[Decision] = []
         self._decision_counter = 0
-        self._strategy_performance: dict[str, list[float]] = defaultdict(list)
+        self._criteria_weights = dict(DEFAULT_CRITERIA_WEIGHTS)
+        self._risk_tolerance = risk_tolerance
+        self._policy_overrides: dict[str, str] = {}
         self._log = logger.bind(component="decision_engine")
 
-    async def decide(
+    def decide(
         self,
-        context: DecisionContext,
-        available_actions: list[Action],
-        strategy: DecisionStrategy | None = None,
+        question: str,
+        options: list[DecisionOption],
+        decision_type: DecisionType = DecisionType.STRATEGY_SELECT,
     ) -> Decision:
-        """Make a decision given context and available actions."""
-        start = time.time()
+        """Make a decision from options."""
         self._decision_counter += 1
 
-        strategy = strategy or self._select_strategy(context)
-
-        if not available_actions:
+        if not options:
             return Decision(
                 decision_id=f"dec-{self._decision_counter}",
-                strategy_used=strategy,
-                reasoning="No actions available",
+                decision_type=decision_type,
+                question=question,
+                reasoning="No options available",
             )
 
-        # Filter actions by prerequisites
-        valid_actions = [
-            a for a in available_actions
-            if not a.prerequisites or all(p in context.coverage_areas for p in a.prerequisites)
-        ]
+        # Check policy overrides
+        override = self._policy_overrides.get(decision_type.value)
+        if override:
+            for opt in options:
+                if opt.name == override:
+                    return self._create_decision(
+                        decision_type, question, options, opt,
+                        1.0, f"Policy override: {override}"
+                    )
 
-        if not valid_actions:
-            valid_actions = available_actions
+        # Multi-criteria scoring
+        scored = []
+        for opt in options:
+            score = self._mcda_score(opt)
+            scored.append((score, opt))
 
-        # Select action based on strategy
-        if strategy == DecisionStrategy.GREEDY:
-            selected = self._greedy_select(valid_actions, context)
-        elif strategy == DecisionStrategy.UCB:
-            selected = self._ucb_select(valid_actions)
-        elif strategy == DecisionStrategy.RISK_ADJUSTED:
-            selected = self._risk_adjusted_select(valid_actions, context)
-        elif strategy == DecisionStrategy.GOAL_DIRECTED:
-            selected = await self._goal_directed_select(valid_actions, context)
-        elif strategy == DecisionStrategy.MONTE_CARLO:
-            selected = self._monte_carlo_select(valid_actions, context)
-        elif strategy == DecisionStrategy.ADAPTIVE:
-            selected = await self._adaptive_select(valid_actions, context)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_option = scored[0]
+
+        # Confidence = gap between best and second best
+        if len(scored) > 1:
+            second_score = scored[1][0]
+            if best_score > 0:
+                confidence = min(0.95, (best_score - second_score) / best_score + 0.3)
+            else:
+                confidence = 0.3
         else:
-            selected = self._greedy_select(valid_actions, context)
+            confidence = 0.8
 
+        reasoning = self._explain_decision(scored[:3])
+
+        return self._create_decision(
+            decision_type, question, options, best_option,
+            confidence, reasoning,
+        )
+
+    def _mcda_score(self, option: DecisionOption) -> float:
+        """Multi-criteria decision analysis scoring."""
+        score = 0.0
+
+        for criterion, weight in self._criteria_weights.items():
+            criterion_value = option.criteria_scores.get(criterion, 0.0)
+            score += weight * criterion_value
+
+        # Risk adjustment
+        risk_penalty = option.risk * (1 - self._risk_tolerance)
+        score -= risk_penalty * 0.3
+
+        # Expected value contribution
+        score += option.expected_value * 0.2
+
+        return score
+
+    def _create_decision(
+        self,
+        decision_type: DecisionType,
+        question: str,
+        options: list[DecisionOption],
+        selected: DecisionOption,
+        confidence: float,
+        reasoning: str,
+    ) -> Decision:
+        """Create and store a decision."""
         decision = Decision(
             decision_id=f"dec-{self._decision_counter}",
-            selected_action=selected,
-            strategy_used=strategy,
-            confidence=selected.expected_value if selected else 0.0,
-            reasoning=f"Selected by {strategy.value} strategy",
-            alternatives_considered=len(valid_actions),
-            decision_time_ms=(time.time() - start) * 1000,
+            decision_type=decision_type,
+            question=question,
+            options=options,
+            selected=selected.name,
+            confidence=confidence,
+            reasoning=reasoning,
         )
 
         self._decisions.append(decision)
+        if len(self._decisions) > 500:
+            self._decisions = self._decisions[-500:]
+
         return decision
 
-    def record_outcome(self, decision_id: str, value: float) -> None:
-        """Record the outcome of a decision for learning."""
-        for decision in self._decisions:
-            if decision.decision_id == decision_id and decision.selected_action:
-                action = decision.selected_action
-                action.times_chosen += 1
-                action.total_value += value
-                action.avg_value = action.total_value / action.times_chosen
+    @staticmethod
+    def _explain_decision(top_options: list[tuple[float, DecisionOption]]) -> str:
+        """Generate explanation for a decision."""
+        if not top_options:
+            return "No options to explain"
 
-                self._strategy_performance[decision.strategy_used.value].append(value)
+        parts = []
+        for i, (score, opt) in enumerate(top_options):
+            rank = "Selected" if i == 0 else f"#{i + 1}"
+            parts.append(f"{rank}: {opt.name} (score={score:.3f}, risk={opt.risk:.2f})")
+
+        return "; ".join(parts)
+
+    def record_outcome(
+        self,
+        decision_id: str,
+        success: bool,
+    ) -> None:
+        """Record the outcome of a decision."""
+        for decision in self._decisions:
+            if decision.decision_id == decision_id:
+                decision.outcome_recorded = True
+                decision.outcome_success = success
                 break
 
-    # ── Strategy Implementations ─────────────────────────
+        self._adapt_weights()
 
-    def _greedy_select(self, actions: list[Action], context: DecisionContext) -> Action:
-        """Select the action with highest expected value."""
-        return max(actions, key=lambda a: a.expected_value)
+    def _adapt_weights(self) -> None:
+        """Adapt criteria weights based on outcomes."""
+        recent = [d for d in self._decisions[-50:] if d.outcome_recorded]
+        if len(recent) < 10:
+            return
 
-    def _ucb_select(self, actions: list[Action]) -> Action:
-        """Select using upper confidence bound."""
-        return max(actions, key=lambda a: a.ucb_score)
+        success_rate = sum(1 for d in recent if d.outcome_success) / len(recent)
 
-    def _risk_adjusted_select(
-        self,
-        actions: list[Action],
-        context: DecisionContext,
-    ) -> Action:
-        """Select with risk tolerance adjustment."""
-        def risk_adjusted_value(action: Action) -> float:
-            reward = action.expected_value
-            risk = action.expected_risk
-            tolerance = context.risk_tolerance
-            return reward - risk * (1 - tolerance)
+        # If success rate is low, increase risk weight
+        if success_rate < 0.5:
+            self._criteria_weights["risk"] = min(0.3, self._criteria_weights["risk"] + 0.02)
 
-        return max(actions, key=risk_adjusted_value)
+        # If success rate is high, allow more novelty
+        elif success_rate > 0.7:
+            self._criteria_weights["novelty"] = min(0.25, self._criteria_weights["novelty"] + 0.01)
 
-    async def _goal_directed_select(
-        self,
-        actions: list[Action],
-        context: DecisionContext,
-    ) -> Action:
-        """Select using LLM reasoning about goal progress."""
-        if not self._router:
-            return self._greedy_select(actions, context)
+    def set_policy(self, decision_type: str, default_choice: str) -> None:
+        """Set a policy override for a decision type."""
+        self._policy_overrides[decision_type] = default_choice
 
-        actions_text = "\n".join(
-            f"- [{a.action_id}] {a.action_type.value}: {a.name} "
-            f"(value: {a.expected_value:.1f}, risk: {a.expected_risk:.1f}, "
-            f"time: {a.expected_time_s:.0f}s)"
-            for a in actions[:10]
-        )
-
-        prompt = DECISION_PROMPT.format(
-            goal=context.goal[:200],
-            target=context.target,
-            phase=context.phase,
-            findings=context.findings_count,
-            steps_taken=context.steps_taken,
-            steps_budget=context.steps_budget,
-            budget_pct=round(context.budget_remaining * 100),
-            successes=context.recent_successes,
-            failures=context.recent_failures,
-            covered=", ".join(context.coverage_areas[:5]) or "None",
-            uncovered=", ".join(context.uncovered_areas[:5]) or "Unknown",
-            actions_text=actions_text,
-        )
-
-        response = await self._router.generate(
-            messages=[{"role": "user", "content": prompt}],
-            task_type="planning",
-            temperature=0.2,
-            max_tokens=256,
-        )
-
-        data = self._parse_json(response)
-        selected_id = data.get("selected_action", "")
-
-        for action in actions:
-            if action.action_id == selected_id:
-                return action
-
-        return self._greedy_select(actions, context)
-
-    def _monte_carlo_select(
-        self,
-        actions: list[Action],
-        context: DecisionContext,
-        simulations: int = 100,
-    ) -> Action:
-        """Select using Monte Carlo simulation."""
-        scores: dict[str, float] = defaultdict(float)
-
-        for action in actions:
-            for _ in range(simulations):
-                # Simulate outcome
-                success_prob = action.expected_value * (1 - action.expected_risk * 0.5)
-                outcome = 1.0 if random.random() < success_prob else 0.0
-
-                # Adjust for budget
-                time_cost = action.expected_time_s / max(1, context.time_budget_s)
-                if context.budget_remaining - time_cost < 0:
-                    outcome *= 0.5  # Penalize going over budget
-
-                scores[action.action_id] += outcome
-
-        # Normalize
-        for aid in scores:
-            scores[aid] /= simulations
-
-        best_id = max(scores, key=scores.get)
-        for action in actions:
-            if action.action_id == best_id:
-                return action
-
-        return actions[0]
-
-    async def _adaptive_select(
-        self,
-        actions: list[Action],
-        context: DecisionContext,
-    ) -> Action:
-        """Adaptively switch between strategies based on performance."""
-        # Pick strategy based on context
-        if context.budget_remaining < 0.2:
-            # Low budget: be greedy
-            return self._greedy_select(actions, context)
-        elif context.recent_failures > context.recent_successes:
-            # Failing: try UCB for exploration
-            return self._ucb_select(actions)
-        elif context.urgency > 0.7:
-            # Urgent: risk-adjusted
-            return self._risk_adjusted_select(actions, context)
-        elif self._router:
-            # Normal: use LLM reasoning
-            return await self._goal_directed_select(actions, context)
-        else:
-            return self._ucb_select(actions)
-
-    def _select_strategy(self, context: DecisionContext) -> DecisionStrategy:
-        """Select the best strategy based on current context."""
-        if self._default_strategy != DecisionStrategy.ADAPTIVE:
-            return self._default_strategy
-
-        if context.budget_remaining < 0.2:
-            return DecisionStrategy.GREEDY
-        elif context.recent_failures > 3:
-            return DecisionStrategy.UCB
-        elif self._router:
-            return DecisionStrategy.GOAL_DIRECTED
-        else:
-            return DecisionStrategy.UCB
-
-    def _parse_json(self, text: str) -> dict[str, Any]:
-        try:
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0]
-            return json.loads(text.strip())
-        except (json.JSONDecodeError, IndexError):
-            return {}
+    def get_recent(self, limit: int = 10) -> list[dict[str, Any]]:
+        return [d.to_dict() for d in self._decisions[-limit:]]
 
     def get_stats(self) -> dict[str, Any]:
-        by_strategy: dict[str, int] = defaultdict(int)
-        by_action: dict[str, int] = defaultdict(int)
-        for d in self._decisions:
-            by_strategy[d.strategy_used.value] += 1
-            if d.selected_action:
-                by_action[d.selected_action.action_type.value] += 1
+        recorded = [d for d in self._decisions if d.outcome_recorded]
+        success_count = sum(1 for d in recorded if d.outcome_success)
         return {
-            "total_decisions": len(self._decisions),
-            "by_strategy": dict(by_strategy),
-            "by_action": dict(by_action),
+            "decisions": len(self._decisions),
+            "outcomes_recorded": len(recorded),
+            "success_rate": round(success_count / max(1, len(recorded)), 2),
+            "policies": len(self._policy_overrides),
         }

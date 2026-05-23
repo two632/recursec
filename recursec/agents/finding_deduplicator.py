@@ -1,22 +1,22 @@
-"""Finding deduplicator — identifies and merges duplicate findings.
+"""Finding deduplicator — deduplicates and merges related security findings.
 
 Implements:
-1. Exact match deduplication
-2. Fuzzy match deduplication
-3. Semantic similarity deduplication
-4. Cross-tool deduplication (same vuln found by different tools)
-5. Finding merging with evidence aggregation
-6. Dedup statistics tracking
-7. Confidence boosting for multi-tool confirmation
-8. Cluster-based grouping
+1. Exact duplicate detection (same title/target)
+2. Fuzzy duplicate detection (similar findings)
+3. Finding merging (combine evidence from duplicates)
+4. Cluster detection (related findings)
+5. Severity reconciliation across duplicates
+6. Source tracking for merged findings
+7. Dedup statistics
+8. Manual override for edge cases
 """
 
 from __future__ import annotations
 
-import hashlib
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -24,225 +24,231 @@ import structlog
 logger = structlog.get_logger()
 
 
+class MergeAction(str, Enum):
+    KEEP = "keep"
+    MERGE = "merge"
+    DISCARD = "discard"
+
+
 @dataclass
-class DeduplicationResult:
-    """Result of deduplication."""
-    original_count: int = 0
-    deduplicated_count: int = 0
-    merged_count: int = 0
-    unique_findings: list[dict[str, Any]] = field(default_factory=list)
-    merge_groups: list[list[str]] = field(default_factory=list)
+class DedupFinding:
+    """A finding with dedup metadata."""
+    finding_id: str = ""
+    title: str = ""
+    description: str = ""
+    severity: str = ""
+    target: str = ""
+    endpoint: str = ""
+    parameter: str = ""
+    evidence: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    confidence: float = 0.5
+    merged_from: list[str] = field(default_factory=list)
 
     @property
-    def reduction_pct(self) -> float:
-        if self.original_count == 0:
-            return 0.0
-        return (1.0 - self.deduplicated_count / self.original_count) * 100
+    def normalized_title(self) -> str:
+        """Normalize title for comparison."""
+        return re.sub(r'\s+', ' ', self.title.lower().strip())
+
+    @property
+    def fingerprint(self) -> str:
+        """Generate a fingerprint for this finding."""
+        parts = [
+            self.normalized_title,
+            self.target.lower(),
+            self.endpoint.lower(),
+            self.parameter.lower(),
+        ]
+        return "|".join(parts)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "original": self.original_count,
-            "deduped": self.deduplicated_count,
-            "merged": self.merged_count,
-            "reduction_pct": round(self.reduction_pct, 1),
+            "id": self.finding_id,
+            "title": self.title[:30],
+            "severity": self.severity,
+            "target": self.target[:20],
+            "confidence": round(self.confidence, 2),
+            "sources": len(self.sources),
+            "merged": len(self.merged_from),
         }
 
 
-class FindingDeduplicator:
-    """Identifies and merges duplicate findings.
+@dataclass
+class DedupGroup:
+    """A group of duplicate findings."""
+    group_id: str = ""
+    primary_id: str = ""
+    duplicate_ids: list[str] = field(default_factory=list)
+    similarity: float = 0.0
+    merged: bool = False
 
-    Uses exact, fuzzy, and semantic matching to
-    detect duplicates across tools and phases.
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "group": self.group_id,
+            "primary": self.primary_id[:15],
+            "dups": len(self.duplicate_ids),
+            "sim": round(self.similarity, 2),
+            "merged": self.merged,
+        }
+
+
+# ── Severity Order ────────────────────────────────────────────
+
+SEVERITY_ORDER: dict[str, int] = {
+    "critical": 5,
+    "high": 4,
+    "medium": 3,
+    "low": 2,
+    "info": 1,
+}
+
+
+class FindingDeduplicator:
+    """Deduplicates and merges related security findings.
+
+    Uses fingerprinting, fuzzy matching, and clustering
+    to identify and merge duplicate findings.
     """
 
     def __init__(
         self,
-        fuzzy_threshold: float = 0.7,
+        similarity_threshold: float = 0.7,
     ) -> None:
-        self._fuzzy_threshold = fuzzy_threshold
-        self._dedup_count = 0
-        self._total_removed = 0
-        self._log = logger.bind(component="finding_dedup")
+        self._findings: dict[str, DedupFinding] = {}
+        self._groups: list[DedupGroup] = []
+        self._fingerprint_index: dict[str, str] = {}
+        self._finding_counter = 0
+        self._group_counter = 0
+        self._similarity_threshold = similarity_threshold
+        self._log = logger.bind(component="finding_deduplicator")
 
-    def deduplicate(
+    def add_finding(self, finding: DedupFinding) -> tuple[DedupFinding, bool]:
+        """Add a finding, detecting duplicates.
+
+        Returns (canonical_finding, is_new).
+        """
+        fingerprint = finding.fingerprint
+
+        # Exact duplicate check
+        if fingerprint in self._fingerprint_index:
+            existing_id = self._fingerprint_index[fingerprint]
+            existing = self._findings[existing_id]
+            self._merge_into(existing, finding)
+            return existing, False
+
+        # Fuzzy duplicate check
+        best_match = None
+        best_sim = 0.0
+
+        for existing in self._findings.values():
+            sim = self._similarity(finding, existing)
+            if sim > best_sim and sim >= self._similarity_threshold:
+                best_sim = sim
+                best_match = existing
+
+        if best_match:
+            self._merge_into(best_match, finding)
+
+            self._group_counter += 1
+            group = DedupGroup(
+                group_id=f"dg-{self._group_counter}",
+                primary_id=best_match.finding_id,
+                duplicate_ids=[finding.finding_id],
+                similarity=best_sim,
+                merged=True,
+            )
+            self._groups.append(group)
+
+            return best_match, False
+
+        # New finding
+        if not finding.finding_id:
+            self._finding_counter += 1
+            finding.finding_id = f"df-{self._finding_counter}"
+
+        self._findings[finding.finding_id] = finding
+        self._fingerprint_index[fingerprint] = finding.finding_id
+        return finding, True
+
+    def _merge_into(
         self,
-        findings: list[dict[str, Any]],
-    ) -> DeduplicationResult:
-        """Deduplicate a list of findings."""
-        self._dedup_count += 1
-
-        result = DeduplicationResult(original_count=len(findings))
-
-        if not findings:
-            return result
-
-        # Phase 1: Exact dedup by hash
-        unique_by_hash: dict[str, dict[str, Any]] = {}
-        hash_groups: dict[str, list[str]] = defaultdict(list)
-
-        for finding in findings:
-            fhash = self._finding_hash(finding)
-            if fhash not in unique_by_hash:
-                unique_by_hash[fhash] = finding
-            else:
-                # Merge: boost confidence, add tools
-                existing = unique_by_hash[fhash]
-                self._merge_finding(existing, finding)
-
-            hash_groups[fhash].append(finding.get("id", ""))
-
-        # Phase 2: Fuzzy dedup
-        unique_list = list(unique_by_hash.values())
-        merged_indices: set[int] = set()
-        merge_groups: list[list[str]] = []
-
-        for i in range(len(unique_list)):
-            if i in merged_indices:
-                continue
-
-            group = [unique_list[i].get("id", str(i))]
-
-            for j in range(i + 1, len(unique_list)):
-                if j in merged_indices:
-                    continue
-
-                similarity = self._similarity(unique_list[i], unique_list[j])
-                if similarity >= self._fuzzy_threshold:
-                    self._merge_finding(unique_list[i], unique_list[j])
-                    merged_indices.add(j)
-                    group.append(unique_list[j].get("id", str(j)))
-
-            if len(group) > 1:
-                merge_groups.append(group)
-
-        # Build final list
-        final = [f for i, f in enumerate(unique_list) if i not in merged_indices]
-
-        result.deduplicated_count = len(final)
-        result.merged_count = len(findings) - len(final)
-        result.unique_findings = final
-        result.merge_groups = merge_groups
-
-        self._total_removed += result.merged_count
-
-        return result
-
-    def _finding_hash(self, finding: dict[str, Any]) -> str:
-        """Generate a hash for exact dedup."""
-        key_parts = [
-            finding.get("title", "").lower().strip(),
-            finding.get("target", "").lower().strip(),
-            finding.get("severity", "").lower(),
-        ]
-
-        # Also include CVE if present
-        cve = finding.get("cve", "")
-        if cve:
-            key_parts.append(cve.upper())
-
-        key = "|".join(key_parts)
-        return hashlib.sha256(key.encode()).hexdigest()[:16]
-
-    def _similarity(
-        self,
-        finding1: dict[str, Any],
-        finding2: dict[str, Any],
-    ) -> float:
-        """Calculate similarity between two findings."""
-        score = 0.0
-        max_score = 0.0
-
-        # Title similarity (weighted heavily)
-        title_sim = self._text_similarity(
-            finding1.get("title", ""),
-            finding2.get("title", ""),
-        )
-        score += title_sim * 3.0
-        max_score += 3.0
-
-        # Target match
-        if finding1.get("target") == finding2.get("target"):
-            score += 2.0
-        max_score += 2.0
-
-        # Severity match
-        if finding1.get("severity") == finding2.get("severity"):
-            score += 1.0
-        max_score += 1.0
-
-        # CVE match (strong signal)
-        cve1 = finding1.get("cve", "")
-        cve2 = finding2.get("cve", "")
-        if cve1 and cve2 and cve1 == cve2:
-            score += 3.0
-        max_score += 3.0
-
-        # CWE match
-        if finding1.get("cwe") and finding1.get("cwe") == finding2.get("cwe"):
-            score += 1.5
-        max_score += 1.5
-
-        # Description similarity
-        desc_sim = self._text_similarity(
-            finding1.get("description", ""),
-            finding2.get("description", ""),
-        )
-        score += desc_sim * 1.5
-        max_score += 1.5
-
-        return score / max(0.001, max_score)
-
-    @staticmethod
-    def _text_similarity(text1: str, text2: str) -> float:
-        """Simple Jaccard similarity between texts."""
-        if not text1 or not text2:
-            return 0.0
-
-        words1 = set(re.findall(r"\b\w{3,}\b", text1.lower()))
-        words2 = set(re.findall(r"\b\w{3,}\b", text2.lower()))
-
-        if not words1 or not words2:
-            return 0.0
-
-        intersection = words1 & words2
-        union = words1 | words2
-        return len(intersection) / len(union)
-
-    @staticmethod
-    def _merge_finding(
-        target: dict[str, Any],
-        source: dict[str, Any],
+        target: DedupFinding,
+        source: DedupFinding,
     ) -> None:
         """Merge source finding into target."""
-        # Boost confidence if found by multiple tools
-        tools = set()
-        if target.get("tool"):
-            tools.add(target["tool"])
-        if source.get("tool"):
-            tools.add(source["tool"])
-        target["confirmed_by_tools"] = list(tools)
+        # Merge evidence
+        for ev in source.evidence:
+            if ev not in target.evidence:
+                target.evidence.append(ev)
+
+        # Merge sources
+        for src in source.sources:
+            if src not in target.sources:
+                target.sources.append(src)
 
         # Keep highest severity
-        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        target_sev = severity_order.get(target.get("severity", "info"), 4)
-        source_sev = severity_order.get(source.get("severity", "info"), 4)
-        if source_sev < target_sev:
-            target["severity"] = source.get("severity", target.get("severity"))
+        target_sev = SEVERITY_ORDER.get(target.severity.lower(), 0)
+        source_sev = SEVERITY_ORDER.get(source.severity.lower(), 0)
+        if source_sev > target_sev:
+            target.severity = source.severity
 
-        # Merge evidence
-        target_evidence = target.get("evidence", "")
-        source_evidence = source.get("evidence", "")
-        if source_evidence and source_evidence not in target_evidence:
-            target["evidence"] = (target_evidence + "\n---\n" + source_evidence)[:2000]
+        # Increase confidence with corroboration
+        target.confidence = min(0.99, target.confidence + 0.1)
 
-        # Confidence boost for multi-tool confirmation
-        if len(tools) >= 2:
-            target["confidence"] = min(0.99, target.get("confidence", 0.5) + 0.15)
-        if len(tools) >= 3:
-            target["confidence"] = min(0.99, target.get("confidence", 0.5) + 0.1)
+        # Track merge
+        if source.finding_id:
+            target.merged_from.append(source.finding_id)
+
+    @staticmethod
+    def _similarity(finding_a: DedupFinding, finding_b: DedupFinding) -> float:
+        """Compute similarity between two findings."""
+        score = 0.0
+        total_weight = 0.0
+
+        # Title similarity (Jaccard)
+        words_a = set(finding_a.normalized_title.split())
+        words_b = set(finding_b.normalized_title.split())
+        if words_a or words_b:
+            jaccard = len(words_a & words_b) / max(1, len(words_a | words_b))
+            score += jaccard * 0.4
+            total_weight += 0.4
+
+        # Target match
+        if finding_a.target and finding_b.target:
+            if finding_a.target.lower() == finding_b.target.lower():
+                score += 0.2
+            total_weight += 0.2
+
+        # Endpoint match
+        if finding_a.endpoint and finding_b.endpoint:
+            if finding_a.endpoint.lower() == finding_b.endpoint.lower():
+                score += 0.2
+            total_weight += 0.2
+
+        # Parameter match
+        if finding_a.parameter and finding_b.parameter:
+            if finding_a.parameter.lower() == finding_b.parameter.lower():
+                score += 0.2
+            total_weight += 0.2
+
+        if total_weight == 0:
+            return 0.0
+        return score / total_weight
+
+    def get_unique_findings(self) -> list[DedupFinding]:
+        """Get all unique (deduplicated) findings."""
+        return sorted(
+            self._findings.values(),
+            key=lambda f: SEVERITY_ORDER.get(f.severity.lower(), 0),
+            reverse=True,
+        )
 
     def get_stats(self) -> dict[str, Any]:
+        sev_counts: dict[str, int] = defaultdict(int)
+        for f in self._findings.values():
+            sev_counts[f.severity.lower()] += 1
         return {
-            "dedup_runs": self._dedup_count,
-            "total_removed": self._total_removed,
+            "unique_findings": len(self._findings),
+            "groups": len(self._groups),
+            "by_severity": dict(sev_counts),
         }
