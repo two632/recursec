@@ -1,13 +1,13 @@
-"""Threat modeler — models threats using STRIDE and DREAD methodologies.
+"""Threat modeler — generates threat models for targets.
 
 Implements:
-1. STRIDE threat classification
-2. DREAD risk scoring
-3. Attack tree generation
-4. Threat-asset mapping
-5. Data flow analysis
-6. Trust boundary identification
-7. Mitigation recommendation
+1. STRIDE-based threat modeling
+2. Attack surface enumeration
+3. Threat actor profiling
+4. Attack tree construction
+5. Risk scoring (impact x likelihood)
+6. Trust boundary analysis
+7. Data flow analysis
 8. Threat prioritization
 """
 
@@ -23,7 +23,7 @@ import structlog
 logger = structlog.get_logger()
 
 
-class StrideCategory(str, Enum):
+class STRIDECategory(str, Enum):
     SPOOFING = "spoofing"
     TAMPERING = "tampering"
     REPUDIATION = "repudiation"
@@ -32,363 +32,371 @@ class StrideCategory(str, Enum):
     ELEVATION_OF_PRIVILEGE = "elevation_of_privilege"
 
 
-@dataclass
-class DreadScore:
-    """DREAD risk scoring model."""
-    damage: int = 5          # 1-10
-    reproducibility: int = 5  # 1-10
-    exploitability: int = 5   # 1-10
-    affected_users: int = 5   # 1-10
-    discoverability: int = 5  # 1-10
+class ThreatActorType(str, Enum):
+    SCRIPT_KIDDIE = "script_kiddie"
+    OPPORTUNISTIC = "opportunistic"
+    CYBERCRIMINAL = "cybercriminal"
+    HACKTIVIST = "hacktivist"
+    INSIDER = "insider"
+    NATION_STATE = "nation_state"
+    APT = "apt"
 
-    @property
-    def total(self) -> float:
-        return (self.damage + self.reproducibility + self.exploitability +
-                self.affected_users + self.discoverability) / 5.0
 
-    @property
-    def risk_level(self) -> str:
-        score = self.total
-        if score >= 8.0:
-            return "critical"
-        if score >= 6.0:
-            return "high"
-        if score >= 4.0:
-            return "medium"
-        return "low"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "D": self.damage, "R": self.reproducibility,
-            "E": self.exploitability, "A": self.affected_users,
-            "D2": self.discoverability,
-            "total": round(self.total, 1),
-            "risk": self.risk_level,
-        }
+class ComponentType(str, Enum):
+    WEB_APP = "web_app"
+    API = "api"
+    DATABASE = "database"
+    AUTH_SERVICE = "auth_service"
+    FILE_STORAGE = "file_storage"
+    MESSAGE_QUEUE = "message_queue"
+    CACHE = "cache"
+    CDN = "cdn"
+    LOAD_BALANCER = "load_balancer"
+    DNS = "dns"
+    EXTERNAL_SERVICE = "external_service"
 
 
 @dataclass
-class Threat:
-    """A modeled threat."""
-    threat_id: str = ""
-    title: str = ""
-    description: str = ""
-    stride: StrideCategory = StrideCategory.SPOOFING
-    dread: DreadScore = field(default_factory=DreadScore)
-    affected_assets: list[str] = field(default_factory=list)
-    attack_vector: str = ""
-    prerequisites: list[str] = field(default_factory=list)
-    mitigations: list[str] = field(default_factory=list)
-    is_mitigated: bool = False
-    finding_ids: list[str] = field(default_factory=list)
+class SystemComponent:
+    """A component in the target system."""
+    component_id: str = ""
+    name: str = ""
+    component_type: ComponentType = ComponentType.WEB_APP
+    technologies: list[str] = field(default_factory=list)
+    exposed: bool = False
+    trust_level: int = 0       # 0=untrusted, 1=semi, 2=trusted, 3=highly-trusted
+    data_sensitivity: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.threat_id, "title": self.title[:60],
-            "stride": self.stride.value,
-            "dread": self.dread.to_dict(),
-            "assets": self.affected_assets[:5],
-            "mitigated": self.is_mitigated,
+            "id": self.component_id,
+            "name": self.name[:20],
+            "type": self.component_type.value,
+            "exposed": self.exposed,
+            "trust": self.trust_level,
         }
 
 
 @dataclass
 class DataFlow:
-    """A data flow in the system."""
+    """Data flow between components."""
     flow_id: str = ""
     source: str = ""
     destination: str = ""
-    data_type: str = ""            # auth, user_data, api_call, file, config
-    protocol: str = ""             # http, https, tcp, udp, grpc
-    crosses_boundary: bool = False
-    is_encrypted: bool = False
+    data_type: str = ""
+    protocol: str = ""
+    encrypted: bool = False
+    crosses_trust_boundary: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.flow_id, "source": self.source[:30],
-            "dest": self.destination[:30],
-            "encrypted": self.is_encrypted,
-            "boundary": self.crosses_boundary,
+            "id": self.flow_id,
+            "src": self.source[:15],
+            "dst": self.destination[:15],
+            "encrypted": self.encrypted,
+            "boundary": self.crosses_trust_boundary,
+        }
+
+
+@dataclass
+class ThreatEntry:
+    """A threat in the model."""
+    threat_id: str = ""
+    title: str = ""
+    stride_category: STRIDECategory = STRIDECategory.SPOOFING
+    component: str = ""
+    description: str = ""
+    attack_vector: str = ""
+    impact: int = 5            # 1-10
+    likelihood: int = 5        # 1-10
+    mitigations: list[str] = field(default_factory=list)
+    affected_data_flows: list[str] = field(default_factory=list)
+    threat_actors: list[ThreatActorType] = field(default_factory=list)
+
+    @property
+    def risk_score(self) -> int:
+        return self.impact * self.likelihood
+
+    @property
+    def risk_level(self) -> str:
+        score = self.risk_score
+        if score >= 70:
+            return "critical"
+        if score >= 50:
+            return "high"
+        if score >= 25:
+            return "medium"
+        return "low"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.threat_id,
+            "title": self.title[:30],
+            "stride": self.stride_category.value,
+            "risk": self.risk_score,
+            "level": self.risk_level,
+            "mitigations": len(self.mitigations),
+        }
+
+
+@dataclass
+class AttackTreeNode:
+    """Node in an attack tree."""
+    node_id: str = ""
+    description: str = ""
+    is_and: bool = False       # AND node (all children needed) vs OR node
+    cost: int = 0
+    difficulty: int = 0
+    children: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.node_id,
+            "desc": self.description[:30],
+            "type": "AND" if self.is_and else "OR",
+            "children": len(self.children),
         }
 
 
 @dataclass
 class ThreatModel:
-    """A complete threat model."""
+    """Complete threat model for a target."""
     model_id: str = ""
     target: str = ""
-    threats: list[Threat] = field(default_factory=list)
+    components: list[SystemComponent] = field(default_factory=list)
     data_flows: list[DataFlow] = field(default_factory=list)
-    assets: list[str] = field(default_factory=list)
-    trust_boundaries: list[str] = field(default_factory=list)
+    threats: list[ThreatEntry] = field(default_factory=list)
+    attack_trees: dict[str, AttackTreeNode] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.model_id, "target": self.target[:40],
+            "id": self.model_id,
+            "target": self.target[:25],
+            "components": len(self.components),
+            "flows": len(self.data_flows),
             "threats": len(self.threats),
-            "data_flows": len(self.data_flows),
-            "assets": len(self.assets),
+            "trees": len(self.attack_trees),
         }
 
 
-# ── STRIDE Patterns ───────────────────────────────────────────
+# ── Default STRIDE Threats per Component ──────────────────────
 
-STRIDE_PATTERNS: dict[str, list[dict[str, Any]]] = {
+STRIDE_THREATS: dict[str, list[dict[str, Any]]] = {
     "web_app": [
-        {
-            "stride": "spoofing", "title": "Session Hijacking",
-            "desc": "Attacker steals or forges session tokens",
-            "vector": "Cookie theft, session fixation",
-            "dread": {"D": 8, "R": 7, "E": 6, "A": 8, "D2": 5},
-            "mitigations": ["Secure cookie flags", "Session timeout", "HTTPS only"],
-        },
-        {
-            "stride": "spoofing", "title": "Credential Stuffing",
-            "desc": "Using leaked credentials to gain access",
-            "vector": "Login endpoint",
-            "dread": {"D": 8, "R": 9, "E": 8, "A": 7, "D2": 8},
-            "mitigations": ["MFA", "Rate limiting", "Account lockout"],
-        },
-        {
-            "stride": "tampering", "title": "SQL Injection",
-            "desc": "Modifying SQL queries through user input",
-            "vector": "Input fields, URL parameters",
-            "dread": {"D": 10, "R": 8, "E": 7, "A": 10, "D2": 7},
-            "mitigations": ["Parameterized queries", "Input validation", "WAF"],
-        },
-        {
-            "stride": "tampering", "title": "Cross-Site Scripting (XSS)",
-            "desc": "Injecting malicious scripts into pages",
-            "vector": "Input fields, URL parameters",
-            "dread": {"D": 7, "R": 8, "E": 7, "A": 9, "D2": 8},
-            "mitigations": ["Output encoding", "CSP", "Input sanitization"],
-        },
-        {
-            "stride": "information_disclosure", "title": "Sensitive Data Exposure",
-            "desc": "Unprotected sensitive data in transit or at rest",
-            "vector": "HTTP responses, error messages, debug info",
-            "dread": {"D": 9, "R": 7, "E": 5, "A": 8, "D2": 6},
-            "mitigations": ["Encryption", "Data classification", "Error handling"],
-        },
-        {
-            "stride": "denial_of_service", "title": "Application DoS",
-            "desc": "Overwhelming application resources",
-            "vector": "Complex queries, file uploads, API abuse",
-            "dread": {"D": 7, "R": 8, "E": 7, "A": 10, "D2": 7},
-            "mitigations": ["Rate limiting", "Input validation", "CDN"],
-        },
-        {
-            "stride": "elevation_of_privilege", "title": "IDOR",
-            "desc": "Accessing other users' data via ID manipulation",
-            "vector": "API endpoints, URL parameters",
-            "dread": {"D": 8, "R": 9, "E": 8, "A": 7, "D2": 6},
-            "mitigations": ["Authorization checks", "UUID instead of sequential IDs"],
-        },
-        {
-            "stride": "elevation_of_privilege", "title": "Privilege Escalation",
-            "desc": "Gaining admin access from regular user",
-            "vector": "Admin endpoints, role manipulation",
-            "dread": {"D": 10, "R": 6, "E": 5, "A": 10, "D2": 4},
-            "mitigations": ["RBAC", "Principle of least privilege", "Authorization checks"],
-        },
-    ],
-    "network": [
-        {
-            "stride": "spoofing", "title": "ARP Spoofing",
-            "desc": "Impersonating another host on the network",
-            "vector": "Local network",
-            "dread": {"D": 7, "R": 8, "E": 6, "A": 6, "D2": 4},
-            "mitigations": ["Static ARP entries", "Network segmentation", "802.1X"],
-        },
-        {
-            "stride": "tampering", "title": "Man-in-the-Middle",
-            "desc": "Intercepting and modifying network traffic",
-            "vector": "Network position",
-            "dread": {"D": 9, "R": 5, "E": 5, "A": 8, "D2": 4},
-            "mitigations": ["TLS", "Certificate pinning", "VPN"],
-        },
-        {
-            "stride": "information_disclosure", "title": "Network Sniffing",
-            "desc": "Capturing unencrypted network traffic",
-            "vector": "Network access",
-            "dread": {"D": 8, "R": 9, "E": 7, "A": 7, "D2": 5},
-            "mitigations": ["Encryption", "Network segmentation", "VPN"],
-        },
-        {
-            "stride": "denial_of_service", "title": "Network Flood",
-            "desc": "Overwhelming network bandwidth",
-            "vector": "Internet",
-            "dread": {"D": 7, "R": 9, "E": 8, "A": 10, "D2": 8},
-            "mitigations": ["DDoS protection", "Rate limiting", "CDN"],
-        },
+        {"stride": "spoofing", "title": "Session hijacking", "desc": "Steal/forge session tokens", "impact": 8, "likelihood": 6, "mitigations": ["Secure session management", "HTTPOnly cookies", "SameSite attribute"]},
+        {"stride": "tampering", "title": "Client-side data modification", "desc": "Tamper with form data or API requests", "impact": 7, "likelihood": 7, "mitigations": ["Server-side validation", "Input sanitization"]},
+        {"stride": "information_disclosure", "title": "Sensitive data in response", "desc": "API responses leak sensitive data", "impact": 8, "likelihood": 5, "mitigations": ["Response filtering", "Data minimization"]},
+        {"stride": "denial_of_service", "title": "Application-layer DoS", "desc": "Resource exhaustion via expensive requests", "impact": 6, "likelihood": 5, "mitigations": ["Rate limiting", "Request size limits"]},
+        {"stride": "elevation_of_privilege", "title": "IDOR access control bypass", "desc": "Access other users' data via ID manipulation", "impact": 9, "likelihood": 7, "mitigations": ["Authorization checks", "Object-level access control"]},
     ],
     "api": [
-        {
-            "stride": "spoofing", "title": "API Key Theft",
-            "desc": "Stealing or leaking API keys",
-            "vector": "Code repos, logs, headers",
-            "dread": {"D": 8, "R": 7, "E": 7, "A": 7, "D2": 7},
-            "mitigations": ["Key rotation", "Secrets management", "Scoped keys"],
-        },
-        {
-            "stride": "tampering", "title": "API Parameter Tampering",
-            "desc": "Modifying API request parameters",
-            "vector": "API endpoints",
-            "dread": {"D": 7, "R": 8, "E": 7, "A": 6, "D2": 7},
-            "mitigations": ["Input validation", "Schema validation", "HMAC"],
-        },
-        {
-            "stride": "information_disclosure", "title": "Excessive Data Exposure",
-            "desc": "API returns more data than needed",
-            "vector": "API responses",
-            "dread": {"D": 6, "R": 9, "E": 5, "A": 8, "D2": 5},
-            "mitigations": ["Response filtering", "GraphQL limits", "Field selection"],
-        },
+        {"stride": "spoofing", "title": "API key theft", "desc": "Steal API keys from logs/config/traffic", "impact": 9, "likelihood": 5, "mitigations": ["Key rotation", "Secrets manager", "TLS"]},
+        {"stride": "tampering", "title": "Parameter pollution", "desc": "Inject extra parameters to bypass logic", "impact": 7, "likelihood": 6, "mitigations": ["Strict schema validation", "Whitelist params"]},
+        {"stride": "information_disclosure", "title": "Excessive data exposure", "desc": "API returns more fields than needed", "impact": 6, "likelihood": 8, "mitigations": ["Response filtering", "GraphQL depth limiting"]},
+        {"stride": "elevation_of_privilege", "title": "Broken function level auth", "desc": "Access admin endpoints without authorization", "impact": 10, "likelihood": 5, "mitigations": ["Role-based access control", "Endpoint authorization"]},
+    ],
+    "database": [
+        {"stride": "tampering", "title": "SQL injection", "desc": "Inject SQL via application inputs", "impact": 10, "likelihood": 4, "mitigations": ["Parameterized queries", "ORM", "WAF"]},
+        {"stride": "information_disclosure", "title": "Database exposure", "desc": "Database port exposed to internet", "impact": 10, "likelihood": 3, "mitigations": ["Network segmentation", "Firewall rules"]},
+        {"stride": "denial_of_service", "title": "Query bomb", "desc": "Complex queries exhausting database resources", "impact": 7, "likelihood": 4, "mitigations": ["Query timeout", "Connection pooling"]},
+    ],
+    "auth_service": [
+        {"stride": "spoofing", "title": "Credential stuffing", "desc": "Automated login attempts with leaked credentials", "impact": 8, "likelihood": 8, "mitigations": ["Rate limiting", "CAPTCHA", "MFA"]},
+        {"stride": "spoofing", "title": "JWT forgery", "desc": "Forge tokens via algorithm confusion or weak keys", "impact": 10, "likelihood": 4, "mitigations": ["Strong keys", "Algorithm whitelist", "Token validation"]},
+        {"stride": "elevation_of_privilege", "title": "Privilege escalation via token manipulation", "desc": "Modify role claims in tokens", "impact": 10, "likelihood": 4, "mitigations": ["Token signing verification", "Server-side role checks"]},
+    ],
+    "file_storage": [
+        {"stride": "information_disclosure", "title": "Public bucket/blob exposure", "desc": "Cloud storage publicly readable", "impact": 9, "likelihood": 6, "mitigations": ["Private by default", "Access policies", "Monitoring"]},
+        {"stride": "tampering", "title": "Malicious file upload", "desc": "Upload executable/malware via file upload", "impact": 8, "likelihood": 5, "mitigations": ["File type validation", "Virus scanning", "Content-Type enforcement"]},
+    ],
+    "dns": [
+        {"stride": "spoofing", "title": "DNS cache poisoning", "desc": "Insert fake DNS records into resolver", "impact": 9, "likelihood": 3, "mitigations": ["DNSSEC", "Source port randomization"]},
+        {"stride": "spoofing", "title": "DNS rebinding", "desc": "Change DNS resolution to access internal network", "impact": 8, "likelihood": 4, "mitigations": ["DNS pinning", "Host header validation"]},
     ],
 }
 
 
 class ThreatModeler:
-    """Models threats using STRIDE and DREAD methodologies.
+    """Generates threat models for targets.
 
-    Generates threat models for targets based on
-    their type, technologies, and discovered data.
+    Creates STRIDE-based threat models with attack surfaces,
+    data flows, trust boundaries, and prioritized threats.
     """
 
     def __init__(self) -> None:
         self._models: dict[str, ThreatModel] = {}
         self._model_counter = 0
-        self._threat_counter = 0
+        self._component_counter = 0
         self._flow_counter = 0
+        self._threat_counter = 0
+        self._node_counter = 0
         self._log = logger.bind(component="threat_modeler")
 
-    def create_model(
-        self,
-        target: str,
-        target_type: str = "web_app",
-        technologies: list[str] | None = None,
-        assets: list[str] | None = None,
-    ) -> ThreatModel:
-        """Create a threat model for a target."""
+    def create_model(self, target: str) -> ThreatModel:
+        """Create a new threat model for a target."""
         self._model_counter += 1
-        model_id = f"tm-{self._model_counter}"
-
         model = ThreatModel(
-            model_id=model_id,
+            model_id=f"tm-{self._model_counter}",
             target=target,
-            assets=assets or [],
         )
-
-        # Apply STRIDE patterns
-        patterns = STRIDE_PATTERNS.get(target_type, STRIDE_PATTERNS.get("web_app", []))
-
-        for pattern in patterns:
-            self._threat_counter += 1
-            threat = Threat(
-                threat_id=f"threat-{self._threat_counter}",
-                title=pattern["title"],
-                description=pattern["desc"],
-                stride=StrideCategory(pattern["stride"]),
-                dread=DreadScore(**pattern.get("dread", {})),
-                attack_vector=pattern.get("vector", ""),
-                mitigations=pattern.get("mitigations", []),
-            )
-
-            if assets:
-                threat.affected_assets = assets[:3]
-
-            model.threats.append(threat)
-
-        # Generate data flows
-        if target_type == "web_app":
-            model.data_flows = self._generate_web_flows(target)
-            model.trust_boundaries = [
-                "Internet → WAF",
-                "WAF → Web Server",
-                "Web Server → Application",
-                "Application → Database",
-            ]
-        elif target_type == "api":
-            model.data_flows = self._generate_api_flows(target)
-            model.trust_boundaries = [
-                "Client → API Gateway",
-                "API Gateway → Service",
-                "Service → Database",
-            ]
-
-        # Sort threats by risk
-        model.threats.sort(key=lambda t: t.dread.total, reverse=True)
-
-        self._models[model_id] = model
+        self._models[model.model_id] = model
         return model
 
-    def _generate_web_flows(self, target: str) -> list[DataFlow]:
-        """Generate typical web app data flows."""
-        flows = []
-        flow_defs = [
-            ("Client", "Web Server", "http_request", "https", True, True),
-            ("Web Server", "Application", "internal", "http", False, False),
-            ("Application", "Database", "sql_query", "tcp", True, False),
-            ("Client", "CDN", "static_assets", "https", True, True),
-            ("Application", "Cache", "cache_data", "tcp", False, False),
-            ("Application", "Auth Service", "auth_token", "https", True, True),
-        ]
-
-        for src, dst, data_type, proto, crosses, encrypted in flow_defs:
-            self._flow_counter += 1
-            flows.append(DataFlow(
-                flow_id=f"flow-{self._flow_counter}",
-                source=src, destination=dst,
-                data_type=data_type, protocol=proto,
-                crosses_boundary=crosses, is_encrypted=encrypted,
-            ))
-
-        return flows
-
-    def _generate_api_flows(self, target: str) -> list[DataFlow]:
-        """Generate typical API data flows."""
-        flows = []
-        flow_defs = [
-            ("Client", "API Gateway", "api_request", "https", True, True),
-            ("API Gateway", "Auth Service", "auth_check", "grpc", True, True),
-            ("API Gateway", "Service", "request", "grpc", False, True),
-            ("Service", "Database", "query", "tcp", True, False),
-        ]
-
-        for src, dst, data_type, proto, crosses, encrypted in flow_defs:
-            self._flow_counter += 1
-            flows.append(DataFlow(
-                flow_id=f"flow-{self._flow_counter}",
-                source=src, destination=dst,
-                data_type=data_type, protocol=proto,
-                crosses_boundary=crosses, is_encrypted=encrypted,
-            ))
-
-        return flows
-
-    def prioritize_threats(
+    def add_component(
         self,
         model_id: str,
-    ) -> list[dict[str, Any]]:
-        """Prioritize threats by DREAD score."""
+        name: str,
+        component_type: ComponentType,
+        exposed: bool = False,
+        trust_level: int = 0,
+        technologies: list[str] | None = None,
+    ) -> SystemComponent | None:
+        """Add a component to the threat model."""
+        model = self._models.get(model_id)
+        if not model:
+            return None
+
+        self._component_counter += 1
+        component = SystemComponent(
+            component_id=f"comp-{self._component_counter}",
+            name=name,
+            component_type=component_type,
+            exposed=exposed,
+            trust_level=trust_level,
+            technologies=technologies or [],
+        )
+        model.components.append(component)
+
+        # Auto-generate STRIDE threats for this component
+        self._generate_threats(model, component)
+
+        return component
+
+    def add_data_flow(
+        self,
+        model_id: str,
+        source: str,
+        destination: str,
+        data_type: str = "",
+        protocol: str = "",
+        encrypted: bool = False,
+    ) -> DataFlow | None:
+        """Add a data flow between components."""
+        model = self._models.get(model_id)
+        if not model:
+            return None
+
+        self._flow_counter += 1
+
+        # Determine if it crosses a trust boundary
+        src_comp = next((c for c in model.components if c.name == source), None)
+        dst_comp = next((c for c in model.components if c.name == destination), None)
+        crosses_boundary = False
+        if src_comp and dst_comp:
+            crosses_boundary = src_comp.trust_level != dst_comp.trust_level
+
+        flow = DataFlow(
+            flow_id=f"flow-{self._flow_counter}",
+            source=source,
+            destination=destination,
+            data_type=data_type,
+            protocol=protocol,
+            encrypted=encrypted,
+            crosses_trust_boundary=crosses_boundary,
+        )
+        model.data_flows.append(flow)
+
+        # Add threats for unencrypted cross-boundary flows
+        if crosses_boundary and not encrypted:
+            self._threat_counter += 1
+            model.threats.append(ThreatEntry(
+                threat_id=f"th-{self._threat_counter}",
+                title=f"Unencrypted data flow: {source} → {destination}",
+                stride_category=STRIDECategory.INFORMATION_DISCLOSURE,
+                component=f"{source}/{destination}",
+                description=f"Data flow from {source} to {destination} crosses trust boundary without encryption",
+                impact=7,
+                likelihood=5,
+                mitigations=["Enable TLS/mTLS", "Encrypt sensitive fields"],
+                affected_data_flows=[flow.flow_id],
+            ))
+
+        return flow
+
+    def _generate_threats(
+        self,
+        model: ThreatModel,
+        component: SystemComponent,
+    ) -> None:
+        """Generate STRIDE threats for a component."""
+        threat_templates = STRIDE_THREATS.get(component.component_type.value, [])
+
+        for tmpl in threat_templates:
+            self._threat_counter += 1
+
+            # Adjust likelihood for exposed components
+            likelihood = tmpl["likelihood"]
+            if component.exposed:
+                likelihood = min(10, likelihood + 2)
+
+            model.threats.append(ThreatEntry(
+                threat_id=f"th-{self._threat_counter}",
+                title=tmpl["title"],
+                stride_category=STRIDECategory(tmpl["stride"]),
+                component=component.name,
+                description=tmpl.get("desc", ""),
+                impact=tmpl["impact"],
+                likelihood=likelihood,
+                mitigations=tmpl.get("mitigations", []),
+            ))
+
+    def build_attack_tree(
+        self,
+        model_id: str,
+        root_goal: str,
+        sub_goals: list[dict[str, Any]],
+    ) -> AttackTreeNode | None:
+        """Build an attack tree for a goal."""
+        model = self._models.get(model_id)
+        if not model:
+            return None
+
+        self._node_counter += 1
+        root = AttackTreeNode(
+            node_id=f"atn-{self._node_counter}",
+            description=root_goal,
+            is_and=False,
+        )
+        model.attack_trees[root.node_id] = root
+
+        for sub in sub_goals:
+            self._node_counter += 1
+            child = AttackTreeNode(
+                node_id=f"atn-{self._node_counter}",
+                description=sub.get("desc", ""),
+                cost=sub.get("cost", 0),
+                difficulty=sub.get("difficulty", 0),
+            )
+            model.attack_trees[child.node_id] = child
+            root.children.append(child.node_id)
+
+        return root
+
+    def prioritize_threats(self, model_id: str) -> list[ThreatEntry]:
+        """Get threats sorted by risk score."""
         model = self._models.get(model_id)
         if not model:
             return []
+        return sorted(model.threats, key=lambda t: t.risk_score, reverse=True)
 
-        return [t.to_dict() for t in model.threats]
-
-    def get_unmitigated(self, model_id: str) -> list[dict[str, Any]]:
-        """Get unmitigated threats."""
-        model = self._models.get(model_id)
-        if not model:
-            return []
-
-        return [t.to_dict() for t in model.threats if not t.is_mitigated]
+    def get_model(self, model_id: str) -> ThreatModel | None:
+        return self._models.get(model_id)
 
     def get_stats(self) -> dict[str, Any]:
+        total_threats = sum(len(m.threats) for m in self._models.values())
         return {
             "models": len(self._models),
-            "threats": self._threat_counter,
-            "data_flows": self._flow_counter,
+            "total_threats": total_threats,
+            "total_components": sum(len(m.components) for m in self._models.values()),
         }
