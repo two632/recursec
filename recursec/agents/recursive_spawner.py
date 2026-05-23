@@ -1,14 +1,14 @@
-"""Recursive agent spawner — bounded recursive agent hierarchy.
+"""Recursive agent spawner — dynamic child agent management.
 
-Implements the core recursive multi-agent pattern:
-1. Parent agents decompose goals into sub-goals
-2. Child agents are dynamically instantiated with specific roles
-3. Budget decay (70% per level) prevents runaway recursion
-4. Max depth limits (default 5 levels)
-5. Agent pools for reuse of common agent types
-6. Result aggregation from children to parent
-7. Timeout enforcement per agent
-8. State tracking across recursion levels
+Implements:
+1. Budget-decayed child spawning (70% budget per level)
+2. Role-based agent assignment
+3. Depth-limited recursion (max 5)
+4. Result aggregation from children
+5. Child lifecycle management
+6. Inter-agent communication
+7. Work stealing between idle agents
+8. Agent pool management
 """
 
 from __future__ import annotations
@@ -28,429 +28,400 @@ class AgentRole(str, Enum):
     COORDINATOR = "coordinator"
     RECON = "recon"
     SCANNER = "scanner"
-    ANALYZER = "analyzer"
     EXPLOITER = "exploiter"
     VALIDATOR = "validator"
+    ANALYZER = "analyzer"
     REPORTER = "reporter"
-    CODE_AUDITOR = "code_auditor"
-    NETWORK_ANALYST = "network_analyst"
+    CODE_REVIEWER = "code_reviewer"
     OSINT = "osint"
-    CLOUD_ANALYST = "cloud_analyst"
-    SUPPLY_CHAIN = "supply_chain"
-    REASONING = "reasoning"
-    PLANNING = "planning"
+    FUZZER = "fuzzer"
 
 
-class SpawnStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
+class SpawnReason(str, Enum):
+    TASK_DECOMPOSITION = "task_decomposition"
+    PARALLEL_SCAN = "parallel_scan"
+    VALIDATION = "validation"
+    SPECIALIZED_ANALYSIS = "specialized_analysis"
+    EXPLOITATION_ATTEMPT = "exploitation_attempt"
+    DEPTH_EXPANSION = "depth_expansion"
+
+
+class AgentState(str, Enum):
+    INITIALIZING = "initializing"
+    IDLE = "idle"
+    WORKING = "working"
+    WAITING = "waiting"
     COMPLETE = "complete"
     FAILED = "failed"
-    TIMEOUT = "timeout"
-    CANCELLED = "cancelled"
+    TERMINATED = "terminated"
 
 
 @dataclass
 class AgentBudget:
     """Resource budget for an agent."""
     max_tokens: int = 50000
+    max_tool_calls: int = 50
+    max_llm_calls: int = 20
     max_time_s: float = 600.0
-    max_tool_calls: int = 20
-    max_llm_queries: int = 10
-    max_child_agents: int = 5
-    tokens_used: int = 0
-    time_used_s: float = 0.0
-    tool_calls_used: int = 0
-    llm_queries_used: int = 0
-    children_spawned: int = 0
+    max_children: int = 5
+    max_depth: int = 5
+    used_tokens: int = 0
+    used_tool_calls: int = 0
+    used_llm_calls: int = 0
+    started_at: float = field(default_factory=time.time)
 
     @property
-    def tokens_remaining(self) -> int:
-        return max(0, self.max_tokens - self.tokens_used)
+    def token_remaining(self) -> int:
+        return max(0, self.max_tokens - self.used_tokens)
 
     @property
-    def time_remaining_s(self) -> float:
-        return max(0, self.max_time_s - self.time_used_s)
+    def time_remaining(self) -> float:
+        elapsed = time.time() - self.started_at
+        return max(0.0, self.max_time_s - elapsed)
 
     @property
-    def can_spawn_child(self) -> bool:
-        return self.children_spawned < self.max_child_agents
+    def budget_consumed(self) -> float:
+        token_frac = self.used_tokens / max(1, self.max_tokens)
+        tool_frac = self.used_tool_calls / max(1, self.max_tool_calls)
+        llm_frac = self.used_llm_calls / max(1, self.max_llm_calls)
+        return max(token_frac, tool_frac, llm_frac)
 
     def decay(self, factor: float = 0.7) -> "AgentBudget":
-        """Create a decayed budget for a child agent."""
+        """Create a decayed budget for child agent."""
         return AgentBudget(
-            max_tokens=int(self.tokens_remaining * factor),
-            max_time_s=self.time_remaining_s * factor,
-            max_tool_calls=max(1, int(self.max_tool_calls * factor)),
-            max_llm_queries=max(1, int(self.max_llm_queries * factor)),
-            max_child_agents=max(0, self.max_child_agents - 1),
+            max_tokens=int(self.token_remaining * factor),
+            max_tool_calls=int(max(1, self.max_tool_calls * factor)),
+            max_llm_calls=int(max(1, self.max_llm_calls * factor)),
+            max_time_s=self.time_remaining * factor,
+            max_children=max(0, self.max_children - 1),
+            max_depth=self.max_depth - 1,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "tokens": f"{self.tokens_used}/{self.max_tokens}",
-            "time": f"{self.time_used_s:.0f}/{self.max_time_s:.0f}s",
-            "tools": f"{self.tool_calls_used}/{self.max_tool_calls}",
-            "llm": f"{self.llm_queries_used}/{self.max_llm_queries}",
-            "children": f"{self.children_spawned}/{self.max_child_agents}",
+            "tokens": f"{self.used_tokens}/{self.max_tokens}",
+            "tools": f"{self.used_tool_calls}/{self.max_tool_calls}",
+            "llm": f"{self.used_llm_calls}/{self.max_llm_calls}",
+            "time_remaining": round(self.time_remaining, 0),
+            "consumed": round(self.budget_consumed, 2),
         }
 
 
 @dataclass
-class SpawnedAgent:
-    """A spawned agent instance."""
+class ChildAgent:
+    """A spawned child agent."""
     agent_id: str = ""
-    role: AgentRole = AgentRole.COORDINATOR
+    role: AgentRole = AgentRole.SCANNER
+    state: AgentState = AgentState.INITIALIZING
     parent_id: str = ""
     depth: int = 0
-    goal: str = ""
-    context: str = ""
-    tools: list[str] = field(default_factory=list)
-    model: str = ""
+    task: str = ""
+    target: str = ""
     budget: AgentBudget = field(default_factory=AgentBudget)
-    status: SpawnStatus = SpawnStatus.PENDING
+    spawn_reason: SpawnReason = SpawnReason.TASK_DECOMPOSITION
+    model: str = ""
+    tools: list[str] = field(default_factory=list)
+    findings: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] = field(default_factory=dict)
-    children: list[str] = field(default_factory=list)
+    children_ids: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     completed_at: float = 0.0
-    system_prompt: str = ""
 
     @property
     def duration_s(self) -> float:
-        if self.completed_at > 0:
-            return self.completed_at - self.created_at
-        return time.time() - self.created_at
+        end = self.completed_at if self.completed_at > 0 else time.time()
+        return end - self.created_at
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.agent_id[:10],
             "role": self.role.value,
+            "state": self.state.value,
             "depth": self.depth,
-            "parent": self.parent_id[:10] if self.parent_id else "root",
-            "status": self.status.value,
-            "children": len(self.children),
+            "task": self.task[:25],
+            "findings": len(self.findings),
+            "children": len(self.children_ids),
             "budget": self.budget.to_dict(),
         }
 
 
-# ── Role → Model + Tools Mapping ─────────────────────────────
+# ── Role→Model+Tool assignments ─────────────────────────────
 
-ROLE_CONFIG: dict[str, dict[str, Any]] = {
+ROLE_CONFIGS: dict[str, dict[str, Any]] = {
     "coordinator": {
-        "model": "hermes-14b",
+        "models": ["hermes-14b", "deepseek-r1-7b"],
         "tools": [],
-        "system_prompt": (
-            "You are the COORDINATOR agent. Your job is to:\n"
-            "1. Decompose the security assessment goal into sub-tasks\n"
-            "2. Assign each sub-task to the appropriate specialist agent\n"
-            "3. Aggregate results from all child agents\n"
-            "4. Make decisions about what to investigate further\n"
-            "5. Produce the final assessment summary"
-        ),
+        "system_prompt": "You are a security assessment coordinator. Decompose the assessment goal into subtasks and assign to specialized agents.",
     },
     "recon": {
-        "model": "mistral-7b",
-        "tools": ["subfinder", "httpx", "dig", "whois"],
-        "system_prompt": (
-            "You are the RECON agent. Your job is to:\n"
-            "1. Enumerate subdomains, IP addresses, and infrastructure\n"
-            "2. Identify technologies, frameworks, and services\n"
-            "3. Map the attack surface comprehensively\n"
-            "4. Report all findings to your parent coordinator"
-        ),
+        "models": ["mistral-7b", "llama-3.1-8b"],
+        "tools": ["nmap", "subfinder", "amass", "httpx", "wafw00f", "dnsrecon", "theHarvester"],
+        "system_prompt": "You are a reconnaissance specialist. Enumerate the target's attack surface: domains, subdomains, IPs, ports, services, technologies.",
     },
     "scanner": {
-        "model": "whiterabbitneo",
-        "tools": ["nmap", "nuclei", "nikto", "testssl"],
-        "system_prompt": (
-            "You are the SCANNER agent. Your job is to:\n"
-            "1. Run port scans and service detection\n"
-            "2. Execute vulnerability scans with nuclei\n"
-            "3. Check TLS configuration\n"
-            "4. Identify known CVEs in detected services"
-        ),
-    },
-    "analyzer": {
-        "model": "qwen-coder-14b",
-        "tools": ["semgrep", "bandit"],
-        "system_prompt": (
-            "You are the ANALYZER agent. Your job is to:\n"
-            "1. Analyze code for security vulnerabilities\n"
-            "2. Review configurations for misconfigurations\n"
-            "3. Identify business logic flaws\n"
-            "4. Assess the severity and exploitability of findings"
-        ),
+        "models": ["whiterabbitneo-7b", "qwen-coder-7b"],
+        "tools": ["nuclei", "nikto", "sqlmap", "dalfox", "wpscan"],
+        "system_prompt": "You are a vulnerability scanner. Run scanning tools against the target and identify potential vulnerabilities.",
     },
     "exploiter": {
-        "model": "whiterabbitneo",
-        "tools": ["sqlmap", "gobuster", "ffuf", "hydra"],
-        "system_prompt": (
-            "You are the EXPLOITER agent. Your job is to:\n"
-            "1. Validate vulnerabilities through safe exploitation\n"
-            "2. Determine actual impact and exploitability\n"
-            "3. Build exploitation chains from individual findings\n"
-            "4. Document proof-of-concept for each confirmed vulnerability"
-        ),
+        "models": ["whiterabbitneo-7b", "dolphin-8b"],
+        "tools": ["sqlmap", "hydra", "metasploit", "searchsploit"],
+        "system_prompt": "You are an exploitation specialist. Attempt to exploit confirmed vulnerabilities to demonstrate impact.",
     },
     "validator": {
-        "model": "deepseek-r1",
+        "models": ["qwen-coder-14b", "hermes-14b"],
+        "tools": ["curl", "httpx", "nmap"],
+        "system_prompt": "You are a finding validator. Verify each finding independently using different tools and methods. Eliminate false positives.",
+    },
+    "analyzer": {
+        "models": ["deepseek-r1-7b", "qwen-coder-14b"],
         "tools": [],
-        "system_prompt": (
-            "You are the VALIDATOR agent. Your job is to:\n"
-            "1. Cross-check findings for false positives\n"
-            "2. Verify evidence quality and completeness\n"
-            "3. Assess confidence level for each finding\n"
-            "4. Challenge assumptions and conclusions"
-        ),
+        "system_prompt": "You are a vulnerability analyzer. Assess the severity, impact, and exploitability of each finding. Map to CWE/CVSS.",
     },
-    "code_auditor": {
-        "model": "qwen-coder-14b",
-        "tools": ["semgrep", "bandit"],
-        "system_prompt": (
-            "You are the CODE AUDITOR agent. Your job is to:\n"
-            "1. Perform deep code review for security vulnerabilities\n"
-            "2. Identify insecure patterns, injections, and logic flaws\n"
-            "3. Review authentication and authorization code\n"
-            "4. Check for hardcoded secrets and sensitive data exposure"
-        ),
+    "code_reviewer": {
+        "models": ["qwen-coder-14b", "codellama-13b", "yi-9b-200k"],
+        "tools": ["semgrep", "bandit", "trufflehog", "gitleaks"],
+        "system_prompt": "You are a code security reviewer. Analyze source code for vulnerabilities, hardcoded secrets, and insecure patterns.",
     },
-    "reasoning": {
-        "model": "deepseek-r1",
+    "osint": {
+        "models": ["llama-3.1-8b", "mistral-7b"],
+        "tools": ["theHarvester", "subfinder", "dnsrecon"],
+        "system_prompt": "You are an OSINT specialist. Gather intelligence from public sources about the target organization.",
+    },
+    "fuzzer": {
+        "models": ["whiterabbitneo-7b", "phi-3.5-mini"],
+        "tools": ["ffuf", "gobuster", "wfuzz"],
+        "system_prompt": "You are a fuzzing specialist. Generate and test malformed inputs to discover hidden endpoints and input handling vulnerabilities.",
+    },
+    "reporter": {
+        "models": ["hermes-14b", "llama-3.1-8b"],
         "tools": [],
-        "system_prompt": (
-            "You are the REASONING agent. Your job is to:\n"
-            "1. Perform deep analysis and chain-of-thought reasoning\n"
-            "2. Identify non-obvious attack vectors\n"
-            "3. Build attack chain hypotheses\n"
-            "4. Evaluate trade-offs between different investigation paths"
-        ),
-    },
-    "cloud_analyst": {
-        "model": "hermes-14b",
-        "tools": ["curl"],
-        "system_prompt": (
-            "You are the CLOUD ANALYST agent. Your job is to:\n"
-            "1. Identify cloud infrastructure (AWS/Azure/GCP)\n"
-            "2. Check for metadata service exposure\n"
-            "3. Assess IAM configuration and privilege escalation paths\n"
-            "4. Evaluate storage permissions and data exposure"
-        ),
+        "system_prompt": "You are a report generator. Compile findings into a structured security assessment report.",
     },
 }
 
 
 class RecursiveSpawner:
-    """Manages recursive agent hierarchy with bounded execution.
+    """Manages recursive agent spawning and lifecycle.
 
-    Creates a tree of agents where each parent can spawn children,
-    with budget decay (70% per level) and depth limits to prevent
-    unbounded recursion.
+    Creates child agents with decayed budgets, tracks
+    their execution, and aggregates results back to
+    parent agents.
     """
 
     def __init__(
         self,
         max_depth: int = 5,
         budget_decay: float = 0.7,
-        default_budget: AgentBudget | None = None,
+        max_total_agents: int = 50,
     ) -> None:
+        self._agents: dict[str, ChildAgent] = {}
+        self._counter = 0
         self._max_depth = max_depth
         self._budget_decay = budget_decay
-        self._default_budget = default_budget or AgentBudget()
-        self._agents: dict[str, SpawnedAgent] = {}
-        self._agent_counter = 0
-        self._depth_stats: dict[int, int] = defaultdict(int)
-        self._role_stats: dict[str, int] = defaultdict(int)
+        self._max_total_agents = max_total_agents
         self._log = logger.bind(component="recursive_spawner")
 
     def spawn(
         self,
         role: AgentRole,
-        goal: str,
+        task: str,
+        target: str = "",
         parent_id: str = "",
-        context: str = "",
-        budget: AgentBudget | None = None,
-        model_override: str = "",
-        tools_override: list[str] | None = None,
-    ) -> SpawnedAgent | None:
-        """Spawn a new agent."""
-        # Determine depth
-        depth = 0
-        if parent_id:
-            parent = self._agents.get(parent_id)
-            if not parent:
-                return None
-            depth = parent.depth + 1
+        parent_budget: AgentBudget | None = None,
+        depth: int = 0,
+        reason: SpawnReason = SpawnReason.TASK_DECOMPOSITION,
+    ) -> ChildAgent | None:
+        """Spawn a new child agent."""
+        # Depth check
+        if depth >= self._max_depth:
+            self._log.warning("Max depth reached", depth=depth)
+            return None
 
-            # Check depth limit
-            if depth > self._max_depth:
-                self._log.warning("max_depth_reached", depth=depth, role=role.value)
-                return None
+        # Total agent limit
+        active = sum(1 for a in self._agents.values() if a.state in (AgentState.WORKING, AgentState.IDLE))
+        if active >= self._max_total_agents:
+            self._log.warning("Max total agents reached", active=active)
+            return None
 
-            # Check parent budget
-            if not parent.budget.can_spawn_child:
-                self._log.warning("parent_budget_exhausted", parent=parent_id)
-                return None
+        # Calculate budget
+        if parent_budget:
+            budget = parent_budget.decay(self._budget_decay)
+        else:
+            budget = AgentBudget(max_depth=self._max_depth - depth)
 
-            parent.budget.children_spawned += 1
-            parent.children.append("")  # Will update with actual ID
+        # Budget exhaustion check
+        if budget.max_tokens < 100 or budget.max_time_s < 10:
+            self._log.warning("Budget too small for child", tokens=budget.max_tokens)
+            return None
 
-        # Determine budget
-        if budget is None:
-            if parent_id and parent_id in self._agents:
-                budget = self._agents[parent_id].budget.decay(self._budget_decay)
-            else:
-                budget = AgentBudget(
-                    max_tokens=self._default_budget.max_tokens,
-                    max_time_s=self._default_budget.max_time_s,
-                    max_tool_calls=self._default_budget.max_tool_calls,
-                    max_llm_queries=self._default_budget.max_llm_queries,
-                    max_child_agents=self._default_budget.max_child_agents,
-                )
+        self._counter += 1
+        role_config = ROLE_CONFIGS.get(role.value, {})
 
-        # Get role config
-        role_cfg = ROLE_CONFIG.get(role.value, {})
-        model = model_override or role_cfg.get("model", "mistral-7b")
-        tools = tools_override if tools_override is not None else role_cfg.get("tools", [])
-        system_prompt = role_cfg.get("system_prompt", "")
-
-        self._agent_counter += 1
-        agent_id = f"agent-{self._agent_counter}-{role.value}"
-
-        agent = SpawnedAgent(
-            agent_id=agent_id,
+        agent = ChildAgent(
+            agent_id=f"agent-{self._counter}-{role.value[:4]}",
             role=role,
+            state=AgentState.IDLE,
             parent_id=parent_id,
             depth=depth,
-            goal=goal,
-            context=context,
-            tools=tools,
-            model=model,
+            task=task,
+            target=target,
             budget=budget,
-            status=SpawnStatus.RUNNING,
-            system_prompt=system_prompt,
+            spawn_reason=reason,
+            model=role_config.get("models", [""])[0] if role_config.get("models") else "",
+            tools=role_config.get("tools", []),
         )
 
-        self._agents[agent_id] = agent
+        self._agents[agent.agent_id] = agent
 
-        # Update parent's children list
+        # Register with parent
         if parent_id and parent_id in self._agents:
-            parent_agent = self._agents[parent_id]
-            if parent_agent.children and parent_agent.children[-1] == "":
-                parent_agent.children[-1] = agent_id
-            else:
-                parent_agent.children.append(agent_id)
-
-        self._depth_stats[depth] += 1
-        self._role_stats[role.value] += 1
+            self._agents[parent_id].children_ids.append(agent.agent_id)
 
         return agent
+
+    def start_agent(self, agent_id: str) -> bool:
+        """Start an agent's execution."""
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return False
+        agent.state = AgentState.WORKING
+        return True
 
     def complete_agent(
         self,
         agent_id: str,
         result: dict[str, Any] | None = None,
+        findings: list[dict[str, Any]] | None = None,
         success: bool = True,
-    ) -> SpawnedAgent | None:
-        """Mark an agent as complete."""
+    ) -> bool:
+        """Complete an agent's execution."""
         agent = self._agents.get(agent_id)
         if not agent:
-            return None
-
-        agent.status = SpawnStatus.COMPLETE if success else SpawnStatus.FAILED
-        agent.completed_at = time.time()
-        agent.result = result or {}
-
-        return agent
-
-    def cancel_agent(self, agent_id: str) -> bool:
-        """Cancel a running agent."""
-        agent = self._agents.get(agent_id)
-        if not agent or agent.status != SpawnStatus.RUNNING:
             return False
 
-        agent.status = SpawnStatus.CANCELLED
+        agent.state = AgentState.COMPLETE if success else AgentState.FAILED
         agent.completed_at = time.time()
-
-        # Cancel all children
-        for child_id in agent.children:
-            self.cancel_agent(child_id)
+        agent.result = result or {}
+        if findings:
+            agent.findings.extend(findings)
 
         return True
 
-    def get_children_results(self, agent_id: str) -> list[dict[str, Any]]:
-        """Get results from all children of an agent."""
-        agent = self._agents.get(agent_id)
-        if not agent:
-            return []
+    def aggregate_results(self, parent_id: str) -> dict[str, Any]:
+        """Aggregate results from all children of a parent."""
+        parent = self._agents.get(parent_id)
+        if not parent:
+            return {}
 
-        results = []
-        for child_id in agent.children:
+        all_findings: list[dict[str, Any]] = []
+        child_results: list[dict[str, Any]] = []
+        total_tokens = 0
+        total_tools = 0
+
+        for child_id in parent.children_ids:
             child = self._agents.get(child_id)
-            if child and child.status == SpawnStatus.COMPLETE:
-                results.append({
-                    "agent_id": child.agent_id,
-                    "role": child.role.value,
-                    "result": child.result,
-                    "duration_s": child.duration_s,
-                })
+            if not child:
+                continue
 
-        return results
+            all_findings.extend(child.findings)
+            child_results.append({
+                "agent": child.agent_id,
+                "role": child.role.value,
+                "state": child.state.value,
+                "findings": len(child.findings),
+                "duration_s": round(child.duration_s, 1),
+            })
+            total_tokens += child.budget.used_tokens
+            total_tools += child.budget.used_tool_calls
 
-    def get_tree(self, root_id: str = "") -> dict[str, Any]:
-        """Get the agent tree structure."""
-        if not root_id:
-            # Find root (depth 0)
-            roots = [a for a in self._agents.values() if a.depth == 0]
-            if not roots:
-                return {}
-            root_id = roots[0].agent_id
+        # Deduplicate findings by title
+        seen_titles: set[str] = set()
+        unique_findings = []
+        for f in all_findings:
+            title = f.get("title", "")
+            if title not in seen_titles:
+                seen_titles.add(title)
+                unique_findings.append(f)
 
+        return {
+            "parent_id": parent_id,
+            "children": len(parent.children_ids),
+            "completed": sum(1 for cid in parent.children_ids
+                           if self._agents.get(cid, ChildAgent()).state == AgentState.COMPLETE),
+            "total_findings": len(unique_findings),
+            "findings": unique_findings,
+            "child_results": child_results,
+            "total_tokens": total_tokens,
+            "total_tool_calls": total_tools,
+        }
+
+    def get_idle_agents(self) -> list[ChildAgent]:
+        """Get agents that are idle (for work stealing)."""
+        return [a for a in self._agents.values() if a.state == AgentState.IDLE]
+
+    def get_agent(self, agent_id: str) -> ChildAgent | None:
+        """Get an agent by ID."""
+        return self._agents.get(agent_id)
+
+    def get_children(self, parent_id: str) -> list[ChildAgent]:
+        """Get all children of a parent."""
+        parent = self._agents.get(parent_id)
+        if not parent:
+            return []
+        return [self._agents[cid] for cid in parent.children_ids if cid in self._agents]
+
+    def get_tree(self, root_id: str) -> dict[str, Any]:
+        """Get the full agent tree from a root."""
         agent = self._agents.get(root_id)
         if not agent:
             return {}
 
-        tree: dict[str, Any] = agent.to_dict()
-        tree["children_details"] = []
-        for child_id in agent.children:
-            child_tree = self.get_tree(child_id)
-            if child_tree:
-                tree["children_details"].append(child_tree)
+        def build_tree(aid: str) -> dict[str, Any]:
+            a = self._agents.get(aid)
+            if not a:
+                return {}
+            children = []
+            for cid in a.children_ids:
+                children.append(build_tree(cid))
+            return {
+                "agent": a.to_dict(),
+                "children": children,
+            }
 
-        return tree
+        return build_tree(root_id)
 
-    def get_running_agents(self) -> list[SpawnedAgent]:
-        """Get all currently running agents."""
-        return [
-            a for a in self._agents.values()
-            if a.status == SpawnStatus.RUNNING
-        ]
+    def terminate_agent(self, agent_id: str) -> bool:
+        """Terminate an agent and all its children."""
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return False
 
-    def check_timeouts(self) -> list[str]:
-        """Check for timed-out agents."""
-        timed_out = []
-        for agent in self._agents.values():
-            if agent.status != SpawnStatus.RUNNING:
-                continue
-            if agent.duration_s > agent.budget.max_time_s:
-                agent.status = SpawnStatus.TIMEOUT
-                agent.completed_at = time.time()
-                timed_out.append(agent.agent_id)
+        agent.state = AgentState.TERMINATED
+        agent.completed_at = time.time()
 
-        return timed_out
+        # Recursively terminate children
+        for child_id in agent.children_ids:
+            self.terminate_agent(child_id)
 
-    def get_agent(self, agent_id: str) -> SpawnedAgent | None:
-        return self._agents.get(agent_id)
+        return True
 
     def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
+        state_counts: dict[str, int] = defaultdict(int)
+        role_counts: dict[str, int] = defaultdict(int)
+        total_findings = 0
+        max_depth = 0
+
         for a in self._agents.values():
-            status_counts[a.status.value] += 1
+            state_counts[a.state.value] += 1
+            role_counts[a.role.value] += 1
+            total_findings += len(a.findings)
+            max_depth = max(max_depth, a.depth)
 
         return {
             "total_agents": len(self._agents),
-            "by_status": dict(status_counts),
-            "by_depth": dict(self._depth_stats),
-            "by_role": dict(self._role_stats),
-            "max_depth": self._max_depth,
-            "budget_decay": self._budget_decay,
+            "total_findings": total_findings,
+            "max_depth": max_depth,
+            "by_state": dict(state_counts),
+            "by_role": dict(role_counts),
         }
