@@ -1,14 +1,13 @@
-"""Context manager — manages LLM context windows across agent hierarchy.
+"""Context manager — manages agent context across recursion levels.
 
 Implements:
-1. Context window allocation per agent
-2. Context compression when approaching limits
-3. Priority-based content selection
-4. Hierarchical context inheritance (parent → child)
-5. Context summarization for long conversations
-6. Token counting and budget tracking
-7. Sliding window with importance scoring
-8. Context snapshot and restore
+1. Hierarchical context propagation
+2. Context window budgeting
+3. Context compression/summarization
+4. Parent→child context inheritance
+5. Shared context between agents
+6. Context versioning
+7. Rolling context window
 """
 
 from __future__ import annotations
@@ -23,103 +22,75 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ContentPriority(str, Enum):
-    CRITICAL = "critical"       # System prompt, current task — never evict
-    HIGH = "high"               # Recent tool outputs, findings
-    MEDIUM = "medium"           # Earlier observations, context
-    LOW = "low"                 # Background info, history
-    EPHEMERAL = "ephemeral"     # Can be dropped anytime
+class ContextScope(str, Enum):
+    GLOBAL = "global"           # Shared across all agents
+    ASSESSMENT = "assessment"    # Assessment-level
+    AGENT = "agent"              # Agent-private
+    INHERITED = "inherited"      # From parent agent
+
+
+class ContextPriority(str, Enum):
+    CRITICAL = "critical"       # Never drop (target, constraints)
+    HIGH = "high"               # Drop last (findings, tool results)
+    MEDIUM = "medium"           # Drop early (history, examples)
+    LOW = "low"                 # Drop first (verbose data)
 
 
 @dataclass
 class ContextEntry:
-    """A single entry in the context window."""
+    """A context entry."""
     entry_id: str = ""
-    content: str = ""
-    role: str = "system"          # system, user, assistant, tool
-    priority: ContentPriority = ContentPriority.MEDIUM
-    token_count: int = 0
-    source: str = ""              # Which agent/tool produced this
-    timestamp: float = field(default_factory=time.time)
-    access_count: int = 0
-    is_summary: bool = False      # Was this summarized from longer content?
-
-    @property
-    def importance_score(self) -> float:
-        """Dynamic importance based on priority, recency, and access."""
-        priority_weights = {
-            ContentPriority.CRITICAL: 10.0,
-            ContentPriority.HIGH: 5.0,
-            ContentPriority.MEDIUM: 2.0,
-            ContentPriority.LOW: 1.0,
-            ContentPriority.EPHEMERAL: 0.5,
-        }
-        base = priority_weights.get(self.priority, 1.0)
-
-        # Recency boost (decays over 10 minutes)
-        age = time.time() - self.timestamp
-        recency = max(0.1, 1.0 - age / 600.0)
-
-        # Access boost
-        access_boost = min(2.0, 1.0 + self.access_count * 0.1)
-
-        return base * recency * access_boost
+    key: str = ""
+    value: str = ""
+    scope: ContextScope = ContextScope.AGENT
+    priority: ContextPriority = ContextPriority.MEDIUM
+    token_estimate: int = 0
+    created_at: float = field(default_factory=time.time)
+    expires_at: float = 0.0
+    version: int = 1
+    source_agent: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.entry_id,
-            "role": self.role,
+            "id": self.entry_id[:10],
+            "key": self.key[:15],
+            "scope": self.scope.value,
             "priority": self.priority.value,
-            "tokens": self.token_count,
-            "importance": round(self.importance_score, 2),
-            "source": self.source[:20],
+            "tokens": self.token_estimate,
         }
 
 
 @dataclass
 class ContextWindow:
-    """A managed context window."""
-    window_id: str = ""
+    """A context window for an agent."""
     agent_id: str = ""
     max_tokens: int = 4096
     entries: list[ContextEntry] = field(default_factory=list)
     total_tokens: int = 0
-    eviction_count: int = 0
-    compression_count: int = 0
-
-    @property
-    def remaining_tokens(self) -> int:
-        return max(0, self.max_tokens - self.total_tokens)
-
-    @property
-    def utilization(self) -> float:
-        if self.max_tokens == 0:
-            return 0.0
-        return self.total_tokens / self.max_tokens
+    dropped_entries: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.window_id,
-            "agent": self.agent_id[:20],
-            "tokens": self.total_tokens,
+            "agent": self.agent_id[:10],
             "max": self.max_tokens,
+            "used": self.total_tokens,
             "entries": len(self.entries),
-            "util_pct": round(self.utilization * 100, 1),
+            "dropped": self.dropped_entries,
         }
 
 
 class ContextManager:
-    """Manages LLM context windows across the agent hierarchy.
+    """Manages agent context across recursion levels.
 
-    Handles token budgeting, priority-based eviction,
-    compression, and hierarchical context inheritance.
+    Handles context propagation from parent to child,
+    context window budgeting, and shared context.
     """
 
     def __init__(self, default_max_tokens: int = 4096) -> None:
         self._windows: dict[str, ContextWindow] = {}
-        self._window_counter = 0
-        self._entry_counter = 0
-        self._default_max = default_max_tokens
+        self._global_context: dict[str, ContextEntry] = {}
+        self._counter = 0
+        self._default_max_tokens = default_max_tokens
         self._log = logger.bind(component="context_manager")
 
     def create_window(
@@ -128,222 +99,221 @@ class ContextManager:
         max_tokens: int = 0,
     ) -> ContextWindow:
         """Create a context window for an agent."""
-        self._window_counter += 1
         window = ContextWindow(
-            window_id=f"ctx-{self._window_counter}",
             agent_id=agent_id,
-            max_tokens=max_tokens or self._default_max,
+            max_tokens=max_tokens or self._default_max_tokens,
         )
-        self._windows[window.window_id] = window
+        self._windows[agent_id] = window
         return window
 
-    def add(
+    def add_context(
         self,
-        window_id: str,
-        content: str,
-        role: str = "system",
-        priority: ContentPriority = ContentPriority.MEDIUM,
-        source: str = "",
+        agent_id: str,
+        key: str,
+        value: str,
+        scope: ContextScope = ContextScope.AGENT,
+        priority: ContextPriority = ContextPriority.MEDIUM,
+        expires_in_s: float = 0,
     ) -> ContextEntry | None:
-        """Add content to a context window."""
-        window = self._windows.get(window_id)
+        """Add a context entry."""
+        window = self._windows.get(agent_id)
         if not window:
             return None
 
-        token_count = self._estimate_tokens(content)
+        self._counter += 1
+        token_estimate = len(value) // 4
 
-        # Check if we need to make room
-        while window.total_tokens + token_count > window.max_tokens:
-            if not self._evict_lowest(window):
-                break
-
-        # Still too big? Truncate
-        if window.total_tokens + token_count > window.max_tokens:
-            available = window.remaining_tokens
-            if available < 50:
-                return None
-            content = content[:available * 4]  # ~4 chars per token
-            token_count = self._estimate_tokens(content)
-
-        self._entry_counter += 1
         entry = ContextEntry(
-            entry_id=f"ce-{self._entry_counter}",
-            content=content,
-            role=role,
+            entry_id=f"ctx-{self._counter}",
+            key=key,
+            value=value,
+            scope=scope,
             priority=priority,
-            token_count=token_count,
-            source=source,
+            token_estimate=token_estimate,
+            source_agent=agent_id,
         )
 
-        window.entries.append(entry)
-        window.total_tokens += token_count
+        if expires_in_s > 0:
+            entry.expires_at = time.time() + expires_in_s
+
+        # Check if we need to evict
+        while window.total_tokens + token_estimate > window.max_tokens:
+            if not self._evict_lowest_priority(window):
+                break
+
+        if window.total_tokens + token_estimate <= window.max_tokens:
+            window.entries.append(entry)
+            window.total_tokens += token_estimate
+        else:
+            window.dropped_entries += 1
+            return None
+
+        # Also add to global if scope is global
+        if scope == ContextScope.GLOBAL:
+            self._global_context[key] = entry
 
         return entry
 
-    def get_context(
-        self,
-        window_id: str,
-        max_tokens: int = 0,
-    ) -> list[dict[str, str]]:
-        """Get the context as a list of messages."""
-        window = self._windows.get(window_id)
-        if not window:
-            return []
-
-        entries = window.entries
-        if max_tokens > 0:
-            # Take highest-importance entries that fit
-            sorted_entries = sorted(entries, key=lambda e: e.importance_score, reverse=True)
-            selected = []
-            used = 0
-            for entry in sorted_entries:
-                if used + entry.token_count <= max_tokens:
-                    selected.append(entry)
-                    used += entry.token_count
-                    entry.access_count += 1
-
-            # Re-sort by timestamp for correct ordering
-            selected.sort(key=lambda e: e.timestamp)
-            entries = selected
-
-        return [{"role": e.role, "content": e.content} for e in entries]
-
-    def compress(self, window_id: str) -> int:
-        """Compress the context by summarizing old entries."""
-        window = self._windows.get(window_id)
-        if not window:
-            return 0
-
-        # Find low-priority entries that can be compressed
-        compressible = [
-            e for e in window.entries
-            if e.priority in (ContentPriority.LOW, ContentPriority.EPHEMERAL)
-            and not e.is_summary and e.token_count > 50
+    def _evict_lowest_priority(self, window: ContextWindow) -> bool:
+        """Evict the lowest priority entry from a window."""
+        priority_order = [
+            ContextPriority.LOW,
+            ContextPriority.MEDIUM,
+            ContextPriority.HIGH,
+            ContextPriority.CRITICAL,
         ]
 
-        tokens_saved = 0
-        for entry in compressible:
-            # Simple compression: truncate to ~25% of original
-            original_tokens = entry.token_count
-            compressed_len = len(entry.content) // 4
-            entry.content = entry.content[:compressed_len] + "..."
-            entry.token_count = self._estimate_tokens(entry.content)
-            entry.is_summary = True
+        for priority in priority_order:
+            for i, entry in enumerate(window.entries):
+                if entry.priority == priority:
+                    window.total_tokens -= entry.token_estimate
+                    window.entries.pop(i)
+                    window.dropped_entries += 1
+                    return True
 
-            saved = original_tokens - entry.token_count
-            tokens_saved += saved
-            window.total_tokens -= saved
+        return False
 
-        window.compression_count += 1
-        return tokens_saved
-
-    def inherit(
+    def inherit_context(
         self,
-        parent_window_id: str,
-        child_window_id: str,
-        max_inherit_tokens: int = 1024,
+        parent_id: str,
+        child_id: str,
+        max_inherit_tokens: int = 2048,
     ) -> int:
-        """Inherit context from parent to child window."""
-        parent = self._windows.get(parent_window_id)
-        child = self._windows.get(child_window_id)
+        """Inherit context from parent to child agent."""
+        parent = self._windows.get(parent_id)
+        child = self._windows.get(child_id)
         if not parent or not child:
             return 0
 
-        # Get highest-priority entries from parent
+        inherited = 0
+        # Inherit entries by priority (critical first)
         sorted_entries = sorted(
             parent.entries,
-            key=lambda e: e.importance_score,
-            reverse=True,
+            key=lambda e: {
+                ContextPriority.CRITICAL: 0,
+                ContextPriority.HIGH: 1,
+                ContextPriority.MEDIUM: 2,
+                ContextPriority.LOW: 3,
+            }.get(e.priority, 4),
         )
 
-        inherited = 0
         for entry in sorted_entries:
-            if inherited + entry.token_count > max_inherit_tokens:
+            if inherited + entry.token_estimate > max_inherit_tokens:
+                break
+
+            # Don't inherit agent-private context
+            if entry.scope == ContextScope.AGENT:
                 continue
 
-            self.add(
-                child_window_id,
-                content=entry.content,
-                role=entry.role,
+            self.add_context(
+                child_id,
+                key=entry.key,
+                value=entry.value,
+                scope=ContextScope.INHERITED,
                 priority=entry.priority,
-                source=f"inherited:{entry.source}",
             )
-            inherited += entry.token_count
+            inherited += entry.token_estimate
+
+        # Also inject global context
+        for key, entry in self._global_context.items():
+            if inherited + entry.token_estimate > max_inherit_tokens:
+                break
+            self.add_context(
+                child_id,
+                key=entry.key,
+                value=entry.value,
+                scope=ContextScope.GLOBAL,
+                priority=entry.priority,
+            )
+            inherited += entry.token_estimate
 
         return inherited
 
-    def _evict_lowest(self, window: ContextWindow) -> bool:
-        """Evict the lowest-importance entry."""
-        if not window.entries:
-            return False
+    def get_context_text(
+        self,
+        agent_id: str,
+        max_tokens: int = 0,
+    ) -> str:
+        """Get the full context text for an agent."""
+        window = self._windows.get(agent_id)
+        if not window:
+            return ""
 
-        # Never evict CRITICAL entries
-        evictable = [
-            (i, e) for i, e in enumerate(window.entries)
-            if e.priority != ContentPriority.CRITICAL
+        # Remove expired entries
+        now = time.time()
+        window.entries = [
+            e for e in window.entries
+            if e.expires_at == 0 or e.expires_at > now
         ]
 
-        if not evictable:
-            return False
+        parts = []
+        tokens_used = 0
+        max_t = max_tokens or window.max_tokens
 
-        # Find lowest importance
-        min_idx, min_entry = min(evictable, key=lambda x: x[1].importance_score)
-        window.entries.pop(min_idx)
-        window.total_tokens -= min_entry.token_count
-        window.eviction_count += 1
-        return True
-
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        """Estimate token count (~4 chars per token)."""
-        return max(1, len(text) // 4)
-
-    def snapshot(self, window_id: str) -> dict[str, Any]:
-        """Snapshot a context window for later restore."""
-        window = self._windows.get(window_id)
-        if not window:
-            return {}
-
-        return {
-            "window_id": window.window_id,
-            "agent_id": window.agent_id,
-            "max_tokens": window.max_tokens,
-            "entries": [
-                {
-                    "content": e.content,
-                    "role": e.role,
-                    "priority": e.priority.value,
-                    "source": e.source,
-                    "tokens": e.token_count,
-                }
-                for e in window.entries
-            ],
-        }
-
-    def restore(self, snapshot: dict[str, Any]) -> str:
-        """Restore a context window from a snapshot."""
-        window = self.create_window(
-            agent_id=snapshot.get("agent_id", ""),
-            max_tokens=snapshot.get("max_tokens", self._default_max),
+        # Output in priority order
+        sorted_entries = sorted(
+            window.entries,
+            key=lambda e: {
+                ContextPriority.CRITICAL: 0,
+                ContextPriority.HIGH: 1,
+                ContextPriority.MEDIUM: 2,
+                ContextPriority.LOW: 3,
+            }.get(e.priority, 4),
         )
 
-        for entry_data in snapshot.get("entries", []):
-            self.add(
-                window.window_id,
-                content=entry_data.get("content", ""),
-                role=entry_data.get("role", "system"),
-                priority=ContentPriority(entry_data.get("priority", "medium")),
-                source=entry_data.get("source", "restored"),
-            )
+        for entry in sorted_entries:
+            if tokens_used + entry.token_estimate > max_t:
+                break
+            parts.append(f"[{entry.key}]\n{entry.value}")
+            tokens_used += entry.token_estimate
 
-        return window.window_id
+        return "\n\n".join(parts)
+
+    def update_context(
+        self,
+        agent_id: str,
+        key: str,
+        value: str,
+    ) -> bool:
+        """Update an existing context entry."""
+        window = self._windows.get(agent_id)
+        if not window:
+            return False
+
+        for entry in window.entries:
+            if entry.key == key:
+                old_tokens = entry.token_estimate
+                entry.value = value
+                entry.token_estimate = len(value) // 4
+                entry.version += 1
+                window.total_tokens += entry.token_estimate - old_tokens
+                return True
+
+        return False
+
+    def remove_context(self, agent_id: str, key: str) -> bool:
+        """Remove a context entry."""
+        window = self._windows.get(agent_id)
+        if not window:
+            return False
+
+        for i, entry in enumerate(window.entries):
+            if entry.key == key:
+                window.total_tokens -= entry.token_estimate
+                window.entries.pop(i)
+                return True
+
+        return False
 
     def get_stats(self) -> dict[str, Any]:
+        total_entries = sum(len(w.entries) for w in self._windows.values())
         total_tokens = sum(w.total_tokens for w in self._windows.values())
-        total_evictions = sum(w.eviction_count for w in self._windows.values())
+        total_dropped = sum(w.dropped_entries for w in self._windows.values())
+
         return {
             "windows": len(self._windows),
+            "total_entries": total_entries,
             "total_tokens": total_tokens,
-            "total_entries": self._entry_counter,
-            "total_evictions": total_evictions,
+            "total_dropped": total_dropped,
+            "global_entries": len(self._global_context),
         }
