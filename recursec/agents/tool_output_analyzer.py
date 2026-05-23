@@ -1,19 +1,19 @@
-"""Tool output analyzer — intelligently parses external tool results.
+"""Tool output analyzer — structured parsing and insight extraction.
 
 Implements:
-1. Structured parsing for 30+ tool output formats
-2. Finding extraction from raw output
-3. Severity classification
-4. Output normalization
-5. Multi-format support (text, JSON, XML, CSV)
-6. Error detection in tool output
-7. Output summarization for LLM context
+1. Pattern-based extraction from raw tool outputs
+2. Severity classification of findings
+3. Cross-tool finding correlation
+4. Output summarization for LLM consumption
+5. Anomaly detection in tool results
+6. Finding extraction rules per tool
+7. Analyzer prompt for LLM context
 """
 
 from __future__ import annotations
 
-import json
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -30,10 +30,9 @@ class OutputFormat(str, Enum):
     CSV = "csv"
     NMAP_XML = "nmap_xml"
     NUCLEI_JSON = "nuclei_json"
-    UNKNOWN = "unknown"
 
 
-class ParsedSeverity(str, Enum):
+class FindingSeverity(str, Enum):
     CRITICAL = "critical"
     HIGH = "high"
     MEDIUM = "medium"
@@ -42,419 +41,278 @@ class ParsedSeverity(str, Enum):
 
 
 @dataclass
-class ParsedFinding:
+class ExtractedFinding:
     """A finding extracted from tool output."""
+    finding_id: str = ""
     tool: str = ""
+    severity: FindingSeverity = FindingSeverity.INFO
     title: str = ""
-    severity: ParsedSeverity = ParsedSeverity.INFO
+    description: str = ""
     target: str = ""
-    detail: str = ""
-    cve: str = ""
-    cwe: str = ""
-    reference: str = ""
+    port: int = 0
+    protocol: str = ""
+    evidence: str = ""
+    cve_ids: list[str] = field(default_factory=list)
+    cwe_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.8
     raw_line: str = ""
+    timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.finding_id[:10],
             "tool": self.tool[:10],
-            "title": self.title[:30],
-            "severity": self.severity.value,
-            "target": self.target[:20],
-            "cve": self.cve[:15] if self.cve else "",
+            "sev": self.severity.value[:4],
+            "title": self.title[:25],
+            "target": self.target[:15],
+            "cves": len(self.cve_ids),
         }
 
 
-@dataclass
-class ParsedOutput:
-    """Parsed and structured tool output."""
-    tool_name: str = ""
-    raw_length: int = 0
-    format_detected: OutputFormat = OutputFormat.UNKNOWN
-    findings: list[ParsedFinding] = field(default_factory=list)
-    summary: str = ""
-    errors: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
+# ── Tool-specific extraction patterns ────────────────────────
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tool": self.tool_name[:10],
-            "format": self.format_detected.value,
-            "findings": len(self.findings),
-            "errors": len(self.errors),
-        }
-
-
-# ── Severity keywords per tool ───────────────────────────────
-
-SEVERITY_KEYWORDS: dict[str, list[str]] = {
-    "critical": [
-        "critical", "rce", "remote code execution", "command injection",
-        "sql injection", "authentication bypass", "unauthenticated",
+EXTRACTION_RULES: dict[str, list[dict[str, Any]]] = {
+    "nmap": [
+        {
+            "pattern": r"(\d+)/(\w+)\s+open\s+(\S+)",
+            "fields": ["port", "protocol", "service"],
+            "severity": "info",
+            "title_template": "Open port {port}/{protocol} ({service})",
+        },
+        {
+            "pattern": r"(\d+)/(\w+)\s+open\s+(\S+)\s+(.+)",
+            "fields": ["port", "protocol", "service", "version"],
+            "severity": "info",
+            "title_template": "Service: {service} {version} on {port}/{protocol}",
+        },
+        {
+            "pattern": r"VULNERABLE:\s*\n\s*(.+)",
+            "fields": ["vuln_name"],
+            "severity": "high",
+            "title_template": "Nmap vulnerability: {vuln_name}",
+        },
     ],
-    "high": [
-        "high", "xss", "ssrf", "lfi", "rfi", "file inclusion",
-        "privilege escalation", "path traversal", "deserialization",
+    "nuclei": [
+        {
+            "pattern": r"\[(\w+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(.+)",
+            "fields": ["severity", "template_id", "protocol", "matched_url"],
+            "severity": "dynamic",  # From captured group
+            "title_template": "Nuclei: {template_id}",
+        },
     ],
-    "medium": [
-        "medium", "csrf", "information disclosure", "clickjacking",
-        "session fixation", "open redirect",
+    "sqlmap": [
+        {
+            "pattern": r"Parameter:\s*(\S+)\s*\((.*?)\)",
+            "fields": ["parameter", "injection_type"],
+            "severity": "critical",
+            "title_template": "SQL Injection in {parameter} ({injection_type})",
+        },
+        {
+            "pattern": r"back-end DBMS:\s*(.+)",
+            "fields": ["dbms"],
+            "severity": "info",
+            "title_template": "Database: {dbms}",
+        },
     ],
-    "low": [
-        "low", "verbose error", "server header", "directory listing",
-        "missing header", "cookie without",
+    "ffuf": [
+        {
+            "pattern": r"(\S+)\s+\[Status:\s*(\d+),\s*Size:\s*(\d+)",
+            "fields": ["path", "status", "size"],
+            "severity": "low",
+            "title_template": "Directory: {path} (HTTP {status})",
+        },
+    ],
+    "nikto": [
+        {
+            "pattern": r"\+\s+OSVDB-(\d+):\s+(.+)",
+            "fields": ["osvdb_id", "description"],
+            "severity": "medium",
+            "title_template": "Nikto: {description}",
+        },
+    ],
+    "hydra": [
+        {
+            "pattern": r"\[(\d+)\]\[(\w+)\]\s+host:\s*(\S+)\s+login:\s*(\S+)\s+password:\s*(\S+)",
+            "fields": ["port", "service", "host", "login", "password"],
+            "severity": "critical",
+            "title_template": "Credential found: {login}:{password} on {service}:{port}",
+        },
+    ],
+    "gobuster": [
+        {
+            "pattern": r"(/\S+)\s+\(Status:\s*(\d+)\)",
+            "fields": ["path", "status"],
+            "severity": "low",
+            "title_template": "Path: {path} (HTTP {status})",
+        },
+    ],
+    "semgrep": [
+        {
+            "pattern": r"(\S+):(\d+):\s+(\S+)\s+(.+)",
+            "fields": ["file", "line", "rule_id", "message"],
+            "severity": "medium",
+            "title_template": "Code issue: {rule_id} in {file}:{line}",
+        },
     ],
 }
 
-# ── Tool-specific parsers ────────────────────────────────────
-
-
-def _parse_nmap_text(output: str) -> list[ParsedFinding]:
-    """Parse nmap text output."""
-    findings: list[ParsedFinding] = []
-    current_host = ""
-
-    for line in output.splitlines():
-        # Host detection
-        host_match = re.search(r'Nmap scan report for (.+)', line)
-        if host_match:
-            current_host = host_match.group(1).strip()
-            continue
-
-        # Open port
-        port_match = re.match(r'(\d+)/(tcp|udp)\s+open\s+(\S+)\s*(.*)', line)
-        if port_match:
-            port = port_match.group(1)
-            proto = port_match.group(2)
-            service = port_match.group(3)
-            version = port_match.group(4).strip()
-            findings.append(ParsedFinding(
-                tool="nmap",
-                title=f"Open port {port}/{proto} ({service})",
-                severity=ParsedSeverity.INFO,
-                target=current_host,
-                detail=version,
-                raw_line=line.strip(),
-            ))
-            continue
-
-        # Script output (vulns)
-        if line.strip().startswith('|') and 'VULNERABLE' in line.upper():
-            findings.append(ParsedFinding(
-                tool="nmap",
-                title="NSE vulnerability detected",
-                severity=ParsedSeverity.HIGH,
-                target=current_host,
-                detail=line.strip().lstrip('| '),
-                raw_line=line.strip(),
-            ))
-
-    return findings
-
-
-def _parse_nuclei_output(output: str) -> list[ParsedFinding]:
-    """Parse nuclei output (text or JSONL)."""
-    findings: list[ParsedFinding] = []
-
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        # Try JSON format
-        if line.startswith('{'):
-            try:
-                data = json.loads(line)
-                info = data.get("info", {})
-                severity_str = info.get("severity", "info").lower()
-                try:
-                    severity = ParsedSeverity(severity_str)
-                except ValueError:
-                    severity = ParsedSeverity.INFO
-
-                findings.append(ParsedFinding(
-                    tool="nuclei",
-                    title=data.get("template-id", info.get("name", "")),
-                    severity=severity,
-                    target=data.get("matched-at", data.get("host", "")),
-                    detail=data.get("matcher-name", ""),
-                    cve=",".join(info.get("classification", {}).get("cve-id", [])),
-                    cwe=",".join(info.get("classification", {}).get("cwe-id", [])),
-                    reference=",".join(info.get("reference", [])[:2]),
-                    raw_line=line[:200],
-                ))
-            except json.JSONDecodeError:
-                pass
-            continue
-
-        # Text format: [severity] [template-id] [protocol] target
-        text_match = re.match(
-            r'\[(\w+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(.*)',
-            line,
-        )
-        if text_match:
-            sev_str = text_match.group(1).lower()
-            try:
-                severity = ParsedSeverity(sev_str)
-            except ValueError:
-                severity = ParsedSeverity.INFO
-
-            findings.append(ParsedFinding(
-                tool="nuclei",
-                title=text_match.group(2),
-                severity=severity,
-                target=text_match.group(4),
-                raw_line=line[:200],
-            ))
-
-    return findings
-
-
-def _parse_sqlmap_output(output: str) -> list[ParsedFinding]:
-    """Parse sqlmap output."""
-    findings: list[ParsedFinding] = []
-    current_param = ""
-
-    for line in output.splitlines():
-        param_match = re.search(r"Parameter: (.+?) \(", line)
-        if param_match:
-            current_param = param_match.group(1)
-
-        if "is vulnerable" in line.lower() or "injectable" in line.lower():
-            findings.append(ParsedFinding(
-                tool="sqlmap",
-                title=f"SQL Injection in parameter: {current_param}",
-                severity=ParsedSeverity.CRITICAL,
-                detail=line.strip(),
-                raw_line=line.strip(),
-            ))
-
-        if "available databases" in line.lower():
-            findings.append(ParsedFinding(
-                tool="sqlmap",
-                title="Database enumeration successful",
-                severity=ParsedSeverity.HIGH,
-                detail=line.strip(),
-                raw_line=line.strip(),
-            ))
-
-    return findings
-
-
-def _parse_ffuf_output(output: str) -> list[ParsedFinding]:
-    """Parse ffuf output."""
-    findings: list[ParsedFinding] = []
-
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        # JSON mode
-        if line.startswith('{'):
-            try:
-                data = json.loads(line)
-                status = data.get("status", 0)
-                url = data.get("url", "")
-                length = data.get("length", 0)
-                findings.append(ParsedFinding(
-                    tool="ffuf",
-                    title=f"Discovered: {url} [{status}]",
-                    severity=ParsedSeverity.INFO,
-                    target=url,
-                    detail=f"Status={status}, Length={length}",
-                    raw_line=line[:200],
-                ))
-            except json.JSONDecodeError:
-                pass
-            continue
-
-        # Text: URL [Status: X, Size: Y, Words: Z]
-        text_match = re.search(
-            r'(\S+)\s+\[Status:\s*(\d+),\s*Size:\s*(\d+)',
-            line,
-        )
-        if text_match:
-            findings.append(ParsedFinding(
-                tool="ffuf",
-                title=f"Discovered: {text_match.group(1)}",
-                severity=ParsedSeverity.INFO,
-                target=text_match.group(1),
-                detail=f"Status={text_match.group(2)}, Size={text_match.group(3)}",
-                raw_line=line[:200],
-            ))
-
-    return findings
-
-
-def _parse_generic(output: str, tool_name: str) -> list[ParsedFinding]:
-    """Generic parser — extract CVEs and severity keywords."""
-    findings: list[ParsedFinding] = []
-
-    cve_pattern = re.compile(r'(CVE-\d{4}-\d{4,})')
-    for line in output.splitlines():
-        cves = cve_pattern.findall(line)
-        if cves:
-            severity = _classify_severity(line)
-            findings.append(ParsedFinding(
-                tool=tool_name,
-                title=f"CVE detected: {cves[0]}",
-                severity=severity,
-                cve=",".join(cves),
-                detail=line.strip()[:100],
-                raw_line=line.strip()[:200],
-            ))
-
-    return findings
-
-
-def _classify_severity(text: str) -> ParsedSeverity:
-    """Classify severity from text content."""
-    text_lower = text.lower()
-    for severity, keywords in SEVERITY_KEYWORDS.items():
-        for kw in keywords:
-            if kw in text_lower:
-                return ParsedSeverity(severity)
-    return ParsedSeverity.INFO
-
-
-# ── Parser registry ──────────────────────────────────────────
-
-TOOL_PARSERS = {
-    "nmap": _parse_nmap_text,
-    "nuclei": _parse_nuclei_output,
-    "sqlmap": _parse_sqlmap_output,
-    "ffuf": _parse_ffuf_output,
-    "gobuster": _parse_ffuf_output,  # Similar format
-}
+# CVE pattern for any tool output
+CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,7}")
+CWE_PATTERN = re.compile(r"CWE-\d{1,4}")
 
 
 class ToolOutputAnalyzer:
-    """Analyzes and structures external tool output.
+    """Analyzes and extracts findings from tool outputs.
 
-    Parses output from 30+ security tools into
-    structured findings that agents can reason about.
+    Parses raw CLI output from security tools,
+    extracts structured findings, classifies
+    severity, and prepares context for LLM.
     """
 
     def __init__(self) -> None:
-        self._parsed_count = 0
-        self._total_findings = 0
+        self._findings: list[ExtractedFinding] = []
+        self._counter = 0
+        self._tools_analyzed: dict[str, int] = {}
         self._log = logger.bind(component="tool_output_analyzer")
 
     def analyze(
         self,
-        tool_name: str,
-        raw_output: str,
+        tool: str,
+        output: str,
         target: str = "",
-    ) -> ParsedOutput:
+    ) -> list[ExtractedFinding]:
         """Analyze tool output and extract findings."""
-        self._parsed_count += 1
+        findings: list[ExtractedFinding] = []
 
-        result = ParsedOutput(
-            tool_name=tool_name,
-            raw_length=len(raw_output),
-            format_detected=self._detect_format(raw_output),
-        )
+        rules = EXTRACTION_RULES.get(tool.lower(), [])
 
-        # Check for errors
-        result.errors = self._detect_errors(raw_output)
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
 
-        # Use tool-specific parser or generic
-        parser = TOOL_PARSERS.get(tool_name.lower(), None)
-        if parser:
-            result.findings = parser(raw_output)
-        else:
-            result.findings = _parse_generic(raw_output, tool_name)
+            for rule in rules:
+                match = re.search(rule["pattern"], line)
+                if not match:
+                    continue
 
-        # Set target on findings if not already set
-        for finding in result.findings:
-            if not finding.target and target:
-                finding.target = target
+                groups = match.groups()
+                field_values: dict[str, str] = {}
+                for i, field_name in enumerate(rule["fields"]):
+                    if i < len(groups):
+                        field_values[field_name] = groups[i]
 
-        # Generate summary
-        result.summary = self._generate_summary(result)
+                # Determine severity
+                severity_str = rule["severity"]
+                if severity_str == "dynamic" and "severity" in field_values:
+                    severity_str = field_values["severity"].lower()
 
-        self._total_findings += len(result.findings)
-        return result
+                try:
+                    severity = FindingSeverity(severity_str)
+                except ValueError:
+                    severity = FindingSeverity.INFO
 
-    def _detect_format(self, output: str) -> OutputFormat:
-        """Detect output format."""
-        stripped = output.strip()
-        if not stripped:
-            return OutputFormat.UNKNOWN
+                # Build title
+                title = rule["title_template"].format(**field_values)
 
-        if stripped.startswith('{') or stripped.startswith('['):
-            return OutputFormat.JSON
-        if stripped.startswith('<?xml') or stripped.startswith('<'):
-            return OutputFormat.XML
-        if ',' in stripped.splitlines()[0] and stripped.count(',') > 3:
-            return OutputFormat.CSV
-        return OutputFormat.TEXT
+                # Extract CVEs and CWEs
+                cves = CVE_PATTERN.findall(line)
+                cwes = CWE_PATTERN.findall(line)
 
-    def _detect_errors(self, output: str) -> list[str]:
-        """Detect error messages in output."""
-        errors: list[str] = []
-        error_patterns = [
-            r'(?i)error:?\s+(.+)',
-            r'(?i)failed:?\s+(.+)',
-            r'(?i)permission denied',
-            r'(?i)connection refused',
-            r'(?i)timeout',
-            r'(?i)not found',
-        ]
-        for line in output.splitlines()[:50]:
-            for pattern in error_patterns:
-                if re.search(pattern, line):
-                    errors.append(line.strip()[:100])
-                    break
-        return errors[:10]
-
-    def _generate_summary(self, result: ParsedOutput) -> str:
-        """Generate a summary of parsed output."""
-        severity_counts: dict[str, int] = {}
-        for f in result.findings:
-            severity_counts[f.severity.value] = severity_counts.get(f.severity.value, 0) + 1
-
-        parts = [f"{result.tool_name}: {len(result.findings)} findings"]
-        for sev in ["critical", "high", "medium", "low", "info"]:
-            count = severity_counts.get(sev, 0)
-            if count:
-                parts.append(f"{count} {sev}")
-
-        if result.errors:
-            parts.append(f"{len(result.errors)} errors")
-
-        return ", ".join(parts)
-
-    def build_output_prompt(
-        self,
-        parsed: ParsedOutput,
-        max_findings: int = 10,
-    ) -> str:
-        """Build tool output context for LLM."""
-        lines = [f"## Tool Output: {parsed.tool_name}\n"]
-        lines.append(f"Summary: {parsed.summary}")
-
-        if parsed.findings:
-            lines.append("\nFindings:")
-            sorted_findings = sorted(
-                parsed.findings,
-                key=lambda f: ["critical", "high", "medium", "low", "info"].index(f.severity.value),
-            )
-            for f in sorted_findings[:max_findings]:
-                lines.append(
-                    f"  [{f.severity.value.upper()}] {f.title}"
-                    + (f" ({f.cve})" if f.cve else "")
+                self._counter += 1
+                finding = ExtractedFinding(
+                    finding_id=f"ext-{self._counter}",
+                    tool=tool,
+                    severity=severity,
+                    title=title,
+                    target=target,
+                    port=int(field_values.get("port", 0) or 0),
+                    protocol=field_values.get("protocol", ""),
+                    evidence=line[:200],
+                    cve_ids=cves,
+                    cwe_ids=cwes,
+                    raw_line=line,
                 )
+                findings.append(finding)
 
-        if parsed.errors:
-            lines.append("\nErrors:")
-            for err in parsed.errors[:3]:
-                lines.append(f"  - {err[:60]}")
+        # Also extract CVEs from any line not matched by rules
+        for line in output.split("\n"):
+            cves = CVE_PATTERN.findall(line)
+            for cve in cves:
+                if not any(cve in f.cve_ids for f in findings):
+                    self._counter += 1
+                    findings.append(ExtractedFinding(
+                        finding_id=f"ext-{self._counter}",
+                        tool=tool,
+                        severity=FindingSeverity.HIGH,
+                        title=f"CVE reference: {cve}",
+                        target=target,
+                        cve_ids=[cve],
+                        evidence=line.strip()[:200],
+                        raw_line=line.strip(),
+                    ))
+
+        self._findings.extend(findings)
+        self._tools_analyzed[tool] = self._tools_analyzed.get(tool, 0) + 1
+
+        return findings
+
+    def summarize(
+        self,
+        findings: list[ExtractedFinding] | None = None,
+        max_findings: int = 20,
+    ) -> str:
+        """Summarize findings for LLM context."""
+        items = findings or self._findings
+        if not items:
+            return "No findings extracted."
+
+        # Count by severity
+        sev_counts: dict[str, int] = {}
+        for f in items:
+            sev_counts[f.severity.value] = sev_counts.get(f.severity.value, 0) + 1
+
+        lines = [
+            f"Extracted {len(items)} findings from {len(self._tools_analyzed)} tools.",
+            "Severity: " + " ".join(f"{k}={v}" for k, v in sev_counts.items()),
+        ]
+
+        # Sort by severity (critical first)
+        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        sorted_items = sorted(items, key=lambda f: sev_order.get(f.severity.value, 5))
+
+        for f in sorted_items[:max_findings]:
+            cve_str = f" [{','.join(f.cve_ids[:2])}]" if f.cve_ids else ""
+            lines.append(
+                f"  [{f.severity.value[0].upper()}] {f.title[:35]}{cve_str}"
+            )
+
+        return "\n".join(lines)
+
+    def build_analyzer_prompt(self, max_findings: int = 15) -> str:
+        """Build analyzer context for LLM."""
+        lines = ["## Tool Output Analysis\n"]
+        lines.append(self.summarize(max_findings=max_findings))
+
+        # Tool breakdown
+        if self._tools_analyzed:
+            lines.append("\nTools analyzed:")
+            for tool, count in self._tools_analyzed.items():
+                tool_findings = [f for f in self._findings if f.tool == tool]
+                lines.append(f"  {tool}: {count} runs, {len(tool_findings)} findings")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
+        sev_counts: dict[str, int] = {}
+        for f in self._findings:
+            sev_counts[f.severity.value] = sev_counts.get(f.severity.value, 0) + 1
+
         return {
-            "outputs_parsed": self._parsed_count,
-            "total_findings": self._total_findings,
+            "total_findings": len(self._findings),
+            "by_severity": sev_counts,
+            "tools_analyzed": dict(self._tools_analyzed),
+            "unique_cves": len(set(
+                cve for f in self._findings for cve in f.cve_ids
+            )),
         }
