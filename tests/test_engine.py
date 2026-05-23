@@ -1,9 +1,7 @@
 """Test the engine, memory, and router."""
 
-import asyncio
 
 import pytest
-import pytest_asyncio
 
 from recursec.config.settings import LLMModelConfig, RecurSecConfig
 from recursec.llm.backends import BACKEND_REGISTRY, create_backend

@@ -2,7 +2,7 @@
 
 **Recursive Multi-Agent Security Framework**
 
-Autonomous security testing with unlimited local LLMs, 200+ tools, recursive agent spawning, and 24/7 daemon mode. Everything runs locally — no cloud required.
+Autonomous security testing with unlimited local LLMs, 215+ tools, recursive agent spawning, and 24/7 daemon mode. Everything runs locally — no cloud, no Ollama.
 
 ```
  ____  ____  ____  _  _  ____  ____  ____  ____
@@ -13,253 +13,190 @@ Autonomous security testing with unlimited local LLMs, 200+ tools, recursive age
 
 ---
 
-## What This Does
+## Your 16-Model Setup
 
-RecurSec is a framework that connects your local LLMs to 200+ security tools and lets them run autonomously. The **DecisionBrain** (orchestrator) analyzes your target, breaks the work into specialized sub-tasks, and dispatches them to **15 specialized agents** — each an expert in their domain.
+RecurSec is pre-configured for your exact GGUF models, with each model assigned to what it's best at:
 
-Agents can spawn child agents recursively (up to configurable depth), creating attack chains that would take a human team days to assemble.
-
-### Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│              YOUR LLMs (unlimited)                    │
-│  vLLM • llama.cpp • SGLang • LiteLLM • any endpoint │
-└───────────────────────┬──────────────────────────────┘
-                        │
-┌───────────────────────▼──────────────────────────────┐
-│          INTELLIGENT MODEL ROUTER                     │
-│  Routes by task type • Load balancing • Fallbacks    │
-│  Hot-add/remove models at runtime                    │
-└───────────────────────┬──────────────────────────────┘
-                        │
-┌───────────────────────▼──────────────────────────────┐
-│            DECISIONBRAIN (Orchestrator)               │
-│  Decomposes targets • Assembles attack chains        │
-│  Spawns specialized agents recursively               │
-└───────────────────────┬──────────────────────────────┘
-                        │
-  ┌─────────┬─────────┬─┴───────┬─────────┬──────────┐
-  ▼         ▼         ▼         ▼         ▼          ▼
-┌─────┐ ┌─────┐ ┌─────────┐ ┌──────┐ ┌──────┐ ┌────────┐
-│Recon│ │Vuln │ │Web Scan │ │Exploit│ │Code  │ │Post-   │
-│Agent│ │Scan │ │Agent    │ │Agent │ │Audit │ │Exploit │
-└─────┘ └─────┘ └─────────┘ └──────┘ └──────┘ └────────┘
-  + OSINT, Network, Fuzzer, Crypto, Cloud, Wireless,
-    Forensics, Report, Validator agents
-```
-
-### Key Features
-
-- **Unlimited LLMs** — Not hardcoded to any number. Add 1 or 100 models. Hot-add/remove at runtime via API.
-- **6 Inference Backends** — vLLM (fastest throughput), llama.cpp (lightest), SGLang (lowest latency), LiteLLM (universal proxy), Ollama, any OpenAI-compatible endpoint.
-- **Intelligent Routing** — Routes each task to the best model based on task type (code analysis → DeepSeek, reasoning → Qwen, fast queries → Mistral-7B, etc.). Load balancing, weighted selection, automatic fallbacks.
-- **200+ Security Tools** — nmap, masscan, nuclei, sqlmap, metasploit, semgrep, hydra, hashcat, wireshark, and 190+ more. All auto-detected, installable via CLI.
-- **15 Specialized Agents** — Recon, VulnScan, WebScan, Exploit, PostExploit, CodeAudit, Network, OSINT, Fuzzer, Crypto, Cloud, Wireless, Forensics, Report, Validator.
-- **Recursive Agent Spawning** — Agents create sub-agents for specialized tasks. The Orchestrator plans, delegates, and aggregates results up the tree.
-- **Anti-Hallucination Validation** — Dedicated Validator agent cross-checks every finding with different tools and models before marking it confirmed.
-- **24/7 Daemon Mode** — Task queue, scheduled recurring scans, auto-restart on failure.
-- **Web Dashboard** — Real-time monitoring, task submission, model management, findings viewer.
-- **Docker Sandboxed** — Everything runs in containers. Host system protected.
-- **Fully Configurable** — Single YAML file controls everything. Every parameter is tunable.
+| Port | Model | Role | Task Types |
+|------|-------|------|------------|
+| 8100 | **WhiteRabbitNeo-7B** | Security Brain | security, exploit, vuln_analysis |
+| 8101 | **Qwen2.5-Coder-14B** | Code Analysis (Large) | code, code_audit, exploit_dev |
+| 8102 | **Qwen2.5-Coder-7B** | Code Analysis (Medium) | code, code_audit |
+| 8103 | **CodeLlama-13B** | Exploit Code | code, exploit_dev |
+| 8104 | **CodeLlama-7B** | Code (Fast) | code, fast |
+| 8105 | **DeepSeek-R1-Distill** | Reasoning | reasoning, planning, analysis |
+| 8106 | **DeepSeek-Math-7B** | Math/Crypto Reasoning | reasoning, crypto, math |
+| 8107 | **Hermes-4-14B** | General (Large) | general, writing, report |
+| 8108 | **Llama-3.1-8B** | General (Medium) | general, recon, osint |
+| 8109 | **Dolphin-2.9** | Uncensored General | general, security, pentest |
+| 8110 | **Mistral-7B** | General (Fast) | general, fast, recon |
+| 8111 | **Yi-9B-200K** | Long Context (200K!) | long_context, code_audit |
+| 8112 | **Phi-3.5-mini** | Ultra-Fast Triage | fast, triage, classification |
+| 8113 | **FunctionGemma-270m** | Tool Call Router | function_call, tool_routing |
+| 8114 | **Llama-Guard-3** | Safety Guardrail | safety classification |
+| 8115 | **Nomic-Embed-Text** | RAG / Embedding | semantic memory search |
 
 ---
 
 ## Quick Start
 
-### 1. Install
+### 1. Install Everything
 
 ```bash
-git clone https://github.com/youruser/recursec.git
-cd recursec
+git clone <repo-url> ~/agent/recursec
+cd ~/agent/recursec
+
+# Full install (llama.cpp + tools + RecurSec)
+./scripts/install.sh --all
+
+# Or just RecurSec
 pip install -e .
 ```
 
-### 2. Generate Config
+### 2. Launch All 16 Models
 
 ```bash
-recursec init
+# Make sure your GGUF models are in ~/agent/models/gguf/
+./scripts/launch_models.sh
+
+# This starts 16 llama.cpp servers on ports 8100-8115
+# Each model gets its own server with optimal settings
 ```
 
-This creates `recursec.yaml`. Edit it to add your LLM endpoints.
-
-### 3. Start Your LLM Servers
-
-You need at least one LLM server running. Pick any backend:
-
-**vLLM (recommended for GPU):**
-```bash
-python -m vllm.entrypoints.openai.api_server \
-    --model deepseek-ai/deepseek-coder-v2-lite-instruct \
-    --port 8000
-```
-
-**llama.cpp (recommended for CPU):**
-```bash
-./llama-server -m your-model.gguf --host 0.0.0.0 --port 8080 -ngl 99
-```
-
-**SGLang (fastest latency):**
-```bash
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000
-```
-
-### 4. Run a Scan
+### 3. Run RecurSec
 
 ```bash
 # Single target scan
-recursec run --target 192.168.1.100 --objective "Full security assessment"
+recursec run --config configs/recursec.yaml --target 192.168.1.100
+
+# Full auto-assessment
+recursec run --target 192.168.1.0/24 --objective "Complete security assessment"
 
 # Daemon mode (24/7)
-recursec run --daemon --config recursec.yaml
+recursec run --daemon
 
 # Check available tools
 recursec tools
 ```
 
-### 5. Docker (Recommended)
+### 4. Stop Everything
 
 ```bash
-cd docker
-docker compose up -d
-```
-
-The Docker image comes with Kali Linux + all 200+ tools pre-installed.
-
----
-
-## Configuration
-
-Everything is in `recursec.yaml`:
-
-### Adding LLMs
-
-```yaml
-models:
-  - name: my-model
-    backend: vllm          # vllm, llama_cpp, sglang, litellm, ollama, openai_compatible
-    model_id: my-model-id
-    base_url: http://localhost:8000
-    task_types: [code, security]  # What this model is good at
-    priority: 1            # 1 = highest priority
-    max_concurrent: 10     # Max parallel requests
-    weight: 1.0            # Selection weight
-```
-
-Task types: `general`, `code`, `reasoning`, `security`, `writing`, `fast`
-
-### Adding Custom Tools
-
-```yaml
-tools:
-  custom_tools:
-    - name: my-scanner
-      binary: my-scanner
-      category: vuln_scan
-      description: "My custom vulnerability scanner"
-      install: "pip install my-scanner"
-```
-
-### Scheduled Scans
-
-```yaml
-daemon:
-  schedule:
-    - objective: "Scan internal network"
-      target: "192.168.1.0/24"
-      target_type: network_range
-      interval_s: 21600  # Every 6 hours
+./scripts/stop_models.sh
 ```
 
 ---
 
-## API
+## Architecture
 
-The dashboard exposes a REST API:
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/status` | GET | Engine status |
-| `/api/tasks` | POST | Submit a task |
-| `/api/tasks` | GET | List tasks |
-| `/api/findings` | GET | Get findings |
-| `/api/models` | GET | List models |
-| `/api/models` | POST | Add a model (hot-add) |
-| `/api/models/{name}` | DELETE | Remove a model |
-| `/api/models/health` | GET | Health check all models |
-| `/api/tools` | GET | List tools |
-| `/api/tools` | POST | Add custom tool |
-| `/api/tools/{name}/install` | POST | Install a tool |
-| `/api/memory/stats` | GET | Memory statistics |
-
-### Example: Add a Model at Runtime
-
-```bash
-curl -X POST http://localhost:8080/api/models \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "new-model",
-    "backend": "vllm",
-    "model_id": "Qwen/Qwen2.5-32B-Instruct",
-    "base_url": "http://localhost:8002",
-    "task_types": ["reasoning"],
-    "priority": 2
-  }'
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    YOUR 16 GGUF MODELS                            │
+│  WhiteRabbitNeo • Qwen-Coder • CodeLlama • DeepSeek-R1          │
+│  Hermes • Llama • Dolphin • Mistral • Yi-200K • Phi             │
+│  FunctionGemma (router) • Llama-Guard (safety) • Nomic (embed)  │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────┐
+│                   INTELLIGENT MODEL ROUTER                        │
+│  Security tasks → WhiteRabbitNeo + Dolphin (priority)            │
+│  Code analysis → Qwen-Coder-14B + CodeLlama-13B                 │
+│  Reasoning → DeepSeek-R1 (chain-of-thought)                     │
+│  Long files → Yi-9B-200K (200K context)                          │
+│  Quick triage → Phi-3.5-mini + FunctionGemma (instant)          │
+│  Reports → Hermes-14B (best writing)                             │
+│  Load balanced • Fallback chains • Hot-add/remove                │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+            ┌───────────────────┼───────────────────┐
+            ▼                   ▼                   ▼
+    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+    │ SAFETY GUARD │   │ VECTOR MEMORY│   │ TOOL PARSERS │
+    │ Llama-Guard  │   │ Nomic-Embed  │   │ nmap, nuclei │
+    │ Pre-check    │   │ RAG search   │   │ sqlmap, etc. │
+    └──────────────┘   └──────────────┘   └──────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────┐
+│                     DECISIONBRAIN                                  │
+│  Decomposes targets → Spawns agents → Builds attack chains       │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+  ┌─────────┬─────────┬─────────┼─────────┬─────────┬──────────┐
+  ▼         ▼         ▼         ▼         ▼         ▼          ▼
+┌─────┐ ┌─────┐ ┌─────────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌────────┐
+│Recon│ │Vuln │ │Web Scan │ │Exploit│ │Code  │ │Post- │ │Validate│
+│Agent│ │Scan │ │Agent    │ │Agent │ │Audit │ │Exploit│ │Agent   │
+└─────┘ └─────┘ └─────────┘ └──────┘ └──────┘ └──────┘ └────────┘
+  + OSINT, Network, Fuzzer, Crypto, Cloud, Wireless,
+    Forensics, Report agents (15 total)
 ```
 
-### Example: Submit a Task
+### How Model Routing Works
 
-```bash
-curl -X POST http://localhost:8080/api/tasks \
-  -H "Content-Type: application/json" \
-  -d '{
-    "objective": "Find all SQL injection vulnerabilities",
-    "target": "https://example.com",
-    "target_type": "url",
-    "agent_role": "web_scanner"
-  }'
+When an agent needs to think, the router picks the best model:
+
+```
+ReconAgent needs to analyze nmap output
+  → Router checks task_type="security"
+  → Selects WhiteRabbitNeo (priority=1, weight=2.0)
+  → If busy: falls back to Dolphin (uncensored, priority=2)
+
+CodeAuditAgent reviewing Python source
+  → Router checks task_type="code"  
+  → Selects Qwen-Coder-14B (largest code model, priority=1)
+  → If busy: Qwen-Coder-7B → CodeLlama-13B → CodeLlama-7B
+
+OrchestratorAgent planning attack
+  → Router checks task_type="reasoning"
+  → Selects DeepSeek-R1 (chain-of-thought, priority=1)
+
+ReportAgent writing final report
+  → Router checks task_type="writing"
+  → Selects Hermes-14B (best writing quality)
+
+Quick tool selection
+  → Router checks task_type="function_call"
+  → FunctionGemma-270m responds in <50ms
 ```
 
 ---
 
-## How It Works
+## Features
 
-### Recursive Agent Flow
+### Core
+- **Unlimited LLMs** — add any number, hot-add/remove at runtime via API
+- **6 inference backends** — vLLM, llama.cpp, SGLang, LiteLLM, Ollama, any OpenAI-compatible
+- **Intelligent routing** — task-type matching, load balancing, weighted selection, automatic fallbacks
+- **215+ security tools** — auto-detected, installable via CLI or API
+- **15 specialized agents** — each a domain expert with its own system prompt and tool preferences
 
-1. You submit a task: "Full pentest of 192.168.1.0/24"
-2. **DecisionBrain** receives the task and plans:
-   - Spawn ReconAgent → discover hosts and services
-   - Spawn VulnScanAgent → scan discovered services
-   - Spawn WebScanAgent → test any web apps found
-   - Spawn ExploitAgent → attempt exploitation of confirmed vulns
-   - Spawn ValidatorAgent → verify all findings
-   - Spawn ReportAgent → compile report
-3. Each agent may spawn its own children (e.g., WebScanAgent spawns SQLi sub-agent and XSS sub-agent)
-4. Results flow back up the tree
-5. ValidatorAgent cross-checks everything to eliminate false positives
-6. ReportAgent compiles the final report with severity ratings
+### Security Intelligence
+- **Recursive spawning** — DecisionBrain creates child agents, which create grandchildren (configurable depth 1-5)
+- **Anti-hallucination** — ValidatorAgent cross-checks every finding with different tools and models
+- **Attack chain builder** — Links findings into exploitation paths (Recon → Vuln → Exploit → Post-Exploit)
+- **Tool output parsers** — Structured parsing for nmap, nuclei, sqlmap, semgrep, nikto, gobuster, hydra, and more
 
-### Model Routing
+### Safety & Memory
+- **Llama-Guard-3 safety filter** — Blocks harmful content, ensures authorized testing scope
+- **RAG vector memory** — Nomic-Embed creates semantic embeddings of findings for intelligent retrieval
+- **SQLite persistence** — All findings, tool results, and agent messages stored permanently
+- **Knowledge graph** — Searchable knowledge base that grows smarter with each scan
 
-The router assigns models based on what they're best at:
-
-| Task Type | Best Models | Why |
-|-----------|-------------|-----|
-| Code analysis | DeepSeek Coder, CodeLlama | Trained on code |
-| Reasoning | Qwen 72B, Llama 70B | Large context, strong reasoning |
-| Security | DeepSeek, Qwen | Domain knowledge |
-| Writing | Llama, Yi | Natural language quality |
-| Fast queries | Mistral 7B, Phi-3 | Low latency |
+### Operations
+- **24/7 daemon mode** — task queue, scheduled recurring scans, auto-restart
+- **Web dashboard** — real-time monitoring, task submission, model management at http://localhost:8080
+- **REST API** — full programmatic control
+- **Docker** — Kali Linux Dockerfile with all tools pre-installed
 
 ---
 
-## Tools (210+)
+## Tools (215+)
 
 | Category | Count | Examples |
 |----------|-------|---------|
 | Recon | 30 | nmap, masscan, subfinder, amass, httpx |
 | Vuln Scan | 17 | nuclei, nikto, openvas, wpscan, trivy |
-| Web | 25 | sqlmap, xsstrike, ffuf, gobuster, dalfox |
+| Web | 26 | sqlmap, xsstrike, ffuf, gobuster, dalfox |
 | Exploit | 9 | metasploit, searchsploit, pwntools, ropper |
 | Network | 13 | wireshark, tcpdump, bettercap, mitmproxy |
 | Post-Exploit | 14 | linpeas, bloodhound, mimikatz, impacket |
@@ -273,11 +210,28 @@ The router assigns models based on what they're best at:
 | Reporting | 4 | pandoc, wkhtmltopdf, faraday |
 | Misc | 22 | curl, git, docker, openssl, tor |
 
-All tools are auto-detected on startup. Missing tools can be installed via:
+Missing tools can be installed:
 ```bash
-recursec tools                          # List all tools
+recursec tools                                      # List all tools
 curl -X POST localhost:8080/api/tools/nmap/install  # Install via API
 ```
+
+---
+
+## API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/status` | GET | Engine status (models, tools, safety, memory) |
+| `/api/tasks` | POST | Submit a task |
+| `/api/tasks` | GET | List tasks |
+| `/api/findings` | GET | Get findings |
+| `/api/models` | GET/POST | List/add models |
+| `/api/models/{name}` | DELETE | Remove model |
+| `/api/models/health` | GET | Health check all |
+| `/api/tools` | GET/POST | List/add tools |
+| `/api/tools/{name}/install` | POST | Install a tool |
+| `/api/memory/stats` | GET | Memory statistics |
 
 ---
 
@@ -287,61 +241,49 @@ curl -X POST localhost:8080/api/tools/nmap/install  # Install via API
 recursec/
 ├── recursec/
 │   ├── core/
-│   │   ├── models.py          # Data models (Vulnerability, Task, Target, etc.)
-│   │   └── base_agent.py      # Base agent class with ReAct loop
+│   │   ├── models.py          # Pydantic data models
+│   │   ├── base_agent.py      # Base agent + ReAct loop
+│   │   └── attack_chain.py    # Attack chain builder
 │   ├── llm/
-│   │   ├── backends.py        # LLM backends (vLLM, llama.cpp, SGLang, etc.)
-│   │   └── router.py          # Intelligent model router
+│   │   ├── backends.py        # 6 LLM backends
+│   │   ├── router.py          # Intelligent model router
+│   │   └── safety.py          # Llama-Guard safety filter
 │   ├── tools/
-│   │   ├── base.py            # Base tool class + shell execution
-│   │   └── registry.py        # 200+ tool definitions + registry
+│   │   ├── base.py            # Base tool + shell execution
+│   │   ├── registry.py        # 215+ tool definitions
+│   │   └── parsers.py         # Structured output parsers
 │   ├── agents/
-│   │   ├── prompts.py         # System prompts for all 15 agent roles
-│   │   ├── security_agents.py # Agent implementations
+│   │   ├── prompts.py         # 15 specialized system prompts
+│   │   ├── security_agents.py # Agent implementations (ReAct)
 │   │   └── factory.py         # Agent factory
 │   ├── memory/
-│   │   └── store.py           # SQLite + in-memory state management
+│   │   ├── store.py           # SQLite persistence
+│   │   └── embeddings.py      # Nomic-Embed RAG + vector memory
 │   ├── config/
 │   │   └── settings.py        # Pydantic settings from YAML
 │   ├── daemon/
-│   │   └── engine.py          # Main engine + task queue + daemon mode
+│   │   └── engine.py          # Main engine + daemon
 │   ├── dashboard/
 │   │   └── app.py             # FastAPI web dashboard
 │   └── cli.py                 # Typer CLI
+├── scripts/
+│   ├── install.sh             # Full installation script
+│   ├── launch_models.sh       # Start all 16 llama.cpp servers
+│   └── stop_models.sh         # Stop all model servers
 ├── docker/
 │   ├── Dockerfile             # Kali Linux + all tools
 │   └── docker-compose.yml     # Full stack deployment
 ├── configs/
-│   └── recursec.yaml          # Default configuration
+│   └── recursec.yaml          # Pre-configured for your 16 models
 ├── tests/
-├── pyproject.toml
-└── README.md
+└── pyproject.toml
 ```
-
----
-
-## Comparison
-
-| Feature | RecurSec | PentAGI | Agent Zero | CyberStrike |
-|---------|----------|---------|------------|-------------|
-| Unlimited LLMs | **Yes** | 1 | 1 | 1 |
-| LLM backends | **6** (vLLM, llama.cpp, SGLang, LiteLLM, Ollama, custom) | Ollama | Ollama | BYOK |
-| Intelligent routing | **Yes** (task-type, load balance, fallback) | No | No | No |
-| Hot-add models | **Yes** (API) | No | No | No |
-| Security tools | **210+** | ~20 | ~10 | 7,300 skills |
-| Specialized agents | **15** | 1 | 1 | 13 |
-| Recursive spawning | **Yes** (configurable depth) | No | No | No |
-| Anti-hallucination | **Yes** (Validator agent) | No | No | No |
-| 24/7 daemon | **Yes** | No | No | No |
-| Web dashboard | **Yes** | Yes | Yes | Yes |
-| Scheduled scans | **Yes** | No | No | No |
-| Docker sandboxed | **Yes** | Yes | Yes | No |
 
 ---
 
 ## Security Notice
 
-This framework is intended for **authorized security testing only**. Always obtain explicit written permission before testing any system you don't own. Unauthorized access to computer systems is illegal.
+This framework is for **authorized security testing only**. Always obtain written permission before testing any system you don't own. The Llama-Guard safety layer helps enforce this but is not a substitute for proper authorization.
 
 ---
 

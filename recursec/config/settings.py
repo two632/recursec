@@ -58,6 +58,19 @@ class DockerConfig(BaseModel):
     auto_build: bool = True
 
 
+class SafetyConfig(BaseModel):
+    enabled: bool = True
+    base_url: str = "http://localhost:8114"
+    model_id: str = "llama-guard-3-1b"
+    authorization_scope: str = ""
+
+
+class EmbeddingConfig(BaseModel):
+    enabled: bool = True
+    base_url: str = "http://localhost:8115"
+    model_id: str = "nomic-embed-text"
+
+
 class ToolsConfig(BaseModel):
     sandbox_mode: bool = True
     docker_image: str | None = None
@@ -86,6 +99,12 @@ class RecurSecConfig(BaseSettings):
 
     # Tools
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+
+    # Safety guard (Llama-Guard)
+    safety: SafetyConfig = Field(default_factory=SafetyConfig)
+
+    # Embedding / RAG (Nomic-Embed)
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 
     # Memory
     db_path: str = "recursec_memory.db"

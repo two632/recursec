@@ -1,11 +1,9 @@
 """Test the tool registry and basic framework components."""
 
-import asyncio
 
-import pytest
 
 from recursec.config.settings import RecurSecConfig
-from recursec.core.models import AgentRole, AgentTask, Severity, Target, ToolCategory, Vulnerability
+from recursec.core.models import AgentRole, AgentTask, Severity, Target, Vulnerability
 from recursec.tools.registry import ToolRegistry
 
 

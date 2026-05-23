@@ -168,6 +168,29 @@ async def memory_stats(engine=Depends(get_engine)):
     return await engine.memory.get_stats()
 
 
+@app.get("/api/safety/stats")
+async def safety_stats(engine=Depends(get_engine)):
+    return engine.safety.stats()
+
+
+@app.get("/api/chains")
+async def get_chains(engine=Depends(get_engine)):
+    return engine.chain_builder.get_summary()
+
+
+@app.get("/api/chains/report")
+async def chain_report(engine=Depends(get_engine)):
+    return engine.chain_builder.generate_report_data()
+
+
+@app.get("/api/memory/search")
+async def search_memory(q: str, top_k: int = 5, engine=Depends(get_engine)):
+    if engine.vector_memory:
+        results = await engine.vector_memory.search(q, top_k=top_k)
+        return [{"text": r["text"][:500], "score": r["score"], "metadata": r["metadata"]} for r in results]
+    return []
+
+
 # ── Dashboard HTML ──────────────────────────────────────
 
 DASHBOARD_HTML = """<!DOCTYPE html>

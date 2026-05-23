@@ -1,172 +1,239 @@
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║              RecurSec Configuration                              ║
-# ║  Recursive Multi-Agent Security Framework                        ║
-# ║  Fully configurable — add as many models, tools, agents as you   ║
-# ║  want. No limits.                                                ║
+# ║  Configured for YOUR 16 GGUF models via llama.cpp               ║
+# ║  Run: ./scripts/launch_models.sh to start all servers            ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-# ── LLM Models ──────────────────────────────────────────────────────
-# Add unlimited models. Each model can be assigned to specific task types.
-# Backends: vllm, llama_cpp, sglang, litellm, ollama, openai_compatible
-#
-# Task types determine which model gets used for what:
-#   - general: Default fallback
-#   - code: Code analysis, exploit development, code auditing
-#   - reasoning: Complex planning, decision making, analysis
-#   - security: Vulnerability analysis, pentesting decisions
-#   - writing: Report generation, documentation
-#   - fast: Quick responses, simple queries (use smallest model)
-#
-# Priority: 1 = highest priority (used first), 10 = lowest
-# Weight: Higher weight = more likely to be selected among same-priority models
+# ── YOUR 16 LLM MODELS ─────────────────────────────────────────────
+# Each model is served by llama.cpp on a separate port (8100-8115)
+# Models are assigned to task types based on their strengths
 
 models:
-  # Example: vLLM serving DeepSeek Coder (best for code analysis)
-  - name: deepseek-coder
-    backend: vllm
-    model_id: deepseek-ai/deepseek-coder-v2-lite-instruct
-    base_url: http://localhost:8000
-    task_types: [code, security]
-    priority: 1
-    max_concurrent: 10
-    weight: 1.0
-
-  # Example: vLLM serving Qwen (best for reasoning)
-  - name: qwen-reasoning
-    backend: vllm
-    model_id: Qwen/Qwen2.5-72B-Instruct
-    base_url: http://localhost:8001
-    task_types: [reasoning, general]
-    priority: 2
-    max_concurrent: 5
-    weight: 1.0
-
-  # Example: llama.cpp serving Llama 3.1 (CPU-friendly, writing)
-  - name: llama-writer
+  # ═══════════════════════════════════════════════════════════
+  # PRIMARY SECURITY BRAIN
+  # WhiteRabbitNeo — trained specifically for hacking/security
+  # This model gets ALL security-related tasks first
+  # ═══════════════════════════════════════════════════════════
+  - name: whiterabbitneo-security
     backend: llama_cpp
-    model_id: llama-3.1-70b-instruct
-    base_url: http://localhost:8080
-    task_types: [writing, general]
+    model_id: WhiteRabbitNeo-7B-v1.5a
+    base_url: http://localhost:8100
+    task_types: [security, exploit, vuln_analysis, pentest]
+    priority: 1
+    max_concurrent: 4
+    weight: 2.0  # Double weight — prefer for security tasks
+
+  # ═══════════════════════════════════════════════════════════
+  # CODE ANALYSIS MODELS
+  # For source code review, exploit development, code auditing
+  # ═══════════════════════════════════════════════════════════
+  - name: qwen-coder-14b
+    backend: llama_cpp
+    model_id: Qwen2.5-Coder-14B-Instruct
+    base_url: http://localhost:8101
+    task_types: [code, code_audit, exploit_dev]
+    priority: 1
+    max_concurrent: 4
+    weight: 1.5  # Largest code model
+
+  - name: qwen-coder-7b
+    backend: llama_cpp
+    model_id: Qwen2.5-Coder-7B-Instruct
+    base_url: http://localhost:8102
+    task_types: [code, code_audit, security]
+    priority: 2
+    max_concurrent: 4
+    weight: 1.0
+
+  - name: codellama-13b
+    backend: llama_cpp
+    model_id: codellama-13b-instruct
+    base_url: http://localhost:8103
+    task_types: [code, exploit_dev]
+    priority: 2
+    max_concurrent: 4
+    weight: 1.0
+
+  - name: codellama-7b
+    backend: llama_cpp
+    model_id: codellama-7b
+    base_url: http://localhost:8104
+    task_types: [code, fast]
+    priority: 4
+    max_concurrent: 4
+    weight: 0.7
+
+  # ═══════════════════════════════════════════════════════════
+  # REASONING MODELS
+  # For planning, decision-making, complex analysis
+  # ═══════════════════════════════════════════════════════════
+  - name: deepseek-r1-reasoning
+    backend: llama_cpp
+    model_id: DeepSeek-R1-Distill-Qwen-7B
+    base_url: http://localhost:8105
+    task_types: [reasoning, planning, analysis]
+    priority: 1
+    max_concurrent: 4
+    weight: 1.5  # Best for chain-of-thought
+
+  - name: deepseek-math
+    backend: llama_cpp
+    model_id: deepseek-math-7b-instruct
+    base_url: http://localhost:8106
+    task_types: [reasoning, crypto, math]
+    priority: 2
+    max_concurrent: 4
+    weight: 1.0
+
+  # ═══════════════════════════════════════════════════════════
+  # GENERAL PURPOSE MODELS
+  # For recon, OSINT, report writing, general tasks
+  # ═══════════════════════════════════════════════════════════
+  - name: hermes-14b
+    backend: llama_cpp
+    model_id: Hermes-4-14B
+    base_url: http://localhost:8107
+    task_types: [general, writing, report, analysis]
+    priority: 1
+    max_concurrent: 4
+    weight: 1.5  # Largest general model
+
+  - name: llama-3.1-8b
+    backend: llama_cpp
+    model_id: Meta-Llama-3.1-8B-Instruct
+    base_url: http://localhost:8108
+    task_types: [general, recon, osint]
+    priority: 2
+    max_concurrent: 4
+    weight: 1.0
+
+  - name: dolphin-uncensored
+    backend: llama_cpp
+    model_id: dolphin-2.9-llama3-8b
+    base_url: http://localhost:8109
+    task_types: [general, security, exploit, pentest]
+    priority: 2
+    max_concurrent: 4
+    weight: 1.2  # Uncensored — useful for security tasks
+
+  - name: mistral-7b
+    backend: llama_cpp
+    model_id: Mistral-7B-Instruct-v0.3
+    base_url: http://localhost:8110
+    task_types: [general, fast, recon]
     priority: 3
-    max_concurrent: 3
+    max_concurrent: 4
     weight: 0.8
 
-  # Example: SGLang for fast multi-turn (lowest latency)
-  - name: mistral-fast
-    backend: sglang
-    model_id: mistralai/Mistral-7B-Instruct-v0.3
-    base_url: http://localhost:30000
-    task_types: [fast, general]
-    priority: 4
-    max_concurrent: 20
-    weight: 0.5
+  # ═══════════════════════════════════════════════════════════
+  # LONG CONTEXT — Yi-9B-200K (200,000 token context!)
+  # For analyzing large codebases, long reports, full logs
+  # ═══════════════════════════════════════════════════════════
+  - name: yi-200k-longctx
+    backend: llama_cpp
+    model_id: Yi-9B-200K
+    base_url: http://localhost:8111
+    task_types: [long_context, code_audit, report, analysis]
+    priority: 1
+    max_concurrent: 2  # Lower due to large context
+    weight: 1.0
 
-  # Example: LiteLLM proxy (routes to multiple backends)
-  # - name: litellm-proxy
-  #   backend: litellm
-  #   model_id: gpt-4o  # or any model configured in LiteLLM
-  #   base_url: http://localhost:4000
-  #   api_key: sk-your-litellm-key
-  #   task_types: [general]
-  #   priority: 10
+  # ═══════════════════════════════════════════════════════════
+  # FAST / SMALL — Phi-3.5-mini (2.4GB, ultra-fast)
+  # For quick classifications, simple queries, triage
+  # ═══════════════════════════════════════════════════════════
+  - name: phi-fast
+    backend: llama_cpp
+    model_id: Phi-3.5-mini-instruct
+    base_url: http://localhost:8112
+    task_types: [fast, triage, classification]
+    priority: 1
+    max_concurrent: 8
+    weight: 1.0
 
-  # ── ADD MORE MODELS HERE ──
-  # You can add as many as you want. No limit.
-  # Each model runs on its own inference server.
-  #
-  # More examples:
-  # - name: codellama-34b
-  #   backend: vllm
-  #   model_id: codellama/CodeLlama-34b-Instruct-hf
-  #   base_url: http://localhost:8002
-  #   task_types: [code]
-  #   priority: 2
-  #
-  # - name: phi-3-mini
-  #   backend: llama_cpp
-  #   model_id: phi-3-mini-4k-instruct
-  #   base_url: http://localhost:8081
-  #   task_types: [fast]
-  #   priority: 5
-  #
-  # - name: yi-34b
-  #   backend: vllm
-  #   model_id: 01-ai/Yi-34B-Chat
-  #   base_url: http://localhost:8003
-  #   task_types: [reasoning, general]
-  #   priority: 3
+  # ═══════════════════════════════════════════════════════════
+  # FUNCTION CALLING — FunctionGemma-270m (542MB, instant)
+  # Ultra-fast tool call routing, decides which tool to use
+  # ═══════════════════════════════════════════════════════════
+  - name: functiongemma-router
+    backend: llama_cpp
+    model_id: functiongemma-270m-it
+    base_url: http://localhost:8113
+    task_types: [function_call, tool_routing, fast]
+    priority: 1
+    max_concurrent: 16
+    weight: 1.0
 
-# ── Agent Settings ──────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════
+  # SAFETY GUARD — Llama-Guard-3 (955MB)
+  # Filters unsafe content, ensures authorized testing only
+  # ═══════════════════════════════════════════════════════════
+  # NOTE: This model is used by the SafetyGuard system, not
+  # directly by agents. See safety section below.
+
+  # ═══════════════════════════════════════════════════════════
+  # EMBEDDING — Nomic-Embed-Text (548MB)
+  # Converts text to vectors for semantic search (RAG)
+  # ═══════════════════════════════════════════════════════════
+  # NOTE: This model is used by the EmbeddingClient, not
+  # directly by agents. See memory section below.
+
+# ── Agent Settings ──────────────────────────────────────────────
 agent:
-  max_steps: 50          # Max steps per agent before forced completion
-  max_depth: 5           # Max recursion depth (agents spawning agents)
-  temperature: 0.3       # LLM temperature (lower = more deterministic)
-  max_tokens: 4096       # Max response tokens per LLM call
-  human_approval_required: false  # Set true for exploit validation gates
+  max_steps: 50          # Max steps per agent
+  max_depth: 5           # Max recursion depth
+  temperature: 0.3       # LLM temperature
+  max_tokens: 4096       # Max response tokens
+  human_approval_required: false
 
-# ── Daemon Mode (24/7) ──────────────────────────────────────────────
+# ── Safety Guard ────────────────────────────────────────────────
+safety:
+  enabled: true
+  base_url: http://localhost:8114  # Llama-Guard-3
+  authorization_scope: ""           # Set to your engagement scope
+
+# ── Embedding / RAG ────────────────────────────────────────────
+embedding:
+  enabled: true
+  base_url: http://localhost:8115  # Nomic-Embed-Text
+  model_id: nomic-embed-text
+
+# ── Daemon Mode (24/7) ─────────────────────────────────────────
 daemon:
   enabled: true
-  poll_interval_s: 60      # How often to check for new tasks
-  max_concurrent_tasks: 5  # Tasks running simultaneously
-  auto_restart: true       # Restart failed tasks
+  poll_interval_s: 60
+  max_concurrent_tasks: 5
+  auto_restart: true
+  schedule: []
 
-  # Scheduled recurring scans
-  schedule:
-    # Example: Scan internal network every 6 hours
-    # - objective: "Full vulnerability assessment of internal network"
-    #   target: "192.168.1.0/24"
-    #   target_type: network_range
-    #   interval_s: 21600
-    #   priority: 3
-
-    # Example: Code audit daily
-    # - objective: "Security audit of main application codebase"
-    #   target: "/opt/app/src"
-    #   target_type: code_repo
-    #   interval_s: 86400
-    #   priority: 5
-
-# ── Dashboard ───────────────────────────────────────────────────────
+# ── Dashboard ──────────────────────────────────────────────────
 dashboard:
   enabled: true
   host: "0.0.0.0"
   port: 8080
   auth_enabled: true
   username: admin
-  password: changeme  # CHANGE THIS!
+  password: changeme
 
-# ── Docker Sandbox ──────────────────────────────────────────────────
+# ── Docker Sandbox ─────────────────────────────────────────────
 docker:
-  enabled: true
+  enabled: false         # Set true if you want sandboxed tool execution
   image: recursec/kali-tools:latest
   network_mode: host
   memory_limit: 4g
   cpu_limit: 2.0
   auto_build: true
 
-# ── Tools ───────────────────────────────────────────────────────────
+# ── Tools ──────────────────────────────────────────────────────
 tools:
-  sandbox_mode: true    # Run tools in Docker sandbox
-  auto_install: false   # Auto-install missing tools on startup
-  
-  # Add your own custom tools
+  sandbox_mode: false    # Set true for Docker sandboxing
+  auto_install: false    # Set true to auto-install missing tools
   custom_tools: []
-    # - name: my-custom-scanner
-    #   binary: my-scanner
-    #   category: vuln_scan
-    #   description: "My custom vulnerability scanner"
-    #   install: "pip install my-scanner"
-  
-  # Disable specific tools
   disabled_tools: []
-    # - metasploit
-    # - beef
 
-# ── Memory / Database ──────────────────────────────────────────────
-db_path: /data/recursec_memory.db
-data_dir: /data
+# ── Memory / Database ──────────────────────────────────────────
+db_path: ./data/recursec_memory.db
+data_dir: ./data
 
-# ── Logging ─────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────
 log_level: INFO
-# log_file: /data/recursec.log  # Uncomment to log to file

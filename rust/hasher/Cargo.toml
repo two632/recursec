@@ -1,0 +1,17 @@
+[package]
+name = "recursec-hasher"
+version = "0.1.0"
+edition = "2021"
+description = "RecurSec hash cracking and identification utility"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "hasher"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true

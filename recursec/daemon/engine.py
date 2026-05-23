@@ -11,8 +11,11 @@ import structlog
 
 from recursec.agents.factory import AgentFactory
 from recursec.config.settings import RecurSecConfig
+from recursec.core.attack_chain import AttackChainBuilder
 from recursec.core.models import AgentRole, AgentTask, Target, TaskStatus
 from recursec.llm.router import ModelConfig, ModelRouter
+from recursec.llm.safety import SafetyGuard
+from recursec.memory.embeddings import EmbeddingClient, VectorMemory
 from recursec.memory.store import MemoryStore
 from recursec.tools.registry import ToolRegistry
 
@@ -43,6 +46,18 @@ class RecurSecEngine:
             db_path=config.db_path,
             data_dir=config.data_dir,
         )
+        self.safety = SafetyGuard(
+            base_url=config.safety.base_url,
+            model_id=config.safety.model_id,
+            enabled=config.safety.enabled,
+            authorization_scope=config.safety.authorization_scope,
+        )
+        self.embedder = EmbeddingClient(
+            base_url=config.embedding.base_url,
+            model_id=config.embedding.model_id,
+        ) if config.embedding.enabled else None
+        self.vector_memory: VectorMemory | None = None
+        self.chain_builder = AttackChainBuilder()
         self._running = False
         self._task_queue: asyncio.Queue[AgentTask] = asyncio.Queue()
         self._active_tasks: dict[str, AgentTask] = {}
@@ -90,6 +105,18 @@ class RecurSecEngine:
                 **model_cfg.extra,
             ))
 
+        # 4. Initialize safety guard
+        if self.config.safety.enabled:
+            safety_ok = await self.safety.health_check()
+            logger.info("safety_guard", status="online" if safety_ok else "offline")
+
+        # 5. Initialize embedding / vector memory
+        if self.embedder:
+            embed_ok = await self.embedder.health_check()
+            if embed_ok:
+                self.vector_memory = VectorMemory(self.embedder)
+            logger.info("embedding", status="online" if embed_ok else "offline")
+
         # Health check all models
         health = await self.router.health_check_all()
         healthy = sum(1 for v in health.values() if v)
@@ -99,6 +126,8 @@ class RecurSecEngine:
             models_healthy=healthy,
             tools_total=self.tools.count(),
             tools_available=self.tools.count_available(),
+            safety="enabled" if self.config.safety.enabled else "disabled",
+            embedding="enabled" if self.vector_memory else "disabled",
         )
 
     async def submit_task(
@@ -229,6 +258,9 @@ class RecurSecEngine:
             "queued_tasks": self._task_queue.qsize(),
             "completed_tasks": len(self._completed_tasks),
             "memory": memory_stats,
+            "safety": self.safety.stats(),
+            "vector_memory_docs": self.vector_memory.count() if self.vector_memory else 0,
+            "attack_chains": self.chain_builder.get_summary(),
         }
 
     async def add_model_runtime(
@@ -260,5 +292,8 @@ class RecurSecEngine:
         """Clean shutdown."""
         self._running = False
         await self.router.close_all()
+        await self.safety.close()
+        if self.embedder:
+            await self.embedder.close()
         await self.memory.close()
         logger.info("engine_shutdown_complete")

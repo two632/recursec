@@ -16,6 +16,7 @@ from recursec.core.models import (
     ToolResult,
     Vulnerability,
 )
+from recursec.tools.parsers import parse_tool_output
 
 if TYPE_CHECKING:
     from recursec.llm.router import ModelRouter
@@ -204,6 +205,13 @@ class BaseAgent(ABC):
         try:
             result = await tool.execute(**args)
             result.execution_time_s = time.monotonic() - start
+
+            # Auto-parse tool output into structured data
+            if result.stdout and result.exit_code == 0:
+                parsed = parse_tool_output(tool_name, result.stdout)
+                if parsed and parsed != {"raw": result.stdout[:5000]}:
+                    result.parsed_data = parsed
+
             return result
         except Exception as e:
             return ToolResult(
