@@ -1,20 +1,23 @@
-"""Prompt compiler — builds optimized prompts tailored to each model's strengths.
+"""Prompt compiler — dynamic prompt assembly with knowledge injection.
 
-Implements:
-1. Model-specific prompt formatting
-2. System prompt library for different roles
-3. Few-shot example injection
-4. Context window management within prompts
-5. Dynamic prompt assembly from components
-6. Prompt versioning and A/B testing integration
-7. Chain-of-thought instruction insertion
-8. Output format specification
+This is the critical bridge between all knowledge bases and the LLM.
+Compiles a final prompt by:
+1. Selecting the right system prompt for the agent role
+2. Injecting relevant strategy knowledge (web, cloud, API, AI, supply chain)
+3. Adding target-specific context
+4. Including relevant past findings
+5. Adding reasoning chain context
+6. Managing token budget via context window manager
+7. Applying model-specific formatting
+8. Handling multi-turn conversation state
 """
 
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -22,396 +25,388 @@ import structlog
 logger = structlog.get_logger()
 
 
+class PromptSection(str, Enum):
+    SYSTEM = "system"
+    ROLE = "role"
+    STRATEGY_KNOWLEDGE = "strategy_knowledge"
+    TARGET_CONTEXT = "target_context"
+    TOOLS_AVAILABLE = "tools_available"
+    PAST_FINDINGS = "past_findings"
+    REASONING_CHAIN = "reasoning_chain"
+    EXPERIENCE_HINTS = "experience_hints"
+    TASK_INSTRUCTION = "task_instruction"
+    CONVERSATION = "conversation"
+    RESPONSE_FORMAT = "response_format"
+
+
+class PromptFormat(str, Enum):
+    CHATML = "chatml"             # <|im_start|>system\n...<|im_end|>
+    LLAMA3 = "llama3"            # <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    MISTRAL = "mistral"          # [INST] ... [/INST]
+    ALPACA = "alpaca"            # ### Instruction:\n...\n### Response:
+    RAW = "raw"                  # Plain text, no formatting
+
+
 @dataclass
-class PromptComponent:
-    """A reusable prompt component."""
-    component_id: str = ""
-    name: str = ""
-    content: str = ""
-    category: str = ""           # system, context, instruction, example, output_format
-    model_affinity: list[str] = field(default_factory=list)
-    token_estimate: int = 0
+class PromptConfig:
+    """Configuration for prompt compilation."""
+    max_tokens: int = 4096
+    max_knowledge_tokens: int = 1500
+    max_findings_tokens: int = 800
+    max_reasoning_tokens: int = 600
+    max_experience_tokens: int = 400
+    max_conversation_tokens: int = 2000
+    include_strategy_knowledge: bool = True
+    include_past_findings: bool = True
+    include_reasoning_chain: bool = True
+    include_experience_hints: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.component_id,
-            "name": self.name[:25],
-            "category": self.category[:15],
-            "tokens": self.token_estimate,
+            "max_tokens": self.max_tokens,
+            "knowledge": self.max_knowledge_tokens,
+            "findings": self.max_findings_tokens,
         }
 
 
 @dataclass
 class CompiledPrompt:
-    """A fully compiled prompt ready for inference."""
+    """A compiled prompt ready for LLM consumption."""
     prompt_id: str = ""
-    model_id: str = ""
     system_prompt: str = ""
+    user_prompt: str = ""
     messages: list[dict[str, str]] = field(default_factory=list)
     estimated_tokens: int = 0
-    components_used: list[str] = field(default_factory=list)
+    sections_included: list[str] = field(default_factory=list)
+    knowledge_injected: list[str] = field(default_factory=list)
+    model_format: PromptFormat = PromptFormat.CHATML
     compiled_at: float = field(default_factory=time.time)
+
+    def to_chat_messages(self) -> list[dict[str, str]]:
+        """Convert to chat API format."""
+        msgs = []
+        if self.system_prompt:
+            msgs.append({"role": "system", "content": self.system_prompt})
+        msgs.extend(self.messages)
+        if self.user_prompt:
+            msgs.append({"role": "user", "content": self.user_prompt})
+        return msgs
+
+    def to_completion_text(self) -> str:
+        """Convert to single text prompt."""
+        parts = []
+        if self.system_prompt:
+            parts.append(self.system_prompt)
+        for msg in self.messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"[{role}]: {content}")
+        if self.user_prompt:
+            parts.append(f"[user]: {self.user_prompt}")
+        return "\n\n".join(parts)
+
+    def to_formatted_text(self) -> str:
+        """Format based on model format."""
+        if self.model_format == PromptFormat.CHATML:
+            return self._format_chatml()
+        if self.model_format == PromptFormat.LLAMA3:
+            return self._format_llama3()
+        if self.model_format == PromptFormat.MISTRAL:
+            return self._format_mistral()
+        if self.model_format == PromptFormat.ALPACA:
+            return self._format_alpaca()
+        return self.to_completion_text()
+
+    def _format_chatml(self) -> str:
+        parts = []
+        if self.system_prompt:
+            parts.append(f"<|im_start|>system\n{self.system_prompt}<|im_end|>")
+        for msg in self.messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+        if self.user_prompt:
+            parts.append(f"<|im_start|>user\n{self.user_prompt}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")
+        return "\n".join(parts)
+
+    def _format_llama3(self) -> str:
+        parts = ["<|begin_of_text|>"]
+        if self.system_prompt:
+            parts.append(f"<|start_header_id|>system<|end_header_id|>\n\n{self.system_prompt}<|eot_id|>")
+        for msg in self.messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>")
+        if self.user_prompt:
+            parts.append(f"<|start_header_id|>user<|end_header_id|>\n\n{self.user_prompt}<|eot_id|>")
+        parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        return "".join(parts)
+
+    def _format_mistral(self) -> str:
+        parts = []
+        system = self.system_prompt or ""
+        user_parts = []
+        for msg in self.messages:
+            if msg.get("role") == "user":
+                user_parts.append(msg.get("content", ""))
+        if self.user_prompt:
+            user_parts.append(self.user_prompt)
+        instruction = "\n\n".join(user_parts)
+        if system:
+            instruction = f"{system}\n\n{instruction}"
+        parts.append(f"[INST] {instruction} [/INST]")
+        return "\n".join(parts)
+
+    def _format_alpaca(self) -> str:
+        parts = []
+        if self.system_prompt:
+            parts.append(f"### System:\n{self.system_prompt}\n")
+        user_content = self.user_prompt or ""
+        for msg in self.messages:
+            if msg.get("role") == "user":
+                user_content += "\n" + msg.get("content", "")
+        parts.append(f"### Instruction:\n{user_content.strip()}\n")
+        parts.append("### Response:\n")
+        return "\n".join(parts)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.prompt_id,
-            "model": self.model_id[:20],
-            "messages": len(self.messages),
-            "est_tokens": self.estimated_tokens,
-            "components": len(self.components_used),
+            "id": self.prompt_id[:10],
+            "tokens": self.estimated_tokens,
+            "sections": self.sections_included,
+            "knowledge": len(self.knowledge_injected),
+            "format": self.model_format.value,
         }
 
 
-# ── System Prompts ────────────────────────────────────────────
+# ── Model → Format mapping ──────────────────────────────────
 
-SYSTEM_PROMPTS: dict[str, str] = {
-    "security_analyst": (
-        "You are an expert security analyst conducting an authorized security assessment. "
-        "Analyze the provided data for vulnerabilities, misconfigurations, and security risks. "
-        "For each finding, provide: title, severity (critical/high/medium/low), description, "
-        "evidence, and remediation. Be thorough but avoid false positives. "
-        "Only report findings you have evidence for. "
-        "Go beyond basic vulnerability scanning — look for emergent complexity bugs "
-        "(cache desync, consistency windows, cross-service races), timing side channels, "
-        "business logic flaws (price manipulation, workflow skipping, IDOR), "
-        "AI/LLM vulnerabilities (prompt injection, RAG poisoning, excessive agency), "
-        "supply chain risks (dependency confusion, typosquatting), "
-        "and cloud-specific misconfigurations (SSRF to metadata, IAM escalation). "
-        "These advanced attack surfaces are often missed by traditional scanners."
+MODEL_FORMATS: dict[str, PromptFormat] = {
+    "whiterabbitneo": PromptFormat.CHATML,
+    "qwen-coder-14b": PromptFormat.CHATML,
+    "qwen-coder-7b": PromptFormat.CHATML,
+    "deepseek-r1": PromptFormat.CHATML,
+    "deepseek-math": PromptFormat.CHATML,
+    "hermes-14b": PromptFormat.CHATML,
+    "llama-3.1-8b": PromptFormat.LLAMA3,
+    "dolphin-2.9": PromptFormat.CHATML,
+    "mistral-7b": PromptFormat.MISTRAL,
+    "codellama-13b": PromptFormat.LLAMA3,
+    "codellama-7b": PromptFormat.LLAMA3,
+    "yi-9b-200k": PromptFormat.CHATML,
+    "phi-3.5-mini": PromptFormat.CHATML,
+    "nomic-embed": PromptFormat.RAW,
+    "llama-guard": PromptFormat.LLAMA3,
+    "functiongemma": PromptFormat.RAW,
+}
+
+
+# ── Role System Prompts ──────────────────────────────────────
+
+ROLE_SYSTEM_PROMPTS: dict[str, str] = {
+    "coordinator": (
+        "You are the COORDINATOR of a recursive multi-agent security assessment system. "
+        "Your role is to decompose complex security goals into sub-tasks, delegate to "
+        "specialist agents, aggregate their results, and make strategic decisions about "
+        "investigation direction. You operate autonomously within your budget constraints."
     ),
-    "code_auditor": (
-        "You are an expert code security auditor. Review the provided code for security "
-        "vulnerabilities including injection flaws, authentication issues, authorization "
-        "bypasses, cryptographic weaknesses, and unsafe deserialization. "
-        "Trace data flow from user inputs to sensitive operations. "
-        "Provide specific line numbers, CWE IDs, and remediation for each finding."
+    "recon": (
+        "You are a RECONNAISSANCE specialist agent. Your role is to map the target's "
+        "attack surface: enumerate subdomains, discover services, identify technologies, "
+        "and catalog assets. Be thorough and methodical. Report all findings to your "
+        "parent coordinator with structured data."
     ),
-    "recon_analyst": (
-        "You are a reconnaissance specialist. Analyze the provided reconnaissance data "
-        "to build a comprehensive picture of the target. Go beyond basic port/service detection: "
-        "(1) Map full infrastructure topology including CDNs, WAFs, load balancers, reverse proxies. "
-        "(2) Discover hidden attack surface: forgotten subdomains, debug endpoints, dev environments, "
-        "exposed git repos, backup files, API docs (swagger/graphql). "
-        "(3) Deep tech fingerprinting: exact framework versions, auth mechanisms (JWT vs session), "
-        "database backend, caching layer, API style. "
-        "(4) Look for cloud resource exposure: S3 buckets, Azure blobs, GCS. "
-        "(5) Check certificate transparency for internal hostnames in SANs. "
-        "(6) Identify microservice boundaries from URL patterns and API versioning. "
-        "Each technology has known vulnerability patterns — identify the full stack to guide testing."
+    "scanner": (
+        "You are a VULNERABILITY SCANNER agent. Your role is to identify known "
+        "vulnerabilities, misconfigurations, and security weaknesses in the target. "
+        "Use appropriate scanning tools and interpret their results accurately. "
+        "Flag potential false positives and prioritize findings by severity."
     ),
-    "exploit_analyst": (
-        "You are an exploitation specialist. Given the vulnerabilities and target information, "
-        "determine the most effective exploitation approach. Think about CHAINING findings: "
-        "(1) SSRF → cloud metadata → IAM creds → full account compromise. "
-        "(2) XSS → CSRF → admin password change → account takeover. "
-        "(3) IDOR → info disclosure → password reset → account takeover. "
-        "(4) SQLi → admin creds → RCE via admin panel. "
-        "Individual findings may be low severity but CHAINED they become critical. "
-        "For validation, use SAFE techniques: read-only SQLi, DNS callbacks for SSRF/RCE, "
-        "alert(document.domain) for XSS. Prove exploitation without causing damage. "
-        "After initial access, assess lateral movement: what internal services, databases, "
-        "cloud resources, and other accounts can be reached from this foothold?"
+    "analyzer": (
+        "You are a SECURITY ANALYZER agent. Your role is to perform deep analysis "
+        "of code, configurations, and system behavior to identify security issues. "
+        "Look for logic flaws, insecure patterns, and architectural weaknesses "
+        "that automated scanners miss."
     ),
-    "planner": (
-        "You are a security assessment planner. Create a detailed plan for the security "
-        "assessment. Consider scope, tools, and strategy selection based on TARGET TYPE: "
-        "For web apps: test business logic (price manipulation, workflow bypass, IDOR), "
-        "timing/race conditions, API gateway bypasses, crypto weaknesses, supply chain. "
-        "For microservices: focus on emergent complexity (cache desync, consistency windows, "
-        "cross-service races, cascading failures). "
-        "For AI/LLM features: prompt injection, RAG poisoning, tool abuse, info disclosure. "
-        "For cloud: SSRF to metadata, IAM misconfig, public storage, container escape. "
-        "For e-commerce: financial logic abuse, double-spend races, coupon stacking. "
-        "Prioritize by: (1) High-impact, easy to exploit, (2) Chained attacks, "
-        "(3) Advanced surfaces that scanners miss. Think step by step."
+    "exploiter": (
+        "You are an EXPLOITATION specialist agent. Your role is to safely validate "
+        "vulnerabilities through proof-of-concept exploitation. Determine actual impact "
+        "and exploitability. Build exploitation chains from individual findings. "
+        "Document evidence for each confirmed vulnerability."
     ),
     "validator": (
-        "You are a finding validator. Critically evaluate the reported vulnerability. "
-        "Consider: Is the evidence sufficient? Could this be a false positive? "
-        "What additional testing would confirm or refute this finding? "
-        "For emergent/timing bugs: Was the race condition reliably reproduced? "
-        "For business logic: Does the behavior actually violate business rules? "
-        "For AI/LLM findings: Did the injection actually change model behavior? "
-        "For supply chain: Is the vulnerable dependency actually reachable? "
-        "Be especially skeptical of: informational findings presented as vulns, "
-        "theoretical attacks without PoC, and findings that rely on unlikely preconditions. "
-        "Rate your confidence 0-1 and explain your reasoning."
+        "You are a VALIDATION agent. Your role is to cross-check findings from "
+        "other agents, verify evidence quality, and identify false positives. "
+        "Challenge assumptions and provide confidence assessments. Use different "
+        "tools and approaches to confirm or deny findings."
     ),
     "reasoning": (
-        "You are a deep reasoning engine. Think through problems step by step. "
-        "Consider multiple hypotheses, evaluate evidence for and against each, "
-        "and reach well-supported conclusions. Use <thinking> tags for your "
-        "internal reasoning process."
+        "You are a REASONING agent. Your role is deep analysis: build hypotheses "
+        "about attack vectors, reason about cause-and-effect chains, identify "
+        "non-obvious security implications, and evaluate trade-offs between "
+        "different investigation approaches."
     ),
-}
-
-# ── Model-specific Formatting ─────────────────────────────────
-
-MODEL_FORMATS: dict[str, dict[str, str]] = {
-    "whiterabbitneo-7b": {
-        "cot_prefix": "Let me analyze this from a security perspective:\n",
-        "output_prefix": "## Security Analysis\n",
-    },
-    "deepseek-r1-7b": {
-        "cot_prefix": "<think>\n",
-        "cot_suffix": "</think>\n",
-        "output_prefix": "After careful reasoning:\n",
-    },
-    "qwen-coder-14b": {
-        "cot_prefix": "Let me review this code systematically:\n",
-        "output_prefix": "## Code Review Findings\n",
-    },
-    "hermes-14b": {
-        "cot_prefix": "Let me think through this step by step:\n",
-        "output_prefix": "Based on my analysis:\n",
-    },
-}
-
-# ── Few-Shot Examples ─────────────────────────────────────────
-
-FEW_SHOT_EXAMPLES: dict[str, list[dict[str, str]]] = {
-    "finding_report": [
-        {
-            "role": "user",
-            "content": "Analyze this nmap output:\n22/tcp open ssh OpenSSH 7.2p2\n80/tcp open http Apache 2.4.18",
-        },
-        {
-            "role": "assistant",
-            "content": '{"findings": [{"title": "Outdated OpenSSH 7.2p2", "severity": "high", '
-                        '"description": "SSH server running OpenSSH 7.2p2 which has known vulnerabilities '
-                        'including CVE-2016-10009 (agent forwarding) and CVE-2016-10012 (privilege escalation)", '
-                        '"evidence": "nmap service detection: 22/tcp open ssh OpenSSH 7.2p2", '
-                        '"remediation": "Upgrade OpenSSH to latest version (9.x)"}]}',
-        },
-    ],
-    "tool_selection": [
-        {
-            "role": "user",
-            "content": "Target has port 80 (Apache) and 443 (nginx) open. What tools should I use?",
-        },
-        {
-            "role": "assistant",
-            "content": '{"tools": ["nuclei -u https://target -severity critical,high", '
-                        '"nikto -h http://target", "ffuf -u https://target/FUZZ -w /usr/share/wordlists/dirb/common.txt", '
-                        '"whatweb https://target"], '
-                        '"reasoning": "Mix of active scanning (nuclei, nikto) and content discovery (ffuf) '
-                        'with technology fingerprinting (whatweb)"}',
-        },
-    ],
 }
 
 
 class PromptCompiler:
-    """Builds optimized prompts tailored to each model's strengths.
+    """Compiles dynamic prompts with knowledge injection.
 
-    Assembles system prompts, few-shot examples, context,
-    advanced strategy knowledge, and instructions into
-    model-optimized prompts.
+    The critical bridge between all knowledge bases, context,
+    and the LLM. Assembles prompts that give the LLM everything
+    it needs to make intelligent security decisions.
     """
 
-    def __init__(self) -> None:
-        self._components: dict[str, PromptComponent] = {}
-        self._compile_counter = 0
-        self._component_counter = 0
-        self._strategy_kb: Any = None
+    def __init__(self, config: PromptConfig | None = None) -> None:
+        self._config = config or PromptConfig()
+        self._counter = 0
+        self._compilation_history: list[dict[str, Any]] = []
         self._log = logger.bind(component="prompt_compiler")
-
-    def set_strategy_kb(self, strategy_kb: Any) -> None:
-        """Set the advanced strategy knowledge base for prompt injection."""
-        self._strategy_kb = strategy_kb
 
     def compile(
         self,
-        role: str,
-        task: str,
-        model_id: str = "",
-        context: str = "",
-        data: str = "",
-        include_examples: bool = True,
-        include_cot: bool = True,
-        output_format: str = "json",
-        max_tokens: int = 4096,
-        target_type: str = "",
-        phase: str = "",
+        role: str = "coordinator",
+        model_id: str = "hermes-14b",
+        task_instruction: str = "",
+        target_context: str = "",
+        strategy_knowledge: list[str] | None = None,
+        past_findings: list[str] | None = None,
+        reasoning_chain: str = "",
+        experience_hints: list[str] | None = None,
+        tools_available: list[str] | None = None,
+        conversation_history: list[dict[str, str]] | None = None,
+        response_format: str = "",
     ) -> CompiledPrompt:
-        """Compile a full prompt for a specific model and task."""
-        self._compile_counter += 1
+        """Compile a complete prompt."""
+        self._counter += 1
 
-        # Get system prompt
-        system_prompt = SYSTEM_PROMPTS.get(role, SYSTEM_PROMPTS.get("security_analyst", ""))
+        # Get format for model
+        fmt = MODEL_FORMATS.get(model_id, PromptFormat.CHATML)
 
-        # Build messages
-        messages: list[dict[str, str]] = []
-        components_used: list[str] = [f"system:{role}"]
+        # Build system prompt
+        system_parts = []
+        sections = []
 
-        # Add few-shot examples if requested
-        if include_examples:
-            examples = self._select_examples(task)
-            messages.extend(examples)
-            if examples:
-                components_used.append("few_shot")
+        # 1. Role prompt
+        role_prompt = ROLE_SYSTEM_PROMPTS.get(role, "")
+        if role_prompt:
+            system_parts.append(role_prompt)
+            sections.append("role")
 
-        # Inject strategy knowledge if available
-        strategy_context = ""
-        if self._strategy_kb and (target_type or phase):
-            strategy_phase = phase
-            if not strategy_phase:
-                role_phase_map = {
-                    "recon_analyst": "recon",
-                    "security_analyst": "discovery",
-                    "code_auditor": "discovery",
-                    "exploit_analyst": "exploitation",
-                    "planner": "recon",
-                    "validator": "discovery",
-                }
-                strategy_phase = role_phase_map.get(role, "")
-            if strategy_phase:
-                strategy_context = self._strategy_kb.build_phase_prompt(
-                    phase=strategy_phase,
-                    target_type=target_type,
-                    max_fragments=3,
-                )
-
-        # Build user message
-        user_content = self._build_user_message(
-            task=task,
-            context=context,
-            data=data,
-            model_id=model_id,
-            include_cot=include_cot,
-            output_format=output_format,
-            strategy_context=strategy_context,
-        )
-
-        messages.append({"role": "user", "content": user_content})
-
-        # Estimate tokens (rough: 4 chars per token)
-        total_chars = len(system_prompt) + sum(len(m["content"]) for m in messages)
-        estimated_tokens = total_chars // 4
-
-        # Truncate if over budget
-        if estimated_tokens > max_tokens * 0.8:
-            messages, estimated_tokens = self._truncate_messages(
-                messages, max_tokens, system_prompt
+        # 2. Strategy knowledge
+        knowledge_injected = []
+        if self._config.include_strategy_knowledge and strategy_knowledge:
+            budget = self._config.max_knowledge_tokens
+            knowledge_text = self._truncate_to_tokens(
+                "\n\n".join(strategy_knowledge), budget
             )
+            if knowledge_text:
+                system_parts.append(
+                    "## Attack Strategies & Testing Methodology\n" + knowledge_text
+                )
+                knowledge_injected = [f"strategy_{i}" for i in range(len(strategy_knowledge))]
+                sections.append("strategy_knowledge")
 
-        return CompiledPrompt(
-            prompt_id=f"cp-{self._compile_counter}",
-            model_id=model_id,
+        # 3. Target context
+        if target_context:
+            system_parts.append(f"## Target Information\n{target_context}")
+            sections.append("target_context")
+
+        # 4. Tools available
+        if tools_available:
+            tools_text = "## Available Tools\n" + ", ".join(tools_available)
+            system_parts.append(tools_text)
+            sections.append("tools_available")
+
+        # 5. Past findings
+        if self._config.include_past_findings and past_findings:
+            findings_text = self._truncate_to_tokens(
+                "\n".join(f"- {f}" for f in past_findings),
+                self._config.max_findings_tokens,
+            )
+            if findings_text:
+                system_parts.append(f"## Findings So Far\n{findings_text}")
+                sections.append("past_findings")
+
+        # 6. Reasoning chain
+        if self._config.include_reasoning_chain and reasoning_chain:
+            reason_text = self._truncate_to_tokens(
+                reasoning_chain, self._config.max_reasoning_tokens
+            )
+            if reason_text:
+                system_parts.append(f"## Reasoning Chain\n{reason_text}")
+                sections.append("reasoning_chain")
+
+        # 7. Experience hints
+        if self._config.include_experience_hints and experience_hints:
+            hints_text = self._truncate_to_tokens(
+                "\n".join(f"- {h}" for h in experience_hints),
+                self._config.max_experience_tokens,
+            )
+            if hints_text:
+                system_parts.append(f"## Experience Hints\n{hints_text}")
+                sections.append("experience_hints")
+
+        # 8. Response format
+        if response_format:
+            system_parts.append(f"## Response Format\n{response_format}")
+            sections.append("response_format")
+
+        system_prompt = "\n\n".join(system_parts)
+
+        # Build user prompt
+        user_prompt = task_instruction
+
+        # Conversation history
+        messages = []
+        if conversation_history:
+            budget = self._config.max_conversation_tokens
+            token_count = 0
+            for msg in reversed(conversation_history):
+                msg_tokens = len(msg.get("content", "")) // 4
+                if token_count + msg_tokens > budget:
+                    break
+                messages.insert(0, msg)
+                token_count += msg_tokens
+            sections.append("conversation")
+
+        # Estimate total tokens
+        total_text = system_prompt + user_prompt + "".join(
+            m.get("content", "") for m in messages
+        )
+        estimated_tokens = len(total_text) // 4
+
+        prompt = CompiledPrompt(
+            prompt_id=f"prompt-{self._counter}",
             system_prompt=system_prompt,
+            user_prompt=user_prompt,
             messages=messages,
             estimated_tokens=estimated_tokens,
-            components_used=components_used,
+            sections_included=sections,
+            knowledge_injected=knowledge_injected,
+            model_format=fmt,
         )
 
-    def _build_user_message(
-        self,
-        task: str,
-        context: str,
-        data: str,
-        model_id: str,
-        include_cot: bool,
-        output_format: str,
-        strategy_context: str = "",
-    ) -> str:
-        """Build the user message content."""
-        parts = []
+        self._compilation_history.append(prompt.to_dict())
 
-        # Model-specific CoT prefix
-        if include_cot:
-            model_fmt = MODEL_FORMATS.get(model_id, {})
-            cot_prefix = model_fmt.get("cot_prefix", "Think step by step:\n")
-            parts.append(cot_prefix)
-
-        # Context
-        if context:
-            parts.append(f"Context:\n{context}\n")
-
-        # Inject advanced strategy knowledge
-        if strategy_context:
-            parts.append(f"{strategy_context}\n")
-
-        # Task
-        parts.append(f"Task: {task}\n")
-
-        # Data
-        if data:
-            parts.append(f"Data:\n{data}\n")
-
-        # Output format
-        if output_format == "json":
-            parts.append("\nRespond in JSON format.")
-        elif output_format == "structured":
-            parts.append("\nProvide a structured response with clear sections.")
-
-        return "\n".join(parts)
+        return prompt
 
     @staticmethod
-    def _select_examples(task: str) -> list[dict[str, str]]:
-        """Select relevant few-shot examples."""
-        task_lower = task.lower()
-
-        if any(kw in task_lower for kw in ("finding", "vulnerability", "analyze")):
-            return FEW_SHOT_EXAMPLES.get("finding_report", [])
-
-        if any(kw in task_lower for kw in ("tool", "scan", "what to use")):
-            return FEW_SHOT_EXAMPLES.get("tool_selection", [])
-
-        return []
-
-    @staticmethod
-    def _truncate_messages(
-        messages: list[dict[str, str]],
-        max_tokens: int,
-        system_prompt: str,
-    ) -> tuple[list[dict[str, str]], int]:
-        """Truncate messages to fit within token budget."""
-        budget = max_tokens - len(system_prompt) // 4
-
-        truncated = []
-        used = 0
-
-        for msg in messages:
-            msg_tokens = len(msg["content"]) // 4
-            if used + msg_tokens > budget:
-                # Truncate this message
-                remaining = (budget - used) * 4
-                truncated.append({
-                    "role": msg["role"],
-                    "content": msg["content"][:remaining],
-                })
-                used = budget
-                break
-            else:
-                truncated.append(msg)
-                used += msg_tokens
-
-        return truncated, used
-
-    def register_component(
-        self,
-        name: str,
-        content: str,
-        category: str = "instruction",
-        model_affinity: list[str] | None = None,
-    ) -> PromptComponent:
-        """Register a reusable prompt component."""
-        self._component_counter += 1
-        component = PromptComponent(
-            component_id=f"pc-{self._component_counter}",
-            name=name,
-            content=content,
-            category=category,
-            model_affinity=model_affinity or [],
-            token_estimate=len(content) // 4,
-        )
-        self._components[component.component_id] = component
-        return component
+    def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+        """Truncate text to approximate token budget."""
+        max_chars = max_tokens * 4
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n[...truncated]"
 
     def get_stats(self) -> dict[str, Any]:
+        section_counts: dict[str, int] = defaultdict(int)
+        for hist in self._compilation_history:
+            for sec in hist.get("sections", []):
+                section_counts[sec] += 1
+
         return {
-            "compiled": self._compile_counter,
-            "components": len(self._components),
-            "system_prompts": len(SYSTEM_PROMPTS),
-            "examples": len(FEW_SHOT_EXAMPLES),
+            "compiled": len(self._compilation_history),
+            "sections_used": dict(section_counts),
         }
