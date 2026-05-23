@@ -1,14 +1,13 @@
-"""Chain of thought reasoning engine.
+"""Chain-of-thought engine — structured reasoning chains.
 
-Implements structured reasoning for security analysis:
-1. Step-by-step reasoning chains
-2. Evidence-based reasoning
-3. Attack tree construction
-4. Risk assessment reasoning
-5. Vulnerability impact analysis
-6. Exploitation feasibility analysis
-7. Multi-step reasoning verification
-8. Reasoning chain compression
+Implements:
+1. Chain-of-thought reasoning
+2. Tree-of-thought branching
+3. Reasoning step tracking
+4. Confidence propagation
+5. Reasoning chain visualization
+6. Self-critique and reflection
+7. Multi-step planning chains
 """
 
 from __future__ import annotations
@@ -25,126 +24,143 @@ logger = structlog.get_logger()
 
 
 class ReasoningType(str, Enum):
-    DEDUCTIVE = "deductive"       # From general to specific
-    INDUCTIVE = "inductive"       # From specific to general
-    ABDUCTIVE = "abductive"       # Best explanation for observations
-    ANALOGICAL = "analogical"     # By similarity to known cases
-    CAUSAL = "causal"             # Cause and effect
+    CHAIN_OF_THOUGHT = "cot"         # Linear reasoning
+    TREE_OF_THOUGHT = "tot"          # Branching reasoning
+    SELF_CRITIQUE = "self_critique"  # Self-evaluation
+    REFLECTION = "reflection"        # Post-action reflection
+    DECOMPOSITION = "decomposition"  # Task breakdown
+    SYNTHESIS = "synthesis"          # Result combination
 
 
-class StepType(str, Enum):
-    OBSERVATION = "observation"
-    HYPOTHESIS = "hypothesis"
-    INFERENCE = "inference"
-    EVIDENCE = "evidence"
-    CONCLUSION = "conclusion"
-    QUESTION = "question"
-    ACTION = "action"
-    VERIFICATION = "verification"
+class StepStatus(str, Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    PRUNED = "pruned"
 
 
 @dataclass
 class ReasoningStep:
-    """A single step in a reasoning chain."""
+    """A single reasoning step."""
     step_id: str = ""
-    step_type: StepType = StepType.OBSERVATION
     content: str = ""
-    confidence: float = 0.8
+    step_type: ReasoningType = ReasoningType.CHAIN_OF_THOUGHT
+    status: StepStatus = StepStatus.PENDING
+    confidence: float = 0.5
+    parent_step: str = ""
+    children: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
-    assumptions: list[str] = field(default_factory=list)
-    depends_on: list[str] = field(default_factory=list)
-    timestamp: float = field(default_factory=time.time)
+    model_used: str = ""
+    tokens_used: int = 0
+    created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.step_id[:10],
+            "content": self.content[:30],
             "type": self.step_type.value,
-            "content": self.content[:50],
+            "status": self.status.value,
             "confidence": round(self.confidence, 2),
-            "evidence": len(self.evidence),
         }
 
 
 @dataclass
 class ReasoningChain:
-    """A complete chain of reasoning."""
+    """A complete reasoning chain."""
     chain_id: str = ""
-    reasoning_type: ReasoningType = ReasoningType.DEDUCTIVE
-    goal: str = ""
-    steps: list[ReasoningStep] = field(default_factory=list)
+    reasoning_type: ReasoningType = ReasoningType.CHAIN_OF_THOUGHT
+    question: str = ""
+    steps: list[str] = field(default_factory=list)
     conclusion: str = ""
     overall_confidence: float = 0.0
-    valid: bool = True
+    total_tokens: int = 0
     created_at: float = field(default_factory=time.time)
-
-    @property
-    def length(self) -> int:
-        return len(self.steps)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.chain_id[:10],
             "type": self.reasoning_type.value,
-            "goal": self.goal[:30],
-            "steps": self.length,
-            "conclusion": self.conclusion[:40],
+            "steps": len(self.steps),
             "confidence": round(self.overall_confidence, 2),
-            "valid": self.valid,
         }
 
 
-@dataclass
-class AttackTreeNode:
-    """A node in an attack tree."""
-    node_id: str = ""
-    description: str = ""
-    node_type: str = "AND"       # AND (all children needed) or OR (any child sufficient)
-    probability: float = 0.5
-    impact: float = 0.5
-    cost: float = 0.5            # Cost to attacker (0=free, 1=expensive)
-    children: list[str] = field(default_factory=list)
-    is_leaf: bool = True
+# ── CoT prompt templates ─────────────────────────────────────
 
-    @property
-    def risk_score(self) -> float:
-        return self.probability * self.impact
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.node_id[:10],
-            "desc": self.description[:30],
-            "type": self.node_type,
-            "prob": round(self.probability, 2),
-            "impact": round(self.impact, 2),
-            "risk": round(self.risk_score, 2),
-        }
+COT_TEMPLATES: dict[str, str] = {
+    "vulnerability_analysis": (
+        "Let's analyze this potential vulnerability step by step:\n"
+        "Step 1: Identify the vulnerability type and CWE\n"
+        "Step 2: Assess the attack surface and prerequisites\n"
+        "Step 3: Determine exploitability (CVSS metrics)\n"
+        "Step 4: Evaluate potential impact (CIA triad)\n"
+        "Step 5: Consider existing mitigations\n"
+        "Step 6: Determine real-world risk rating\n"
+        "Step 7: Recommend verification approach\n"
+    ),
+    "exploitation_planning": (
+        "Let's plan the exploitation approach step by step:\n"
+        "Step 1: Confirm vulnerability is exploitable\n"
+        "Step 2: Identify required tools and payloads\n"
+        "Step 3: Plan attack chain (prerequisite → exploit → post-exploit)\n"
+        "Step 4: Assess detection risk\n"
+        "Step 5: Prepare rollback/cleanup plan\n"
+        "Step 6: Estimate success probability\n"
+    ),
+    "finding_verification": (
+        "Let's verify this finding step by step:\n"
+        "Step 1: Review the raw evidence\n"
+        "Step 2: Check for false positive indicators\n"
+        "Step 3: Cross-reference with other tools/findings\n"
+        "Step 4: Attempt manual reproduction\n"
+        "Step 5: Determine confidence level\n"
+    ),
+    "attack_surface_analysis": (
+        "Let's analyze the attack surface step by step:\n"
+        "Step 1: Map all exposed services and ports\n"
+        "Step 2: Identify technologies and versions\n"
+        "Step 3: Enumerate entry points (forms, APIs, parameters)\n"
+        "Step 4: Assess authentication mechanisms\n"
+        "Step 5: Identify trust boundaries\n"
+        "Step 6: Rate each surface by risk\n"
+    ),
+    "task_decomposition": (
+        "Let's decompose this task into subtasks:\n"
+        "Step 1: Define the overall objective\n"
+        "Step 2: Identify required inputs and prerequisites\n"
+        "Step 3: Break into independent subtasks\n"
+        "Step 4: Identify dependencies between subtasks\n"
+        "Step 5: Prioritize subtasks by value and effort\n"
+        "Step 6: Assign tools and models to each subtask\n"
+    ),
+}
 
 
 class ChainOfThoughtEngine:
-    """Structured reasoning engine for security analysis.
+    """Structured reasoning chain engine.
 
-    Constructs, validates, and manages chains of reasoning
-    for vulnerability assessment. Uses step-by-step reasoning
-    to ensure thorough analysis and reduce hallucination.
+    Builds chain-of-thought and tree-of-thought
+    reasoning chains for security analysis.
     """
 
     def __init__(self) -> None:
+        self._steps: dict[str, ReasoningStep] = {}
         self._chains: dict[str, ReasoningChain] = {}
-        self._attack_trees: dict[str, dict[str, AttackTreeNode]] = {}
         self._counter = 0
         self._log = logger.bind(component="chain_of_thought")
 
     def start_chain(
         self,
-        goal: str,
-        reasoning_type: ReasoningType = ReasoningType.DEDUCTIVE,
+        question: str,
+        reasoning_type: ReasoningType = ReasoningType.CHAIN_OF_THOUGHT,
     ) -> ReasoningChain:
         """Start a new reasoning chain."""
         self._counter += 1
         chain = ReasoningChain(
-            chain_id=f"cot-{self._counter}",
+            chain_id=f"chain-{self._counter}",
             reasoning_type=reasoning_type,
-            goal=goal,
+            question=question,
         )
         self._chains[chain.chain_id] = chain
         return chain
@@ -152,13 +168,14 @@ class ChainOfThoughtEngine:
     def add_step(
         self,
         chain_id: str,
-        step_type: StepType,
         content: str,
-        confidence: float = 0.8,
+        confidence: float = 0.5,
         evidence: list[str] | None = None,
-        assumptions: list[str] | None = None,
+        model_used: str = "",
+        tokens_used: int = 0,
+        parent_step: str = "",
     ) -> ReasoningStep | None:
-        """Add a step to a reasoning chain."""
+        """Add a reasoning step to a chain."""
         chain = self._chains.get(chain_id)
         if not chain:
             return None
@@ -166,21 +183,30 @@ class ChainOfThoughtEngine:
         self._counter += 1
         step = ReasoningStep(
             step_id=f"step-{self._counter}",
-            step_type=step_type,
             content=content,
+            step_type=chain.reasoning_type,
+            status=StepStatus.COMPLETED,
             confidence=confidence,
+            parent_step=parent_step,
             evidence=evidence or [],
-            assumptions=assumptions or [],
+            model_used=model_used,
+            tokens_used=tokens_used,
         )
 
-        # Link to previous step
-        if chain.steps:
-            step.depends_on.append(chain.steps[-1].step_id)
+        self._steps[step.step_id] = step
+        chain.steps.append(step.step_id)
+        chain.total_tokens += tokens_used
 
-        chain.steps.append(step)
+        # Update parent's children
+        if parent_step and parent_step in self._steps:
+            self._steps[parent_step].children.append(step.step_id)
+
+        # Update overall confidence
+        self._update_chain_confidence(chain)
+
         return step
 
-    def conclude(
+    def conclude_chain(
         self,
         chain_id: str,
         conclusion: str,
@@ -191,230 +217,130 @@ class ChainOfThoughtEngine:
             return None
 
         chain.conclusion = conclusion
-
-        # Calculate overall confidence
-        if chain.steps:
-            # Confidence degrades multiplicatively across steps
-            confidence = 1.0
-            for step in chain.steps:
-                confidence *= step.confidence
-            chain.overall_confidence = confidence
-        else:
-            chain.overall_confidence = 0.0
-
-        # Validate chain
-        chain.valid = self._validate_chain(chain)
-
         return chain
 
-    def _validate_chain(self, chain: ReasoningChain) -> bool:
-        """Validate a reasoning chain for logical consistency."""
+    def _update_chain_confidence(self, chain: ReasoningChain) -> None:
+        """Update chain's overall confidence from steps."""
         if not chain.steps:
-            return False
+            return
 
-        # Must have at least one observation and one conclusion
-        types = {s.step_type for s in chain.steps}
-        if StepType.OBSERVATION not in types:
-            return False
+        step_confidences = []
+        for step_id in chain.steps:
+            step = self._steps.get(step_id)
+            if step and step.status == StepStatus.COMPLETED:
+                step_confidences.append(step.confidence)
 
-        # Check for circular dependencies
-        seen: set[str] = set()
-        for step in chain.steps:
-            if step.step_id in seen:
-                return False
-            seen.add(step.step_id)
-
-        # Minimum confidence threshold
-        if chain.overall_confidence < 0.01:
-            return False
-
-        return True
-
-    def build_vuln_reasoning(
-        self,
-        vuln_type: str,
-        target: str,
-        evidence_list: list[str],
-    ) -> ReasoningChain:
-        """Build a structured vulnerability reasoning chain."""
-        chain = self.start_chain(
-            goal=f"Determine if {target} is vulnerable to {vuln_type}",
-            reasoning_type=ReasoningType.ABDUCTIVE,
-        )
-
-        # Observation step
-        self.add_step(
-            chain.chain_id,
-            StepType.OBSERVATION,
-            f"Target: {target}, Testing for: {vuln_type}",
-            confidence=1.0,
-        )
-
-        # Evidence steps
-        for i, ev in enumerate(evidence_list):
-            self.add_step(
-                chain.chain_id,
-                StepType.EVIDENCE,
-                ev,
-                confidence=0.7 + (0.1 if "confirmed" in ev.lower() else 0),
-                evidence=[ev],
-            )
-
-        # Hypothesis
-        self.add_step(
-            chain.chain_id,
-            StepType.HYPOTHESIS,
-            f"Based on {len(evidence_list)} evidence items, {target} appears vulnerable to {vuln_type}",
-            confidence=0.6,
-        )
-
-        return chain
-
-    def build_attack_tree(
-        self,
-        root_goal: str,
-        target: str,
-    ) -> str:
-        """Build an attack tree for a target."""
-        self._counter += 1
-        tree_id = f"tree-{self._counter}"
-        self._attack_trees[tree_id] = {}
-
-        # Root node
-        root = AttackTreeNode(
-            node_id="node-root",
-            description=root_goal,
-            node_type="OR",
-            is_leaf=False,
-        )
-        self._attack_trees[tree_id]["root"] = root
-
-        return tree_id
-
-    def add_tree_node(
-        self,
-        tree_id: str,
-        parent_id: str,
-        description: str,
-        node_type: str = "AND",
-        probability: float = 0.5,
-        impact: float = 0.5,
-        cost: float = 0.5,
-    ) -> AttackTreeNode | None:
-        """Add a node to an attack tree."""
-        tree = self._attack_trees.get(tree_id)
-        if not tree or parent_id not in tree:
-            return None
-
-        self._counter += 1
-        node = AttackTreeNode(
-            node_id=f"node-{self._counter}",
-            description=description,
-            node_type=node_type,
-            probability=probability,
-            impact=impact,
-            cost=cost,
-        )
-
-        tree[node.node_id] = node
-        tree[parent_id].children.append(node.node_id)
-        tree[parent_id].is_leaf = False
-
-        return node
-
-    def evaluate_tree(self, tree_id: str) -> dict[str, Any]:
-        """Evaluate an attack tree's overall risk."""
-        tree = self._attack_trees.get(tree_id)
-        if not tree or "root" not in tree:
-            return {"risk": 0.0}
-
-        def evaluate_node(node_id: str) -> float:
-            node = tree.get(node_id)
-            if not node:
-                return 0.0
-
-            if node.is_leaf:
-                return node.probability
-
-            child_probs = [evaluate_node(cid) for cid in node.children]
-            if not child_probs:
-                return node.probability
-
-            if node.node_type == "AND":
-                # All children must succeed
-                result = 1.0
-                for p in child_probs:
-                    result *= p
-                return result
+        if step_confidences:
+            # Chain confidence = product of step confidences
+            if chain.reasoning_type == ReasoningType.CHAIN_OF_THOUGHT:
+                conf = 1.0
+                for c in step_confidences:
+                    conf *= c
+                chain.overall_confidence = conf
             else:
-                # OR: at least one child succeeds
-                result = 1.0
-                for p in child_probs:
-                    result *= (1 - p)
-                return 1 - result
+                # Tree: max of branch confidences
+                chain.overall_confidence = max(step_confidences)
 
-        overall_prob = evaluate_node("root")
-        root = tree["root"]
+    def build_cot_prompt(
+        self,
+        template_name: str,
+        context: str = "",
+    ) -> str:
+        """Build a chain-of-thought prompt from a template."""
+        template = COT_TEMPLATES.get(template_name, "")
+        if not template:
+            return ""
 
-        return {
-            "tree_id": tree_id,
-            "overall_probability": round(overall_prob, 3),
-            "impact": round(root.impact, 2),
-            "risk_score": round(overall_prob * root.impact, 3),
-            "nodes": len(tree),
-        }
+        parts = []
+        if context:
+            parts.append(f"Context:\n{context}\n")
+        parts.append(template)
+        parts.append("Think through each step carefully before proceeding to the next.")
 
-    def build_reasoning_prompt(
+        return "\n".join(parts)
+
+    def build_self_critique_prompt(
         self,
         chain_id: str,
     ) -> str:
-        """Build a reasoning prompt from a chain."""
+        """Build a self-critique prompt for a chain."""
         chain = self._chains.get(chain_id)
         if not chain:
             return ""
 
-        lines = [f"## Reasoning: {chain.goal}\n"]
-        lines.append(f"Type: {chain.reasoning_type.value}")
-        lines.append("")
+        lines = [
+            "Review the following reasoning chain and critique it:\n",
+            f"Question: {chain.question}\n",
+        ]
 
-        for i, step in enumerate(chain.steps):
-            prefix = {
-                StepType.OBSERVATION: "OBSERVE",
-                StepType.HYPOTHESIS: "HYPOTHESIZE",
-                StepType.INFERENCE: "INFER",
-                StepType.EVIDENCE: "EVIDENCE",
-                StepType.CONCLUSION: "CONCLUDE",
-                StepType.QUESTION: "QUESTION",
-                StepType.ACTION: "ACTION",
-                StepType.VERIFICATION: "VERIFY",
-            }.get(step.step_type, "STEP")
-
-            lines.append(f"{i+1}. [{prefix}] {step.content}")
-            if step.evidence:
-                for ev in step.evidence:
-                    lines.append(f"   Evidence: {ev[:60]}")
-            if step.assumptions:
-                for asn in step.assumptions:
-                    lines.append(f"   Assumption: {asn[:60]}")
+        for i, step_id in enumerate(chain.steps):
+            step = self._steps.get(step_id)
+            if step:
+                lines.append(f"Step {i + 1} (confidence={step.confidence:.2f}): {step.content}")
 
         if chain.conclusion:
-            lines.append(f"\nCONCLUSION: {chain.conclusion}")
-            lines.append(f"Confidence: {chain.overall_confidence:.0%}")
+            lines.append(f"\nConclusion: {chain.conclusion}")
+
+        lines.append(
+            "\nCritique:\n"
+            "1. Are there any logical errors in the reasoning?\n"
+            "2. Are there any missing steps or overlooked factors?\n"
+            "3. Is the confidence level appropriate for each step?\n"
+            "4. Could the conclusion be wrong? What alternative conclusions are possible?\n"
+            "5. What additional evidence would strengthen or weaken this analysis?"
+        )
+
+        return "\n".join(lines)
+
+    def prune_low_confidence(
+        self,
+        chain_id: str,
+        threshold: float = 0.3,
+    ) -> int:
+        """Prune low-confidence branches in tree-of-thought."""
+        chain = self._chains.get(chain_id)
+        if not chain:
+            return 0
+
+        pruned = 0
+        for step_id in chain.steps:
+            step = self._steps.get(step_id)
+            if step and step.confidence < threshold:
+                step.status = StepStatus.PRUNED
+                pruned += 1
+
+        return pruned
+
+    def get_chain_text(self, chain_id: str) -> str:
+        """Get the full text of a reasoning chain."""
+        chain = self._chains.get(chain_id)
+        if not chain:
+            return ""
+
+        lines = [f"## Reasoning: {chain.question}\n"]
+        for i, step_id in enumerate(chain.steps):
+            step = self._steps.get(step_id)
+            if step and step.status != StepStatus.PRUNED:
+                lines.append(f"Step {i + 1}: {step.content}")
+
+        if chain.conclusion:
+            lines.append(f"\nConclusion: {chain.conclusion}")
+            lines.append(f"Confidence: {chain.overall_confidence:.2f}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         type_counts: dict[str, int] = defaultdict(int)
-        for c in self._chains.values():
-            type_counts[c.reasoning_type.value] += 1
-
-        total_steps = sum(c.length for c in self._chains.values())
-        confirmed = sum(1 for c in self._chains.values() if c.valid)
+        for chain in self._chains.values():
+            type_counts[chain.reasoning_type.value] += 1
 
         return {
             "chains": len(self._chains),
-            "total_steps": total_steps,
-            "confirmed_valid": confirmed,
-            "attack_trees": len(self._attack_trees),
+            "steps": len(self._steps),
+            "total_tokens": sum(c.total_tokens for c in self._chains.values()),
+            "avg_confidence": round(
+                sum(c.overall_confidence for c in self._chains.values()) /
+                max(1, len(self._chains)), 2,
+            ),
             "by_type": dict(type_counts),
         }
