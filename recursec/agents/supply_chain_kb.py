@@ -1,11 +1,11 @@
 """Supply chain security knowledge base.
 
-Deep knowledge about supply chain attacks:
-1. Dependency confusion and typosquatting
-2. CI/CD pipeline attacks
-3. Package manager exploitation
-4. Build system compromise
-5. Third-party code review
+Deep knowledge about software supply chain security:
+1. Dependency confusion attacks
+2. Build pipeline security
+3. Package manager attacks
+4. Software composition analysis
+5. SBOM and provenance
 """
 
 from __future__ import annotations
@@ -40,184 +40,185 @@ class SupplyChainPattern:
 SUPPLY_CHAIN_PATTERNS: list[dict[str, Any]] = [
     {
         "id": "sc-001", "name": "Dependency Confusion",
-        "category": "deps", "severity": "critical",
-        "desc": "Dependency confusion and typosquatting attacks.",
+        "category": "dependency", "severity": "critical",
+        "desc": "Dependency confusion and substitution attacks.",
         "detection": (
-            "DEPENDENCY CONFUSION:\n"
-            "ATTACK VECTOR:\n"
-            "  - Internal package name claimed on public registry\n"
-            "  - Higher version number on public registry wins\n"
-            "  - Affects: npm, pip, gems, NuGet, Maven\n"
-            "  - Attacker publishes malicious package with same name\n"
-            "TYPOSQUATTING:\n"
-            "  - Register misspelled package names\n"
-            "  - lodash → lodahs, lodashs, lodash-utils\n"
-            "  - requests → requets, request, python-requests\n"
-            "  - Install scripts execute on install\n"
+            "DEPENDENCY CONFUSION ATTACKS:\n"
+            "CONCEPT:\n"
+            "  - Private package name registered on public registry\n"
+            "  - Build system pulls public (malicious) over private\n"
+            "  - Affects: npm, PyPI, RubyGems, NuGet, Maven\n"
+            "  - Alex Birsan research (2021): compromised Apple, MS, etc.\n"
+            "ATTACK VECTORS:\n"
+            "  npm:\n"
+            "    - Register internal package name on npmjs.com\n"
+            "    - Higher version number wins\n"
+            "    - .npmrc scoping misconfiguration\n"
+            "  PyPI:\n"
+            "    - Register internal package on pypi.org\n"
+            "    - pip installs from PyPI by default\n"
+            "    - --extra-index-url adds PyPI as fallback\n"
+            "  RubyGems:\n"
+            "    - Register on rubygems.org\n"
+            "    - Bundler gem source priority\n"
             "DETECTION:\n"
-            "  # Check for internal packages on public registries\n"
-            "  # npm: npm info <package-name>\n"
-            "  # pip: pip index versions <package-name>\n"
-            "  # Look for packages installed from unexpected registries\n"
-            "  pip list --format=json | jq '.[].name'\n"
-            "  npm list --all --json | jq '.dependencies'\n"
+            "  - Audit registry for internal package names\n"
+            "  - Monitor new packages matching internal names\n"
+            "  - Lock file verification\n"
+            "  - Scoped registries (@company/ in npm)\n"
             "PREVENTION:\n"
-            "  - Scope packages: @company/package\n"
-            "  - Pin exact versions with lockfiles\n"
-            "  - Use private registry with upstream proxying\n"
-            "  - Configure .npmrc, pip.conf, settings.xml\n"
+            "  - Namespace all internal packages\n"
+            "  - Pin exact versions in lock files\n"
+            "  - Use private registries (Artifactory, Nexus)\n"
+            "  - Reserve names on public registries\n"
             "TOOLS:\n"
-            "  confused  # Dependency confusion scanner\n"
-            "  snyk  # Vulnerability database\n"
-            "  socket.dev  # Package quality analysis"
+            "  confused (detection), safety, snyk"
         ),
         "tools": ["confused", "snyk"],
     },
     {
-        "id": "sc-002", "name": "CI/CD Pipeline Attacks",
-        "category": "cicd", "severity": "critical",
-        "desc": "CI/CD pipeline exploitation techniques.",
+        "id": "sc-002", "name": "Build Pipeline Security",
+        "category": "pipeline", "severity": "critical",
+        "desc": "CI/CD pipeline security and attacks.",
         "detection": (
-            "CI/CD PIPELINE ATTACKS:\n"
-            "GITHUB ACTIONS:\n"
-            "  - Poisoned pipeline execution (PPE)\n"
-            "  - workflow_run with pull_request_target\n"
-            "  - Secrets in environment variables\n"
+            "BUILD PIPELINE SECURITY:\n"
+            "ATTACK SURFACES:\n"
+            "  - Source code repo (commit injection)\n"
+            "  - Build system (Jenkins, GitHub Actions)\n"
+            "  - Artifact registry (Docker Hub, npm)\n"
+            "  - Deployment pipeline\n"
+            "  - Infrastructure-as-Code\n"
+            "CI/CD ATTACKS:\n"
+            "  - Poisoned Pipeline Execution (PPE)\n"
+            "    Direct PPE: Modify CI config in PR\n"
+            "    Indirect PPE: Modify called scripts\n"
+            "  - Secret extraction from CI env\n"
             "  - Self-hosted runner compromise\n"
-            "  - GITHUB_TOKEN scope abuse\n"
-            "  # Check workflow permissions\n"
-            "  # Look for: permissions: write-all\n"
-            "  # Check for: pull_request_target triggers\n"
-            "JENKINS:\n"
-            "  - Unauthenticated access (no auth configured)\n"
-            "  - Script console: /script\n"
-            "  - Credential extraction from /credentials/\n"
-            "  - Pipeline-as-code injection\n"
-            "  - Plugin vulnerabilities\n"
-            "GITLAB CI:\n"
-            "  - CI/CD variables exposed in logs\n"
-            "  - Protected branch bypass\n"
-            "  - Shared runners: Cross-project attacks\n"
-            "GENERAL:\n"
-            "  - Build artifact poisoning\n"
-            "  - Cache poisoning between builds\n"
-            "  - Secrets in build logs\n"
-            "  - Container image supply chain\n"
+            "  - Dependency cache poisoning\n"
+            "  - Build artifact tampering\n"
+            "GITHUB ACTIONS:\n"
+            "  - pull_request_target event abuse\n"
+            "  - Workflow injection (untrusted input in run)\n"
+            "  - Action pinning (use SHA not tag)\n"
+            "  - GITHUB_TOKEN permission abuse\n"
+            "  - Third-party action supply chain\n"
+            "DETECTION:\n"
+            "  - Review workflow files in PRs\n"
+            "  - Audit secret access\n"
+            "  - Build reproducibility checks\n"
+            "  - SLSA provenance verification\n"
             "TOOLS:\n"
-            "  poutine  # CI/CD security scanner\n"
-            "  legitify  # GitHub/GitLab security posture"
+            "  step-security/harden-runner, zizmor, scorecard"
         ),
-        "tools": ["poutine", "legitify"],
+        "tools": ["scorecard"],
     },
     {
-        "id": "sc-003", "name": "Package Manager Exploitation",
-        "category": "packages", "severity": "high",
-        "desc": "Package manager security issues.",
+        "id": "sc-003", "name": "Package Manager Attacks",
+        "category": "packages", "severity": "critical",
+        "desc": "Package manager attack techniques.",
         "detection": (
-            "PACKAGE MANAGER EXPLOITATION:\n"
-            "NPM:\n"
-            "  # Install scripts (preinstall, postinstall)\n"
-            "  # .npmrc credential leakage\n"
-            "  # Unpublished scope claiming\n"
-            "  npm audit  # Known vulnerabilities\n"
-            "  npm audit --json | jq '.vulnerabilities'\n"
-            "PYPI:\n"
-            "  # setup.py arbitrary code execution on install\n"
-            "  # Wheel vs sdist security differences\n"
-            "  pip-audit  # Python dependency audit\n"
-            "  safety check  # Check for known vulns\n"
-            "RUBYGEMS:\n"
-            "  # gem install runs extconf.rb\n"
-            "  bundle-audit check\n"
-            "MAVEN/GRADLE:\n"
-            "  # Build plugin code execution\n"
-            "  # Repository impersonation\n"
-            "  mvn dependency:tree  # Analyze dependencies\n"
-            "CONTAINER IMAGES:\n"
-            "  # Base image vulnerabilities\n"
-            "  trivy image <image>  # Scan container\n"
-            "  grype <image>  # Alternative scanner\n"
-            "  # Layer analysis\n"
-            "  dive <image>  # Explore layers\n"
-            "SBOMs:\n"
-            "  # Generate Software Bill of Materials\n"
-            "  syft <image> -o cyclonedx-json\n"
-            "  # Analyze SBOM for vulnerabilities\n"
-            "  grype sbom:sbom.json"
+            "PACKAGE MANAGER ATTACKS:\n"
+            "TYPOSQUATTING:\n"
+            "  - Register similar-name packages\n"
+            "  - Examples: lodash → 1odash, faker → f4ker\n"
+            "  - Automated mass registration\n"
+            "  - Target popular packages\n"
+            "MALICIOUS PACKAGES:\n"
+            "  - Install scripts (postinstall in npm)\n"
+            "  - setup.py code execution\n"
+            "  - Data exfiltration (env vars, SSH keys)\n"
+            "  - Cryptominer injection\n"
+            "  - Reverse shell in package\n"
+            "ACCOUNT TAKEOVER:\n"
+            "  - Maintainer account compromise\n"
+            "  - Credential reuse (breached passwords)\n"
+            "  - Social engineering maintainers\n"
+            "  - Abandoned package takeover\n"
+            "  - event-stream incident (2018)\n"
+            "STAR JACKING:\n"
+            "  - Fork popular repo\n"
+            "  - Transfer stars (GitHub)\n"
+            "  - Create package pointing to fork\n"
+            "  - Users trust star count\n"
+            "DETECTION:\n"
+            "  - Lock file auditing (npm audit, pip-audit)\n"
+            "  - New dependency review in PRs\n"
+            "  - Socket.dev (npm supply chain)\n"
+            "  - Phylum (automated detection)\n"
+            "TOOLS:\n"
+            "  npm audit, pip-audit, Socket.dev, Phylum"
         ),
-        "tools": ["trivy", "grype", "pip-audit"],
+        "tools": ["npm-audit", "pip-audit"],
     },
     {
-        "id": "sc-004", "name": "Build System Compromise",
-        "category": "build", "severity": "critical",
-        "desc": "Build system and artifact integrity attacks.",
+        "id": "sc-004", "name": "Software Composition",
+        "category": "sca", "severity": "high",
+        "desc": "Software composition analysis.",
         "detection": (
-            "BUILD SYSTEM COMPROMISE:\n"
-            "REPRODUCIBLE BUILDS:\n"
-            "  - Verify build output matches source\n"
-            "  - Compare hashes across build environments\n"
-            "  - Detect injected code during build\n"
-            "SIGNING AND VERIFICATION:\n"
-            "  # GPG signing\n"
-            "  gpg --verify package.tar.gz.sig package.tar.gz\n"
-            "  # Sigstore/cosign (container signing)\n"
-            "  cosign verify --key cosign.pub <image>\n"
-            "  # npm package provenance\n"
-            "  npm audit signatures\n"
-            "SUPPLY CHAIN LEVELS (SLSA):\n"
-            "  - L0: No guarantees\n"
-            "  - L1: Build process documented\n"
-            "  - L2: Hosted build, signed provenance\n"
-            "  - L3: Hardened build, non-falsifiable provenance\n"
-            "  - L4: Two-party review, hermetic builds\n"
-            "ARTIFACT INTEGRITY:\n"
-            "  - Check package checksums\n"
-            "  - Verify download sources\n"
-            "  - Use lockfiles (package-lock.json, Pipfile.lock)\n"
-            "  - Pin dependencies by hash\n"
-            "  # pip install --require-hashes -r requirements.txt\n"
-            "ATTACKS:\n"
-            "  - SolarWinds-style build injection\n"
-            "  - Codecov bash uploader compromise\n"
-            "  - Event-Stream npm incident\n"
-            "  - ua-parser-js npm hijack"
+            "SOFTWARE COMPOSITION ANALYSIS:\n"
+            "VULNERABILITY SCANNING:\n"
+            "  # Known vulnerabilities in dependencies\n"
+            "  trivy fs --scanners vuln .  # Aqua Trivy\n"
+            "  grype .  # Anchore Grype\n"
+            "  snyk test  # Snyk\n"
+            "  npm audit  # npm built-in\n"
+            "  pip-audit  # Python\n"
+            "  cargo audit  # Rust\n"
+            "LICENSE COMPLIANCE:\n"
+            "  - Identify all dependency licenses\n"
+            "  - Check compatibility (GPL, AGPL, MIT)\n"
+            "  - License conflict detection\n"
+            "  - FOSSA, SPDX tools\n"
+            "DEPENDENCY GRAPH:\n"
+            "  - Transitive dependency analysis\n"
+            "  - Phantom dependencies\n"
+            "  - Version conflict resolution\n"
+            "  - Dependency tree visualization\n"
+            "AUTOMATION:\n"
+            "  - Dependabot / Renovate (auto-update)\n"
+            "  - CI pipeline integration\n"
+            "  - Policy-as-code (OPA)\n"
+            "  - Break build on critical CVE\n"
+            "  - Merge queue with security gates\n"
+            "TOOLS:\n"
+            "  Trivy, Grype, Snyk, OWASP Dep-Check, Dependabot"
         ),
-        "tools": ["cosign", "slsa-verifier"],
+        "tools": ["trivy", "grype", "snyk"],
     },
     {
-        "id": "sc-005", "name": "Third-Party Code Review",
-        "category": "review", "severity": "high",
-        "desc": "Reviewing third-party code for security.",
+        "id": "sc-005", "name": "SBOM and Provenance",
+        "category": "sbom", "severity": "medium",
+        "desc": "SBOM generation and provenance verification.",
         "detection": (
-            "THIRD-PARTY CODE REVIEW:\n"
-            "AUTOMATED ANALYSIS:\n"
-            "  # Static analysis of dependencies\n"
-            "  semgrep --config p/supply-chain .\n"
-            "  # Check for suspicious patterns\n"
-            "  - eval(), exec(), Function() calls\n"
-            "  - Network requests in install scripts\n"
-            "  - File system access outside package dir\n"
-            "  - Obfuscated code (base64, hex encoding)\n"
-            "  - Environment variable exfiltration\n"
-            "MANUAL CHECKS:\n"
-            "  - Review recent version changes\n"
-            "  - Check maintainer changes (npm owner ls)\n"
-            "  - Verify GitHub repo matches published package\n"
-            "  - Compare package size across versions\n"
-            "  - Read install/post-install scripts\n"
-            "RED FLAGS:\n"
-            "  - New maintainer on popular package\n"
-            "  - Sudden version bump with minimal changes\n"
-            "  - Install scripts making network requests\n"
-            "  - Obfuscated or minified source in package\n"
-            "  - Reading environment variables or SSH keys\n"
-            "  - Spawning child processes\n"
-            "MONITORING:\n"
-            "  socket.dev  # Real-time package analysis\n"
-            "  deps.dev  # Google dependency insights\n"
-            "  snyk.io  # Continuous monitoring"
+            "SBOM AND PROVENANCE:\n"
+            "SBOM FORMATS:\n"
+            "  - SPDX (ISO standard)\n"
+            "  - CycloneDX (OWASP)\n"
+            "  - SWID tags\n"
+            "GENERATION:\n"
+            "  # CycloneDX\n"
+            "  cyclonedx-bom -o bom.json  # Python\n"
+            "  npx @cyclonedx/cyclonedx-npm -o bom.json  # npm\n"
+            "  # SPDX\n"
+            "  syft . -o spdx-json > sbom.spdx.json  # Syft\n"
+            "  # Trivy\n"
+            "  trivy fs --format cyclonedx .  # Multi-format\n"
+            "PROVENANCE:\n"
+            "  SLSA (Supply-chain Levels for Software Artifacts)\n"
+            "  - Level 1: Documentation of build process\n"
+            "  - Level 2: Hosted source/build, signed provenance\n"
+            "  - Level 3: Hardened builds, unforgeable provenance\n"
+            "  - Level 4: Two-person reviewed, hermetic builds\n"
+            "SIGSTORE:\n"
+            "  - Cosign (container signing)\n"
+            "  - Rekor (transparency log)\n"
+            "  - Fulcio (certificate authority)\n"
+            "  cosign sign --key cosign.key image:tag\n"
+            "  cosign verify --key cosign.pub image:tag\n"
+            "TOOLS:\n"
+            "  Syft, Grype, Cosign, SLSA verifier"
         ),
-        "tools": ["semgrep", "socket"],
+        "tools": ["syft", "cosign"],
     },
 ]
 
@@ -225,7 +226,7 @@ SUPPLY_CHAIN_PATTERNS: list[dict[str, Any]] = [
 class SupplyChainKB:
     """Supply chain security knowledge base.
 
-    Provides supply chain attack patterns
+    Provides supply chain attack/defense patterns
     injected into agent prompts.
     """
 
@@ -261,7 +262,7 @@ class SupplyChainKB:
         max_patterns: int = 4,
     ) -> str:
         """Build supply chain security prompt."""
-        lines = ["## Supply Chain Security Patterns\n"]
+        lines = ["## Supply Chain Security\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
