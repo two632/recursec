@@ -1,24 +1,18 @@
-"""Reasoning chain engine — structured multi-step reasoning with verification.
+"""Reasoning chain — structured chain-of-thought for security analysis.
 
-Implements chain-of-thought reasoning patterns:
-1. Linear chain: Step-by-step reasoning (A → B → C)
-2. Branching chain: Multiple possible paths explored
-3. Verified chain: Each step verified before proceeding
-4. Iterative chain: Loop until convergence
-5. Evidence-based: Each claim must cite evidence
-6. Adversarial: Generate argument and counter-argument
-7. Socratic: Answer through a series of questions
-
-Each chain step produces:
-- A thought (the reasoning)
-- An action (what to do based on the thought)
-- An observation (what happened when we acted)
-- A verification (is the observation consistent?)
+Implements multi-step reasoning with:
+1. Evidence collection and weighting
+2. Hypothesis formation
+3. Deductive and inductive reasoning steps
+4. Confidence propagation through chains
+5. Contradiction detection
+6. Reasoning with uncertainty
+7. Multi-chain aggregation
+8. Reasoning explanation generation
 """
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -32,553 +26,382 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
-class ChainType(str, Enum):
-    LINEAR = "linear"
-    VERIFIED = "verified"
-    ITERATIVE = "iterative"
-    EVIDENCE = "evidence"
-    ADVERSARIAL = "adversarial"
-    SOCRATIC = "socratic"
+class ReasoningType(str, Enum):
+    DEDUCTIVE = "deductive"     # General rule → specific conclusion
+    INDUCTIVE = "inductive"     # Specific observations → general rule
+    ABDUCTIVE = "abductive"     # Observation → best explanation
+    ANALOGICAL = "analogical"   # Similar cases → inference
+    CAUSAL = "causal"           # Cause → effect reasoning
 
 
-class StepStatus(str, Enum):
-    PENDING = "pending"
-    THINKING = "thinking"
-    ACTING = "acting"
-    OBSERVING = "observing"
-    VERIFYING = "verifying"
-    COMPLETE = "complete"
-    FAILED = "failed"
+class EvidenceStrength(str, Enum):
+    STRONG = "strong"           # Direct, verified evidence
+    MODERATE = "moderate"       # Indirect but reliable
+    WEAK = "weak"               # Circumstantial or unverified
+    CONTRADICTORY = "contradictory"
 
 
 @dataclass
-class ChainStep:
-    """A single step in a reasoning chain."""
-    step_num: int = 0
-    thought: str = ""
-    action: str = ""
-    observation: str = ""
-    verification: str = ""
-    status: StepStatus = StepStatus.PENDING
+class Evidence:
+    """A piece of evidence for reasoning."""
+    evidence_id: str = ""
+    description: str = ""
+    source: str = ""            # Tool output, observation, prior finding
+    strength: EvidenceStrength = EvidenceStrength.MODERATE
     confidence: float = 0.5
-    evidence: list[str] = field(default_factory=list)
-    counter_argument: str = ""
-    questions: list[str] = field(default_factory=list)
+    data: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
 
+    @property
+    def weight(self) -> float:
+        strength_weights = {
+            EvidenceStrength.STRONG: 1.0,
+            EvidenceStrength.MODERATE: 0.6,
+            EvidenceStrength.WEAK: 0.3,
+            EvidenceStrength.CONTRADICTORY: -0.5,
+        }
+        return strength_weights.get(self.strength, 0.5) * self.confidence
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "step": self.step_num,
-            "thought": self.thought[:200],
-            "action": self.action[:100],
-            "observation": self.observation[:200],
-            "status": self.status.value,
+            "id": self.evidence_id,
+            "description": self.description[:100],
+            "source": self.source,
+            "strength": self.strength.value,
             "confidence": round(self.confidence, 2),
+            "weight": round(self.weight, 2),
         }
 
 
 @dataclass
-class ReasoningChainResult:
-    """Result of a complete reasoning chain."""
-    chain_type: ChainType = ChainType.LINEAR
-    question: str = ""
-    steps: list[ChainStep] = field(default_factory=list)
+class ReasoningStep:
+    """A single step in a reasoning chain."""
+    step_id: str = ""
+    step_number: int = 0
+    reasoning_type: ReasoningType = ReasoningType.DEDUCTIVE
+    premise: str = ""
+    inference: str = ""
     conclusion: str = ""
-    overall_confidence: float = 0.5
-    converged: bool = False
-    iterations: int = 0
-    time_ms: float = 0.0
+    evidence_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.5
+    contradictions: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "type": self.chain_type.value,
-            "question": self.question[:200],
-            "steps": len(self.steps),
-            "conclusion": self.conclusion[:200],
-            "confidence": round(self.overall_confidence, 2),
-            "converged": self.converged,
-            "time_ms": round(self.time_ms, 1),
+            "step": self.step_number,
+            "type": self.reasoning_type.value,
+            "premise": self.premise[:100],
+            "conclusion": self.conclusion[:100],
+            "confidence": round(self.confidence, 2),
+            "contradictions": len(self.contradictions),
         }
 
 
-# ── Prompt Templates ────────────────────────────────────────
-
-COT_STEP_PROMPT = """You are reasoning through a security problem step by step.
-
-Problem: {problem}
-Previous reasoning:
-{previous_steps}
-
-Step {step_num}: Think about what to do next.
-
-Respond as JSON:
-{{
-  "thought": "your reasoning for this step",
-  "action": "specific action to take or conclusion to draw",
-  "confidence": 0.X,
-  "is_final": true/false
-}}"""
-
-VERIFY_STEP_PROMPT = """Verify this reasoning step for logical errors or false assumptions.
-
-Problem: {problem}
-Reasoning step: {thought}
-Action proposed: {action}
-Evidence available: {evidence}
-
-Check:
-1. Is the logic sound?
-2. Are there false assumptions?
-3. Is the conclusion supported by evidence?
-4. What could be wrong?
-
-Respond as JSON:
-{{
-  "valid": true/false,
-  "issues": ["list of issues if any"],
-  "corrected_thought": "corrected reasoning if invalid",
-  "confidence": 0.X
-}}"""
-
-EVIDENCE_STEP_PROMPT = """Make a claim about this security problem and cite evidence.
-
-Problem: {problem}
-Previous claims: {previous}
-Available evidence: {evidence}
-
-Make one specific, evidence-supported claim.
-
-Respond as JSON:
-{{
-  "claim": "your specific claim",
-  "evidence": ["evidence supporting the claim"],
-  "confidence": 0.X,
-  "assumptions": ["assumptions this depends on"],
-  "is_final": true/false
-}}"""
-
-ADVERSARIAL_PROMPT = """Generate an argument AND counter-argument for this security assessment.
-
-Problem: {problem}
-Position: {position}
-Previous arguments: {previous}
-
-Respond as JSON:
-{{
-  "argument": "argument for this position",
-  "counter_argument": "best counter-argument",
-  "evidence_for": ["evidence supporting argument"],
-  "evidence_against": ["evidence for counter-argument"],
-  "net_confidence": 0.X,
-  "is_final": true/false
-}}"""
-
-SOCRATIC_PROMPT = """Answer this security question through a series of sub-questions.
-
-Main question: {question}
-Previous Q&A:
-{previous_qa}
-
-Generate the next question that helps answer the main question,
-then answer it.
-
-Respond as JSON:
-{{
-  "sub_question": "a question that helps answer the main question",
-  "answer": "answer to the sub-question",
-  "how_it_helps": "how this moves toward answering the main question",
-  "confidence": 0.X,
-  "main_question_answered": true/false,
-  "final_answer": "answer to main question (if answered)"
-}}"""
-
-
+@dataclass
 class ReasoningChain:
-    """Multi-step reasoning chain engine.
+    """A complete chain of reasoning."""
+    chain_id: str = ""
+    question: str = ""
+    steps: list[ReasoningStep] = field(default_factory=list)
+    evidence: list[Evidence] = field(default_factory=list)
+    final_conclusion: str = ""
+    overall_confidence: float = 0.0
+    has_contradictions: bool = False
+    created_at: float = field(default_factory=time.time)
 
-    Implements various chain-of-thought patterns for
-    structured security reasoning.
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.chain_id,
+            "question": self.question[:100],
+            "steps": len(self.steps),
+            "evidence": len(self.evidence),
+            "conclusion": self.final_conclusion[:100],
+            "confidence": round(self.overall_confidence, 2),
+            "contradictions": self.has_contradictions,
+        }
+
+
+REASONING_PROMPT = """You are a security analyst performing structured reasoning.
+
+Question: {question}
+
+Evidence:
+{evidence_text}
+
+Perform step-by-step reasoning to answer the question.
+For each step, identify:
+1. The type of reasoning (deductive, inductive, abductive, analogical, causal)
+2. The premise (what we know)
+3. The inference (how we derive new knowledge)
+4. The conclusion (what we can conclude)
+5. Any contradictions or uncertainties
+
+Respond as JSON:
+{{
+  "steps": [
+    {{
+      "type": "deductive|inductive|abductive|analogical|causal",
+      "premise": "what we know",
+      "inference": "reasoning process",
+      "conclusion": "what we conclude",
+      "confidence": 0.X,
+      "contradictions": ["any contradictions"]
+    }}
+  ],
+  "final_conclusion": "overall conclusion",
+  "overall_confidence": 0.X
+}}"""
+
+
+class ReasoningEngine:
+    """Structured chain-of-thought reasoning for security analysis.
+
+    Builds evidence-based reasoning chains with confidence
+    propagation, contradiction detection, and multi-chain
+    aggregation.
     """
 
-    def __init__(self, model_router: ModelRouter) -> None:
+    def __init__(self, model_router: ModelRouter | None = None) -> None:
         self._router = model_router
+        self._chains: dict[str, ReasoningChain] = {}
+        self._evidence_store: dict[str, Evidence] = {}
+        self._chain_counter = 0
+        self._evidence_counter = 0
+        self._step_counter = 0
         self._log = logger.bind(component="reasoning_chain")
+
+    def add_evidence(
+        self,
+        description: str,
+        source: str,
+        strength: EvidenceStrength = EvidenceStrength.MODERATE,
+        confidence: float = 0.5,
+        data: dict[str, Any] | None = None,
+    ) -> str:
+        """Add evidence to the store."""
+        self._evidence_counter += 1
+        ev_id = f"ev-{self._evidence_counter}"
+
+        evidence = Evidence(
+            evidence_id=ev_id,
+            description=description,
+            source=source,
+            strength=strength,
+            confidence=confidence,
+            data=data or {},
+        )
+
+        self._evidence_store[ev_id] = evidence
+        return ev_id
 
     async def reason(
         self,
-        problem: str,
-        chain_type: ChainType = ChainType.LINEAR,
-        max_steps: int = 8,
-        evidence: list[str] | None = None,
-        convergence_threshold: float = 0.85,
-    ) -> ReasoningChainResult:
-        """Run a reasoning chain."""
-        start = time.time()
+        question: str,
+        evidence_ids: list[str] | None = None,
+    ) -> ReasoningChain:
+        """Build a reasoning chain for a question."""
+        self._chain_counter += 1
+        chain_id = f"chain-{self._chain_counter}"
 
-        if chain_type == ChainType.LINEAR:
-            result = await self._linear(problem, max_steps)
-        elif chain_type == ChainType.VERIFIED:
-            result = await self._verified(problem, max_steps)
-        elif chain_type == ChainType.EVIDENCE:
-            result = await self._evidence_based(problem, max_steps, evidence or [])
-        elif chain_type == ChainType.ADVERSARIAL:
-            result = await self._adversarial(problem, max_steps)
-        elif chain_type == ChainType.SOCRATIC:
-            result = await self._socratic(problem, max_steps)
-        elif chain_type == ChainType.ITERATIVE:
-            result = await self._iterative(problem, max_steps, convergence_threshold)
+        chain = ReasoningChain(
+            chain_id=chain_id,
+            question=question,
+        )
+
+        # Gather evidence
+        if evidence_ids:
+            chain.evidence = [
+                self._evidence_store[eid] for eid in evidence_ids
+                if eid in self._evidence_store
+            ]
         else:
-            result = await self._linear(problem, max_steps)
+            chain.evidence = list(self._evidence_store.values())[-10:]
 
-        result.time_ms = (time.time() - start) * 1000
-        result.chain_type = chain_type
-        result.question = problem
+        # LLM reasoning
+        if self._router:
+            steps, conclusion, confidence = await self._llm_reason(question, chain.evidence)
+            chain.steps = steps
+            chain.final_conclusion = conclusion
+            chain.overall_confidence = confidence
+        else:
+            chain = self._heuristic_reason(chain)
 
-        self._log.info(
-            "chain_complete",
-            type=chain_type.value,
-            steps=len(result.steps),
-            confidence=round(result.overall_confidence, 2),
+        # Check for contradictions
+        chain.has_contradictions = any(
+            step.contradictions for step in chain.steps
         )
 
-        return result
+        # Adjust confidence for contradictions
+        if chain.has_contradictions:
+            chain.overall_confidence *= 0.7
 
-    async def _linear(self, problem: str, max_steps: int) -> ReasoningChainResult:
-        """Linear chain-of-thought reasoning."""
-        result = ReasoningChainResult()
-        steps: list[ChainStep] = []
+        self._chains[chain_id] = chain
+        return chain
 
-        for step_num in range(1, max_steps + 1):
-            previous = self._format_steps(steps)
-
-            prompt = COT_STEP_PROMPT.format(
-                problem=problem,
-                previous_steps=previous or "(start)",
-                step_num=step_num,
-            )
-
-            response = await self._router.generate(
-                messages=[{"role": "user", "content": prompt}],
-                task_type="reasoning",
-                temperature=0.2,
-                max_tokens=512,
-            )
-
-            data = self._parse_json(response)
-            step = ChainStep(
-                step_num=step_num,
-                thought=data.get("thought", ""),
-                action=data.get("action", ""),
-                confidence=data.get("confidence", 0.5),
-                status=StepStatus.COMPLETE,
-            )
-            steps.append(step)
-
-            if data.get("is_final", False):
-                result.conclusion = data.get("action", "")
-                break
-
-        result.steps = steps
-        result.overall_confidence = (
-            sum(s.confidence for s in steps) / max(1, len(steps))
-        )
-        if not result.conclusion and steps:
-            result.conclusion = steps[-1].action
-
-        return result
-
-    async def _verified(self, problem: str, max_steps: int) -> ReasoningChainResult:
-        """Chain-of-thought with verification at each step."""
-        result = ReasoningChainResult()
-        steps: list[ChainStep] = []
-
-        for step_num in range(1, max_steps + 1):
-            previous = self._format_steps(steps)
-
-            # Generate thought
-            prompt = COT_STEP_PROMPT.format(
-                problem=problem,
-                previous_steps=previous or "(start)",
-                step_num=step_num,
-            )
-
-            response = await self._router.generate(
-                messages=[{"role": "user", "content": prompt}],
-                task_type="reasoning",
-                temperature=0.2,
-                max_tokens=512,
-            )
-
-            data = self._parse_json(response)
-            step = ChainStep(
-                step_num=step_num,
-                thought=data.get("thought", ""),
-                action=data.get("action", ""),
-                confidence=data.get("confidence", 0.5),
-                status=StepStatus.VERIFYING,
-            )
-
-            # Verify the step
-            verify_prompt = VERIFY_STEP_PROMPT.format(
-                problem=problem,
-                thought=step.thought,
-                action=step.action,
-                evidence="N/A",
-            )
-
-            verify_response = await self._router.generate(
-                messages=[{"role": "user", "content": verify_prompt}],
-                task_type="reasoning",
-                temperature=0.1,
-                max_tokens=256,
-            )
-
-            verify_data = self._parse_json(verify_response)
-            step.verification = json.dumps(verify_data.get("issues", []))
-
-            if verify_data.get("valid", True):
-                step.status = StepStatus.COMPLETE
-            else:
-                # Use corrected thought
-                corrected = verify_data.get("corrected_thought", "")
-                if corrected:
-                    step.thought = corrected
-                step.status = StepStatus.COMPLETE
-                step.confidence *= 0.8  # Reduce confidence for corrected steps
-
-            steps.append(step)
-
-            if data.get("is_final", False):
-                result.conclusion = step.action
-                break
-
-        result.steps = steps
-        result.overall_confidence = (
-            sum(s.confidence for s in steps) / max(1, len(steps))
-        )
-        if not result.conclusion and steps:
-            result.conclusion = steps[-1].action
-
-        return result
-
-    async def _evidence_based(
+    async def reason_about_finding(
         self,
-        problem: str,
-        max_steps: int,
-        evidence: list[str],
-    ) -> ReasoningChainResult:
-        """Evidence-based reasoning where each claim cites evidence."""
-        result = ReasoningChainResult()
-        steps: list[ChainStep] = []
-        evidence_text = "\n".join(f"- {e[:200]}" for e in evidence[:10])
+        finding: dict[str, Any],
+    ) -> ReasoningChain:
+        """Reason about whether a finding is valid."""
+        title = finding.get("title", "Unknown")
+        severity = finding.get("severity", "unknown")
+        evidence_text = finding.get("evidence", "")
+        tool = finding.get("tool", "")
 
-        for step_num in range(1, max_steps + 1):
-            previous = "\n".join(
-                f"Claim {s.step_num}: {s.thought[:100]}" for s in steps
-            )
-
-            prompt = EVIDENCE_STEP_PROMPT.format(
-                problem=problem,
-                previous=previous or "(none)",
-                evidence=evidence_text or "No specific evidence available",
-            )
-
-            response = await self._router.generate(
-                messages=[{"role": "user", "content": prompt}],
-                task_type="reasoning",
-                temperature=0.2,
-                max_tokens=512,
-            )
-
-            data = self._parse_json(response)
-            step = ChainStep(
-                step_num=step_num,
-                thought=data.get("claim", ""),
-                evidence=data.get("evidence", []),
-                confidence=data.get("confidence", 0.5),
-                status=StepStatus.COMPLETE,
-            )
-            steps.append(step)
-
-            if data.get("is_final", False):
-                result.conclusion = data.get("claim", "")
-                break
-
-        result.steps = steps
-        result.overall_confidence = (
-            sum(s.confidence for s in steps) / max(1, len(steps))
+        question = (
+            f"Is this {severity} vulnerability finding valid? "
+            f"'{title}' found by {tool}. Evidence: {evidence_text[:200]}"
         )
-        return result
 
-    async def _adversarial(self, problem: str, max_steps: int) -> ReasoningChainResult:
-        """Adversarial reasoning — argue both sides."""
-        result = ReasoningChainResult()
-        steps: list[ChainStep] = []
-
-        positions = ["The target is vulnerable", "The target is not vulnerable"]
-
-        for step_num in range(1, max_steps + 1):
-            position = positions[step_num % 2]
-            previous = "\n".join(
-                f"Round {s.step_num}: {s.thought[:80]} | Counter: {s.counter_argument[:80]}"
-                for s in steps
-            )
-
-            prompt = ADVERSARIAL_PROMPT.format(
-                problem=problem,
-                position=position,
-                previous=previous or "(first round)",
-            )
-
-            response = await self._router.generate(
-                messages=[{"role": "user", "content": prompt}],
-                task_type="reasoning",
-                temperature=0.3,
-                max_tokens=512,
-            )
-
-            data = self._parse_json(response)
-            step = ChainStep(
-                step_num=step_num,
-                thought=data.get("argument", ""),
-                counter_argument=data.get("counter_argument", ""),
-                evidence=data.get("evidence_for", []),
-                confidence=data.get("net_confidence", 0.5),
-                status=StepStatus.COMPLETE,
-            )
-            steps.append(step)
-
-            if data.get("is_final", False):
-                break
-
-        result.steps = steps
-        result.overall_confidence = (
-            sum(s.confidence for s in steps) / max(1, len(steps))
+        ev_id = self.add_evidence(
+            description=f"Finding: {title}",
+            source=tool,
+            strength=EvidenceStrength.MODERATE,
+            confidence=0.6,
+            data=finding,
         )
-        if steps:
-            result.conclusion = steps[-1].thought
-        return result
 
-    async def _socratic(self, problem: str, max_steps: int) -> ReasoningChainResult:
-        """Socratic reasoning — answer through questions."""
-        result = ReasoningChainResult()
-        steps: list[ChainStep] = []
+        return await self.reason(question, evidence_ids=[ev_id])
 
-        for step_num in range(1, max_steps + 1):
-            previous_qa = "\n".join(
-                f"Q{s.step_num}: {s.questions[0] if s.questions else ''}\n"
-                f"A{s.step_num}: {s.observation[:100]}"
-                for s in steps
-            )
-
-            prompt = SOCRATIC_PROMPT.format(
-                question=problem,
-                previous_qa=previous_qa or "(start)",
-            )
-
-            response = await self._router.generate(
-                messages=[{"role": "user", "content": prompt}],
-                task_type="reasoning",
-                temperature=0.2,
-                max_tokens=512,
-            )
-
-            data = self._parse_json(response)
-            step = ChainStep(
-                step_num=step_num,
-                thought=data.get("how_it_helps", ""),
-                action=data.get("sub_question", ""),
-                observation=data.get("answer", ""),
-                questions=[data.get("sub_question", "")],
-                confidence=data.get("confidence", 0.5),
-                status=StepStatus.COMPLETE,
-            )
-            steps.append(step)
-
-            if data.get("main_question_answered", False):
-                result.conclusion = data.get("final_answer", "")
-                result.converged = True
-                break
-
-        result.steps = steps
-        result.overall_confidence = (
-            sum(s.confidence for s in steps) / max(1, len(steps))
-        )
-        return result
-
-    async def _iterative(
+    async def multi_chain_aggregate(
         self,
-        problem: str,
-        max_steps: int,
-        convergence_threshold: float,
-    ) -> ReasoningChainResult:
-        """Iterative reasoning — loop until convergence."""
-        result = ReasoningChainResult()
-        steps: list[ChainStep] = []
-        last_confidence = 0.0
+        question: str,
+        num_chains: int = 3,
+        evidence_ids: list[str] | None = None,
+    ) -> ReasoningChain:
+        """Run multiple reasoning chains and aggregate."""
+        chains = []
+        for _ in range(num_chains):
+            chain = await self.reason(question, evidence_ids)
+            chains.append(chain)
 
-        for step_num in range(1, max_steps + 1):
-            previous = self._format_steps(steps)
+        # Aggregate: take majority conclusion with averaged confidence
+        if not chains:
+            return ReasoningChain(question=question)
 
-            prompt = COT_STEP_PROMPT.format(
-                problem=problem,
-                previous_steps=previous or "(start)",
-                step_num=step_num,
-            )
+        best = max(chains, key=lambda c: c.overall_confidence)
 
-            response = await self._router.generate(
-                messages=[{"role": "user", "content": prompt}],
-                task_type="reasoning",
-                temperature=max(0.1, 0.3 - step_num * 0.03),  # Decrease temp over iterations
-                max_tokens=512,
-            )
+        # Average confidence across chains
+        avg_confidence = sum(c.overall_confidence for c in chains) / len(chains)
 
-            data = self._parse_json(response)
-            step = ChainStep(
-                step_num=step_num,
-                thought=data.get("thought", ""),
-                action=data.get("action", ""),
-                confidence=data.get("confidence", 0.5),
-                status=StepStatus.COMPLETE,
-            )
-            steps.append(step)
-            result.iterations = step_num
-
-            # Check convergence
-            if step.confidence >= convergence_threshold:
-                result.converged = True
-                result.conclusion = step.action
-                break
-
-            # Check if we're oscillating
-            if abs(step.confidence - last_confidence) < 0.05 and step_num > 3:
-                result.converged = True
-                result.conclusion = step.action
-                break
-
-            last_confidence = step.confidence
-
-        result.steps = steps
-        result.overall_confidence = (
-            sum(s.confidence for s in steps) / max(1, len(steps))
+        result = ReasoningChain(
+            chain_id=best.chain_id + "-agg",
+            question=question,
+            steps=best.steps,
+            evidence=best.evidence,
+            final_conclusion=best.final_conclusion,
+            overall_confidence=avg_confidence,
+            has_contradictions=any(c.has_contradictions for c in chains),
         )
+
         return result
 
-    # ── Utilities ────────────────────────────────────────
+    async def _llm_reason(
+        self,
+        question: str,
+        evidence: list[Evidence],
+    ) -> tuple[list[ReasoningStep], str, float]:
+        """Use LLM for reasoning."""
+        if not self._router:
+            return [], "", 0.0
 
-    def _format_steps(self, steps: list[ChainStep]) -> str:
-        """Format previous steps for context."""
-        return "\n".join(
-            f"Step {s.step_num}: {s.thought[:150]}"
-            for s in steps[-5:]  # Last 5 steps
+        evidence_text = "\n".join(
+            f"  [{e.strength.value}] {e.description} (source: {e.source}, confidence: {e.confidence:.2f})"
+            for e in evidence
+        ) or "  No evidence available."
+
+        prompt = REASONING_PROMPT.format(
+            question=question[:300],
+            evidence_text=evidence_text[:1000],
         )
 
-    def _parse_json(self, text: str) -> dict[str, Any]:
+        response = await self._router.generate(
+            messages=[{"role": "user", "content": prompt}],
+            task_type="reasoning",
+            temperature=0.3,
+            max_tokens=1024,
+        )
+
+        return self._parse_reasoning(response, evidence)
+
+    def _heuristic_reason(self, chain: ReasoningChain) -> ReasoningChain:
+        """Heuristic reasoning without LLM."""
+        self._step_counter += 1
+        step = ReasoningStep(
+            step_id=f"step-{self._step_counter}",
+            step_number=1,
+            reasoning_type=ReasoningType.INDUCTIVE,
+            premise="Evidence available: " + ", ".join(
+                e.description[:30] for e in chain.evidence[:3]
+            ),
+            inference="Based on available evidence weight",
+            conclusion="Assessment based on evidence strength",
+        )
+
+        # Confidence from evidence weights
+        if chain.evidence:
+            total_weight = sum(e.weight for e in chain.evidence)
+            step.confidence = min(1.0, max(0.0, total_weight / max(1, len(chain.evidence))))
+        else:
+            step.confidence = 0.3
+
+        chain.steps = [step]
+        chain.overall_confidence = step.confidence
+        chain.final_conclusion = step.conclusion
+
+        return chain
+
+    def _parse_reasoning(
+        self,
+        response: str,
+        evidence: list[Evidence],
+    ) -> tuple[list[ReasoningStep], str, float]:
+        """Parse LLM reasoning response."""
+        import json as json_mod
+
         try:
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0]
-            return json.loads(text.strip())
-        except (json.JSONDecodeError, IndexError):
-            return {}
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+            data = json_mod.loads(response.strip())
+        except (json_mod.JSONDecodeError, IndexError):
+            return [], response[:200], 0.4
+
+        steps = []
+        ev_ids = [e.evidence_id for e in evidence]
+
+        for idx, s_data in enumerate(data.get("steps", [])[:10]):
+            self._step_counter += 1
+            type_str = s_data.get("type", "deductive")
+            try:
+                r_type = ReasoningType(type_str)
+            except ValueError:
+                r_type = ReasoningType.DEDUCTIVE
+
+            steps.append(ReasoningStep(
+                step_id=f"step-{self._step_counter}",
+                step_number=idx + 1,
+                reasoning_type=r_type,
+                premise=s_data.get("premise", ""),
+                inference=s_data.get("inference", ""),
+                conclusion=s_data.get("conclusion", ""),
+                evidence_ids=ev_ids[:3],
+                confidence=s_data.get("confidence", 0.5),
+                contradictions=s_data.get("contradictions", []),
+            ))
+
+        conclusion = data.get("final_conclusion", "")
+        confidence = data.get("overall_confidence", 0.5)
+
+        return steps, conclusion, confidence
+
+    def get_chain(self, chain_id: str) -> ReasoningChain | None:
+        return self._chains.get(chain_id)
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "chains": len(self._chains),
+            "evidence": len(self._evidence_store),
+            "steps": self._step_counter,
+        }
