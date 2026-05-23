@@ -1,19 +1,18 @@
-"""Semantic memory — stores and retrieves factual knowledge and concepts.
+"""Semantic memory — long-term knowledge store.
 
-Unlike episodic memory (events/episodes), semantic memory stores
-general facts, relationships, and concepts. Implements:
-1. Concept storage and retrieval
-2. Hierarchical concept organization
-3. Concept similarity scoring
-4. Fact confidence tracking
-5. Concept linking and relationships
-6. Semantic search over knowledge
-7. Knowledge decay and refresh
-8. Concept generalization from episodes
+Implements:
+1. Fact storage with semantic tagging
+2. Pattern consolidation from episodes
+3. Cross-assessment knowledge transfer
+4. Decay-based relevance scoring
+5. Memory retrieval by similarity
+6. Knowledge graph triplets
+7. Procedural knowledge (how-to) storage
 """
 
 from __future__ import annotations
 
+import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -25,352 +24,308 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ConceptType(str, Enum):
-    FACT = "fact"                 # A known fact
-    RULE = "rule"                 # A learned rule/heuristic
-    PATTERN = "pattern"          # A recognized pattern
-    TAXONOMY = "taxonomy"        # Category/classification
-    RELATIONSHIP = "relationship"  # Relationship between concepts
-    PROCEDURE = "procedure"      # How to do something
+class MemoryType(str, Enum):
+    FACT = "fact"                     # Declarative knowledge
+    PATTERN = "pattern"               # Recurring patterns
+    PROCEDURE = "procedure"           # How-to knowledge
+    ASSOCIATION = "association"        # Related concepts
+    HEURISTIC = "heuristic"          # Rules of thumb
 
 
-class RelationType(str, Enum):
-    IS_A = "is_a"                # X is a Y
-    PART_OF = "part_of"          # X is part of Y
-    CAUSES = "causes"            # X causes Y
-    REQUIRES = "requires"        # X requires Y
-    LEADS_TO = "leads_to"        # X often leads to Y
-    MITIGATED_BY = "mitigated_by"  # X is mitigated by Y
-    RELATED_TO = "related_to"    # General relation
-    CONTRADICTS = "contradicts"  # X contradicts Y
+class MemorySource(str, Enum):
+    OBSERVATION = "observation"       # From tool output
+    REASONING = "reasoning"           # From LLM reasoning
+    CONSOLIDATION = "consolidation"   # From episode consolidation
+    INJECTION = "injection"           # From knowledge base
+    USER = "user"                     # From user input
 
 
 @dataclass
-class Concept:
-    """A concept in semantic memory."""
-    concept_id: str = ""
-    name: str = ""
-    concept_type: ConceptType = ConceptType.FACT
-    description: str = ""
-    properties: dict[str, Any] = field(default_factory=dict)
-    confidence: float = 0.5
-    source_count: int = 1
+class MemoryEntry:
+    """A semantic memory entry."""
+    entry_id: str = ""
+    content: str = ""
+    memory_type: MemoryType = MemoryType.FACT
+    source: MemorySource = MemorySource.OBSERVATION
     tags: list[str] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
+    confidence: float = 0.5
     access_count: int = 0
+    created_at: float = field(default_factory=time.time)
+    last_accessed: float = field(default_factory=time.time)
+    related_entries: list[str] = field(default_factory=list)
 
     @property
-    def strength(self) -> float:
-        """How strong this concept is in memory."""
-        recency = 1.0 / (1.0 + (time.time() - self.updated_at) / 3600.0)
-        reinforcement = min(1.0, self.source_count / 5.0)
-        return self.confidence * (recency * 0.3 + reinforcement * 0.4 + 0.3)
+    def relevance_score(self) -> float:
+        """Decay-based relevance score."""
+        age_hours = (time.time() - self.last_accessed) / 3600
+        recency = math.exp(-0.01 * age_hours)
+        frequency = min(1.0, self.access_count / 10)
+        return self.confidence * 0.4 + recency * 0.3 + frequency * 0.3
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.concept_id,
-            "name": self.name[:30],
-            "type": self.concept_type.value,
+            "id": self.entry_id[:10],
+            "type": self.memory_type.value,
+            "content": self.content[:30],
             "confidence": round(self.confidence, 2),
-            "strength": round(self.strength, 3),
-            "sources": self.source_count,
+            "relevance": round(self.relevance_score, 2),
         }
 
 
 @dataclass
-class ConceptRelation:
-    """A relationship between two concepts."""
-    relation_id: str = ""
-    source_id: str = ""
-    target_id: str = ""
-    relation_type: RelationType = RelationType.RELATED_TO
-    strength: float = 0.5
-    evidence: str = ""
+class KnowledgeTriple:
+    """A subject-predicate-object triple."""
+    triple_id: str = ""
+    subject: str = ""
+    predicate: str = ""
+    obj: str = ""
+    confidence: float = 0.5
+    source: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.relation_id,
-            "source": self.source_id[:15],
-            "target": self.target_id[:15],
-            "type": self.relation_type.value,
-            "strength": round(self.strength, 2),
+            "id": self.triple_id[:10],
+            "s": self.subject[:15],
+            "p": self.predicate[:15],
+            "o": self.obj[:15],
         }
-
-
-# ── Default Security Knowledge ────────────────────────────────
-
-DEFAULT_CONCEPTS: list[dict[str, Any]] = [
-    # Vulnerability types
-    {"name": "SQL Injection", "type": "taxonomy", "tags": ["vuln", "web"],
-     "desc": "Injection of SQL code via untrusted input", "conf": 1.0},
-    {"name": "XSS", "type": "taxonomy", "tags": ["vuln", "web"],
-     "desc": "Cross-site scripting via injected client-side code", "conf": 1.0},
-    {"name": "CSRF", "type": "taxonomy", "tags": ["vuln", "web"],
-     "desc": "Cross-site request forgery via forged requests", "conf": 1.0},
-    {"name": "SSRF", "type": "taxonomy", "tags": ["vuln", "web"],
-     "desc": "Server-side request forgery via manipulated server requests", "conf": 1.0},
-    {"name": "RCE", "type": "taxonomy", "tags": ["vuln", "critical"],
-     "desc": "Remote code execution vulnerability", "conf": 1.0},
-    {"name": "LFI", "type": "taxonomy", "tags": ["vuln", "web"],
-     "desc": "Local file inclusion via path traversal", "conf": 1.0},
-    {"name": "IDOR", "type": "taxonomy", "tags": ["vuln", "web"],
-     "desc": "Insecure direct object reference", "conf": 1.0},
-    {"name": "XXE", "type": "taxonomy", "tags": ["vuln", "web"],
-     "desc": "XML external entity injection", "conf": 1.0},
-    # Rules
-    {"name": "Open port 22 suggests SSH", "type": "rule", "tags": ["recon", "network"],
-     "desc": "If port 22 is open, SSH service is likely running", "conf": 0.9},
-    {"name": "Port 80/443 indicates web server", "type": "rule", "tags": ["recon", "web"],
-     "desc": "Open HTTP/HTTPS ports indicate web service", "conf": 0.95},
-    {"name": "Default credentials are common", "type": "rule", "tags": ["auth", "vuln"],
-     "desc": "Many services use default credentials that are not changed", "conf": 0.7},
-    {"name": "WAF evasion may require encoding", "type": "rule", "tags": ["exploitation"],
-     "desc": "Web application firewalls can often be bypassed with encoding", "conf": 0.6},
-    # Patterns
-    {"name": "Apache/Nginx version disclosure", "type": "pattern", "tags": ["recon", "web"],
-     "desc": "Server headers often reveal software version", "conf": 0.8},
-    {"name": "Error messages reveal internals", "type": "pattern", "tags": ["recon", "web"],
-     "desc": "Verbose error messages can reveal stack traces and paths", "conf": 0.75},
-    # Procedures
-    {"name": "Web reconnaissance workflow", "type": "procedure", "tags": ["recon", "web"],
-     "desc": "subdomain enum → port scan → service detection → tech fingerprint → directory brute", "conf": 0.9},
-    {"name": "SQL injection testing", "type": "procedure", "tags": ["exploitation", "web"],
-     "desc": "Detect input points → test with quotes → confirm with boolean → extract data", "conf": 0.85},
-]
-
-DEFAULT_RELATIONS: list[dict[str, Any]] = [
-    {"source": "SQL Injection", "target": "RCE", "type": "leads_to", "str": 0.3},
-    {"source": "LFI", "target": "RCE", "type": "leads_to", "str": 0.5},
-    {"source": "SSRF", "target": "RCE", "type": "leads_to", "str": 0.4},
-    {"source": "XXE", "target": "SSRF", "type": "leads_to", "str": 0.6},
-    {"source": "XSS", "target": "CSRF", "type": "related_to", "str": 0.5},
-    {"source": "SQL Injection", "target": "SQL injection testing", "type": "related_to", "str": 0.8},
-]
 
 
 class SemanticMemory:
-    """Stores and retrieves factual knowledge and concepts.
+    """Long-term semantic memory store.
 
-    General facts, rules, patterns, and procedures that the
-    agent has learned, organized hierarchically with relationships.
+    Stores declarative facts, patterns, and procedures
+    that persist across assessments.
     """
 
-    def __init__(self) -> None:
-        self._concepts: dict[str, Concept] = {}
-        self._relations: list[ConceptRelation] = []
-        self._name_index: dict[str, str] = {}  # name → concept_id
+    def __init__(self, max_entries: int = 10_000) -> None:
+        self._entries: dict[str, MemoryEntry] = {}
+        self._triples: dict[str, KnowledgeTriple] = {}
         self._tag_index: dict[str, list[str]] = defaultdict(list)
-        self._concept_counter = 0
-        self._relation_counter = 0
+        self._counter = 0
+        self._max_entries = max_entries
         self._log = logger.bind(component="semantic_memory")
-
-        self._initialize_knowledge()
-
-    def _initialize_knowledge(self) -> None:
-        """Initialize default security knowledge."""
-        concept_ids: dict[str, str] = {}
-
-        for data in DEFAULT_CONCEPTS:
-            concept = self.store(
-                name=data["name"],
-                concept_type=ConceptType(data["type"]),
-                description=data["desc"],
-                confidence=data["conf"],
-                tags=data.get("tags", []),
-            )
-            concept_ids[data["name"]] = concept.concept_id
-
-        for rel in DEFAULT_RELATIONS:
-            source_id = concept_ids.get(rel["source"])
-            target_id = concept_ids.get(rel["target"])
-            if source_id and target_id:
-                self.relate(
-                    source_id=source_id,
-                    target_id=target_id,
-                    relation_type=RelationType(rel["type"]),
-                    strength=rel["str"],
-                )
 
     def store(
         self,
-        name: str,
-        concept_type: ConceptType = ConceptType.FACT,
-        description: str = "",
-        properties: dict[str, Any] | None = None,
-        confidence: float = 0.5,
+        content: str,
+        memory_type: MemoryType = MemoryType.FACT,
+        source: MemorySource = MemorySource.OBSERVATION,
         tags: list[str] | None = None,
-    ) -> Concept:
-        """Store a new concept or reinforce existing one."""
-        # Check if concept already exists
-        existing_id = self._name_index.get(name.lower())
-        if existing_id and existing_id in self._concepts:
-            existing = self._concepts[existing_id]
-            existing.source_count += 1
-            existing.confidence = min(1.0, existing.confidence + 0.05)
-            existing.updated_at = time.time()
-            if description:
-                existing.description = description
-            return existing
-
-        self._concept_counter += 1
-        concept = Concept(
-            concept_id=f"sem-{self._concept_counter}",
-            name=name,
-            concept_type=concept_type,
-            description=description,
-            properties=properties or {},
-            confidence=confidence,
+        confidence: float = 0.5,
+    ) -> MemoryEntry:
+        """Store a memory entry."""
+        self._counter += 1
+        entry = MemoryEntry(
+            entry_id=f"mem-{self._counter}",
+            content=content,
+            memory_type=memory_type,
+            source=source,
             tags=tags or [],
+            confidence=confidence,
         )
 
-        self._concepts[concept.concept_id] = concept
-        self._name_index[name.lower()] = concept.concept_id
+        self._entries[entry.entry_id] = entry
 
-        for tag in concept.tags:
-            self._tag_index[tag].append(concept.concept_id)
+        for tag in entry.tags:
+            self._tag_index[tag].append(entry.entry_id)
 
-        return concept
+        # Evict if over capacity
+        if len(self._entries) > self._max_entries:
+            self._evict_least_relevant()
 
-    def relate(
+        return entry
+
+    def store_triple(
         self,
-        source_id: str,
-        target_id: str,
-        relation_type: RelationType = RelationType.RELATED_TO,
-        strength: float = 0.5,
-        evidence: str = "",
-    ) -> ConceptRelation:
-        """Create a relationship between concepts."""
-        self._relation_counter += 1
-        relation = ConceptRelation(
-            relation_id=f"rel-{self._relation_counter}",
-            source_id=source_id,
-            target_id=target_id,
-            relation_type=relation_type,
-            strength=strength,
-            evidence=evidence,
+        subject: str,
+        predicate: str,
+        obj: str,
+        confidence: float = 0.5,
+        source: str = "",
+    ) -> KnowledgeTriple:
+        """Store a knowledge triple."""
+        self._counter += 1
+        triple = KnowledgeTriple(
+            triple_id=f"triple-{self._counter}",
+            subject=subject,
+            predicate=predicate,
+            obj=obj,
+            confidence=confidence,
+            source=source,
         )
-        self._relations.append(relation)
-        return relation
+        self._triples[triple.triple_id] = triple
+        return triple
 
-    def retrieve(self, name: str) -> Concept | None:
-        """Retrieve a concept by name."""
-        concept_id = self._name_index.get(name.lower())
-        if concept_id:
-            concept = self._concepts.get(concept_id)
-            if concept:
-                concept.access_count += 1
-                return concept
-        return None
+    def recall_by_tags(
+        self,
+        tags: list[str],
+        limit: int = 10,
+    ) -> list[MemoryEntry]:
+        """Recall memories matching tags."""
+        matching_ids: set[str] = set()
+        for tag in tags:
+            matching_ids.update(self._tag_index.get(tag, []))
 
-    def search(
+        entries = [
+            self._entries[mid] for mid in matching_ids
+            if mid in self._entries
+        ]
+
+        # Sort by relevance and update access
+        entries.sort(key=lambda e: e.relevance_score, reverse=True)
+        for entry in entries[:limit]:
+            entry.access_count += 1
+            entry.last_accessed = time.time()
+
+        return entries[:limit]
+
+    def recall_by_type(
+        self,
+        memory_type: MemoryType,
+        limit: int = 10,
+    ) -> list[MemoryEntry]:
+        """Recall memories by type."""
+        entries = [
+            e for e in self._entries.values()
+            if e.memory_type == memory_type
+        ]
+        entries.sort(key=lambda e: e.relevance_score, reverse=True)
+
+        for entry in entries[:limit]:
+            entry.access_count += 1
+            entry.last_accessed = time.time()
+
+        return entries[:limit]
+
+    def recall_similar(
         self,
         query: str,
-        concept_type: ConceptType | None = None,
-        tags: list[str] | None = None,
-        min_confidence: float = 0.0,
         limit: int = 10,
-    ) -> list[Concept]:
-        """Search for concepts."""
-        query_lower = query.lower()
-        results = []
+    ) -> list[MemoryEntry]:
+        """Recall memories similar to a query string."""
+        query_words = set(query.lower().split())
+        scored: list[tuple[float, MemoryEntry]] = []
 
-        for concept in self._concepts.values():
-            if concept_type and concept.concept_type != concept_type:
-                continue
+        for entry in self._entries.values():
+            entry_words = set(entry.content.lower().split())
+            entry_words.update(t.lower() for t in entry.tags)
 
-            if concept.confidence < min_confidence:
-                continue
+            overlap = len(query_words & entry_words)
+            if overlap > 0:
+                sim = overlap / max(len(query_words), len(entry_words))
+                combined = sim * 0.6 + entry.relevance_score * 0.4
+                scored.append((combined, entry))
 
-            if tags:
-                if not set(tags) & set(concept.tags):
-                    continue
+        scored.sort(key=lambda x: x[0], reverse=True)
 
-            # Relevance scoring
-            score = 0.0
-            if query_lower in concept.name.lower():
-                score += 0.5
-            if query_lower in concept.description.lower():
-                score += 0.3
-            for tag in concept.tags:
-                if query_lower in tag:
-                    score += 0.1
+        result = []
+        for _score, entry in scored[:limit]:
+            entry.access_count += 1
+            entry.last_accessed = time.time()
+            result.append(entry)
 
-            if score > 0:
-                results.append((score * concept.strength, concept))
+        return result
 
-        results.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in results[:limit]]
-
-    def get_related(
+    def query_triples(
         self,
-        concept_id: str,
-        relation_type: RelationType | None = None,
-    ) -> list[tuple[ConceptRelation, Concept]]:
-        """Get concepts related to a given concept."""
+        subject: str = "",
+        predicate: str = "",
+        obj: str = "",
+    ) -> list[KnowledgeTriple]:
+        """Query knowledge triples."""
         results = []
-
-        for rel in self._relations:
-            if rel.source_id == concept_id or rel.target_id == concept_id:
-                if relation_type and rel.relation_type != relation_type:
-                    continue
-
-                other_id = rel.target_id if rel.source_id == concept_id else rel.source_id
-                other = self._concepts.get(other_id)
-                if other:
-                    results.append((rel, other))
-
+        for triple in self._triples.values():
+            if subject and triple.subject.lower() != subject.lower():
+                continue
+            if predicate and triple.predicate.lower() != predicate.lower():
+                continue
+            if obj and triple.obj.lower() != obj.lower():
+                continue
+            results.append(triple)
         return results
 
-    def get_by_tag(self, tag: str, limit: int = 20) -> list[Concept]:
-        """Get concepts by tag."""
-        concept_ids = self._tag_index.get(tag, [])
-        concepts = []
-        for cid in concept_ids[:limit]:
-            concept = self._concepts.get(cid)
-            if concept:
-                concepts.append(concept)
-        return concepts
-
-    def generalize_from_episodes(
+    def consolidate_from_episode(
         self,
-        episodes: list[dict[str, Any]],
-    ) -> list[Concept]:
-        """Generalize new concepts from episodes."""
-        new_concepts = []
+        findings: list[dict[str, Any]],
+        strategies: list[str],
+        target: str,
+    ) -> list[MemoryEntry]:
+        """Consolidate episode results into semantic memory."""
+        new_entries = []
 
-        # Count tool-outcome pairs
-        tool_outcomes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for episode in episodes:
-            outcome = episode.get("outcome", "unknown")
-            for tool in episode.get("tools_used", []):
-                tool_outcomes[tool][outcome] += 1
+        # Store findings as facts
+        for finding in findings:
+            entry = self.store(
+                content=f"Found {finding.get('title', '')} on {target}",
+                memory_type=MemoryType.FACT,
+                source=MemorySource.CONSOLIDATION,
+                tags=[
+                    target,
+                    finding.get("severity", "medium"),
+                    finding.get("tool", ""),
+                ],
+                confidence=finding.get("confidence", 0.5),
+            )
+            new_entries.append(entry)
 
-        # Create rules from strong patterns
-        for tool, outcomes in tool_outcomes.items():
-            total = sum(outcomes.values())
-            if total >= 3:
-                success_rate = outcomes.get("success", 0) / total
-                if success_rate > 0.7:
-                    concept = self.store(
-                        name=f"{tool} is effective",
-                        concept_type=ConceptType.RULE,
-                        description=f"{tool} has {success_rate:.0%} success rate over {total} episodes",
-                        confidence=success_rate,
-                        tags=["learned", "tool_effectiveness"],
-                    )
-                    new_concepts.append(concept)
+        # Store effective strategies as procedures
+        for strategy in strategies:
+            entry = self.store(
+                content=f"Strategy '{strategy}' effective against {target}",
+                memory_type=MemoryType.PROCEDURE,
+                source=MemorySource.CONSOLIDATION,
+                tags=[target, "strategy", strategy],
+                confidence=0.7,
+            )
+            new_entries.append(entry)
 
-        return new_concepts
+        return new_entries
+
+    def _evict_least_relevant(self) -> None:
+        """Evict the least relevant entry."""
+        if not self._entries:
+            return
+
+        least = min(self._entries.values(), key=lambda e: e.relevance_score)
+        del self._entries[least.entry_id]
+
+    def build_memory_prompt(
+        self,
+        tags: list[str] | None = None,
+        limit: int = 5,
+    ) -> str:
+        """Build a prompt from relevant memories."""
+        if tags:
+            entries = self.recall_by_tags(tags, limit)
+        else:
+            entries = sorted(
+                self._entries.values(),
+                key=lambda e: e.relevance_score,
+                reverse=True,
+            )[:limit]
+
+        if not entries:
+            return ""
+
+        lines = ["## Relevant Knowledge\n"]
+        for entry in entries:
+            lines.append(f"- [{entry.memory_type.value}] {entry.content}")
+
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         type_counts: dict[str, int] = defaultdict(int)
-        for concept in self._concepts.values():
-            type_counts[concept.concept_type.value] += 1
+        source_counts: dict[str, int] = defaultdict(int)
+
+        for entry in self._entries.values():
+            type_counts[entry.memory_type.value] += 1
+            source_counts[entry.source.value] += 1
 
         return {
-            "concepts": len(self._concepts),
-            "relations": len(self._relations),
-            "types": dict(type_counts),
+            "entries": len(self._entries),
+            "triples": len(self._triples),
             "tags": len(self._tag_index),
+            "by_type": dict(type_counts),
+            "by_source": dict(source_counts),
         }
