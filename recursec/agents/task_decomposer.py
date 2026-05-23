@@ -1,20 +1,18 @@
-"""Task decomposer — recursive goal decomposition.
+"""Task decomposer — recursive task breakdown.
 
 Implements:
-1. Goal → sub-goal decomposition
+1. High-level task decomposition into subtasks
 2. Dependency graph construction
-3. Task estimation (time, tokens, tools)
-4. Critical path analysis
-5. Task merging for efficiency
-6. Dynamic re-decomposition
-7. Task templates for common patterns
-8. Complexity estimation
+3. Parallel/sequential ordering
+4. Budget-aware decomposition
+5. Depth-limited recursion
+6. Task templates for common patterns
+7. Dynamic re-decomposition on failure
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -24,356 +22,327 @@ import structlog
 logger = structlog.get_logger()
 
 
-class TaskComplexity(str, Enum):
-    TRIVIAL = "trivial"       # Single tool call
-    SIMPLE = "simple"         # Few steps, linear
-    MODERATE = "moderate"     # Multiple tools, some branching
-    COMPLEX = "complex"       # Multi-agent, deep analysis
-    EXTREME = "extreme"       # Recursive, multi-phase
-
-
 class TaskStatus(str, Enum):
-    PLANNED = "planned"
-    READY = "ready"
-    EXECUTING = "executing"
-    COMPLETE = "complete"
+    PENDING = "pending"
+    READY = "ready"          # Dependencies met
+    RUNNING = "running"
+    COMPLETED = "completed"
     FAILED = "failed"
-    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+
+
+class TaskPriority(str, Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class ExecutionMode(str, Enum):
+    SEQUENTIAL = "sequential"
+    PARALLEL = "parallel"
+    CONDITIONAL = "conditional"  # Execute based on parent result
 
 
 @dataclass
-class SubTask:
-    """A decomposed sub-task."""
+class Task:
+    """A decomposed task."""
     task_id: str = ""
     name: str = ""
     description: str = ""
-    complexity: TaskComplexity = TaskComplexity.SIMPLE
-    status: TaskStatus = TaskStatus.PLANNED
-    parent_id: str = ""
+    status: TaskStatus = TaskStatus.PENDING
+    priority: TaskPriority = TaskPriority.MEDIUM
+    execution_mode: ExecutionMode = ExecutionMode.SEQUENTIAL
+    parent_task: str = ""
+    subtasks: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
-    tools_required: list[str] = field(default_factory=list)
-    models_preferred: list[str] = field(default_factory=list)
-    estimated_time_s: float = 60.0
-    estimated_tokens: int = 1000
-    actual_time_s: float = 0.0
-    actual_tokens: int = 0
-    result: dict[str, Any] = field(default_factory=dict)
-    children: list[str] = field(default_factory=list)
+    assigned_agent: str = ""
+    assigned_model: str = ""
+    tools: list[str] = field(default_factory=list)
+    token_budget: int = 0
+    time_budget_s: float = 0.0
     depth: int = 0
-    can_parallel: bool = False
-
-    @property
-    def is_leaf(self) -> bool:
-        return len(self.children) == 0
+    max_depth: int = 3
+    result: str = ""
+    created_at: float = field(default_factory=time.time)
+    completed_at: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.task_id[:10],
             "name": self.name[:25],
-            "complexity": self.complexity.value,
             "status": self.status.value,
+            "priority": self.priority.value,
             "depth": self.depth,
-            "children": len(self.children),
-            "tools": len(self.tools_required),
-            "est_time": round(self.estimated_time_s, 0),
+            "subtasks": len(self.subtasks),
         }
 
 
 @dataclass
-class DecompositionPlan:
-    """A complete task decomposition plan."""
-    plan_id: str = ""
-    goal: str = ""
-    target: str = ""
-    tasks: dict[str, SubTask] = field(default_factory=dict)
-    root_task_id: str = ""
-    created_at: float = field(default_factory=time.time)
-    total_estimated_time_s: float = 0.0
-    total_estimated_tokens: int = 0
-    max_depth: int = 0
-
-    @property
-    def total_tasks(self) -> int:
-        return len(self.tasks)
-
-    @property
-    def completed_tasks(self) -> int:
-        return sum(1 for t in self.tasks.values() if t.status == TaskStatus.COMPLETE)
+class TaskGraph:
+    """A graph of decomposed tasks."""
+    graph_id: str = ""
+    root_task: str = ""
+    tasks: dict[str, Task] = field(default_factory=dict)
+    total_tasks: int = 0
+    completed_tasks: int = 0
 
     @property
     def progress(self) -> float:
-        if not self.tasks:
+        if self.total_tasks == 0:
             return 0.0
         return self.completed_tasks / self.total_tasks
 
     def to_dict(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = defaultdict(int)
-        for t in self.tasks.values():
-            status_counts[t.status.value] += 1
         return {
-            "id": self.plan_id[:10],
-            "goal": self.goal[:30],
-            "tasks": self.total_tasks,
-            "progress": round(self.progress, 2),
-            "max_depth": self.max_depth,
-            "by_status": dict(status_counts),
+            "id": self.graph_id[:10],
+            "root": self.root_task[:10],
+            "total": self.total_tasks,
+            "completed": self.completed_tasks,
+            "progress": round(self.progress * 100, 1),
         }
 
 
-# ── Task templates ───────────────────────────────────────────
+# ── Task decomposition templates ─────────────────────────────
 
 TASK_TEMPLATES: dict[str, list[dict[str, Any]]] = {
+    "full_assessment": [
+        {"name": "Target profiling", "priority": "critical", "mode": "sequential",
+         "tools": ["nmap", "whatweb", "httpx"], "time": 300},
+        {"name": "Subdomain enumeration", "priority": "high", "mode": "parallel",
+         "tools": ["subfinder", "amass"], "time": 300},
+        {"name": "Port scanning", "priority": "critical", "mode": "parallel",
+         "tools": ["nmap", "masscan"], "time": 600},
+        {"name": "Vulnerability scanning", "priority": "critical", "mode": "parallel",
+         "tools": ["nuclei", "nikto"], "time": 600},
+        {"name": "Web application testing", "priority": "high", "mode": "sequential",
+         "tools": ["sqlmap", "dalfox", "ffuf"], "time": 600},
+        {"name": "Finding validation", "priority": "high", "mode": "sequential",
+         "tools": ["nuclei", "curl"], "time": 300},
+        {"name": "Report generation", "priority": "medium", "mode": "sequential",
+         "tools": [], "time": 120},
+    ],
     "web_assessment": [
-        {"name": "Technology Detection", "tools": ["httpx", "wafw00f"], "complexity": "simple", "time": 30},
-        {"name": "Subdomain Enumeration", "tools": ["subfinder", "amass"], "complexity": "simple", "time": 120},
-        {"name": "Directory Discovery", "tools": ["gobuster", "ffuf"], "complexity": "simple", "time": 300},
-        {"name": "Vulnerability Scanning", "tools": ["nuclei", "nikto"], "complexity": "moderate", "time": 600},
-        {"name": "SQL Injection Testing", "tools": ["sqlmap"], "complexity": "moderate", "time": 300},
-        {"name": "XSS Testing", "tools": ["dalfox"], "complexity": "moderate", "time": 300},
-        {"name": "Authentication Testing", "tools": ["hydra"], "complexity": "complex", "time": 600},
-        {"name": "Vulnerability Analysis", "tools": [], "models": ["whiterabbitneo", "qwen-coder-14b"], "complexity": "complex", "time": 120},
-        {"name": "Report Generation", "tools": [], "complexity": "simple", "time": 30},
+        {"name": "Technology fingerprinting", "priority": "high", "mode": "sequential",
+         "tools": ["whatweb", "httpx"], "time": 120},
+        {"name": "Directory enumeration", "priority": "high", "mode": "parallel",
+         "tools": ["ffuf", "gobuster"], "time": 300},
+        {"name": "Injection testing", "priority": "critical", "mode": "sequential",
+         "tools": ["sqlmap", "dalfox"], "time": 300},
+        {"name": "Authentication testing", "priority": "high", "mode": "sequential",
+         "tools": ["hydra", "ffuf"], "time": 300},
+        {"name": "Business logic testing", "priority": "medium", "mode": "sequential",
+         "tools": [], "time": 300},
     ],
     "network_assessment": [
-        {"name": "Host Discovery", "tools": ["nmap"], "complexity": "simple", "time": 60},
-        {"name": "Port Scanning", "tools": ["nmap", "masscan"], "complexity": "simple", "time": 300},
-        {"name": "Service Enumeration", "tools": ["nmap"], "complexity": "moderate", "time": 300},
-        {"name": "SMB Assessment", "tools": ["crackmapexec", "enum4linux"], "complexity": "moderate", "time": 120},
-        {"name": "SNMP Assessment", "tools": ["onesixtyone", "snmpwalk"], "complexity": "simple", "time": 60},
-        {"name": "Vulnerability Scanning", "tools": ["nuclei"], "complexity": "moderate", "time": 300},
-        {"name": "Vulnerability Analysis", "tools": [], "models": ["hermes-14b"], "complexity": "complex", "time": 120},
+        {"name": "Network discovery", "priority": "critical", "mode": "parallel",
+         "tools": ["nmap", "masscan"], "time": 600},
+        {"name": "Service enumeration", "priority": "high", "mode": "sequential",
+         "tools": ["nmap", "enum4linux"], "time": 300},
+        {"name": "Vulnerability scanning", "priority": "critical", "mode": "parallel",
+         "tools": ["nuclei", "nmap"], "time": 600},
+        {"name": "Credential testing", "priority": "high", "mode": "sequential",
+         "tools": ["hydra", "crackmapexec"], "time": 300},
     ],
-    "api_assessment": [
-        {"name": "API Discovery", "tools": ["ffuf", "curl"], "complexity": "simple", "time": 120},
-        {"name": "Endpoint Mapping", "tools": ["httpx"], "complexity": "simple", "time": 60},
-        {"name": "Authentication Testing", "tools": [], "complexity": "moderate", "time": 180},
-        {"name": "IDOR Testing", "tools": [], "complexity": "moderate", "time": 300},
-        {"name": "Injection Testing", "tools": ["sqlmap"], "complexity": "moderate", "time": 300},
-        {"name": "Rate Limit Testing", "tools": [], "complexity": "simple", "time": 60},
-        {"name": "Analysis", "tools": [], "models": ["qwen-coder-14b"], "complexity": "complex", "time": 120},
-    ],
-    "code_review": [
-        {"name": "Static Analysis", "tools": ["semgrep", "bandit"], "complexity": "simple", "time": 120},
-        {"name": "Secret Detection", "tools": ["trufflehog", "gitleaks"], "complexity": "simple", "time": 60},
-        {"name": "Dependency Audit", "tools": ["trivy", "grype"], "complexity": "simple", "time": 60},
-        {"name": "Deep Code Review", "tools": [], "models": ["qwen-coder-14b", "yi-9b-200k"], "complexity": "complex", "time": 600},
-        {"name": "Vulnerability Mapping", "tools": [], "models": ["whiterabbitneo"], "complexity": "complex", "time": 120},
+    "code_audit": [
+        {"name": "SAST scanning", "priority": "critical", "mode": "parallel",
+         "tools": ["semgrep", "bandit"], "time": 300},
+        {"name": "Secret detection", "priority": "high", "mode": "parallel",
+         "tools": ["trufflehog", "gitleaks"], "time": 120},
+        {"name": "Dependency audit", "priority": "high", "mode": "parallel",
+         "tools": ["trivy", "grype"], "time": 120},
+        {"name": "Manual code review", "priority": "medium", "mode": "sequential",
+         "tools": [], "time": 600},
     ],
 }
 
 
 class TaskDecomposer:
-    """Recursive goal decomposition engine.
+    """Decomposes high-level tasks into subtask graphs.
 
-    Breaks high-level security assessment goals into
-    executable sub-tasks with dependency tracking,
-    resource estimation, and critical path analysis.
+    Produces executable task graphs with dependency
+    tracking, parallel execution support, and
+    budget-aware decomposition.
     """
 
-    def __init__(self, max_depth: int = 5) -> None:
-        self._plans: dict[str, DecompositionPlan] = {}
+    def __init__(self, max_depth: int = 3) -> None:
+        self._graphs: dict[str, TaskGraph] = {}
         self._counter = 0
         self._max_depth = max_depth
         self._log = logger.bind(component="task_decomposer")
 
     def decompose(
         self,
-        goal: str,
-        target: str,
-        template: str = "",
-    ) -> DecompositionPlan:
-        """Decompose a goal into sub-tasks."""
+        task_name: str,
+        template: str = "full_assessment",
+        total_token_budget: int = 500_000,
+        total_time_budget: float = 3600,
+    ) -> TaskGraph:
+        """Decompose a high-level task into a graph."""
         self._counter += 1
-        plan = DecompositionPlan(
-            plan_id=f"plan-{self._counter}",
-            goal=goal,
-            target=target,
-        )
 
         # Create root task
-        root = SubTask(
-            task_id=f"task-{self._counter}-root",
-            name=goal[:50],
-            description=goal,
-            complexity=TaskComplexity.COMPLEX,
+        root = Task(
+            task_id=f"task-{self._counter}",
+            name=task_name,
+            status=TaskStatus.PENDING,
+            priority=TaskPriority.CRITICAL,
+            token_budget=total_token_budget,
+            time_budget_s=total_time_budget,
             depth=0,
+            max_depth=self._max_depth,
         )
-        plan.tasks[root.task_id] = root
-        plan.root_task_id = root.task_id
 
-        # Apply template if available
-        tmpl = self._select_template(goal, template)
-        if tmpl:
-            self._apply_template(plan, root, tmpl)
-        else:
-            self._auto_decompose(plan, root, goal, target)
+        graph = TaskGraph(
+            graph_id=f"graph-{self._counter}",
+            root_task=root.task_id,
+        )
+        graph.tasks[root.task_id] = root
 
-        # Calculate estimates
-        self._calculate_estimates(plan)
+        # Apply template
+        subtask_templates = TASK_TEMPLATES.get(template, TASK_TEMPLATES["full_assessment"])
+        num_subtasks = len(subtask_templates)
+        token_per_subtask = total_token_budget // max(1, num_subtasks)
+        time_per_subtask = total_time_budget / max(1, num_subtasks)
 
-        self._plans[plan.plan_id] = plan
-        return plan
-
-    def _select_template(
-        self,
-        goal: str,
-        template: str,
-    ) -> list[dict[str, Any]] | None:
-        """Select the best template for a goal."""
-        if template and template in TASK_TEMPLATES:
-            return TASK_TEMPLATES[template]
-
-        goal_lower = goal.lower()
-        if any(w in goal_lower for w in ("web", "website", "http", "url")):
-            return TASK_TEMPLATES["web_assessment"]
-        if any(w in goal_lower for w in ("network", "port", "host", "subnet")):
-            return TASK_TEMPLATES["network_assessment"]
-        if any(w in goal_lower for w in ("api", "endpoint", "rest", "graphql")):
-            return TASK_TEMPLATES["api_assessment"]
-        if any(w in goal_lower for w in ("code", "source", "review", "audit")):
-            return TASK_TEMPLATES["code_review"]
-
-        return None
-
-    def _apply_template(
-        self,
-        plan: DecompositionPlan,
-        parent: SubTask,
-        template: list[dict[str, Any]],
-    ) -> None:
-        """Apply a template to create sub-tasks."""
-        prev_id = ""
-        for i, step in enumerate(template):
+        prev_sequential: str = ""
+        for tmpl in subtask_templates:
             self._counter += 1
-            task = SubTask(
+            subtask = Task(
                 task_id=f"task-{self._counter}",
-                name=step["name"],
-                complexity=TaskComplexity(step.get("complexity", "simple")),
-                parent_id=parent.task_id,
-                tools_required=step.get("tools", []),
-                models_preferred=step.get("models", []),
-                estimated_time_s=step.get("time", 60),
-                depth=parent.depth + 1,
-                can_parallel=step.get("parallel", False),
+                name=tmpl["name"],
+                priority=TaskPriority(tmpl.get("priority", "medium")),
+                execution_mode=ExecutionMode(tmpl.get("mode", "sequential")),
+                parent_task=root.task_id,
+                tools=tmpl.get("tools", []),
+                token_budget=token_per_subtask,
+                time_budget_s=tmpl.get("time", time_per_subtask),
+                depth=1,
+                max_depth=self._max_depth,
             )
 
-            # Add sequential dependency
-            if prev_id and not task.can_parallel:
-                task.dependencies.append(prev_id)
+            # Sequential tasks depend on previous
+            if subtask.execution_mode == ExecutionMode.SEQUENTIAL and prev_sequential:
+                subtask.dependencies.append(prev_sequential)
 
-            plan.tasks[task.task_id] = task
-            parent.children.append(task.task_id)
-            prev_id = task.task_id
+            if subtask.execution_mode == ExecutionMode.SEQUENTIAL:
+                prev_sequential = subtask.task_id
 
-    def _auto_decompose(
-        self,
-        plan: DecompositionPlan,
-        parent: SubTask,
-        goal: str,
-        target: str,
-    ) -> None:
-        """Auto-decompose when no template matches."""
-        default_phases = [
-            {"name": "Reconnaissance", "tools": ["nmap", "subfinder"], "time": 180},
-            {"name": "Scanning", "tools": ["nuclei"], "time": 300},
-            {"name": "Analysis", "tools": [], "time": 120},
-            {"name": "Exploitation", "tools": [], "time": 600},
-            {"name": "Reporting", "tools": [], "time": 30},
-        ]
-        self._apply_template(plan, parent, default_phases)
+            graph.tasks[subtask.task_id] = subtask
+            root.subtasks.append(subtask.task_id)
 
-    def _calculate_estimates(self, plan: DecompositionPlan) -> None:
-        """Calculate total plan estimates."""
-        total_time = 0
-        total_tokens = 0
-        max_depth = 0
+        graph.total_tasks = len(graph.tasks)
+        self._graphs[graph.graph_id] = graph
 
-        for task in plan.tasks.values():
-            total_time += task.estimated_time_s
-            total_tokens += task.estimated_tokens
-            max_depth = max(max_depth, task.depth)
+        return graph
 
-        plan.total_estimated_time_s = total_time
-        plan.total_estimated_tokens = total_tokens
-        plan.max_depth = max_depth
-
-    def get_ready_tasks(self, plan_id: str) -> list[SubTask]:
-        """Get tasks ready for execution."""
-        plan = self._plans.get(plan_id)
-        if not plan:
+    def get_ready_tasks(self, graph_id: str) -> list[Task]:
+        """Get tasks that are ready to execute."""
+        graph = self._graphs.get(graph_id)
+        if not graph:
             return []
 
         ready = []
-        for task in plan.tasks.values():
-            if task.status != TaskStatus.PLANNED:
-                continue
-            if not task.is_leaf:
+        for task in graph.tasks.values():
+            if task.status != TaskStatus.PENDING:
                 continue
 
             deps_met = all(
-                plan.tasks.get(dep, SubTask()).status == TaskStatus.COMPLETE
-                for dep in task.dependencies
+                graph.tasks.get(dep_id, Task()).status == TaskStatus.COMPLETED
+                for dep_id in task.dependencies
             )
             if deps_met:
+                task.status = TaskStatus.READY
                 ready.append(task)
 
         return ready
 
     def complete_task(
         self,
-        plan_id: str,
+        graph_id: str,
         task_id: str,
-        result: dict[str, Any] | None = None,
+        result: str = "",
         success: bool = True,
-        actual_time_s: float = 0.0,
-        actual_tokens: int = 0,
-    ) -> bool:
-        """Mark a task as complete."""
-        plan = self._plans.get(plan_id)
-        if not plan:
-            return False
-        task = plan.tasks.get(task_id)
+    ) -> None:
+        """Mark a task as completed."""
+        graph = self._graphs.get(graph_id)
+        if not graph:
+            return
+
+        task = graph.tasks.get(task_id)
         if not task:
-            return False
+            return
 
-        task.status = TaskStatus.COMPLETE if success else TaskStatus.FAILED
-        task.result = result or {}
-        task.actual_time_s = actual_time_s
-        task.actual_tokens = actual_tokens
+        task.status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
+        task.completed_at = time.time()
+        task.result = result
 
-        return True
+        if success:
+            graph.completed_tasks += 1
 
-    def get_critical_path(self, plan_id: str) -> list[SubTask]:
-        """Get the critical path (longest dependency chain)."""
-        plan = self._plans.get(plan_id)
-        if not plan:
+    def re_decompose(
+        self,
+        graph_id: str,
+        task_id: str,
+    ) -> list[Task]:
+        """Re-decompose a failed task into smaller subtasks."""
+        graph = self._graphs.get(graph_id)
+        if not graph:
             return []
 
-        # BFS from root, tracking longest path
-        longest_path: list[SubTask] = []
-        queue: deque[tuple[str, list[SubTask]]] = deque()
-        queue.append((plan.root_task_id, []))
+        task = graph.tasks.get(task_id)
+        if not task:
+            return []
 
-        while queue:
-            task_id, path = queue.popleft()
-            task = plan.tasks.get(task_id)
-            if not task:
-                continue
+        if task.depth >= task.max_depth:
+            return []
 
-            current_path = path + [task]
-            if not task.children:
-                if len(current_path) > len(longest_path):
-                    longest_path = current_path
-            else:
-                for child_id in task.children:
-                    queue.append((child_id, current_path))
+        # Split budget
+        sub_budget = task.token_budget // 2
+        sub_time = task.time_budget_s / 2
 
-        return longest_path
+        new_tasks = []
+        for i in range(2):
+            self._counter += 1
+            subtask = Task(
+                task_id=f"task-{self._counter}",
+                name=f"{task.name} (retry {i + 1})",
+                parent_task=task_id,
+                tools=task.tools,
+                token_budget=sub_budget,
+                time_budget_s=sub_time,
+                depth=task.depth + 1,
+                max_depth=task.max_depth,
+            )
+            graph.tasks[subtask.task_id] = subtask
+            task.subtasks.append(subtask.task_id)
+            new_tasks.append(subtask)
+            graph.total_tasks += 1
+
+        return new_tasks
+
+    def build_graph_prompt(self, graph_id: str) -> str:
+        """Build a prompt describing the task graph."""
+        graph = self._graphs.get(graph_id)
+        if not graph:
+            return ""
+
+        lines = [f"## Task Graph ({graph.progress * 100:.0f}% complete)\n"]
+
+        for task in sorted(graph.tasks.values(), key=lambda t: t.depth):
+            indent = "  " * task.depth
+            status_icon = {"completed": "+", "failed": "!", "running": ">", "pending": "-", "ready": "*"}.get(task.status.value, "?")
+            lines.append(f"{indent}[{status_icon}] {task.name} ({task.priority.value})")
+
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
+        total_tasks = sum(g.total_tasks for g in self._graphs.values())
+        completed = sum(g.completed_tasks for g in self._graphs.values())
+
         return {
-            "plans": len(self._plans),
-            "plan_details": {
-                pid: p.to_dict() for pid, p in self._plans.items()
-            },
+            "graphs": len(self._graphs),
+            "total_tasks": total_tasks,
+            "completed": completed,
+            "progress": round(completed / max(1, total_tasks) * 100, 1),
         }
