@@ -1,11 +1,11 @@
 """API security knowledge base.
 
 Deep knowledge about API vulnerabilities:
-1. REST API testing methodology
+1. REST API security issues
 2. GraphQL exploitation
-3. gRPC/Protobuf attacks
-4. API authentication bypass
-5. Rate limiting and abuse
+3. gRPC and WebSocket attacks
+4. API authentication flaws
+5. API rate limiting and abuse
 """
 
 from __future__ import annotations
@@ -39,174 +39,194 @@ class APIPattern:
 
 API_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "api-001", "name": "REST API Vulnerability Testing",
+        "id": "api-001", "name": "REST API Vulnerabilities",
         "category": "rest", "severity": "high",
-        "desc": "Comprehensive REST API security testing.",
+        "desc": "Common REST API security issues.",
         "detection": (
-            "REST API TESTING:\n"
+            "REST API VULNERABILITIES:\n"
             "ENDPOINT DISCOVERY:\n"
-            "  # Swagger/OpenAPI discovery\n"
-            "  ffuf -u https://<target>/FUZZ -w api-endpoints.txt\n"
-            "  # Common paths:\n"
-            "  /api/v1/ /api/v2/ /swagger/ /swagger.json\n"
-            "  /openapi.json /api-docs /graphql /graphiql\n"
-            "  /.well-known/ /actuator /health /metrics\n"
-            "AUTHENTICATION TESTING:\n"
-            "  - Test endpoints without auth token\n"
-            "  - Test with expired token\n"
-            "  - Test with token from different user\n"
-            "  - Test with modified JWT claims\n"
-            "  - Test with API key from different scope\n"
-            "IDOR/BOLA:\n"
-            "  - Change numeric IDs: /api/users/1 → /api/users/2\n"
-            "  - Change UUIDs: Try sequential or predictable patterns\n"
-            "  - Test with different object types in same endpoint\n"
-            "  - Check batch endpoints: /api/users?ids=1,2,3\n"
+            "  # Swagger/OpenAPI\n"
+            "  /swagger.json, /openapi.json\n"
+            "  /api-docs, /swagger-ui.html\n"
+            "  /v1/docs, /v2/api-docs\n"
+            "  /.well-known/openapi.json\n"
+            "  # Wordlist fuzzing\n"
+            "  ffuf -u https://target/api/FUZZ -w api-endpoints.txt\n"
+            "BOLA (Broken Object Level Authorization):\n"
+            "  - OWASP API Security #1\n"
+            "  - Change resource IDs in URLs\n"
+            "  - GET /api/users/123 → GET /api/users/124\n"
+            "  - Test with different auth tokens\n"
+            "BFLA (Broken Function Level Authorization):\n"
+            "  - User accessing admin endpoints\n"
+            "  - POST /api/admin/users (with user token)\n"
+            "  - DELETE /api/users/123 (user deleting others)\n"
             "MASS ASSIGNMENT:\n"
-            "  - Add extra fields: {\"name\": \"x\", \"role\": \"admin\"}\n"
-            "  - Add fields from API docs that aren't in UI\n"
-            "  - Test PATCH with restricted fields\n"
-            "RATE LIMITING:\n"
-            "  - Test with rapid requests (no rate limit = DoS risk)\n"
-            "  - Test from different IPs/headers\n"
-            "  - Check X-Forwarded-For bypass"
+            "  - POST /api/users {\"name\":\"test\",\"role\":\"admin\"}\n"
+            "  - PUT /api/profile {\"isAdmin\":true}\n"
+            "  - Include unexpected fields in request\n"
+            "SSRF VIA API:\n"
+            "  - URL parameters: ?url=http://169.254.169.254/\n"
+            "  - Webhook URLs pointing to internal services\n"
+            "  - File import from URL\n"
+            "EXCESSIVE DATA EXPOSURE:\n"
+            "  - API returning sensitive fields\n"
+            "  - Debug information in responses\n"
+            "  - Stack traces in error responses"
         ),
-        "tools": ["ffuf", "burp", "postman"],
+        "tools": ["ffuf", "nuclei", "burpsuite"],
     },
     {
         "id": "api-002", "name": "GraphQL Exploitation",
-        "category": "graphql", "severity": "high",
-        "desc": "Exploiting GraphQL endpoints.",
+        "category": "graphql", "severity": "critical",
+        "desc": "GraphQL-specific attack techniques.",
         "detection": (
             "GRAPHQL EXPLOITATION:\n"
-            "INTROSPECTION:\n"
-            "  # Full schema dump\n"
-            "  {__schema{types{name,fields{name,args{name,type{name}}}}}}\n"
-            "  # Tools\n"
-            "  graphql-cop -t https://<target>/graphql\n"
-            "  clairvoyance -o schema.json https://<target>/graphql\n"
-            "  InQL (Burp extension)\n"
-            "INJECTION:\n"
-            "  # SQL injection through arguments\n"
-            "  query { user(id: \"1' OR '1'='1\") { name, email }}\n"
-            "  # NoSQL injection\n"
-            "  query { user(filter: {\"$gt\": \"\"}) { name }}\n"
-            "BATCHING ATTACKS:\n"
-            "  # Send multiple queries in one request\n"
-            "  [{\"query\": \"q1\"}, {\"query\": \"q2\"}, ...]\n"
-            "  # Bypass rate limiting by batching\n"
-            "  # Brute force via aliased queries\n"
-            "  query { a1: login(user:\"a\",pass:\"1\") a2: login(user:\"a\",pass:\"2\") }\n"
-            "DENIAL OF SERVICE:\n"
-            "  # Deeply nested queries\n"
-            "  query { user { friends { friends { friends { ... } } } } }\n"
-            "  # Alias-based DoS\n"
-            "  # Fragment-based circular queries\n"
-            "AUTHORIZATION:\n"
-            "  - Access mutations without proper roles\n"
-            "  - Query fields that should be restricted\n"
-            "  - Test subscription endpoints for data leaks"
-        ),
-        "tools": ["graphql-cop", "clairvoyance", "burp"],
-    },
-    {
-        "id": "api-003", "name": "gRPC/Protobuf Attacks",
-        "category": "grpc", "severity": "high",
-        "desc": "Attacking gRPC and Protocol Buffer endpoints.",
-        "detection": (
-            "gRPC/PROTOBUF ATTACKS:\n"
             "DISCOVERY:\n"
-            "  # Detect gRPC services\n"
-            "  nmap -p 50051 --script=http-grpc <target>\n"
-            "  # Server reflection (if enabled)\n"
-            "  grpcurl -plaintext <host>:<port> list\n"
-            "  grpcurl -plaintext <host>:<port> describe <service>\n"
-            "  # If no reflection:\n"
-            "  # Intercept .proto files from mobile apps/web\n"
-            "  # Decompile from binary\n"
-            "ENUMERATION:\n"
-            "  # List all services\n"
-            "  grpcurl -plaintext <host>:<port> list\n"
-            "  # Describe service methods\n"
-            "  grpcurl -plaintext <host>:<port> describe <Service>\n"
-            "  # Call method\n"
-            "  grpcurl -plaintext -d '{\"id\": 1}' <host>:<port> <Service>/<Method>\n"
+            "  # Common endpoints\n"
+            "  /graphql, /graphiql, /v1/graphql\n"
+            "  /api/graphql, /query, /gql\n"
+            "  # Introspection query\n"
+            "  {__schema{types{name fields{name type{name}}}}}\n"
+            "  # Check if introspection is enabled\n"
+            "  {__type(name:\"Query\"){name fields{name}}}\n"
             "ATTACKS:\n"
-            "  - Missing authentication on methods\n"
-            "  - IDOR through request parameters\n"
-            "  - Protobuf deserialization issues\n"
-            "  - Type confusion (send wrong type)\n"
-            "  - Integer overflow in protobuf fields\n"
-            "  - Large message DoS (no size limits)\n"
-            "  - Stream abuse (bidirectional streaming)\n"
-            "  - Metadata injection (HTTP/2 headers)"
-        ),
-        "tools": ["grpcurl", "nmap", "protobuf-inspector"],
-    },
-    {
-        "id": "api-004", "name": "WebSocket Security",
-        "category": "websocket", "severity": "high",
-        "desc": "Testing WebSocket connections for vulnerabilities.",
-        "detection": (
-            "WEBSOCKET SECURITY:\n"
-            "DETECTION:\n"
-            "  - Look for ws:// or wss:// in source code\n"
-            "  - Check for Upgrade: websocket headers\n"
-            "  - Monitor network tab for WS connections\n"
-            "  - Common endpoints: /ws /socket /socket.io /hub\n"
-            "CROSS-SITE WEBSOCKET HIJACKING:\n"
-            "  - Check if Origin header is validated\n"
-            "  - If not → can connect from attacker's domain\n"
-            "  - Test: Connect from different origin\n"
-            "  - Exploit: Read messages, send commands\n"
-            "INJECTION:\n"
-            "  - Send SQL injection via WS messages\n"
-            "  - Send XSS payloads through WS\n"
-            "  - Send command injection via WS\n"
-            "  - Test message format manipulation\n"
+            "  INJECTION:\n"
+            "    - SQL injection in resolvers\n"
+            "    - NoSQL injection in filters\n"
+            "    query { users(filter: \"{$ne: null}\") { name } }\n"
+            "  BATCHING:\n"
+            "    - Send multiple queries in one request\n"
+            "    - Bypass rate limiting\n"
+            "    [{\"query\":\"...\"},{ \"query\":\"...\"}]\n"
+            "  DEPTH ATTACK:\n"
+            "    - Nested queries causing DoS\n"
+            "    { users { friends { friends { friends { ... } } } } }\n"
+            "  FIELD SUGGESTION:\n"
+            "    - Misspell field names to get suggestions\n"
+            "    - Reveals schema without introspection\n"
             "AUTHORIZATION:\n"
-            "  - Connect without authentication\n"
-            "  - Subscribe to channels of other users\n"
-            "  - Send admin-level commands as regular user\n"
-            "  - Test reconnection with stale tokens\n"
-            "DENIAL OF SERVICE:\n"
-            "  - Rapidly open many connections\n"
-            "  - Send very large messages\n"
-            "  - Send malformed frames"
+            "  - Query other users' data\n"
+            "  - Mutation without proper auth\n"
+            "  - Subscription access control\n"
+            "TOOLS:\n"
+            "  graphql-voyager  # Schema visualization\n"
+            "  InQL (Burp extension)  # GraphQL testing\n"
+            "  graphw00f  # GraphQL fingerprinting"
         ),
-        "tools": ["burp", "wscat", "autobahn-testsuite"],
+        "tools": ["graphw00f", "burpsuite"],
     },
     {
-        "id": "api-005", "name": "OAuth/OIDC Exploitation",
-        "category": "oauth", "severity": "critical",
-        "desc": "Exploiting OAuth 2.0 and OpenID Connect flaws.",
+        "id": "api-003", "name": "WebSocket Attacks",
+        "category": "websocket", "severity": "high",
+        "desc": "WebSocket security vulnerabilities.",
         "detection": (
-            "OAUTH/OIDC EXPLOITATION:\n"
-            "AUTHORIZATION CODE FLOW:\n"
-            "  - Missing state parameter → CSRF\n"
-            "  - Redirect URI manipulation:\n"
-            "    redirect_uri=https://attacker.com\n"
-            "    redirect_uri=https://legitimate.com@attacker.com\n"
-            "    redirect_uri=https://legitimate.com/..%2F..%2Fattacker.com\n"
-            "  - Authorization code replay (no PKCE)\n"
-            "  - Code injection via redirect_uri path\n"
-            "TOKEN ATTACKS:\n"
-            "  - Token leakage via Referer header\n"
-            "  - Token in URL fragment → leaked to JS\n"
-            "  - Token scope escalation\n"
-            "  - Refresh token rotation not enforced\n"
-            "  - Token stored in localStorage (XSS risk)\n"
-            "IMPLICIT FLOW ATTACKS:\n"
-            "  - Access token in URL → history, logs, Referer\n"
-            "  - Token substitution (use token from attacker app)\n"
-            "  - Confused deputy (mix up client IDs)\n"
-            "OIDC SPECIFIC:\n"
-            "  - ID token validation bypass\n"
-            "  - Nonce reuse → replay attack\n"
-            "  - Issuer validation missing\n"
-            "  - User info endpoint IDOR"
+            "WEBSOCKET ATTACKS:\n"
+            "DISCOVERY:\n"
+            "  - Look for ws:// or wss:// connections\n"
+            "  - Check Upgrade: websocket headers\n"
+            "  - Browser DevTools → Network → WS filter\n"
+            "CROSS-SITE WEBSOCKET HIJACKING:\n"
+            "  - No Origin header validation\n"
+            "  - Create malicious page that connects to target WS\n"
+            "  - Steal data from authenticated WS connection\n"
+            "  - Similar to CSRF but for WebSockets\n"
+            "MESSAGE MANIPULATION:\n"
+            "  - Intercept and modify WS messages\n"
+            "  - Inject additional messages\n"
+            "  - Replay captured messages\n"
+            "  - Test for injection in message content\n"
+            "AUTHENTICATION:\n"
+            "  - Token in URL parameter (leaks in logs)\n"
+            "  - No authentication on WS upgrade\n"
+            "  - Session token not validated per message\n"
+            "DoS:\n"
+            "  - Flood with messages\n"
+            "  - Large message payload\n"
+            "  - Many concurrent connections\n"
+            "TESTING:\n"
+            "  - Burp Suite WebSocket support\n"
+            "  - wscat CLI tool\n"
+            "  wscat -c ws://target/ws"
         ),
-        "tools": ["burp", "oauth-tester"],
+        "tools": ["burpsuite", "wscat"],
+    },
+    {
+        "id": "api-004", "name": "API Authentication Flaws",
+        "category": "api_auth", "severity": "critical",
+        "desc": "API authentication and key management issues.",
+        "detection": (
+            "API AUTHENTICATION FLAWS:\n"
+            "API KEY ISSUES:\n"
+            "  - Keys in URL parameters (logged)\n"
+            "  - Keys in client-side code (exposed)\n"
+            "  - Keys in git repositories\n"
+            "  - No key rotation\n"
+            "  - Overly permissive key scope\n"
+            "  # Search for exposed keys\n"
+            "  trufflehog git https://github.com/org/repo\n"
+            "  gitleaks detect --source .\n"
+            "JWT ISSUES:\n"
+            "  - Algorithm confusion (RS256 → HS256)\n"
+            "  - Weak signing key\n"
+            "  - No expiration validation\n"
+            "  - Token in URL (referer leakage)\n"
+            "  - Claim manipulation (role, sub)\n"
+            "BEARER TOKEN:\n"
+            "  - Token leakage in logs\n"
+            "  - No token revocation\n"
+            "  - Long-lived tokens\n"
+            "  - Token reuse across services\n"
+            "API KEY ENUMERATION:\n"
+            "  - Predictable key format\n"
+            "  - Key in response headers\n"
+            "  - Key generation endpoint without auth\n"
+            "TESTING:\n"
+            "  1. Test with no auth\n"
+            "  2. Test with expired token\n"
+            "  3. Test with modified token\n"
+            "  4. Test with different user's token"
+        ),
+        "tools": ["trufflehog", "gitleaks", "jwt_tool"],
+    },
+    {
+        "id": "api-005", "name": "gRPC Security",
+        "category": "grpc", "severity": "high",
+        "desc": "gRPC and Protocol Buffer security issues.",
+        "detection": (
+            "gRPC SECURITY:\n"
+            "DISCOVERY:\n"
+            "  - Port scanning for gRPC (common: 50051)\n"
+            "  - gRPC reflection enabled?\n"
+            "  grpcurl -plaintext target:50051 list\n"
+            "  grpcurl -plaintext target:50051 describe <service>\n"
+            "ATTACKS:\n"
+            "  - No TLS (plaintext gRPC)\n"
+            "  - Reflection enabled in production\n"
+            "  - Missing authentication metadata\n"
+            "  - Message size limit abuse\n"
+            "  - Protobuf deserialization issues\n"
+            "TESTING:\n"
+            "  # List services\n"
+            "  grpcurl -plaintext target:50051 list\n"
+            "  # Describe service\n"
+            "  grpcurl -plaintext target:50051 describe pkg.Service\n"
+            "  # Invoke method\n"
+            "  grpcurl -plaintext -d '{\"id\": 1}' target:50051 pkg.Service/GetUser\n"
+            "  # Test auth\n"
+            "  grpcurl -plaintext -H 'authorization: Bearer <token>' \\\n"
+            "    target:50051 pkg.Service/AdminMethod\n"
+            "PROTOBUF:\n"
+            "  - Decode unknown protobuf messages\n"
+            "  - Modify field values\n"
+            "  - Add unexpected fields\n"
+            "  - Fuzz protobuf messages with random data\n"
+            "TOOLS:\n"
+            "  grpcurl  # gRPC CLI\n"
+            "  grpcui  # gRPC web UI\n"
+            "  protobuf-inspector  # Decode protobufs"
+        ),
+        "tools": ["grpcurl", "grpcui"],
     },
 ]
 
