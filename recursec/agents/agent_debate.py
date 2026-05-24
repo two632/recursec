@@ -1,11 +1,11 @@
-"""Agent debate system — adversarial multi-model debate.
+"""Agent debate engine — multi-model adversarial debate.
 
 Implements:
-1. Structured debate rounds (advocate vs. challenger)
-2. Evidence-based argumentation
-3. Judge scoring and resolution
-4. Debate history and learning
-5. Confidence calibration through debate
+1. Structured debate protocol (advocate vs challenger)
+2. Judge model for resolution
+3. Evidence-based argumentation
+4. Confidence calibration
+5. Consensus detection
 6. Debate prompt for LLM
 """
 
@@ -22,342 +22,337 @@ logger = structlog.get_logger()
 
 
 class DebateRole(str, Enum):
-    ADVOCATE = "advocate"       # Supports the proposition
-    CHALLENGER = "challenger"   # Challenges the proposition
-    JUDGE = "judge"             # Evaluates arguments
+    ADVOCATE = "advocate"       # Argues FOR the finding
+    CHALLENGER = "challenger"   # Argues AGAINST
+    JUDGE = "judge"             # Makes final decision
+    OBSERVER = "observer"       # Provides context
 
 
-class ArgumentStrength(str, Enum):
-    STRONG = "strong"           # Clear evidence, logical
-    MODERATE = "moderate"       # Some evidence, reasonable
-    WEAK = "weak"               # Little evidence, speculative
-    FALLACIOUS = "fallacious"   # Logical fallacy detected
+class ArgumentType(str, Enum):
+    CLAIM = "claim"             # Initial assertion
+    EVIDENCE = "evidence"       # Supporting evidence
+    REBUTTAL = "rebuttal"       # Counter-argument
+    CONCESSION = "concession"   # Partial agreement
+    SYNTHESIS = "synthesis"     # Combined view
 
 
 class DebateOutcome(str, Enum):
-    ADVOCATE_WINS = "advocate_wins"
-    CHALLENGER_WINS = "challenger_wins"
-    DRAW = "draw"
-    INCONCLUSIVE = "inconclusive"
+    CONFIRMED = "confirmed"         # Finding is valid
+    REJECTED = "rejected"           # Finding is false positive
+    MODIFIED = "modified"           # Finding valid but needs adjustment
+    INCONCLUSIVE = "inconclusive"   # Needs more evidence
+    ESCALATED = "escalated"         # Needs human review
 
 
 @dataclass
 class Argument:
-    """A single argument in a debate."""
+    """A single argument in the debate."""
     argument_id: str = ""
     role: DebateRole = DebateRole.ADVOCATE
-    model_id: str = ""
-    round_num: int = 0
-    claim: str = ""
+    arg_type: ArgumentType = ArgumentType.CLAIM
+    content: str = ""
     evidence: list[str] = field(default_factory=list)
-    strength: ArgumentStrength = ArgumentStrength.MODERATE
-    rebuts: str = ""           # ID of argument being rebutted
-    score: float = 0.5
+    confidence: float = 0.5
+    model_name: str = ""
+    responds_to: str = ""
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "role": self.role.value[:5],
-            "model": self.model_id[:10],
-            "round": self.round_num,
-            "strength": self.strength.value[:6],
-            "score": f"{self.score:.1f}",
+            "role": self.role.value[:8],
+            "type": self.arg_type.value[:7],
+            "conf": f"{self.confidence:.2f}",
+            "content": self.content[:25],
         }
 
 
 @dataclass
-class JudgeVerdict:
-    """Judge's verdict on a debate."""
-    judge_model: str = ""
-    advocate_score: float = 0.0
-    challenger_score: float = 0.0
-    reasoning: str = ""
-    outcome: DebateOutcome = DebateOutcome.INCONCLUSIVE
-    confidence: float = 0.5
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "outcome": self.outcome.value[:10],
-            "adv": f"{self.advocate_score:.1f}",
-            "chl": f"{self.challenger_score:.1f}",
-            "conf": f"{self.confidence:.0%}",
-        }
-
-
-@dataclass
-class Debate:
+class DebateSession:
     """A complete debate session."""
     debate_id: str = ""
-    proposition: str = ""       # What's being debated
-    context: str = ""
+    topic: str = ""
+    finding: dict[str, Any] = field(default_factory=dict)
+    arguments: list[Argument] = field(default_factory=list)
     advocate_model: str = ""
     challenger_model: str = ""
     judge_model: str = ""
-    arguments: list[Argument] = field(default_factory=list)
+    outcome: DebateOutcome = DebateOutcome.INCONCLUSIVE
+    final_confidence: float = 0.0
+    rounds: int = 0
     max_rounds: int = 3
-    current_round: int = 0
-    verdict: JudgeVerdict | None = None
-    created_at: float = field(default_factory=time.time)
-
-    @property
-    def is_complete(self) -> bool:
-        return self.verdict is not None
-
-    @property
-    def advocate_args(self) -> list[Argument]:
-        return [a for a in self.arguments if a.role == DebateRole.ADVOCATE]
-
-    @property
-    def challenger_args(self) -> list[Argument]:
-        return [a for a in self.arguments if a.role == DebateRole.CHALLENGER]
+    started_at: float = field(default_factory=time.time)
+    ended_at: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.debate_id[:10],
-            "prop": self.proposition[:25],
-            "rounds": f"{self.current_round}/{self.max_rounds}",
-            "complete": self.is_complete,
+            "topic": self.topic[:20],
+            "rounds": self.rounds,
+            "outcome": self.outcome.value[:10],
+            "conf": f"{self.final_confidence:.2f}",
         }
 
 
-class AgentDebate:
-    """Adversarial multi-model debate for critical decisions.
+# Model assignments for debate roles
+DEBATE_MODELS: dict[DebateRole, list[str]] = {
+    DebateRole.ADVOCATE: ["WhiteRabbitNeo", "Dolphin-2.9"],
+    DebateRole.CHALLENGER: ["Qwen2.5-Coder-14B", "Hermes-4-14B"],
+    DebateRole.JUDGE: ["DeepSeek-R1", "Hermes-4-14B"],
+}
 
-    Pits models against each other in structured debate
-    to rigorously test security findings and decisions.
-    Uses advocate/challenger/judge roles.
+
+class AgentDebateEngine:
+    """Multi-model adversarial debate for findings.
+
+    Uses structured debate to validate critical
+    findings through adversarial argumentation.
     """
 
-    def __init__(self) -> None:
-        self._debates: dict[str, Debate] = {}
+    def __init__(self, max_rounds: int = 3) -> None:
+        self._debates: dict[str, DebateSession] = {}
         self._debate_counter = 0
         self._argument_counter = 0
+        self._max_rounds = max_rounds
         self._log = logger.bind(component="debate")
 
-    def create_debate(
+    def start_debate(
         self,
-        proposition: str,
-        context: str = "",
+        topic: str,
+        finding: dict[str, Any],
         advocate_model: str = "",
         challenger_model: str = "",
         judge_model: str = "",
-        max_rounds: int = 3,
-    ) -> Debate:
-        """Create a new debate."""
+    ) -> DebateSession:
+        """Start a new debate session."""
         self._debate_counter += 1
 
-        debate = Debate(
-            debate_id=f"dbt-{self._debate_counter}",
-            proposition=proposition,
-            context=context,
+        if not advocate_model:
+            advocate_model = DEBATE_MODELS[DebateRole.ADVOCATE][0]
+        if not challenger_model:
+            challenger_model = DEBATE_MODELS[DebateRole.CHALLENGER][0]
+        if not judge_model:
+            judge_model = DEBATE_MODELS[DebateRole.JUDGE][0]
+
+        session = DebateSession(
+            debate_id=f"debate-{self._debate_counter}",
+            topic=topic,
+            finding=finding,
             advocate_model=advocate_model,
             challenger_model=challenger_model,
             judge_model=judge_model,
-            max_rounds=max_rounds,
+            max_rounds=self._max_rounds,
         )
-
-        self._debates[debate.debate_id] = debate
-        return debate
+        self._debates[session.debate_id] = session
+        return session
 
     def add_argument(
         self,
         debate_id: str,
         role: DebateRole,
-        model_id: str,
-        claim: str,
+        arg_type: ArgumentType,
+        content: str,
         evidence: list[str] | None = None,
-        strength: ArgumentStrength = ArgumentStrength.MODERATE,
-        rebuts: str = "",
-    ) -> Argument | None:
+        confidence: float = 0.5,
+        model_name: str = "",
+        responds_to: str = "",
+    ) -> Argument:
         """Add an argument to the debate."""
-        debate = self._debates.get(debate_id)
-        if not debate:
-            return None
-
         self._argument_counter += 1
+
         arg = Argument(
             argument_id=f"arg-{self._argument_counter}",
             role=role,
-            model_id=model_id,
-            round_num=debate.current_round,
-            claim=claim,
+            arg_type=arg_type,
+            content=content,
             evidence=evidence or [],
-            strength=strength,
-            rebuts=rebuts,
+            confidence=confidence,
+            model_name=model_name,
+            responds_to=responds_to,
         )
 
-        debate.arguments.append(arg)
-
-        # Score based on strength
-        strength_scores = {
-            ArgumentStrength.STRONG: 0.9,
-            ArgumentStrength.MODERATE: 0.6,
-            ArgumentStrength.WEAK: 0.3,
-            ArgumentStrength.FALLACIOUS: 0.0,
-        }
-        arg.score = strength_scores.get(strength, 0.5)
-
-        # Evidence bonus
-        arg.score = min(1.0, arg.score + len(arg.evidence) * 0.05)
-
-        # Rebuttal bonus
-        if rebuts:
-            arg.score = min(1.0, arg.score + 0.1)
+        session = self._debates.get(debate_id)
+        if session:
+            session.arguments.append(arg)
+            session.rounds = max(
+                session.rounds,
+                sum(1 for a in session.arguments if a.role == DebateRole.ADVOCATE),
+            )
 
         return arg
 
-    def advance_round(self, debate_id: str) -> bool:
-        """Advance to next debate round."""
-        debate = self._debates.get(debate_id)
-        if not debate:
+    def should_continue(self, debate_id: str) -> bool:
+        """Check if the debate should continue."""
+        session = self._debates.get(debate_id)
+        if not session:
             return False
 
-        if debate.current_round >= debate.max_rounds:
+        # Max rounds reached
+        if session.rounds >= session.max_rounds:
             return False
 
-        debate.current_round += 1
+        # Check for early consensus
+        if len(session.arguments) >= 4:
+            advocate_conf = [
+                a.confidence for a in session.arguments
+                if a.role == DebateRole.ADVOCATE
+            ]
+            challenger_conf = [
+                a.confidence for a in session.arguments
+                if a.role == DebateRole.CHALLENGER
+            ]
+
+            if advocate_conf and challenger_conf:
+                avg_adv = sum(advocate_conf) / len(advocate_conf)
+                avg_cha = sum(challenger_conf) / len(challenger_conf)
+
+                # Strong consensus (both sides agree)
+                if abs(avg_adv - avg_cha) < 0.15:
+                    return False
+
+                # One side clearly dominant
+                if max(avg_adv, avg_cha) > 0.9:
+                    return False
+
         return True
 
-    def render_verdict(
+    def resolve(
         self,
         debate_id: str,
-        judge_model: str = "",
-        reasoning: str = "",
-    ) -> JudgeVerdict | None:
-        """Judge renders final verdict."""
-        debate = self._debates.get(debate_id)
-        if not debate:
-            return None
+        judge_verdict: str = "",
+        judge_confidence: float = 0.0,
+    ) -> DebateOutcome:
+        """Resolve the debate with a judge verdict."""
+        session = self._debates.get(debate_id)
+        if not session:
+            return DebateOutcome.INCONCLUSIVE
 
-        # Score each side
-        adv_score = sum(a.score for a in debate.advocate_args)
-        chl_score = sum(a.score for a in debate.challenger_args)
-
-        # Normalize
-        total = adv_score + chl_score + 1e-10
-        adv_norm = adv_score / total
-        chl_norm = chl_score / total
+        # Calculate from arguments if no judge
+        if not judge_confidence:
+            judge_confidence = self._calculate_confidence(debate_id)
 
         # Determine outcome
-        if adv_norm > 0.6:
-            outcome = DebateOutcome.ADVOCATE_WINS
-        elif chl_norm > 0.6:
-            outcome = DebateOutcome.CHALLENGER_WINS
-        elif abs(adv_norm - chl_norm) < 0.1:
-            outcome = DebateOutcome.DRAW
-        else:
+        if judge_confidence >= 0.8:
+            outcome = DebateOutcome.CONFIRMED
+        elif judge_confidence >= 0.5:
+            outcome = DebateOutcome.MODIFIED
+        elif judge_confidence >= 0.3:
             outcome = DebateOutcome.INCONCLUSIVE
+        else:
+            outcome = DebateOutcome.REJECTED
 
-        verdict = JudgeVerdict(
-            judge_model=judge_model or debate.judge_model,
-            advocate_score=adv_norm,
-            challenger_score=chl_norm,
-            reasoning=reasoning,
-            outcome=outcome,
-            confidence=abs(adv_norm - chl_norm),
-        )
+        session.outcome = outcome
+        session.final_confidence = judge_confidence
+        session.ended_at = time.time()
 
-        debate.verdict = verdict
-        return verdict
+        # Add judge argument
+        if judge_verdict:
+            self.add_argument(
+                debate_id,
+                DebateRole.JUDGE,
+                ArgumentType.SYNTHESIS,
+                judge_verdict,
+                confidence=judge_confidence,
+                model_name=session.judge_model,
+            )
 
-    def build_advocate_prompt(self, debate_id: str) -> str:
-        """Build prompt for advocate model."""
-        debate = self._debates.get(debate_id)
-        if not debate:
-            return ""
+        return outcome
 
-        lines = [
-            "You are the ADVOCATE in a security debate.",
-            f"Proposition: {debate.proposition}",
-            f"Context: {debate.context[:200]}",
-            f"Round: {debate.current_round}/{debate.max_rounds}",
-            "\nYour role: SUPPORT this proposition with evidence.",
-        ]
+    def _calculate_confidence(self, debate_id: str) -> float:
+        """Calculate confidence from debate arguments."""
+        session = self._debates.get(debate_id)
+        if not session or not session.arguments:
+            return 0.5
 
-        # Include challenger's arguments to rebut
-        for arg in debate.challenger_args:
-            lines.append(f"\nChallenger argued: {arg.claim[:100]}")
+        advocate_strength = 0.0
+        challenger_strength = 0.0
+        evidence_count = 0
 
-        lines.append("\nProvide: claim, evidence, and rebut any challenger arguments.")
-        return "\n".join(lines)
+        for arg in session.arguments:
+            if arg.role == DebateRole.ADVOCATE:
+                advocate_strength += arg.confidence
+                evidence_count += len(arg.evidence)
+            elif arg.role == DebateRole.CHALLENGER:
+                challenger_strength += arg.confidence
 
-    def build_challenger_prompt(self, debate_id: str) -> str:
-        """Build prompt for challenger model."""
-        debate = self._debates.get(debate_id)
-        if not debate:
-            return ""
+        total = advocate_strength + challenger_strength
+        if total == 0:
+            return 0.5
 
-        lines = [
-            "You are the CHALLENGER in a security debate.",
-            f"Proposition: {debate.proposition}",
-            f"Context: {debate.context[:200]}",
-            f"Round: {debate.current_round}/{debate.max_rounds}",
-            "\nYour role: CHALLENGE this proposition. Find weaknesses.",
-        ]
+        # Advocate ratio
+        ratio = advocate_strength / total
 
-        for arg in debate.advocate_args:
-            lines.append(f"\nAdvocate argued: {arg.claim[:100]}")
+        # Evidence bonus
+        evidence_bonus = min(0.1, evidence_count * 0.02)
 
-        lines.append("\nProvide: counterarguments, evidence against, logical weaknesses.")
-        return "\n".join(lines)
+        return min(1.0, ratio + evidence_bonus)
 
-    def build_judge_prompt(self, debate_id: str) -> str:
-        """Build prompt for judge model."""
-        debate = self._debates.get(debate_id)
-        if not debate:
-            return ""
-
-        lines = [
-            "You are the JUDGE in a security debate.",
-            f"Proposition: {debate.proposition}",
-            f"Rounds completed: {debate.current_round}",
-            "\nAdvocate arguments:",
-        ]
-
-        for arg in debate.advocate_args:
-            lines.append(f"  [{arg.strength.value}] {arg.claim[:80]}")
-
-        lines.append("\nChallenger arguments:")
-        for arg in debate.challenger_args:
-            lines.append(f"  [{arg.strength.value}] {arg.claim[:80]}")
-
-        lines.append("\nRender verdict: which side presented stronger evidence?")
-        return "\n".join(lines)
-
-    def build_debate_prompt(self) -> str:
+    def build_debate_prompt(self, debate_id: str = "") -> str:
         """Build debate context for LLM."""
-        lines = ["## Debate System\n"]
-        lines.append(f"Total debates: {len(self._debates)}")
+        if debate_id and debate_id in self._debates:
+            return self._build_session_detail(debate_id)
 
-        completed = [d for d in self._debates.values() if d.is_complete]
-        active = [d for d in self._debates.values() if not d.is_complete]
+        lines = ["## Debates\n"]
+        lines.append(f"Total: {len(self._debates)}")
 
-        if active:
-            lines.append(f"Active: {len(active)}")
-            for d in active[:2]:
-                lines.append(f"  {d.proposition[:30]} (round {d.current_round}/{d.max_rounds})")
+        confirmed = sum(
+            1 for d in self._debates.values()
+            if d.outcome == DebateOutcome.CONFIRMED
+        )
+        rejected = sum(
+            1 for d in self._debates.values()
+            if d.outcome == DebateOutcome.REJECTED
+        )
+        lines.append(f"Confirmed: {confirmed}, Rejected: {rejected}")
 
-        if completed:
-            lines.append(f"Completed: {len(completed)}")
-            for d in completed[-3:]:
-                v = d.verdict
-                if v:
-                    lines.append(
-                        f"  [{v.outcome.value[:8]}] {d.proposition[:30]} "
-                        f"conf={v.confidence:.0%}"
-                    )
+        # Recent debates
+        recent = sorted(
+            self._debates.values(),
+            key=lambda d: d.started_at,
+            reverse=True,
+        )[:3]
+        for d in recent:
+            lines.append(
+                f"\n[{d.outcome.value[:8]}] {d.topic[:20]} "
+                f"(conf={d.final_confidence:.2f})"
+            )
+
+        return "\n".join(lines)
+
+    def _build_session_detail(self, debate_id: str) -> str:
+        """Build detailed view of a debate session."""
+        session = self._debates.get(debate_id)
+        if not session:
+            return ""
+
+        lines = [f"## Debate: {session.topic}\n"]
+        lines.append(f"Rounds: {session.rounds}/{session.max_rounds}")
+        lines.append(f"Outcome: {session.outcome.value}")
+        lines.append(f"Confidence: {session.final_confidence:.2f}")
+
+        for arg in session.arguments:
+            prefix = {
+                DebateRole.ADVOCATE: "ADV",
+                DebateRole.CHALLENGER: "CHA",
+                DebateRole.JUDGE: "JDG",
+                DebateRole.OBSERVER: "OBS",
+            }.get(arg.role, "???")
+            lines.append(
+                f"  [{prefix}] ({arg.confidence:.2f}) "
+                f"{arg.content[:35]}"
+            )
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         outcome_counts: dict[str, int] = {}
         for d in self._debates.values():
-            if d.verdict:
-                o = d.verdict.outcome.value
-                outcome_counts[o] = outcome_counts.get(o, 0) + 1
+            outcome_counts[d.outcome.value] = (
+                outcome_counts.get(d.outcome.value, 0) + 1
+            )
 
         return {
-            "total_debates": len(self._debates),
-            "total_arguments": self._argument_counter,
-            "outcomes": outcome_counts,
+            "debates": len(self._debates),
+            "total_arguments": sum(
+                len(d.arguments) for d in self._debates.values()
+            ),
+            "by_outcome": outcome_counts,
         }
