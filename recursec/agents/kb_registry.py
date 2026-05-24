@@ -268,6 +268,54 @@ KB_REGISTRY: dict[str, KBEntry] = {
         pattern_count=5, related_domains=["cloud", "identity_sso"],
         tags=["zero_trust", "microsegmentation", "identity", "ztna"], priority=7,
     ),
+    "crypto": KBEntry(
+        domain="crypto", module_path="recursec.agents.crypto_security_kb",
+        build_func_name="build_crypto_security_prompt", description="Cryptography attacks (weak ciphers, key management, TLS, implementation, hashing)",
+        pattern_count=5, related_domains=["web_vuln", "network"],
+        tags=["crypto", "tls", "ssl", "cipher", "hash", "key_management"], priority=8,
+    ),
+    "social_engineering": KBEntry(
+        domain="social_engineering", module_path="recursec.agents.social_engineering_kb",
+        build_func_name="build_social_engineering_prompt", description="Social engineering (phishing, pretexting, OSINT, vishing, physical)",
+        pattern_count=5, related_domains=["physical", "red_team"],
+        tags=["social_engineering", "phishing", "osint", "vishing"], priority=7,
+    ),
+    "hardware": KBEntry(
+        domain="hardware", module_path="recursec.agents.hardware_security_kb",
+        build_func_name="build_hardware_security_prompt", description="Hardware security (side-channel, fault injection, debug, chip-level)",
+        pattern_count=5, related_domains=["iot_ics", "firmware"],
+        tags=["hardware", "side_channel", "jtag", "swd", "fault_injection"], priority=6,
+    ),
+    "automotive": KBEntry(
+        domain="automotive", module_path="recursec.agents.automotive_security_kb",
+        build_func_name="build_automotive_security_prompt", description="Automotive security (CAN bus, ECU, V2X, infotainment, ADAS)",
+        pattern_count=5, related_domains=["iot_ics", "hardware", "wireless"],
+        tags=["automotive", "can", "ecu", "v2x", "adas"], priority=6,
+    ),
+    "satellite": KBEntry(
+        domain="satellite", module_path="recursec.agents.satellite_security_kb",
+        build_func_name="build_satellite_security_prompt", description="Satellite/space security (ground station, link, GNSS, user terminal)",
+        pattern_count=5, related_domains=["rf", "wireless"],
+        tags=["satellite", "space", "gnss", "gps", "vsat"], priority=5,
+    ),
+    "quantum": KBEntry(
+        domain="quantum", module_path="recursec.agents.quantum_security_kb",
+        build_func_name="build_quantum_security_prompt", description="Quantum security (Shor/Grover attacks, PQC transition, QKD, harvest-now)",
+        pattern_count=4, related_domains=["crypto"],
+        tags=["quantum", "pqc", "post_quantum", "shor", "grover"], priority=6,
+    ),
+    "scada": KBEntry(
+        domain="scada", module_path="recursec.agents.scada_security_kb",
+        build_func_name="build_scada_security_prompt", description="SCADA/ICS deep (PLC, DCS, HMI, industrial protocols, safety systems/TRITON)",
+        pattern_count=5, related_domains=["iot_ics", "network"],
+        tags=["scada", "plc", "dcs", "hmi", "modbus", "safety"], priority=7,
+    ),
+    "rf": KBEntry(
+        domain="rf", module_path="recursec.agents.rf_security_kb",
+        build_func_name="build_rf_security_prompt", description="RF security (SDR, protocol exploitation, jamming, replay, signal injection)",
+        pattern_count=5, related_domains=["wireless", "satellite"],
+        tags=["rf", "sdr", "jamming", "replay", "signal"], priority=6,
+    ),
 }
 
 
