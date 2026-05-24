@@ -1,19 +1,19 @@
-"""Convergence monitor — detects when agent should stop.
+"""Convergence monitor — detects when agents are going in circles.
 
 Implements:
-1. Diminishing returns detection
-2. Finding rate tracking (findings per time unit)
-3. Novelty scoring (are we finding new things?)
-4. Exploration vs exploitation balance
-5. Convergence criteria (configurable thresholds)
-6. Stop recommendations
-7. Convergence prompt for LLM
+1. Finding rate tracking (new findings per time window)
+2. Novelty detection (are findings genuinely new?)
+3. Stagnation detection (no progress for N steps)
+4. Loop detection (repeated action sequences)
+5. Early termination recommendation
+6. Convergence prompt for LLM
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -23,225 +23,282 @@ logger = structlog.get_logger()
 
 
 class ConvergenceState(str, Enum):
-    EXPLORING = "exploring"         # Still finding new things
-    CONVERGING = "converging"       # Rate is declining
-    DIMINISHING = "diminishing"     # Very few new findings
-    CONVERGED = "converged"         # Should stop
-    STUCK = "stuck"                 # No progress at all
+    PROGRESSING = "progressing"    # Making good progress
+    SLOWING = "slowing"           # Progress slowing down
+    STAGNATING = "stagnating"     # Little to no new progress
+    LOOPING = "looping"           # Repeating same actions
+    CONVERGED = "converged"       # Task appears complete
 
 
 @dataclass
-class FindingWindow:
-    """A time window of findings."""
-    start_time: float = 0.0
-    end_time: float = 0.0
+class ProgressSnapshot:
+    """A point-in-time progress measurement."""
+    timestamp: float = field(default_factory=time.time)
     total_findings: int = 0
     unique_findings: int = 0
-    duplicate_findings: int = 0
-    novel_findings: int = 0      # Never-seen-before type
-    severity_sum: float = 0.0
-
-    @property
-    def duration_s(self) -> float:
-        return max(0.001, self.end_time - self.start_time)
-
-    @property
-    def finding_rate(self) -> float:
-        return self.total_findings / self.duration_s
-
-    @property
-    def novelty_ratio(self) -> float:
-        if self.total_findings == 0:
-            return 0.0
-        return self.novel_findings / self.total_findings
+    actions_taken: int = 0
+    tokens_used: int = 0
+    agents_active: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "total": self.total_findings,
+            "findings": self.total_findings,
             "unique": self.unique_findings,
-            "rate": round(self.finding_rate, 3),
-            "novelty": round(self.novelty_ratio, 2),
+            "actions": self.actions_taken,
         }
 
 
 @dataclass
-class ConvergenceConfig:
-    """Configuration for convergence detection."""
-    window_size_s: float = 300.0     # 5 minute windows
-    min_windows: int = 3             # Minimum windows before deciding
-    rate_decline_threshold: float = 0.3   # Rate dropped by 70%
-    novelty_threshold: float = 0.1        # Less than 10% novel
-    stuck_threshold_s: float = 600.0      # No findings for 10 minutes
-    max_duration_s: float = 7200.0        # Hard stop at 2 hours
-    max_findings: int = 500               # Hard stop at 500 findings
+class ActionRecord:
+    """Record of an agent action for loop detection."""
+    agent_id: str = ""
+    action_type: str = ""
+    target: str = ""
+    tool: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def signature(self) -> str:
+        return f"{self.action_type}:{self.tool}:{self.target}"
+
+
+@dataclass
+class ConvergenceReport:
+    """Convergence analysis report."""
+    state: ConvergenceState = ConvergenceState.PROGRESSING
+    finding_rate: float = 0.0           # Findings per minute
+    novelty_ratio: float = 1.0          # Unique/total findings
+    stagnation_steps: int = 0           # Steps without progress
+    loop_detected: bool = False
+    loop_pattern: str = ""
+    recommendation: str = ""
+    confidence: float = 0.5
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.value[:8],
+            "rate": f"{self.finding_rate:.1f}/min",
+            "novelty": f"{self.novelty_ratio:.0%}",
+            "stagnation": self.stagnation_steps,
+            "loop": self.loop_detected,
+        }
 
 
 class ConvergenceMonitor:
-    """Monitors assessment progress for convergence.
+    """Monitors agent progress and detects convergence/loops.
 
-    Tracks finding rates, novelty, and progress
-    to determine when the agent should stop or
-    change strategy.
+    Tracks finding rates, novelty, action patterns,
+    and recommends when to stop or change strategy.
     """
 
-    def __init__(self, config: ConvergenceConfig | None = None) -> None:
-        self._config = config or ConvergenceConfig()
-        self._windows: list[FindingWindow] = []
-        self._current_window: FindingWindow | None = None
-        self._seen_types: set[str] = set()
-        self._seen_hashes: set[str] = set()
-        self._total_findings = 0
-        self._start_time = time.time()
-        self._last_finding_time = time.time()
-        self._state = ConvergenceState.EXPLORING
+    def __init__(
+        self,
+        stagnation_threshold: int = 10,
+        loop_window: int = 20,
+        min_novelty: float = 0.2,
+    ) -> None:
+        self._snapshots: deque[ProgressSnapshot] = deque(maxlen=100)
+        self._actions: deque[ActionRecord] = deque(maxlen=200)
+        self._finding_hashes: set[str] = set()
+        self._stagnation_threshold = stagnation_threshold
+        self._loop_window = loop_window
+        self._min_novelty = min_novelty
+        self._steps_without_progress = 0
+        self._last_unique_count = 0
         self._log = logger.bind(component="convergence")
 
-    def record_finding(
+    def record_snapshot(
         self,
-        finding_type: str,
-        severity: float = 0.5,
-        finding_hash: str = "",
+        total_findings: int,
+        unique_findings: int,
+        actions_taken: int,
+        tokens_used: int = 0,
+        agents_active: int = 0,
     ) -> None:
-        """Record a new finding."""
-        now = time.time()
+        """Record a progress snapshot."""
+        snapshot = ProgressSnapshot(
+            total_findings=total_findings,
+            unique_findings=unique_findings,
+            actions_taken=actions_taken,
+            tokens_used=tokens_used,
+            agents_active=agents_active,
+        )
+        self._snapshots.append(snapshot)
 
-        # Create window if needed
-        if self._current_window is None:
-            self._current_window = FindingWindow(start_time=now)
-
-        window = self._current_window
-        window.end_time = now
-        window.total_findings += 1
-
-        # Check uniqueness
-        is_duplicate = False
-        if finding_hash:
-            if finding_hash in self._seen_hashes:
-                is_duplicate = True
-            self._seen_hashes.add(finding_hash)
-
-        if is_duplicate:
-            window.duplicate_findings += 1
+        # Track stagnation
+        if unique_findings > self._last_unique_count:
+            self._steps_without_progress = 0
+            self._last_unique_count = unique_findings
         else:
-            window.unique_findings += 1
+            self._steps_without_progress += 1
 
-        # Check novelty
-        if finding_type not in self._seen_types:
-            window.novel_findings += 1
-            self._seen_types.add(finding_type)
+    def record_action(
+        self,
+        agent_id: str,
+        action_type: str,
+        target: str = "",
+        tool: str = "",
+    ) -> None:
+        """Record an agent action."""
+        action = ActionRecord(
+            agent_id=agent_id,
+            action_type=action_type,
+            target=target,
+            tool=tool,
+        )
+        self._actions.append(action)
 
-        window.severity_sum += severity
-        self._total_findings += 1
-        self._last_finding_time = now
+    def record_finding(self, finding_hash: str) -> bool:
+        """Record a finding. Returns True if genuinely new."""
+        if finding_hash in self._finding_hashes:
+            return False
+        self._finding_hashes.add(finding_hash)
+        return True
 
-        # Rotate window if needed
-        if now - window.start_time >= self._config.window_size_s:
-            self._windows.append(window)
-            self._current_window = FindingWindow(start_time=now)
-            self._update_state()
+    def analyze(self) -> ConvergenceReport:
+        """Analyze current convergence state."""
+        report = ConvergenceReport()
 
-    def _update_state(self) -> None:
-        """Update convergence state based on windows."""
-        if len(self._windows) < self._config.min_windows:
-            self._state = ConvergenceState.EXPLORING
-            return
+        # Finding rate
+        report.finding_rate = self._compute_finding_rate()
 
-        # Check rate decline
-        recent = self._windows[-1]
-        oldest = self._windows[0]
+        # Novelty ratio
+        report.novelty_ratio = self._compute_novelty()
 
-        if oldest.finding_rate > 0:
-            rate_ratio = recent.finding_rate / oldest.finding_rate
-            if rate_ratio < self._config.rate_decline_threshold:
-                if recent.novelty_ratio < self._config.novelty_threshold:
-                    self._state = ConvergenceState.CONVERGED
-                    return
-                self._state = ConvergenceState.DIMINISHING
-                return
+        # Loop detection
+        loop_detected, loop_pattern = self._detect_loops()
+        report.loop_detected = loop_detected
+        report.loop_pattern = loop_pattern
 
-        # Check novelty across recent windows
-        recent_novelty = sum(
-            w.novelty_ratio for w in self._windows[-3:]
-        ) / min(3, len(self._windows))
+        # Stagnation
+        report.stagnation_steps = self._steps_without_progress
 
-        if recent_novelty < self._config.novelty_threshold:
-            self._state = ConvergenceState.CONVERGING
-            return
+        # Determine state
+        report.state = self._determine_state(report)
 
-        self._state = ConvergenceState.EXPLORING
+        # Recommendation
+        report.recommendation = self._generate_recommendation(report)
 
-    def should_stop(self) -> tuple[bool, str]:
-        """Check if the assessment should stop."""
-        now = time.time()
-        elapsed = now - self._start_time
+        # Confidence
+        report.confidence = self._compute_confidence(report)
 
-        # Hard time limit
-        if elapsed > self._config.max_duration_s:
-            return True, "max_duration_exceeded"
+        return report
 
-        # Hard finding limit
-        if self._total_findings >= self._config.max_findings:
-            return True, "max_findings_reached"
+    def _compute_finding_rate(self) -> float:
+        """Compute findings per minute over recent window."""
+        if len(self._snapshots) < 2:
+            return 0.0
 
-        # Stuck (no findings for a long time)
-        since_last = now - self._last_finding_time
-        if since_last > self._config.stuck_threshold_s:
-            self._state = ConvergenceState.STUCK
-            return True, "stuck_no_progress"
+        recent = list(self._snapshots)[-10:]
+        if len(recent) < 2:
+            return 0.0
 
-        # Converged
-        if self._state == ConvergenceState.CONVERGED:
-            return True, "converged"
+        time_span = recent[-1].timestamp - recent[0].timestamp
+        if time_span <= 0:
+            return 0.0
+
+        finding_delta = recent[-1].unique_findings - recent[0].unique_findings
+        return (finding_delta / time_span) * 60.0
+
+    def _compute_novelty(self) -> float:
+        """Compute ratio of unique to total findings."""
+        if not self._snapshots:
+            return 1.0
+
+        latest = self._snapshots[-1]
+        if latest.total_findings == 0:
+            return 1.0
+
+        return latest.unique_findings / latest.total_findings
+
+    def _detect_loops(self) -> tuple[bool, str]:
+        """Detect repeated action sequences."""
+        if len(self._actions) < self._loop_window:
+            return False, ""
+
+        recent = [a.signature for a in list(self._actions)[-self._loop_window:]]
+
+        # Check for repeated subsequences
+        for pattern_len in range(2, min(6, len(recent) // 2)):
+            for start in range(len(recent) - pattern_len * 2 + 1):
+                pattern = recent[start:start + pattern_len]
+                repeat_start = start + pattern_len
+                if recent[repeat_start:repeat_start + pattern_len] == pattern:
+                    return True, " → ".join(pattern[:3])
 
         return False, ""
 
-    def should_change_strategy(self) -> bool:
-        """Check if agent should change approach."""
-        return self._state in (
-            ConvergenceState.DIMINISHING,
-            ConvergenceState.CONVERGING,
-        )
+    def _determine_state(self, report: ConvergenceReport) -> ConvergenceState:
+        """Determine convergence state from metrics."""
+        if report.loop_detected:
+            return ConvergenceState.LOOPING
+
+        if report.stagnation_steps >= self._stagnation_threshold:
+            return ConvergenceState.CONVERGED
+
+        if report.stagnation_steps >= self._stagnation_threshold // 2:
+            return ConvergenceState.STAGNATING
+
+        if report.novelty_ratio < self._min_novelty:
+            return ConvergenceState.SLOWING
+
+        if report.finding_rate < 0.5 and len(self._snapshots) > 5:
+            return ConvergenceState.SLOWING
+
+        return ConvergenceState.PROGRESSING
+
+    def _generate_recommendation(self, report: ConvergenceReport) -> str:
+        """Generate recommendation based on state."""
+        recommendations = {
+            ConvergenceState.PROGRESSING: "Continue current approach",
+            ConvergenceState.SLOWING: "Consider changing strategy or scanning deeper",
+            ConvergenceState.STAGNATING: "Switch to different attack surface or tools",
+            ConvergenceState.LOOPING: f"Break loop: stop repeating {report.loop_pattern}",
+            ConvergenceState.CONVERGED: "Assessment complete — move to reporting",
+        }
+        return recommendations.get(report.state, "Continue")
+
+    def _compute_confidence(self, report: ConvergenceReport) -> float:
+        """Compute confidence in convergence assessment."""
+        if len(self._snapshots) < 3:
+            return 0.3
+
+        confidence = 0.5
+
+        # More data = higher confidence
+        confidence += min(0.2, len(self._snapshots) * 0.02)
+
+        # Clear signals boost confidence
+        if report.loop_detected:
+            confidence += 0.2
+        if report.stagnation_steps > self._stagnation_threshold:
+            confidence += 0.15
+
+        return min(1.0, confidence)
 
     def build_convergence_prompt(self) -> str:
         """Build convergence context for LLM."""
-        now = time.time()
-        elapsed = now - self._start_time
-        lines = ["## Convergence\n"]
+        report = self.analyze()
+        lines = ["## Convergence Monitor\n"]
 
-        lines.append(
-            f"State: {self._state.value} | "
-            f"Findings: {self._total_findings} | "
-            f"Elapsed: {elapsed:.0f}s"
-        )
+        lines.append(f"State: {report.state.value}")
+        lines.append(f"Finding rate: {report.finding_rate:.1f}/min")
+        lines.append(f"Novelty: {report.novelty_ratio:.0%}")
+        lines.append(f"Stagnation: {report.stagnation_steps} steps")
 
-        lines.append(f"Unique types: {len(self._seen_types)}")
+        if report.loop_detected:
+            lines.append(f"LOOP DETECTED: {report.loop_pattern}")
 
-        since_last = now - self._last_finding_time
-        lines.append(f"Since last finding: {since_last:.0f}s")
-
-        # Window trend
-        if self._windows:
-            rates = [w.finding_rate for w in self._windows[-5:]]
-            lines.append(f"Recent rates: {', '.join(f'{r:.3f}' for r in rates)}/s")
-
-            novelties = [w.novelty_ratio for w in self._windows[-5:]]
-            lines.append(f"Novelty trend: {', '.join(f'{n:.0%}' for n in novelties)}")
-
-        should_stop, reason = self.should_stop()
-        if should_stop:
-            lines.append(f"\nRECOMMENDATION: STOP ({reason})")
-        elif self.should_change_strategy():
-            lines.append("\nRECOMMENDATION: Change strategy (diminishing returns)")
+        lines.append(f"\nRecommendation: {report.recommendation}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        now = time.time()
+        report = self.analyze()
         return {
-            "state": self._state.value,
-            "total_findings": self._total_findings,
-            "unique_types": len(self._seen_types),
-            "windows": len(self._windows),
-            "elapsed_s": round(now - self._start_time, 1),
-            "since_last_finding_s": round(now - self._last_finding_time, 1),
+            "state": report.state.value,
+            "snapshots": len(self._snapshots),
+            "actions": len(self._actions),
+            "unique_findings": len(self._finding_hashes),
+            "stagnation_steps": self._steps_without_progress,
         }
