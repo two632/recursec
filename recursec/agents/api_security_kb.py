@@ -1,11 +1,11 @@
 """API security knowledge base.
 
-Deep knowledge about API vulnerabilities:
-1. REST API security issues
-2. GraphQL exploitation
-3. gRPC and WebSocket attacks
-4. API authentication flaws
-5. API rate limiting and abuse
+Deep knowledge about API security testing:
+1. REST API vulnerabilities
+2. GraphQL security
+3. gRPC security
+4. WebSocket security
+5. API authentication attacks
 """
 
 from __future__ import annotations
@@ -41,192 +41,202 @@ API_PATTERNS: list[dict[str, Any]] = [
     {
         "id": "api-001", "name": "REST API Vulnerabilities",
         "category": "rest", "severity": "high",
-        "desc": "Common REST API security issues.",
+        "desc": "REST API security vulnerabilities.",
         "detection": (
             "REST API VULNERABILITIES:\n"
-            "ENDPOINT DISCOVERY:\n"
-            "  # Swagger/OpenAPI\n"
-            "  /swagger.json, /openapi.json\n"
-            "  /api-docs, /swagger-ui.html\n"
-            "  /v1/docs, /v2/api-docs\n"
-            "  /.well-known/openapi.json\n"
-            "  # Wordlist fuzzing\n"
-            "  ffuf -u https://target/api/FUZZ -w api-endpoints.txt\n"
-            "BOLA (Broken Object Level Authorization):\n"
-            "  - OWASP API Security #1\n"
-            "  - Change resource IDs in URLs\n"
-            "  - GET /api/users/123 → GET /api/users/124\n"
-            "  - Test with different auth tokens\n"
-            "BFLA (Broken Function Level Authorization):\n"
-            "  - User accessing admin endpoints\n"
-            "  - POST /api/admin/users (with user token)\n"
-            "  - DELETE /api/users/123 (user deleting others)\n"
-            "MASS ASSIGNMENT:\n"
-            "  - POST /api/users {\"name\":\"test\",\"role\":\"admin\"}\n"
-            "  - PUT /api/profile {\"isAdmin\":true}\n"
-            "  - Include unexpected fields in request\n"
-            "SSRF VIA API:\n"
-            "  - URL parameters: ?url=http://169.254.169.254/\n"
-            "  - Webhook URLs pointing to internal services\n"
-            "  - File import from URL\n"
-            "EXCESSIVE DATA EXPOSURE:\n"
-            "  - API returning sensitive fields\n"
-            "  - Debug information in responses\n"
-            "  - Stack traces in error responses"
+            "OWASP API TOP 10 (2023):\n"
+            "  API1: Broken Object Level Authorization (BOLA/IDOR)\n"
+            "    - Change ID in /api/users/123 → /api/users/124\n"
+            "    - UUID enumeration\n"
+            "    - Check every endpoint with different user IDs\n"
+            "  API2: Broken Authentication\n"
+            "    - Weak JWT (none algo, weak secret)\n"
+            "    - API key exposure\n"
+            "    - No rate limiting on auth endpoints\n"
+            "  API3: Broken Object Property Level Authorization\n"
+            "    - Mass assignment: send extra fields in PUT/PATCH\n"
+            "    - Excessive data exposure in responses\n"
+            "  API4: Unrestricted Resource Consumption\n"
+            "    - No pagination limits\n"
+            "    - GraphQL depth/complexity\n"
+            "    - File upload size limits\n"
+            "  API5: Broken Function Level Authorization\n"
+            "    - Admin endpoints accessible to users\n"
+            "    - HTTP method tampering (GET→DELETE)\n"
+            "  API6: Unrestricted Access to Sensitive Business Flows\n"
+            "    - Purchase flow abuse\n"
+            "    - Comment/review spam\n"
+            "  API7: Server Side Request Forgery\n"
+            "  API8: Security Misconfiguration\n"
+            "    - CORS misconfiguration\n"
+            "    - Verbose error messages\n"
+            "    - Default credentials\n"
+            "  API9: Improper Inventory Management\n"
+            "    - Deprecated API versions still active\n"
+            "    - Shadow APIs\n"
+            "  API10: Unsafe Consumption of APIs\n"
+            "    - Trusting third-party API responses\n"
+            "TOOLS:\n"
+            "  Burp Suite, Postman, ffuf, nuclei, arjun"
         ),
-        "tools": ["ffuf", "nuclei", "burpsuite"],
+        "tools": ["burp", "postman", "arjun"],
     },
     {
-        "id": "api-002", "name": "GraphQL Exploitation",
-        "category": "graphql", "severity": "critical",
-        "desc": "GraphQL-specific attack techniques.",
+        "id": "api-002", "name": "GraphQL Security",
+        "category": "graphql", "severity": "high",
+        "desc": "GraphQL API security testing.",
         "detection": (
-            "GRAPHQL EXPLOITATION:\n"
-            "DISCOVERY:\n"
-            "  # Common endpoints\n"
-            "  /graphql, /graphiql, /v1/graphql\n"
-            "  /api/graphql, /query, /gql\n"
-            "  # Introspection query\n"
-            "  {__schema{types{name fields{name type{name}}}}}\n"
-            "  # Check if introspection is enabled\n"
-            "  {__type(name:\"Query\"){name fields{name}}}\n"
+            "GRAPHQL SECURITY:\n"
+            "INTROSPECTION:\n"
+            "  # Query schema\n"
+            "  {__schema{types{name,fields{name,args{name}}}}}\n"
+            "  # Tools: graphql-voyager, InQL\n"
+            "  # Disable in production!\n"
             "ATTACKS:\n"
             "  INJECTION:\n"
-            "    - SQL injection in resolvers\n"
-            "    - NoSQL injection in filters\n"
-            "    query { users(filter: \"{$ne: null}\") { name } }\n"
-            "  BATCHING:\n"
-            "    - Send multiple queries in one request\n"
-            "    - Bypass rate limiting\n"
-            "    [{\"query\":\"...\"},{ \"query\":\"...\"}]\n"
-            "  DEPTH ATTACK:\n"
-            "    - Nested queries causing DoS\n"
-            "    { users { friends { friends { friends { ... } } } } }\n"
-            "  FIELD SUGGESTION:\n"
-            "    - Misspell field names to get suggestions\n"
-            "    - Reveals schema without introspection\n"
-            "AUTHORIZATION:\n"
-            "  - Query other users' data\n"
-            "  - Mutation without proper auth\n"
-            "  - Subscription access control\n"
+            "    - SQLi through GraphQL variables\n"
+            "    - NoSQLi in resolvers\n"
+            "    - SSRF via URL fields\n"
+            "  AUTHORIZATION:\n"
+            "    - Query fields you shouldn't access\n"
+            "    - Nested object access (user.admin.settings)\n"
+            "    - Mutation authorization bypass\n"
+            "    - Batch queries to bypass rate limits\n"
+            "  DENIAL OF SERVICE:\n"
+            "    - Deep nesting: {a{b{c{d{e{f}}}}}}\n"
+            "    - Circular fragments\n"
+            "    - Aliases: query { a1:user(id:1) a2:user(id:2) ... }\n"
+            "    - Unbounded list queries\n"
+            "  INFORMATION DISCLOSURE:\n"
+            "    - Field suggestions (typo reveals field names)\n"
+            "    - Debug mode errors\n"
+            "    - Stack traces\n"
+            "PREVENTION:\n"
+            "  - Disable introspection in prod\n"
+            "  - Query depth limiting\n"
+            "  - Query complexity analysis\n"
+            "  - Persisted queries only\n"
             "TOOLS:\n"
-            "  graphql-voyager  # Schema visualization\n"
-            "  InQL (Burp extension)  # GraphQL testing\n"
-            "  graphw00f  # GraphQL fingerprinting"
+            "  InQL, graphw00f, GraphQL Voyager, clairvoyance"
         ),
-        "tools": ["graphw00f", "burpsuite"],
+        "tools": ["inql", "graphw00f"],
     },
     {
-        "id": "api-003", "name": "WebSocket Attacks",
-        "category": "websocket", "severity": "high",
-        "desc": "WebSocket security vulnerabilities.",
-        "detection": (
-            "WEBSOCKET ATTACKS:\n"
-            "DISCOVERY:\n"
-            "  - Look for ws:// or wss:// connections\n"
-            "  - Check Upgrade: websocket headers\n"
-            "  - Browser DevTools → Network → WS filter\n"
-            "CROSS-SITE WEBSOCKET HIJACKING:\n"
-            "  - No Origin header validation\n"
-            "  - Create malicious page that connects to target WS\n"
-            "  - Steal data from authenticated WS connection\n"
-            "  - Similar to CSRF but for WebSockets\n"
-            "MESSAGE MANIPULATION:\n"
-            "  - Intercept and modify WS messages\n"
-            "  - Inject additional messages\n"
-            "  - Replay captured messages\n"
-            "  - Test for injection in message content\n"
-            "AUTHENTICATION:\n"
-            "  - Token in URL parameter (leaks in logs)\n"
-            "  - No authentication on WS upgrade\n"
-            "  - Session token not validated per message\n"
-            "DoS:\n"
-            "  - Flood with messages\n"
-            "  - Large message payload\n"
-            "  - Many concurrent connections\n"
-            "TESTING:\n"
-            "  - Burp Suite WebSocket support\n"
-            "  - wscat CLI tool\n"
-            "  wscat -c ws://target/ws"
-        ),
-        "tools": ["burpsuite", "wscat"],
-    },
-    {
-        "id": "api-004", "name": "API Authentication Flaws",
-        "category": "api_auth", "severity": "critical",
-        "desc": "API authentication and key management issues.",
-        "detection": (
-            "API AUTHENTICATION FLAWS:\n"
-            "API KEY ISSUES:\n"
-            "  - Keys in URL parameters (logged)\n"
-            "  - Keys in client-side code (exposed)\n"
-            "  - Keys in git repositories\n"
-            "  - No key rotation\n"
-            "  - Overly permissive key scope\n"
-            "  # Search for exposed keys\n"
-            "  trufflehog git https://github.com/org/repo\n"
-            "  gitleaks detect --source .\n"
-            "JWT ISSUES:\n"
-            "  - Algorithm confusion (RS256 → HS256)\n"
-            "  - Weak signing key\n"
-            "  - No expiration validation\n"
-            "  - Token in URL (referer leakage)\n"
-            "  - Claim manipulation (role, sub)\n"
-            "BEARER TOKEN:\n"
-            "  - Token leakage in logs\n"
-            "  - No token revocation\n"
-            "  - Long-lived tokens\n"
-            "  - Token reuse across services\n"
-            "API KEY ENUMERATION:\n"
-            "  - Predictable key format\n"
-            "  - Key in response headers\n"
-            "  - Key generation endpoint without auth\n"
-            "TESTING:\n"
-            "  1. Test with no auth\n"
-            "  2. Test with expired token\n"
-            "  3. Test with modified token\n"
-            "  4. Test with different user's token"
-        ),
-        "tools": ["trufflehog", "gitleaks", "jwt_tool"],
-    },
-    {
-        "id": "api-005", "name": "gRPC Security",
-        "category": "grpc", "severity": "high",
-        "desc": "gRPC and Protocol Buffer security issues.",
+        "id": "api-003", "name": "gRPC Security",
+        "category": "grpc", "severity": "medium",
+        "desc": "gRPC API security testing.",
         "detection": (
             "gRPC SECURITY:\n"
             "DISCOVERY:\n"
-            "  - Port scanning for gRPC (common: 50051)\n"
-            "  - gRPC reflection enabled?\n"
-            "  grpcurl -plaintext target:50051 list\n"
-            "  grpcurl -plaintext target:50051 describe <service>\n"
+            "  # Server reflection (if enabled)\n"
+            "  grpcurl -plaintext host:port list\n"
+            "  grpcurl -plaintext host:port describe <service>\n"
+            "  # Protobuf file extraction\n"
+            "  # Service enumeration\n"
             "ATTACKS:\n"
-            "  - No TLS (plaintext gRPC)\n"
-            "  - Reflection enabled in production\n"
-            "  - Missing authentication metadata\n"
-            "  - Message size limit abuse\n"
-            "  - Protobuf deserialization issues\n"
-            "TESTING:\n"
-            "  # List services\n"
-            "  grpcurl -plaintext target:50051 list\n"
-            "  # Describe service\n"
-            "  grpcurl -plaintext target:50051 describe pkg.Service\n"
-            "  # Invoke method\n"
-            "  grpcurl -plaintext -d '{\"id\": 1}' target:50051 pkg.Service/GetUser\n"
-            "  # Test auth\n"
-            "  grpcurl -plaintext -H 'authorization: Bearer <token>' \\\n"
-            "    target:50051 pkg.Service/AdminMethod\n"
-            "PROTOBUF:\n"
-            "  - Decode unknown protobuf messages\n"
-            "  - Modify field values\n"
-            "  - Add unexpected fields\n"
-            "  - Fuzz protobuf messages with random data\n"
+            "  AUTHENTICATION:\n"
+            "    - Missing auth on streams\n"
+            "    - Token in metadata vs channel\n"
+            "    - mTLS misconfiguration\n"
+            "  INJECTION:\n"
+            "    - Protobuf field manipulation\n"
+            "    - Type confusion (int32 overflow)\n"
+            "    - Unknown field numbers\n"
+            "  AUTHORIZATION:\n"
+            "    - Method-level access control\n"
+            "    - Stream message authorization\n"
+            "    - Cross-service requests\n"
+            "  RESOURCE:\n"
+            "    - Large message payload\n"
+            "    - Stream flooding\n"
+            "    - Deadline manipulation\n"
+            "  INTERCEPTION:\n"
+            "    - Plaintext gRPC (no TLS)\n"
+            "    - HTTP/2 MITM\n"
+            "    - Channel credential theft\n"
             "TOOLS:\n"
-            "  grpcurl  # gRPC CLI\n"
-            "  grpcui  # gRPC web UI\n"
-            "  protobuf-inspector  # Decode protobufs"
+            "  grpcurl, grpcui, protobuf-inspector, evans"
         ),
-        "tools": ["grpcurl", "grpcui"],
+        "tools": ["grpcurl", "evans"],
+    },
+    {
+        "id": "api-004", "name": "WebSocket Security",
+        "category": "websocket", "severity": "high",
+        "desc": "WebSocket security testing.",
+        "detection": (
+            "WEBSOCKET SECURITY:\n"
+            "CONNECTION:\n"
+            "  - Upgrade from HTTP(S)\n"
+            "  - Origin header validation (CSWSH)\n"
+            "  - Authentication in handshake\n"
+            "  - Token in URL query string (logged!)\n"
+            "ATTACKS:\n"
+            "  CROSS-SITE WEBSOCKET HIJACKING:\n"
+            "    - Malicious page opens WS to target\n"
+            "    - No Origin check → full hijack\n"
+            "    - Read/write messages as victim\n"
+            "  INJECTION:\n"
+            "    - SQLi through WS messages\n"
+            "    - XSS via WS → DOM render\n"
+            "    - Command injection in message\n"
+            "  AUTHORIZATION:\n"
+            "    - Subscribe to unauthorized channels\n"
+            "    - Send admin-only messages\n"
+            "    - Replay messages\n"
+            "  DENIAL OF SERVICE:\n"
+            "    - Connection flooding\n"
+            "    - Large message frames\n"
+            "    - Slow read attack\n"
+            "  INFORMATION LEAK:\n"
+            "    - Sensitive data in WS messages\n"
+            "    - Broadcast to wrong recipients\n"
+            "    - Debug messages in production\n"
+            "TESTING:\n"
+            "  - Intercept with Burp (Repeater → WS)\n"
+            "  - wscat for manual testing\n"
+            "  - Autobahn for fuzzing\n"
+            "TOOLS:\n"
+            "  Burp Suite, wscat, websocat, Autobahn"
+        ),
+        "tools": ["burp", "wscat"],
+    },
+    {
+        "id": "api-005", "name": "API Auth Attacks",
+        "category": "auth", "severity": "critical",
+        "desc": "API authentication attack techniques.",
+        "detection": (
+            "API AUTHENTICATION ATTACKS:\n"
+            "JWT ATTACKS:\n"
+            "  - Algorithm confusion (RS256→HS256)\n"
+            "  - None algorithm: {\"alg\":\"none\"}\n"
+            "  - Weak secret (hashcat -m 16500)\n"
+            "  - Kid injection (path traversal in kid)\n"
+            "  - JKU/X5U header injection\n"
+            "  - JWT expiry not enforced\n"
+            "  - No audience/issuer validation\n"
+            "OAUTH:\n"
+            "  - Open redirect in redirect_uri\n"
+            "  - CSRF in OAuth flow (missing state)\n"
+            "  - Token leakage in Referer\n"
+            "  - Scope escalation\n"
+            "  - Client credential theft\n"
+            "  - PKCE downgrade\n"
+            "API KEY:\n"
+            "  - Key in URL (logged everywhere)\n"
+            "  - Key reuse across environments\n"
+            "  - No per-key rate limiting\n"
+            "  - No key rotation\n"
+            "  - Key scope too broad\n"
+            "SESSION:\n"
+            "  - Session fixation\n"
+            "  - Session hijacking\n"
+            "  - Insufficient session expiry\n"
+            "  - No concurrent session limit\n"
+            "  - Missing secure/httponly flags\n"
+            "TOOLS:\n"
+            "  jwt_tool, Burp JWT extensions, oauth-tester"
+        ),
+        "tools": ["jwt_tool"],
     },
 ]
 
@@ -234,7 +244,7 @@ API_PATTERNS: list[dict[str, Any]] = [
 class APISecurityKB:
     """API security knowledge base.
 
-    Provides API vulnerability patterns
+    Provides API security patterns
     injected into agent prompts.
     """
 
@@ -270,7 +280,7 @@ class APISecurityKB:
         max_patterns: int = 4,
     ) -> str:
         """Build API security prompt."""
-        lines = ["## API Security Patterns\n"]
+        lines = ["## API Security\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
