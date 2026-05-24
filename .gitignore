@@ -19,3 +19,4 @@ data/
 *.swo
 rust/pattern_engine/target/
 rust/hash_engine/target/
+output/
