@@ -1,11 +1,11 @@
-"""Cryptographic attacks knowledge base.
+"""Cryptography attacks knowledge base.
 
 Deep knowledge about cryptographic attacks:
-1. TLS/SSL attacks
-2. Hash attacks
-3. Symmetric cipher attacks
-4. PKI/certificate attacks
-5. Cryptographic implementation flaws
+1. Symmetric cipher attacks
+2. Asymmetric/PKI attacks
+3. Hash function attacks
+4. Protocol-level attacks
+5. Implementation vulnerabilities
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ logger = structlog.get_logger()
 
 @dataclass
 class CryptoPattern:
-    """A cryptographic attack pattern."""
+    """A cryptography attack pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
@@ -39,218 +39,204 @@ class CryptoPattern:
 
 CRYPTO_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "cry-001", "name": "TLS/SSL Attacks",
-        "category": "tls", "severity": "high",
-        "desc": "TLS/SSL protocol attacks.",
-        "detection": (
-            "TLS/SSL ATTACKS:\n"
-            "PROTOCOL:\n"
-            "  - SSLv2 (DROWN attack)\n"
-            "  - SSLv3 (POODLE attack)\n"
-            "  - TLS 1.0 (BEAST attack)\n"
-            "  - TLS 1.1 (deprecated)\n"
-            "  - TLS 1.2 (weak ciphers possible)\n"
-            "  - TLS 1.3 (current best)\n"
-            "CIPHER SUITES:\n"
-            "  - RC4 (biased output)\n"
-            "  - 3DES (Sweet32)\n"
-            "  - CBC mode (Lucky13, padding oracles)\n"
-            "  - Export ciphers (FREAK, Logjam)\n"
-            "  - NULL ciphers\n"
-            "ATTACKS:\n"
-            "  HEARTBLEED (CVE-2014-0160):\n"
-            "    - OpenSSL memory disclosure\n"
-            "    - Leak private keys, session data\n"
-            "  ROBOT:\n"
-            "    - RSA PKCS#1 v1.5 padding oracle\n"
-            "    - Decrypt pre-master secret\n"
-            "  RENEGOTIATION:\n"
-            "    - Client-initiated renegotiation DoS\n"
-            "    - Triple handshake attack\n"
-            "  TICKETBLEED:\n"
-            "    - F5 BIG-IP session ticket leak\n"
-            "TESTING:\n"
-            "  # testssl.sh\n"
-            "  ./testssl.sh target.com\n"
-            "  # sslyze\n"
-            "  sslyze --regular target.com\n"
-            "  # nmap\n"
-            "  nmap --script ssl-enum-ciphers -p 443 target\n"
-            "TOOLS:\n"
-            "  testssl.sh, sslyze, nmap, sslscan"
-        ),
-        "tools": ["testssl.sh", "sslyze"],
-    },
-    {
-        "id": "cry-002", "name": "Hash Attacks",
-        "category": "hash", "severity": "high",
-        "desc": "Cryptographic hash attacks.",
-        "detection": (
-            "HASH ATTACKS:\n"
-            "CRACKING:\n"
-            "  HASHCAT:\n"
-            "    # MD5\n"
-            "    hashcat -m 0 hashes.txt wordlist.txt\n"
-            "    # SHA-256\n"
-            "    hashcat -m 1400 hashes.txt wordlist.txt\n"
-            "    # NTLM\n"
-            "    hashcat -m 1000 hashes.txt wordlist.txt\n"
-            "    # bcrypt\n"
-            "    hashcat -m 3200 hashes.txt wordlist.txt\n"
-            "    # Rule-based\n"
-            "    hashcat -m 0 hashes.txt wordlist.txt -r rules/best64.rule\n"
-            "    # Mask attack\n"
-            "    hashcat -m 0 hashes.txt -a 3 ?u?l?l?l?d?d?d?d\n"
-            "  JOHN THE RIPPER:\n"
-            "    john --wordlist=wordlist.txt hashes.txt\n"
-            "    john --rules hashes.txt\n"
-            "WEAK ALGORITHMS:\n"
-            "  - MD5: collision attacks (chosen-prefix)\n"
-            "  - SHA-1: SHAttered attack\n"
-            "  - CRC32: not cryptographic\n"
-            "  - MD4: completely broken\n"
-            "PASSWORD STORAGE:\n"
-            "  BAD: MD5, SHA-1, SHA-256 (unsalted)\n"
-            "  OK: SHA-256 + salt\n"
-            "  GOOD: bcrypt, scrypt, Argon2\n"
-            "  BEST: Argon2id\n"
-            "RAINBOW TABLES:\n"
-            "  - Pre-computed hash lookups\n"
-            "  - Defeated by salting\n"
-            "  - Online services: CrackStation, hashes.org\n"
-            "TOOLS:\n"
-            "  Hashcat, John the Ripper, CrackStation"
-        ),
-        "tools": ["hashcat", "john"],
-    },
-    {
-        "id": "cry-003", "name": "Symmetric Cipher Attacks",
+        "id": "cry-001", "name": "Symmetric Cipher Attacks",
         "category": "symmetric", "severity": "high",
-        "desc": "Symmetric cipher attack patterns.",
+        "desc": "Symmetric cipher attack techniques.",
         "detection": (
             "SYMMETRIC CIPHER ATTACKS:\n"
             "ECB MODE:\n"
-            "  - Block-level pattern visible\n"
-            "  - ECB penguin problem\n"
-            "  - Block swapping/reordering\n"
-            "  - Detect: repeated ciphertext blocks\n"
+            "  - Block pattern leakage\n"
+            "  - Cut-and-paste attacks\n"
+            "  - Deterministic encryption\n"
+            "  # Detect: identical blocks in ciphertext\n"
             "CBC MODE:\n"
-            "  - Padding oracle (Vaudenay)\n"
-            "  - Byte-at-a-time decryption\n"
-            "  - CBC bit-flipping\n"
-            "  - IV manipulation\n"
-            "  - BEAST (browser exploit)\n"
-            "  - Lucky13 (timing attack)\n"
-            "CTR/GCM:\n"
-            "  - Nonce reuse → keystream recovery\n"
-            "  - GCM nonce reuse → authentication bypass\n"
-            "  - Forbidden attack (nonce reuse in GCM)\n"
+            "  - Padding oracle attacks\n"
+            "    # Vaudenay attack\n"
+            "    # POODLE (SSLv3)\n"
+            "    # Lucky 13\n"
+            "  - Bit-flipping attacks\n"
+            "    # Modify ciphertext → predictable plaintext\n"
+            "  - IV reuse vulnerabilities\n"
+            "  - CBC-R (CBC decryption as encryption)\n"
+            "CTR MODE:\n"
+            "  - Nonce reuse → keystream reuse\n"
+            "  - Two-time pad attack\n"
+            "  - Malleable ciphertext\n"
+            "GCM MODE:\n"
+            "  - Nonce reuse → key recovery\n"
+            "  - Forbidden attack\n"
+            "  - Tag truncation\n"
             "KEY MANAGEMENT:\n"
-            "  - Hardcoded keys\n"
-            "  - Key in source code/config\n"
-            "  - Weak key derivation\n"
-            "  - Same key for encrypt and MAC\n"
-            "  - Predictable IV/nonce\n"
-            "IMPLEMENTATION:\n"
-            "  - Timing side-channels\n"
-            "  - Power analysis\n"
-            "  - Cache-timing attacks\n"
-            "  - Fault injection\n"
+            "  - Hardcoded keys in source\n"
+            "  - Weak key derivation (no PBKDF2/Argon2)\n"
+            "  - Key in memory (cold boot)\n"
+            "  - Key reuse across contexts\n"
             "TOOLS:\n"
-            "  PadBuster, custom scripts, CrypTool"
+            "  PadBuster, python-paddingoracle, CyberChef"
         ),
-        "tools": ["padbuster"],
+        "tools": [],
     },
     {
-        "id": "cry-004", "name": "PKI/Certificate Attacks",
-        "category": "pki", "severity": "high",
-        "desc": "PKI and certificate attacks.",
+        "id": "cry-002", "name": "Asymmetric/PKI Attacks",
+        "category": "asymmetric", "severity": "critical",
+        "desc": "Asymmetric cryptography and PKI attacks.",
         "detection": (
-            "PKI/CERTIFICATE ATTACKS:\n"
-            "CERTIFICATE ISSUES:\n"
-            "  - Self-signed certificates\n"
-            "  - Expired certificates\n"
-            "  - Wildcard certificate misuse\n"
-            "  - Weak signature (SHA-1, MD5)\n"
-            "  - Weak RSA key (< 2048 bits)\n"
-            "  - Missing certificate transparency\n"
-            "VALIDATION BYPASS:\n"
-            "  - Hostname verification skip\n"
-            "  - Certificate pinning bypass\n"
-            "  - Trust store manipulation\n"
-            "  - Intermediate CA abuse\n"
+            "ASYMMETRIC / PKI ATTACKS:\n"
+            "RSA:\n"
+            "  - Small public exponent (e=3)\n"
+            "    # Coppersmith's attack\n"
+            "    # Cube root attack\n"
+            "  - Factorization\n"
+            "    # Fermat's method (close primes)\n"
+            "    # Pollard's rho\n"
+            "    # GNFS (large keys)\n"
+            "  - Common modulus attack\n"
+            "  - Wiener's attack (small d)\n"
+            "  - Bleichenbacher (PKCS#1 v1.5)\n"
+            "  - ROCA (Infineon key generation)\n"
+            "  - Padding oracle (OAEP implementation)\n"
+            "ELLIPTIC CURVE:\n"
+            "  - Invalid curve attack\n"
+            "  - Twist attack\n"
+            "  - Small subgroup attack\n"
+            "  - Nonce reuse in ECDSA (Sony PS3)\n"
+            "  - Lattice attacks on biased nonces\n"
+            "PKI:\n"
+            "  - Certificate validation bypass\n"
             "  - Null byte in CN/SAN\n"
-            "ATTACKS:\n"
-            "  - MITM with rogue CA\n"
-            "  - BGP hijacking + CA challenge\n"
-            "  - Certificate transparency log monitoring\n"
-            "  - Domain fronting\n"
-            "  - Key compromise (Heartbleed)\n"
-            "CT MONITORING:\n"
-            "  # Monitor certificate issuance\n"
-            "  # crt.sh\n"
-            "  curl 'https://crt.sh/?q=%.target.com&output=json'\n"
-            "  # certspotter\n"
-            "  # Facebook CT monitor\n"
-            "ACME/LE:\n"
-            "  - DNS-01 challenge hijacking\n"
-            "  - HTTP-01 challenge race\n"
-            "  - Domain validation bypass\n"
+            "  - Weak CA signing\n"
+            "  - CT log monitoring gaps\n"
+            "  - OCSP stapling issues\n"
+            "  - Certificate pinning bypass\n"
             "TOOLS:\n"
-            "  testssl.sh, crt.sh, OpenSSL"
+            "  RsaCtfTool, SageMath, openssl, certtool"
         ),
-        "tools": ["testssl.sh"],
+        "tools": [],
     },
     {
-        "id": "cry-005", "name": "Crypto Implementation Flaws",
-        "category": "implementation", "severity": "critical",
-        "desc": "Cryptographic implementation vulnerabilities.",
+        "id": "cry-003", "name": "Hash Function Attacks",
+        "category": "hash", "severity": "high",
+        "desc": "Hash function attack techniques.",
         "detection": (
-            "CRYPTO IMPLEMENTATION FLAWS:\n"
-            "RANDOM NUMBER:\n"
-            "  - Predictable PRNG seed\n"
-            "  - Using Math.random() for security\n"
-            "  - Weak entropy sources\n"
-            "  - Time-based seeds\n"
-            "  - PID/thread-based seeds\n"
-            "  FIX: Use /dev/urandom, os.urandom(),\n"
-            "       crypto.getRandomValues()\n"
-            "CUSTOM CRYPTO:\n"
-            "  - Rolling your own encryption\n"
-            "  - XOR-only encryption\n"
-            "  - Substitution ciphers\n"
-            "  - Transposition-only ciphers\n"
-            "  - Home-grown MAC\n"
-            "  RULE: Never roll your own crypto\n"
-            "ORACLE ATTACKS:\n"
-            "  - Padding oracle (AES-CBC)\n"
-            "  - Bleichenbacher (RSA PKCS#1)\n"
-            "  - Error-based oracles\n"
-            "  - Timing-based oracles\n"
-            "  - Compression oracles (CRIME/BREACH)\n"
-            "AUTHENTICATION:\n"
-            "  - MAC-then-encrypt (bad order)\n"
-            "  - No authentication (encrypt-only)\n"
-            "  - Length extension (MD5, SHA-1, SHA-256)\n"
-            "  FIX: Use AEAD (AES-GCM, ChaCha20-Poly1305)\n"
-            "CODE PATTERNS TO FIND:\n"
-            "  # Python\n"
-            "  import random  # NOT for security\n"
-            "  DES.new()  # Deprecated\n"
-            "  AES.new(key, AES.MODE_ECB)  # Bad mode\n"
-            "  # Java\n"
-            "  new Random()  # NOT SecureRandom\n"
-            "  Cipher.getInstance(\"AES\")  # Defaults to ECB\n"
+            "HASH FUNCTION ATTACKS:\n"
+            "WEAK HASHES:\n"
+            "  - MD5 (collision in seconds)\n"
+            "  - SHA-1 (SHAttered, practical collision)\n"
+            "  - CRC32 (trivial collision)\n"
+            "ATTACKS:\n"
+            "  - Length extension attack\n"
+            "    # MD5, SHA-1, SHA-256 (Merkle-Damgard)\n"
+            "    # NOT: SHA-3, HMAC, truncated hashes\n"
+            "    # Tool: hash_extender, hashpump\n"
+            "  - Birthday attack\n"
+            "    # 2^(n/2) operations for n-bit hash\n"
+            "  - Preimage attack (find input for hash)\n"
+            "  - Second preimage (find collision)\n"
+            "PASSWORD HASHING:\n"
+            "  - Unsalted hashes (rainbow table)\n"
+            "  - Fast hashes (MD5, SHA-1 for passwords)\n"
+            "  - Short salt\n"
+            "  - Salt reuse\n"
+            "  PROPER:\n"
+            "    - bcrypt (Blowfish-based)\n"
+            "    - scrypt (memory-hard)\n"
+            "    - Argon2 (OWASP recommended)\n"
+            "CRACKING:\n"
+            "  # hashcat -m 0 hashes.txt wordlist.txt (MD5)\n"
+            "  # hashcat -m 1000 hashes.txt wordlist.txt (NTLM)\n"
+            "  # john --wordlist=rockyou.txt hashes.txt\n"
+            "  - Rule-based mutations\n"
+            "  - Mask attacks\n"
+            "  - Combinator attacks\n"
             "TOOLS:\n"
-            "  Semgrep crypto rules, custom analysis"
+            "  hashcat, john, hash_extender, hashpump"
         ),
-        "tools": ["semgrep"],
+        "tools": ["hashcat"],
+    },
+    {
+        "id": "cry-004", "name": "Protocol-Level Attacks",
+        "category": "protocol", "severity": "critical",
+        "desc": "Cryptographic protocol attacks.",
+        "detection": (
+            "PROTOCOL-LEVEL ATTACKS:\n"
+            "TLS:\n"
+            "  - Downgrade attacks\n"
+            "    # POODLE (force SSLv3)\n"
+            "    # DROWN (SSLv2 on RSA)\n"
+            "    # FREAK (export ciphers)\n"
+            "    # Logjam (512-bit DH)\n"
+            "  - BEAST (CBC in TLS 1.0)\n"
+            "  - CRIME/BREACH (compression oracle)\n"
+            "  - Heartbleed (OpenSSL buffer overread)\n"
+            "  - ROBOT (Bleichenbacher on TLS)\n"
+            "  - Raccoon (DH key exchange)\n"
+            "  # testssl.sh TARGET\n"
+            "  # sslyze --regular TARGET\n"
+            "JWT:\n"
+            "  - Algorithm confusion (RS256→HS256)\n"
+            "  - None algorithm bypass\n"
+            "  - Weak signing key\n"
+            "  - JKU/JWK header injection\n"
+            "  - Kid header path traversal\n"
+            "  # jwt_tool.py -t URL -M at\n"
+            "SSH:\n"
+            "  - Terrapin attack (prefix truncation)\n"
+            "  - Weak key exchange\n"
+            "  - Host key verification\n"
+            "WPA:\n"
+            "  - KRACK (key reinstallation)\n"
+            "  - Dragonblood (WPA3-SAE)\n"
+            "TOOLS:\n"
+            "  testssl.sh, sslyze, jwt_tool, ssh-audit"
+        ),
+        "tools": [],
+    },
+    {
+        "id": "cry-005", "name": "Implementation Vulnerabilities",
+        "category": "implementation", "severity": "high",
+        "desc": "Cryptographic implementation flaws.",
+        "detection": (
+            "IMPLEMENTATION VULNERABILITIES:\n"
+            "SIDE CHANNELS:\n"
+            "  - Timing attacks\n"
+            "    # String comparison timing\n"
+            "    # RSA decryption timing\n"
+            "    # Cache timing (Flush+Reload)\n"
+            "  - Power analysis\n"
+            "    # Simple (SPA)\n"
+            "    # Differential (DPA)\n"
+            "  - Electromagnetic emanation\n"
+            "  - Acoustic (RSA key extraction)\n"
+            "  - Spectre/Meltdown (CPU)\n"
+            "RANDOM NUMBER:\n"
+            "  - Predictable PRNG\n"
+            "    # Math.random() (not crypto)\n"
+            "    # time-based seeds\n"
+            "    # /dev/urandom vs /dev/random\n"
+            "  - Insufficient entropy\n"
+            "  - PRNG state recovery\n"
+            "  - Dual_EC_DRBG (NSA backdoor)\n"
+            "COMMON MISTAKES:\n"
+            "  - Rolling your own crypto\n"
+            "  - ECB mode for structured data\n"
+            "  - Nonce/IV reuse\n"
+            "  - MAC-then-encrypt (vs encrypt-then-MAC)\n"
+            "  - Comparing MACs without constant-time\n"
+            "  - Using encryption for authentication\n"
+            "  - Ignoring return values\n"
+            "  - Key in source code\n"
+            "  - Base64 as 'encryption'\n"
+            "  - XOR with short key\n"
+            "TOOLS:\n"
+            "  CyberChef, SageMath, dieharder, ent"
+        ),
+        "tools": [],
     },
 ]
 
 
 class CryptoAttacksKB:
-    """Cryptographic attacks knowledge base.
+    """Cryptography attacks knowledge base.
 
     Provides crypto attack patterns
     injected into agent prompts.
@@ -288,7 +274,7 @@ class CryptoAttacksKB:
         max_patterns: int = 4,
     ) -> str:
         """Build crypto attacks prompt."""
-        lines = ["## Cryptographic Attacks\n"]
+        lines = ["## Cryptography Attacks\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
