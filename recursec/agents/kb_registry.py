@@ -316,6 +316,30 @@ KB_REGISTRY: dict[str, KBEntry] = {
         pattern_count=5, related_domains=["wireless", "satellite"],
         tags=["rf", "sdr", "jamming", "replay", "signal"], priority=6,
     ),
+    "medical_device": KBEntry(
+        domain="medical_device", module_path="recursec.agents.medical_device_kb",
+        build_func_name="build_medical_device_prompt", description="Medical device/healthcare security (infusion pumps, EHR, HL7, DICOM, PACS)",
+        pattern_count=5, related_domains=["iot_ics", "network"],
+        tags=["medical", "healthcare", "hl7", "dicom", "hipaa", "device"], priority=7,
+    ),
+    "telecom": KBEntry(
+        domain="telecom", module_path="recursec.agents.telecom_security_kb",
+        build_func_name="build_telecom_security_prompt", description="Telecom security (SS7, Diameter, SIP/VoIP, 5G, baseband exploitation)",
+        pattern_count=5, related_domains=["wireless", "rf"],
+        tags=["telecom", "ss7", "sip", "voip", "5g", "baseband"], priority=7,
+    ),
+    "election": KBEntry(
+        domain="election", module_path="recursec.agents.election_security_kb",
+        build_func_name="build_election_security_prompt", description="Election/voting system security (DRE, voter registration, disinformation)",
+        pattern_count=4, related_domains=["physical"],
+        tags=["election", "voting", "democracy", "disinformation"], priority=5,
+    ),
+    "maritime": KBEntry(
+        domain="maritime", module_path="recursec.agents.maritime_security_kb",
+        build_func_name="build_maritime_security_prompt", description="Maritime/port security (AIS spoofing, ECDIS, GMDSS, port infrastructure)",
+        pattern_count=4, related_domains=["satellite", "rf"],
+        tags=["maritime", "ship", "ais", "port", "navigation"], priority=5,
+    ),
 }
 
 
