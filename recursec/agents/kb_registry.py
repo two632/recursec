@@ -130,13 +130,13 @@ KB_REGISTRY: dict[str, KBEntry] = {
         tags=["mobile", "android", "ios", "apk"], priority=7,
     ),
     "wireless": KBEntry(
-        domain="wireless", module_path="recursec.agents.wireless_kb",
+        domain="wireless", module_path="recursec.agents.wireless_security_kb",
         build_func_name="build_wireless_prompt", description="Wireless security (WiFi, Bluetooth, RFID, SDR, cellular)",
         pattern_count=5, related_domains=["network", "iot_ics"],
         tags=["wireless", "wifi", "bluetooth", "rfid"], priority=7,
     ),
     "iot_ics": KBEntry(
-        domain="iot_ics", module_path="recursec.agents.iot_ics_kb",
+        domain="iot_ics", module_path="recursec.agents.iot_ics_security_kb",
         build_func_name="build_iot_ics_prompt", description="IoT/ICS security (SCADA, firmware, protocols, smart home)",
         pattern_count=5, related_domains=["wireless", "firmware", "network"],
         tags=["iot", "ics", "scada", "firmware"], priority=7,
@@ -179,6 +179,7 @@ KB_REGISTRY: dict[str, KBEntry] = {
     ),
     "forensics": KBEntry(
         domain="forensics", module_path="recursec.agents.forensics_kb",
+
         build_func_name="build_forensics_prompt", description="Digital forensics (memory, disk, network, malware, anti-forensics)",
         pattern_count=5, related_domains=["incident_response", "threat_intel"],
         tags=["forensics", "memory", "volatility", "disk"], priority=7,
@@ -220,7 +221,7 @@ KB_REGISTRY: dict[str, KBEntry] = {
         tags=["ai", "ml", "adversarial", "llm", "prompt_injection"], priority=7,
     ),
     "blockchain": KBEntry(
-        domain="blockchain", module_path="recursec.agents.blockchain_kb",
+        domain="blockchain", module_path="recursec.agents.blockchain_security_kb",
         build_func_name="build_blockchain_prompt", description="Blockchain security (smart contracts, DeFi, wallet, consensus)",
         pattern_count=5, related_domains=["crypto"],
         tags=["blockchain", "smart_contract", "defi", "web3"], priority=6,
@@ -260,6 +261,12 @@ KB_REGISTRY: dict[str, KBEntry] = {
         build_func_name="build_advanced_strategy_prompt", description="Advanced attack strategies (emergent complexity, timing, AI-specific)",
         pattern_count=5, related_domains=["advanced_discovery"],
         tags=["strategy", "advanced", "emergent"], priority=8,
+    ),
+    "zero_trust": KBEntry(
+        domain="zero_trust", module_path="recursec.agents.zero_trust_kb",
+        build_func_name="build_zero_trust_prompt", description="Zero trust architecture assessment (identity, devices, network, apps, data)",
+        pattern_count=5, related_domains=["cloud", "identity_sso"],
+        tags=["zero_trust", "microsegmentation", "identity", "ztna"], priority=7,
     ),
 }
 
