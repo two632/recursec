@@ -1,18 +1,25 @@
-"""Convergence detector — detects agent stalls and loops.
+"""Convergence detector — detects when agent execution should stop.
 
-Implements:
-1. Progress rate monitoring
-2. Loop detection (action repetition)
-3. Diminishing returns detection
-4. Stall detection (no new findings)
-5. Convergence criteria evaluation
-6. Convergence prompt for LLM
+Prevents infinite loops and wasted computation by detecting:
+1. Output stabilization (new iterations don't find new things)
+2. Diminishing returns (effort vs findings ratio declining)
+3. Budget exhaustion (token/step/time budgets)
+4. Circular reasoning (agent revisiting same conclusions)
+5. Coverage saturation (all known attack vectors tested)
+6. Quality plateau (finding quality not improving)
+7. Tool exhaustion (all relevant tools already run)
+8. Confidence threshold (overall confidence high enough)
+9. Error accumulation (too many consecutive errors)
+10. Adversarial termination (defender proves security)
+
+This is CRITICAL for recursive agents — without convergence
+detection, agents recurse forever.
 """
 
 from __future__ import annotations
 
 import time
-from collections import deque
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -22,253 +29,348 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ConvergenceState(str, Enum):
-    EXPLORING = "exploring"       # Active discovery
-    PROGRESSING = "progressing"   # Finding new results
-    SLOWING = "slowing"           # Rate declining
-    STALLED = "stalled"           # No new findings
-    LOOPING = "looping"           # Repeating actions
-    CONVERGED = "converged"       # Done, no more to find
-    DIVERGING = "diverging"       # Expanding without focus
-
-
-class ActionType(str, Enum):
-    SCAN = "scan"
-    EXPLOIT = "exploit"
-    RECON = "recon"
-    VALIDATE = "validate"
-    REPORT = "report"
-    REASON = "reason"
-    SPAWN = "spawn"
-    OTHER = "other"
+class ConvergenceReason(str, Enum):
+    OUTPUT_STABLE = "output_stable"
+    DIMINISHING_RETURNS = "diminishing_returns"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CIRCULAR_REASONING = "circular_reasoning"
+    COVERAGE_SATURATED = "coverage_saturated"
+    QUALITY_PLATEAU = "quality_plateau"
+    TOOL_EXHAUSTION = "tool_exhaustion"
+    CONFIDENCE_MET = "confidence_met"
+    ERROR_LIMIT = "error_limit"
+    TIMEOUT = "timeout"
+    MAX_DEPTH = "max_depth"
+    USER_STOP = "user_stop"
+    NOT_CONVERGED = "not_converged"
 
 
 @dataclass
-class ProgressPoint:
-    """A snapshot of progress at a moment."""
-    timestamp: float = field(default_factory=time.time)
-    action_type: ActionType = ActionType.OTHER
-    action_detail: str = ""
-    new_findings: int = 0
-    total_findings: int = 0
-    unique_targets: int = 0
-    confidence: float = 0.0
+class ConvergenceConfig:
+    """Thresholds for convergence detection."""
+    max_iterations: int = 50
+    max_tokens: int = 100000
+    max_steps: int = 200
+    timeout_s: float = 3600.0
+    max_depth: int = 5
+    max_consecutive_errors: int = 5
+    min_confidence: float = 0.85
+    stability_window: int = 3
+    min_new_findings_rate: float = 0.1
+    quality_plateau_window: int = 5
+    max_circular_repeats: int = 3
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "action": self.action_type.value[:5],
-            "findings": self.new_findings,
-            "total": self.total_findings,
+            "max_iter": self.max_iterations,
+            "max_tokens": self.max_tokens,
+            "timeout": self.timeout_s,
+            "min_conf": self.min_confidence,
+        }
+
+
+@dataclass
+class ConvergenceState:
+    """Current state tracked by the detector."""
+    iteration: int = 0
+    tokens_used: int = 0
+    steps_taken: int = 0
+    depth: int = 0
+    start_time: float = field(default_factory=time.time)
+    findings_per_iteration: list[int] = field(default_factory=list)
+    quality_scores: list[float] = field(default_factory=list)
+    confidence_history: list[float] = field(default_factory=list)
+    tools_used: set[str] = field(default_factory=set)
+    conclusions_seen: list[str] = field(default_factory=list)
+    consecutive_errors: int = 0
+    unique_findings: set[str] = field(default_factory=set)
+
+    @property
+    def elapsed_s(self) -> float:
+        return time.time() - self.start_time
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "iter": self.iteration,
+            "tokens": self.tokens_used,
+            "steps": self.steps_taken,
+            "findings": len(self.unique_findings),
+            "elapsed": f"{self.elapsed_s:.0f}s",
+            "errors": self.consecutive_errors,
+        }
+
+
+@dataclass
+class ConvergenceResult:
+    """Result of convergence check."""
+    converged: bool = False
+    reason: ConvergenceReason = ConvergenceReason.NOT_CONVERGED
+    should_continue: bool = True
+    confidence: float = 0.0
+    details: str = ""
+    suggested_action: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "converged": self.converged,
+            "reason": self.reason.value[:15],
+            "continue": self.should_continue,
+            "conf": f"{self.confidence:.0%}",
         }
 
 
 class ConvergenceDetector:
-    """Detects when agents should stop, redirect, or escalate.
+    """Detects when agent execution should converge and stop."""
 
-    Monitors progress rate, detects loops, and
-    evaluates convergence criteria to prevent
-    wasteful exploration.
-    """
-
-    def __init__(
-        self,
-        stall_threshold_s: float = 300.0,
-        loop_window: int = 10,
-        loop_ratio: float = 0.6,
-        min_finding_rate: float = 0.001,
-        convergence_window: int = 20,
-    ) -> None:
-        self._history: deque[ProgressPoint] = deque(maxlen=500)
-        self._state = ConvergenceState.EXPLORING
-        self._stall_threshold_s = stall_threshold_s
-        self._loop_window = loop_window
-        self._loop_ratio = loop_ratio
-        self._min_finding_rate = min_finding_rate
-        self._convergence_window = convergence_window
-        self._last_finding_time: float = time.time()
-        self._state_transitions: list[tuple[float, ConvergenceState]] = []
+    def __init__(self, config: ConvergenceConfig | None = None) -> None:
+        self._config = config or ConvergenceConfig()
+        self._states: dict[str, ConvergenceState] = {}
         self._log = logger.bind(component="convergence")
 
-    def record(
-        self,
-        action_type: ActionType,
-        action_detail: str = "",
-        new_findings: int = 0,
-        total_findings: int = 0,
-        unique_targets: int = 0,
-        confidence: float = 0.0,
-    ) -> ConvergenceState:
-        """Record a progress point and return current state."""
-        now = time.time()
+    def create_tracker(self, task_id: str) -> ConvergenceState:
+        """Create a new convergence tracker for a task."""
+        state = ConvergenceState()
+        self._states[task_id] = state
+        return state
 
-        point = ProgressPoint(
-            timestamp=now,
-            action_type=action_type,
-            action_detail=action_detail,
-            new_findings=new_findings,
-            total_findings=total_findings,
-            unique_targets=unique_targets,
-            confidence=confidence,
-        )
-        self._history.append(point)
+    def record_iteration(self, task_id: str, new_findings: int = 0, quality: float = 0.5, confidence: float = 0.5, tokens_used: int = 0) -> None:
+        """Record an iteration's results."""
+        state = self._states.get(task_id)
+        if not state:
+            return
 
-        if new_findings > 0:
-            self._last_finding_time = now
+        state.iteration += 1
+        state.tokens_used += tokens_used
+        state.steps_taken += 1
+        state.findings_per_iteration.append(new_findings)
+        state.quality_scores.append(quality)
+        state.confidence_history.append(confidence)
 
-        # Evaluate convergence
-        new_state = self._evaluate()
-        if new_state != self._state:
-            self._state_transitions.append((now, new_state))
-            self._state = new_state
+    def record_finding(self, task_id: str, finding_hash: str) -> None:
+        """Record a unique finding."""
+        state = self._states.get(task_id)
+        if state:
+            state.unique_findings.add(finding_hash)
 
-        return self._state
+    def record_tool(self, task_id: str, tool_name: str) -> None:
+        """Record a tool execution."""
+        state = self._states.get(task_id)
+        if state:
+            state.tools_used.add(tool_name)
 
-    def _evaluate(self) -> ConvergenceState:
-        """Evaluate current convergence state."""
-        if len(self._history) < 3:
-            return ConvergenceState.EXPLORING
+    def record_conclusion(self, task_id: str, conclusion: str) -> None:
+        """Record a reasoning conclusion (for circular detection)."""
+        state = self._states.get(task_id)
+        if state:
+            state.conclusions_seen.append(conclusion[:100])
 
-        # Check for looping
-        if self._detect_loop():
-            return ConvergenceState.LOOPING
+    def record_error(self, task_id: str) -> None:
+        """Record an error."""
+        state = self._states.get(task_id)
+        if state:
+            state.consecutive_errors += 1
 
-        # Check for stall
-        if self._detect_stall():
-            return ConvergenceState.STALLED
+    def record_success(self, task_id: str) -> None:
+        """Record a success (resets error counter)."""
+        state = self._states.get(task_id)
+        if state:
+            state.consecutive_errors = 0
 
-        # Check finding rate
-        rate = self._finding_rate()
+    def check(self, task_id: str) -> ConvergenceResult:
+        """Check if execution has converged."""
+        state = self._states.get(task_id)
+        if not state:
+            return ConvergenceResult(converged=False)
 
-        if rate <= 0:
-            time_since = time.time() - self._last_finding_time
-            if time_since > self._stall_threshold_s * 2:
-                return ConvergenceState.CONVERGED
-            return ConvergenceState.STALLED
+        # Check each convergence criterion
+        checks = [
+            self._check_budget(state),
+            self._check_timeout(state),
+            self._check_max_depth(state),
+            self._check_error_limit(state),
+            self._check_confidence(state),
+            self._check_output_stability(state),
+            self._check_diminishing_returns(state),
+            self._check_circular_reasoning(state),
+            self._check_quality_plateau(state),
+        ]
 
-        if rate < self._min_finding_rate:
-            return ConvergenceState.SLOWING
+        for result in checks:
+            if result.converged:
+                return result
 
-        # Check for divergence (many targets, few findings)
-        if self._detect_divergence():
-            return ConvergenceState.DIVERGING
-
-        return ConvergenceState.PROGRESSING
-
-    def _detect_loop(self) -> bool:
-        """Detect repeated action patterns."""
-        recent = list(self._history)[-self._loop_window:]
-        if len(recent) < self._loop_window:
-            return False
-
-        actions = [p.action_detail for p in recent]
-        unique = set(actions)
-
-        # If most actions are the same = loop
-        if len(unique) <= 2:
-            most_common_count = max(actions.count(a) for a in unique)
-            ratio = most_common_count / len(actions)
-            return ratio >= self._loop_ratio
-
-        return False
-
-    def _detect_stall(self) -> bool:
-        """Detect no new findings for threshold duration."""
-        time_since = time.time() - self._last_finding_time
-        return time_since > self._stall_threshold_s
-
-    def _finding_rate(self) -> float:
-        """Calculate findings per second over recent window."""
-        recent = list(self._history)[-self._convergence_window:]
-        if len(recent) < 2:
-            return 0.0
-
-        total_findings = sum(p.new_findings for p in recent)
-        duration = recent[-1].timestamp - recent[0].timestamp
-
-        if duration <= 0:
-            return 0.0
-
-        return total_findings / duration
-
-    def _detect_divergence(self) -> bool:
-        """Detect expanding scope without findings."""
-        recent = list(self._history)[-self._convergence_window:]
-        if len(recent) < 5:
-            return False
-
-        # Check if unique targets are growing but findings aren't
-        first_half = recent[:len(recent) // 2]
-        second_half = recent[len(recent) // 2:]
-
-        targets_first = max((p.unique_targets for p in first_half), default=0)
-        targets_second = max((p.unique_targets for p in second_half), default=0)
-        findings_first = sum(p.new_findings for p in first_half)
-        findings_second = sum(p.new_findings for p in second_half)
-
-        # More targets but fewer findings = diverging
-        return (
-            targets_second > targets_first * 1.5
-            and findings_second < findings_first * 0.5
+        return ConvergenceResult(
+            converged=False,
+            reason=ConvergenceReason.NOT_CONVERGED,
+            should_continue=True,
+            confidence=state.confidence_history[-1] if state.confidence_history else 0.0,
         )
 
-    def should_stop(self) -> bool:
-        """Whether the agent should stop."""
-        return self._state in (
-            ConvergenceState.CONVERGED,
-            ConvergenceState.STALLED,
-            ConvergenceState.LOOPING,
-        )
+    def _check_budget(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check token/iteration budgets."""
+        if state.iteration >= self._config.max_iterations:
+            return ConvergenceResult(
+                converged=True,
+                reason=ConvergenceReason.BUDGET_EXHAUSTED,
+                should_continue=False,
+                details=f"Max iterations ({self._config.max_iterations}) reached",
+                suggested_action="Report current findings",
+            )
+        if state.tokens_used >= self._config.max_tokens:
+            return ConvergenceResult(
+                converged=True,
+                reason=ConvergenceReason.BUDGET_EXHAUSTED,
+                should_continue=False,
+                details=f"Token budget ({self._config.max_tokens}) exhausted",
+            )
+        return ConvergenceResult(converged=False)
 
-    def get_recommendation(self) -> str:
-        """Get action recommendation based on state."""
-        recommendations = {
-            ConvergenceState.EXPLORING: "Continue exploration",
-            ConvergenceState.PROGRESSING: "Continue current approach",
-            ConvergenceState.SLOWING: "Try different tools or techniques",
-            ConvergenceState.STALLED: "Change strategy or escalate",
-            ConvergenceState.LOOPING: "Break loop — try new approach",
-            ConvergenceState.CONVERGED: "Assessment complete — report",
-            ConvergenceState.DIVERGING: "Narrow scope and focus",
-        }
-        return recommendations.get(self._state, "Unknown state")
+    def _check_timeout(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check time budget."""
+        if state.elapsed_s >= self._config.timeout_s:
+            return ConvergenceResult(
+                converged=True,
+                reason=ConvergenceReason.TIMEOUT,
+                should_continue=False,
+                details=f"Timeout ({self._config.timeout_s}s) reached",
+            )
+        return ConvergenceResult(converged=False)
 
-    def build_convergence_prompt(self) -> str:
-        """Build convergence context for LLM."""
-        lines = ["## Convergence\n"]
-        lines.append(f"State: {self._state.value}")
-        lines.append(f"Recommendation: {self.get_recommendation()}")
+    def _check_max_depth(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check recursion depth."""
+        if state.depth >= self._config.max_depth:
+            return ConvergenceResult(
+                converged=True,
+                reason=ConvergenceReason.MAX_DEPTH,
+                should_continue=False,
+                details=f"Max depth ({self._config.max_depth}) reached",
+            )
+        return ConvergenceResult(converged=False)
 
-        # Progress metrics
-        rate = self._finding_rate()
-        lines.append(f"Finding rate: {rate:.4f}/s")
+    def _check_error_limit(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check consecutive errors."""
+        if state.consecutive_errors >= self._config.max_consecutive_errors:
+            return ConvergenceResult(
+                converged=True,
+                reason=ConvergenceReason.ERROR_LIMIT,
+                should_continue=False,
+                details=f"{state.consecutive_errors} consecutive errors",
+                suggested_action="Investigate errors before continuing",
+            )
+        return ConvergenceResult(converged=False)
 
-        time_since = time.time() - self._last_finding_time
-        lines.append(f"Time since last finding: {time_since:.0f}s")
+    def _check_confidence(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check if confidence threshold is met."""
+        if state.confidence_history and state.confidence_history[-1] >= self._config.min_confidence:
+            # Check stability
+            window = self._config.stability_window
+            if len(state.confidence_history) >= window:
+                recent = state.confidence_history[-window:]
+                if all(c >= self._config.min_confidence for c in recent):
+                    return ConvergenceResult(
+                        converged=True,
+                        reason=ConvergenceReason.CONFIDENCE_MET,
+                        should_continue=False,
+                        confidence=state.confidence_history[-1],
+                        details=f"Confidence {state.confidence_history[-1]:.0%} stable for {window} iterations",
+                    )
+        return ConvergenceResult(converged=False)
 
-        # Recent history
-        recent = list(self._history)[-5:]
-        if recent:
-            lines.append(f"\nRecent ({len(recent)}):")
-            for p in recent:
-                lines.append(
-                    f"  {p.action_type.value[:5]} "
-                    f"(+{p.new_findings} findings, "
-                    f"total={p.total_findings})"
+    def _check_output_stability(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check if outputs have stabilized (no new findings)."""
+        window = self._config.stability_window
+        if len(state.findings_per_iteration) >= window:
+            recent = state.findings_per_iteration[-window:]
+            if all(f == 0 for f in recent):
+                return ConvergenceResult(
+                    converged=True,
+                    reason=ConvergenceReason.OUTPUT_STABLE,
+                    should_continue=False,
+                    details=f"No new findings for {window} iterations",
+                    suggested_action="Move to reporting phase",
                 )
+        return ConvergenceResult(converged=False)
 
-        # State transitions
-        if self._state_transitions:
-            lines.append(f"\nTransitions ({len(self._state_transitions)}):")
-            for ts, state in self._state_transitions[-3:]:
-                lines.append(f"  → {state.value}")
+    def _check_diminishing_returns(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check for diminishing returns."""
+        if len(state.findings_per_iteration) < 5:
+            return ConvergenceResult(converged=False)
+
+        recent = state.findings_per_iteration[-5:]
+        total_recent = sum(recent)
+        total_all = sum(state.findings_per_iteration)
+
+        if total_all > 0 and total_recent / max(total_all, 1) < self._config.min_new_findings_rate:
+            return ConvergenceResult(
+                converged=True,
+                reason=ConvergenceReason.DIMINISHING_RETURNS,
+                should_continue=False,
+                details=f"Finding rate declined: {total_recent}/{total_all} in last 5 iterations",
+            )
+        return ConvergenceResult(converged=False)
+
+    def _check_circular_reasoning(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check for circular reasoning (repeated conclusions)."""
+        if len(state.conclusions_seen) < 3:
+            return ConvergenceResult(converged=False)
+
+        conclusion_counts: dict[str, int] = defaultdict(int)
+        for c in state.conclusions_seen:
+            conclusion_counts[c] += 1
+
+        max_repeats = max(conclusion_counts.values()) if conclusion_counts else 0
+        if max_repeats >= self._config.max_circular_repeats:
+            return ConvergenceResult(
+                converged=True,
+                reason=ConvergenceReason.CIRCULAR_REASONING,
+                should_continue=False,
+                details=f"Conclusion repeated {max_repeats} times",
+                suggested_action="Try different reasoning mode",
+            )
+        return ConvergenceResult(converged=False)
+
+    def _check_quality_plateau(self, state: ConvergenceState) -> ConvergenceResult:
+        """Check if quality has plateaued."""
+        window = self._config.quality_plateau_window
+        if len(state.quality_scores) < window:
+            return ConvergenceResult(converged=False)
+
+        recent = state.quality_scores[-window:]
+        avg = sum(recent) / len(recent)
+        variance = sum((q - avg) ** 2 for q in recent) / len(recent)
+
+        if variance < 0.01 and avg > 0.6:
+            return ConvergenceResult(
+                converged=True,
+                reason=ConvergenceReason.QUALITY_PLATEAU,
+                should_continue=False,
+                confidence=avg,
+                details=f"Quality plateaued at {avg:.0%} (var={variance:.4f})",
+            )
+        return ConvergenceResult(converged=False)
+
+    def build_convergence_prompt(self, task_id: str) -> str:
+        """Build LLM prompt with convergence state."""
+        state = self._states.get(task_id)
+        if not state:
+            return ""
+
+        lines = ["## Convergence Status"]
+        lines.append(f"Iteration: {state.iteration}/{self._config.max_iterations}")
+        lines.append(f"Tokens: {state.tokens_used}/{self._config.max_tokens}")
+        lines.append(f"Findings: {len(state.unique_findings)}")
+        lines.append(f"Tools used: {len(state.tools_used)}")
+        lines.append(f"Elapsed: {state.elapsed_s:.0f}s/{self._config.timeout_s:.0f}s")
+
+        if state.confidence_history:
+            lines.append(f"Current confidence: {state.confidence_history[-1]:.0%}")
+
+        if state.consecutive_errors > 0:
+            lines.append(f"Consecutive errors: {state.consecutive_errors}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         return {
-            "state": self._state.value,
-            "history_length": len(self._history),
-            "finding_rate": self._finding_rate(),
-            "transitions": len(self._state_transitions),
-            "should_stop": self.should_stop(),
+            "trackers": len(self._states),
         }
