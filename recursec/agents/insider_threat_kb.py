@@ -1,47 +1,178 @@
-"""Insider threat detection knowledge base."""
-from __future__ import annotations
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
-import structlog
-logger = structlog.get_logger()
+"""Insider threat detection knowledge base.
 
-class InsiderThreatType(str, Enum):
-    DATA_EXFIL = "data_exfiltration"
-    PRIVILEGE_ABUSE = "privilege_abuse"
-    SABOTAGE = "sabotage"
-    CREDENTIAL_SHARING = "credential_sharing"
-    POLICY_VIOLATION = "policy_violation"
+Behavioral indicators, detection patterns, and response strategies for:
+- Malicious insider activity (data exfiltration, sabotage)
+- Negligent insider behavior (misconfigurations, policy violations)
+- Compromised insider accounts
+- Privilege abuse and escalation
+- Social engineering against insiders
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
 
 @dataclass
-class InsiderPattern:
+class InsiderThreatPattern:
     name: str = ""
-    threat_type: InsiderThreatType = InsiderThreatType.DATA_EXFIL
-    description: str = ""
-    detection_methods: list[str] = field(default_factory=list)
-    indicators: list[str] = field(default_factory=list)
-    tools: list[str] = field(default_factory=list)
-    commands: list[str] = field(default_factory=list)
+    category: str = ""
     severity: str = "high"
-    def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "type": self.threat_type.value, "severity": self.severity}
+    indicators: list[str] = field(default_factory=list)
+    detection: list[str] = field(default_factory=list)
+    response: list[str] = field(default_factory=list)
 
-INSIDER_PATTERNS: list[InsiderPattern] = [
-    InsiderPattern(name="Data Exfiltration Detection", threat_type=InsiderThreatType.DATA_EXFIL, description="Detect unauthorized data transfers: USB, cloud uploads, email attachments, print jobs, screen captures, encrypted archives to personal storage.", detection_methods=["Monitor USB device connections and file copies", "Track cloud storage uploads (personal Dropbox/Drive)", "Analyze email attachment patterns and sizes", "Monitor print job volumes for sensitive documents", "Detect large archive creation (zip/7z/rar)", "Track after-hours file access patterns", "Monitor DNS for data exfiltration tunneling", "Check for unauthorized remote access tools"], indicators=["Unusual volume of file downloads/copies", "Large email attachments to personal addresses", "USB device usage outside normal patterns", "Cloud storage sync to unauthorized accounts", "Archive creation in temp directories", "After-hours access to sensitive file shares"], tools=["dlp-solutions", "ueba", "siem", "endpoint-monitor"], commands=["Get-WinEvent -FilterHashtable @{LogName='Security';Id=4663} | Where-Object {$_.Message -match 'removable'}"], severity="critical"),
-    InsiderPattern(name="Privilege Abuse Detection", threat_type=InsiderThreatType.PRIVILEGE_ABUSE, description="Detect misuse of elevated privileges: unauthorized database queries, accessing other users' files, modifying audit logs, creating backdoor accounts.", detection_methods=["Monitor privileged account usage patterns", "Track database query patterns for anomalies", "Detect access to files outside role scope", "Monitor audit log modifications", "Track new account creation by admins", "Analyze privilege escalation patterns", "Check for unauthorized group membership changes", "Monitor service account usage from workstations"], indicators=["Admin accessing user mailboxes", "Database queries outside normal scope", "Audit log clearing or modification", "New admin accounts created without ticket", "Service account used interactively", "Bulk permission changes"], tools=["varonis", "cyberark", "sailpoint"], commands=["Get-WinEvent -FilterHashtable @{LogName='Security';Id=4672} | Select-Object -First 50"], severity="critical"),
-    InsiderPattern(name="Sabotage Detection", threat_type=InsiderThreatType.SABOTAGE, description="Detect intentional damage: mass file deletion, configuration changes, backdoor installation, logic bombs, infrastructure disruption.", detection_methods=["Monitor mass file deletion events", "Track critical configuration changes", "Detect scheduled task creation with delayed execution", "Monitor source code repository force-pushes", "Track infrastructure teardown commands", "Detect backup deletion or corruption", "Monitor for logic bomb patterns in code commits", "Track DNS/firewall rule modifications"], indicators=["Mass file deletion in short timeframe", "Critical service configuration changes", "Scheduled tasks with future execution dates", "Force-push to main branch deleting history", "Backup deletion or encryption", "Firewall rules allowing unauthorized access"], tools=["siem", "git-audit", "backup-monitor"], commands=["git log --diff-filter=D --summary | head -50", "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4660} | Select-Object -First 20"], severity="critical"),
-    InsiderPattern(name="Credential Sharing Detection", threat_type=InsiderThreatType.CREDENTIAL_SHARING, description="Detect credential sharing: concurrent logins from different locations, password sharing via chat, shared service accounts, MFA token sharing.", detection_methods=["Detect concurrent sessions from different IPs/locations", "Monitor for impossible travel (login from two countries)", "Track shared account usage patterns", "Detect credentials in chat/email messages", "Monitor for password manager sharing", "Track MFA device registration anomalies"], indicators=["Same account active from multiple IPs simultaneously", "Impossible travel between login locations", "Credentials found in Slack/Teams messages", "Multiple devices registered for single user MFA", "Login patterns suggesting shared accounts"], tools=["azure-ad-audit", "okta-syslog", "slack-audit"], commands=["az ad signin list --filter 'status/errorCode eq 0' --query '[].{User:userPrincipalName,IP:ipAddress,Location:location.city}'"], severity="high"),
-    InsiderPattern(name="Policy Violation Detection", threat_type=InsiderThreatType.POLICY_VIOLATION, description="Detect policy violations: unauthorized software installation, VPN/proxy usage, personal device connections, shadow IT, unauthorized cloud services.", detection_methods=["Monitor software installation events", "Detect VPN/proxy/Tor usage on corporate network", "Track BYOD connections to corporate resources", "Discover shadow IT cloud services via DNS/proxy logs", "Monitor for unauthorized remote access tools", "Detect policy bypass attempts (proxy avoidance)", "Track software license violations", "Monitor for cryptocurrency mining"], indicators=["Unauthorized software in process list", "Tor/VPN traffic from corporate devices", "Unmanaged devices on corporate network", "DNS queries to unauthorized SaaS services", "Remote desktop tools (TeamViewer, AnyDesk)", "High CPU usage suggesting crypto mining"], tools=["nac", "proxy-logs", "casb"], commands=["netstat -tlnp | grep -E '(9050|1080|8080)'", "ps aux | sort -nk 3 -r | head -10"], severity="medium"),
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "cat": self.category, "sev": self.severity}
+
+
+INSIDER_THREAT_PATTERNS: list[InsiderThreatPattern] = [
+    InsiderThreatPattern(
+        name="Data Exfiltration via Email",
+        category="exfiltration",
+        severity="critical",
+        indicators=[
+            "Large attachments sent to personal email addresses",
+            "Unusual email volume outside business hours",
+            "Emails to domains not in approved vendor list",
+            "Encrypted attachments to external recipients",
+            "Auto-forwarding rules to external addresses",
+        ],
+        detection=[
+            "DLP rules on email gateway for sensitive data patterns",
+            "Monitor attachment sizes exceeding baseline thresholds",
+            "Alert on auto-forward rules to external domains",
+            "Analyze email metadata for anomalous patterns",
+            "Track email volume per user vs historical baseline",
+        ],
+        response=[
+            "Quarantine suspicious emails immediately",
+            "Interview employee with HR present",
+            "Forensic analysis of workstation",
+            "Review access logs for data accessed prior to exfil",
+            "Revoke access if confirmed malicious",
+        ],
+    ),
+    InsiderThreatPattern(
+        name="Unauthorized Cloud Storage",
+        category="exfiltration",
+        severity="high",
+        indicators=[
+            "Uploads to personal Dropbox/Google Drive/OneDrive",
+            "Use of unauthorized file sharing services",
+            "Large data transfers to cloud storage APIs",
+            "Installation of cloud sync clients on corporate devices",
+            "DNS queries to known cloud storage domains",
+        ],
+        detection=[
+            "CASB policies blocking unauthorized cloud services",
+            "Web proxy logs for cloud storage domain access",
+            "DNS monitoring for known cloud storage services",
+            "Endpoint monitoring for cloud sync client installation",
+            "Network DLP for outbound data to cloud APIs",
+        ],
+        response=[
+            "Block access to unauthorized cloud services",
+            "Investigate scope of data uploaded",
+            "Determine if sensitive/classified data was exposed",
+            "Review employee's data access patterns",
+        ],
+    ),
+    InsiderThreatPattern(
+        name="Privilege Escalation Abuse",
+        category="privilege_abuse",
+        severity="critical",
+        indicators=[
+            "Accessing systems outside job role",
+            "Requesting elevated permissions without justification",
+            "Using admin accounts for non-admin tasks",
+            "Accessing HR/finance systems from IT accounts",
+            "Modifying audit logs or disabling monitoring",
+        ],
+        detection=[
+            "UEBA baseline for normal access patterns per role",
+            "Alert on cross-department resource access",
+            "Monitor for audit log modifications",
+            "Track privilege elevation requests and approvals",
+            "Analyze access patterns against job function matrix",
+        ],
+        response=[
+            "Immediately revoke excess privileges",
+            "Review all actions taken with elevated access",
+            "Implement just-in-time privilege access",
+            "Audit all privilege escalation approvals",
+        ],
+    ),
+    InsiderThreatPattern(
+        name="Sabotage via Code/Configuration",
+        category="sabotage",
+        severity="critical",
+        indicators=[
+            "Unusual code changes before resignation",
+            "Deletion of critical files or repositories",
+            "Modification of security configurations",
+            "Introduction of backdoors in codebase",
+            "Disabling monitoring or alerting systems",
+        ],
+        detection=[
+            "Code review requirements for all critical changes",
+            "Monitor for large-scale deletions in version control",
+            "Alert on security configuration changes",
+            "Track departing employee code commits closely",
+            "Automated backdoor detection in CI/CD pipeline",
+        ],
+        response=[
+            "Roll back unauthorized changes immediately",
+            "Full code audit of recent commits by employee",
+            "Revoke all access immediately upon suspicion",
+            "Legal hold on all employee devices",
+        ],
+    ),
+    InsiderThreatPattern(
+        name="Social Engineering Against Insiders",
+        category="social_engineering",
+        severity="high",
+        indicators=[
+            "Employee reporting unusual contact from external parties",
+            "Requests for credentials via phone/chat",
+            "Phishing targeting specific employees with internal knowledge",
+            "Unusual requests from spoofed executive email",
+            "Physical tailgating or impersonation attempts",
+        ],
+        detection=[
+            "Security awareness training with phishing simulations",
+            "Email authentication (DMARC/DKIM/SPF) enforcement",
+            "Behavioral analysis for out-of-pattern credential sharing",
+            "Physical access logs correlated with badge holder identity",
+            "Report mechanisms for suspicious contacts",
+        ],
+        response=[
+            "Isolate affected accounts",
+            "Reset credentials for targeted employees",
+            "Investigate scope of information disclosed",
+            "Update security awareness training",
+        ],
+    ),
 ]
 
-def build_insider_threat_prompt(focus_type: InsiderThreatType | None = None, max_patterns: int = 5) -> str:
-    lines = ["## Insider Threat Detection Knowledge\n"]
-    patterns = INSIDER_PATTERNS if not focus_type else [p for p in INSIDER_PATTERNS if p.threat_type == focus_type]
-    for p in patterns[:max_patterns]:
-        lines.append(f"### {p.name} [{p.severity}]")
-        lines.append(p.description)
-        lines.append("\nDetection:")
-        for d in p.detection_methods[:4]:
-            lines.append(f"  - {d}")
-        lines.append("")
+DOMAIN_META = {
+    "domain": "insider_threat",
+    "patterns": len(INSIDER_THREAT_PATTERNS),
+    "categories": ["exfiltration", "privilege_abuse", "sabotage", "social_engineering"],
+}
+
+
+def build_insider_threat_kb_prompt() -> str:
+    """Build LLM prompt with insider threat knowledge."""
+    lines = ["## Insider Threat Detection Knowledge"]
+    for pat in INSIDER_THREAT_PATTERNS:
+        lines.append(f"\n### {pat.name} [{pat.severity}]")
+        lines.append(f"Category: {pat.category}")
+        lines.append("Indicators:")
+        for ind in pat.indicators[:3]:
+            lines.append(f"  - {ind}")
+        lines.append("Detection:")
+        for det in pat.detection[:2]:
+            lines.append(f"  - {det}")
     return "\n".join(lines)
