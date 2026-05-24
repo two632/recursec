@@ -1,20 +1,19 @@
-"""Experience replay — stores and replays past reasoning chains.
+"""Experience replay — learning from past assessments.
 
 Implements:
-1. Successful reasoning chain storage
-2. Similarity-based retrieval (find relevant past experience)
-3. Chain quality scoring and ranking
-4. Experience categorization by task type
-5. Replay injection into prompts
-6. Experience decay (older experiences fade)
-7. Experience prompt for LLM
+1. Assessment outcome storage
+2. Strategy effectiveness tracking
+3. Tool-vulnerability correlation learning
+4. Target profile building
+5. Adaptive strategy selection
+6. Experience prompt for LLM
 """
 
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import structlog
@@ -22,246 +21,276 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ExperienceOutcome(str, Enum):
-    SUCCESS = "success"
-    PARTIAL = "partial"
-    FAILURE = "failure"
-    TIMEOUT = "timeout"
-
-
 @dataclass
-class ReasoningChain:
-    """A stored reasoning chain from past assessment."""
-    chain_id: str = ""
-    task_type: str = ""
-    target_type: str = ""
-    description: str = ""
-    steps: list[dict[str, Any]] = field(default_factory=list)
-    outcome: ExperienceOutcome = ExperienceOutcome.SUCCESS
-    findings_produced: int = 0
-    tokens_used: int = 0
+class AssessmentOutcome:
+    """Stored outcome of a past assessment."""
+    outcome_id: str = ""
+    target_type: str = ""          # web, network, cloud, etc.
+    target_technologies: list[str] = field(default_factory=list)
+    assessment_type: str = ""
+    strategies_used: list[str] = field(default_factory=list)
+    tools_used: list[str] = field(default_factory=list)
+    findings_by_severity: dict[str, int] = field(default_factory=dict)
+    total_findings: int = 0
+    success_rating: float = 0.0    # 0-1
     duration_s: float = 0.0
-    quality_score: float = 0.5
-    replay_count: int = 0
-    created_at: float = field(default_factory=time.time)
-    keywords: list[str] = field(default_factory=list)
-
-    @property
-    def age_hours(self) -> float:
-        return (time.time() - self.created_at) / 3600
-
-    @property
-    def decayed_score(self) -> float:
-        decay = 0.99 ** self.age_hours
-        return self.quality_score * decay
+    tokens_used: int = 0
+    timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.chain_id[:10],
-            "task": self.task_type[:12],
-            "outcome": self.outcome.value[:6],
-            "steps": len(self.steps),
-            "quality": round(self.quality_score, 2),
+            "id": self.outcome_id[:10],
+            "type": self.target_type[:8],
+            "findings": self.total_findings,
+            "success": f"{self.success_rating:.0%}",
+        }
+
+
+@dataclass
+class ToolEffectiveness:
+    """Tracked effectiveness of a tool."""
+    tool_name: str = ""
+    total_uses: int = 0
+    findings_produced: int = 0
+    avg_severity: float = 0.0       # 0=info, 4=critical
+    false_positive_rate: float = 0.0
+    avg_runtime_s: float = 0.0
+    best_against: list[str] = field(default_factory=list)
+
+    @property
+    def effectiveness_score(self) -> float:
+        if self.total_uses == 0:
+            return 0.0
+        base = self.findings_produced / self.total_uses
+        severity_bonus = self.avg_severity / 4.0
+        fp_penalty = self.false_positive_rate
+        return max(0, (base + severity_bonus) * (1 - fp_penalty))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool": self.tool_name[:12],
+            "uses": self.total_uses,
+            "findings": self.findings_produced,
+            "score": f"{self.effectiveness_score:.2f}",
+        }
+
+
+@dataclass
+class VulnCorrelation:
+    """Correlation between target characteristics and vulnerabilities."""
+    technology: str = ""
+    vuln_types: dict[str, int] = field(default_factory=dict)
+    total_findings: int = 0
+
+    @property
+    def top_vulns(self) -> list[tuple[str, int]]:
+        return sorted(self.vuln_types.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tech": self.technology[:12],
+            "findings": self.total_findings,
+            "top": [v[0] for v in self.top_vulns[:3]],
         }
 
 
 class ExperienceReplay:
-    """Stores and retrieves past successful reasoning chains.
+    """Learns from past assessments to improve future ones.
 
-    When the agent faces a similar task, relevant past
-    experiences are injected into the prompt to guide
-    the reasoning process.
+    Stores assessment outcomes, tracks tool effectiveness,
+    builds target profiles, and provides data-driven
+    strategy recommendations.
     """
 
-    def __init__(self, max_experiences: int = 200) -> None:
-        self._experiences: dict[str, ReasoningChain] = {}
-        self._max_experiences = max_experiences
-        self._counter = 0
+    def __init__(self, max_outcomes: int = 500) -> None:
+        self._outcomes: list[AssessmentOutcome] = []
+        self._max_outcomes = max_outcomes
+        self._tool_stats: dict[str, ToolEffectiveness] = {}
+        self._correlations: dict[str, VulnCorrelation] = {}
+        self._strategy_success: dict[str, list[float]] = defaultdict(list)
+        self._outcome_counter = 0
         self._log = logger.bind(component="experience_replay")
 
-    def store(
+    def record_outcome(
         self,
-        task_type: str,
         target_type: str,
-        description: str,
-        steps: list[dict[str, Any]],
-        outcome: ExperienceOutcome = ExperienceOutcome.SUCCESS,
-        findings_produced: int = 0,
-        tokens_used: int = 0,
+        target_technologies: list[str] | None = None,
+        assessment_type: str = "",
+        strategies_used: list[str] | None = None,
+        tools_used: list[str] | None = None,
+        findings_by_severity: dict[str, int] | None = None,
+        success_rating: float = 0.0,
         duration_s: float = 0.0,
-        keywords: list[str] | None = None,
-    ) -> ReasoningChain:
-        """Store a reasoning chain from a completed task."""
-        self._counter += 1
+        tokens_used: int = 0,
+    ) -> AssessmentOutcome:
+        """Record an assessment outcome."""
+        self._outcome_counter += 1
 
-        # Calculate quality
-        quality = self._calculate_quality(
-            outcome, findings_produced, tokens_used, duration_s, len(steps),
-        )
-
-        chain = ReasoningChain(
-            chain_id=f"exp-{self._counter}",
-            task_type=task_type,
+        outcome = AssessmentOutcome(
+            outcome_id=f"exp-{self._outcome_counter}",
             target_type=target_type,
-            description=description,
-            steps=steps,
-            outcome=outcome,
-            findings_produced=findings_produced,
-            tokens_used=tokens_used,
+            target_technologies=target_technologies or [],
+            assessment_type=assessment_type,
+            strategies_used=strategies_used or [],
+            tools_used=tools_used or [],
+            findings_by_severity=findings_by_severity or {},
+            total_findings=sum((findings_by_severity or {}).values()),
+            success_rating=success_rating,
             duration_s=duration_s,
-            quality_score=quality,
-            keywords=keywords or [],
+            tokens_used=tokens_used,
         )
 
-        self._experiences[chain.chain_id] = chain
+        self._outcomes.append(outcome)
 
-        # Evict low-quality old experiences
-        while len(self._experiences) > self._max_experiences:
-            self._evict_worst()
+        # Trim old
+        while len(self._outcomes) > self._max_outcomes:
+            self._outcomes.pop(0)
 
-        return chain
+        # Update tool stats
+        self._update_tool_stats(outcome)
 
-    def _calculate_quality(
+        # Update correlations
+        self._update_correlations(outcome)
+
+        # Update strategy tracking
+        for strategy in outcome.strategies_used:
+            self._strategy_success[strategy].append(success_rating)
+
+        return outcome
+
+    def _update_tool_stats(self, outcome: AssessmentOutcome) -> None:
+        """Update tool effectiveness from outcome."""
+        findings_per_tool = outcome.total_findings / max(1, len(outcome.tools_used))
+
+        for tool in outcome.tools_used:
+            if tool not in self._tool_stats:
+                self._tool_stats[tool] = ToolEffectiveness(tool_name=tool)
+
+            stats = self._tool_stats[tool]
+            stats.total_uses += 1
+            stats.findings_produced += int(findings_per_tool)
+
+            # Track what types of targets this tool works against
+            if outcome.success_rating > 0.6 and outcome.target_type not in stats.best_against:
+                stats.best_against.append(outcome.target_type)
+
+    def _update_correlations(self, outcome: AssessmentOutcome) -> None:
+        """Update vulnerability correlations."""
+        for tech in outcome.target_technologies:
+            if tech not in self._correlations:
+                self._correlations[tech] = VulnCorrelation(technology=tech)
+
+            corr = self._correlations[tech]
+            corr.total_findings += outcome.total_findings
+
+    def recommend_tools(
         self,
-        outcome: ExperienceOutcome,
-        findings: int,
-        tokens: int,
-        duration: float,
-        steps: int,
-    ) -> float:
-        """Calculate quality score for an experience."""
-        # Outcome score
-        outcome_score = {
-            ExperienceOutcome.SUCCESS: 1.0,
-            ExperienceOutcome.PARTIAL: 0.6,
-            ExperienceOutcome.FAILURE: 0.1,
-            ExperienceOutcome.TIMEOUT: 0.3,
-        }[outcome]
-
-        # Efficiency (findings per token)
-        efficiency = findings / max(1, tokens) * 10000
-        efficiency_score = min(1.0, efficiency)
-
-        # Conciseness (fewer steps for same outcome)
-        conciseness = 1.0 / (1.0 + steps / 10.0)
-
-        quality = outcome_score * 0.5 + efficiency_score * 0.3 + conciseness * 0.2
-        return min(1.0, quality)
-
-    def _evict_worst(self) -> None:
-        """Evict the worst experience."""
-        if not self._experiences:
-            return
-        worst_id = min(
-            self._experiences,
-            key=lambda k: self._experiences[k].decayed_score,
-        )
-        del self._experiences[worst_id]
-
-    def retrieve(
-        self,
-        task_type: str = "",
         target_type: str = "",
-        keywords: list[str] | None = None,
-        max_results: int = 3,
-        min_quality: float = 0.3,
-    ) -> list[ReasoningChain]:
-        """Retrieve relevant past experiences."""
-        candidates: list[tuple[float, ReasoningChain]] = []
+        technologies: list[str] | None = None,
+        top_n: int = 5,
+    ) -> list[str]:
+        """Recommend tools based on past effectiveness."""
+        scored: list[tuple[float, str]] = []
 
-        for chain in self._experiences.values():
-            if chain.decayed_score < min_quality:
+        for name, stats in self._tool_stats.items():
+            score = stats.effectiveness_score
+
+            # Bonus if tool works well against this target type
+            if target_type and target_type in stats.best_against:
+                score *= 1.5
+
+            scored.append((score, name))
+
+        scored.sort(reverse=True)
+        return [name for _, name in scored[:top_n]]
+
+    def recommend_strategies(
+        self,
+        target_type: str = "",
+        top_n: int = 3,
+    ) -> list[tuple[str, float]]:
+        """Recommend strategies based on past success rates."""
+        strategy_scores: list[tuple[float, str]] = []
+
+        for strategy, ratings in self._strategy_success.items():
+            if not ratings:
                 continue
+            avg = sum(ratings) / len(ratings)
+            strategy_scores.append((avg, strategy))
 
-            relevance = 0.0
+        strategy_scores.sort(reverse=True)
+        return [(name, score) for score, name in strategy_scores[:top_n]]
 
-            # Task type match
-            if task_type and chain.task_type == task_type:
-                relevance += 0.4
-
-            # Target type match
-            if target_type and chain.target_type == target_type:
-                relevance += 0.3
-
-            # Keyword overlap
-            if keywords and chain.keywords:
-                chain_kw_set = set(chain.keywords)
-                query_kw_set = set(keywords)
-                overlap = len(chain_kw_set & query_kw_set)
-                if overlap > 0:
-                    relevance += 0.3 * (overlap / len(query_kw_set))
-
-            # Quality bonus
-            relevance += chain.decayed_score * 0.2
-
-            if relevance > 0:
-                candidates.append((relevance, chain))
-
-        # Sort by relevance descending
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        results = [chain for _, chain in candidates[:max_results]]
-
-        # Increment replay count
-        for chain in results:
-            chain.replay_count += 1
-
-        return results
-
-    def build_experience_prompt(
+    def get_target_profile(
         self,
-        task_type: str = "",
         target_type: str = "",
-        keywords: list[str] | None = None,
-    ) -> str:
-        """Build experience replay prompt for LLM."""
-        lines = ["## Past Experience\n"]
-
-        relevant = self.retrieve(
-            task_type=task_type,
-            target_type=target_type,
-            keywords=keywords,
-            max_results=2,
-        )
+        technologies: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Build a target profile from past experience."""
+        relevant = [
+            o for o in self._outcomes
+            if (not target_type or o.target_type == target_type)
+        ]
 
         if not relevant:
-            lines.append("No relevant past experience found.")
-            return "\n".join(lines)
+            return {"known": False}
 
-        for chain in relevant:
-            lines.append(
-                f"### {chain.task_type} on {chain.target_type} "
-                f"({chain.outcome.value}, quality={chain.quality_score:.0%})"
+        avg_findings = sum(o.total_findings for o in relevant) / len(relevant)
+        avg_success = sum(o.success_rating for o in relevant) / len(relevant)
+        common_tools = self.recommend_tools(target_type, technologies)
+
+        return {
+            "known": True,
+            "past_assessments": len(relevant),
+            "avg_findings": round(avg_findings, 1),
+            "avg_success": round(avg_success, 2),
+            "recommended_tools": common_tools[:5],
+        }
+
+    def build_experience_prompt(self, target_type: str = "") -> str:
+        """Build experience context for LLM."""
+        lines = ["## Experience Replay\n"]
+        lines.append(f"Past assessments: {len(self._outcomes)}")
+        lines.append(f"Tools tracked: {len(self._tool_stats)}")
+        lines.append(f"Correlations: {len(self._correlations)}")
+
+        # Top tools
+        if self._tool_stats:
+            sorted_tools = sorted(
+                self._tool_stats.values(),
+                key=lambda t: t.effectiveness_score,
+                reverse=True,
             )
-            lines.append(f"What worked: {chain.description[:80]}")
+            lines.append("\nTop tools:")
+            for t in sorted_tools[:5]:
+                lines.append(
+                    f"  {t.tool_name[:12]} — "
+                    f"score={t.effectiveness_score:.2f} "
+                    f"uses={t.total_uses}"
+                )
 
-            # Show steps summary
-            if chain.steps:
-                lines.append("Steps taken:")
-                for step in chain.steps[:5]:
-                    action = step.get("action", "unknown")
-                    result = step.get("result", "")
-                    lines.append(f"  - {action[:30]}: {result[:40]}")
+        # Top strategies
+        recs = self.recommend_strategies(target_type)
+        if recs:
+            lines.append("\nTop strategies:")
+            for name, score in recs:
+                lines.append(f"  {name[:20]} — success={score:.0%}")
 
-            if chain.findings_produced:
-                lines.append(f"Findings: {chain.findings_produced}")
-
-            lines.append("")
+        # Target profile
+        if target_type:
+            profile = self.get_target_profile(target_type)
+            if profile.get("known"):
+                lines.append(f"\n{target_type} profile:")
+                lines.append(f"  Past: {profile['past_assessments']} assessments")
+                lines.append(f"  Avg findings: {profile['avg_findings']}")
+                lines.append(f"  Avg success: {profile['avg_success']:.0%}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        by_outcome: dict[str, int] = {}
-        by_task: dict[str, int] = {}
-        for chain in self._experiences.values():
-            o = chain.outcome.value
-            by_outcome[o] = by_outcome.get(o, 0) + 1
-            t = chain.task_type
-            by_task[t] = by_task.get(t, 0) + 1
-
         return {
-            "total_experiences": len(self._experiences),
-            "by_outcome": by_outcome,
-            "by_task_type": by_task,
-            "total_replays": sum(c.replay_count for c in self._experiences.values()),
+            "total_outcomes": len(self._outcomes),
+            "tools_tracked": len(self._tool_stats),
+            "correlations": len(self._correlations),
+            "strategies": len(self._strategy_success),
         }
