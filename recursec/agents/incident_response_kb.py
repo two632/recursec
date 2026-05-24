@@ -1,16 +1,17 @@
 """Incident response knowledge base.
 
-Deep knowledge about incident response:
-1. IR lifecycle and process
-2. Containment strategies
-3. Evidence collection
-4. Root cause analysis
-5. Recovery and lessons learned
+Attack patterns and procedures for incident response:
+1. Detection & Triage — alert analysis, severity classification, initial scoping
+2. Containment Strategies — isolation, blocking, network segmentation
+3. Evidence Collection — forensic imaging, log preservation, chain of custody
+4. Eradication & Recovery — malware removal, persistence cleanup, rebuilding
+5. Post-Incident Analysis — root cause, timeline reconstruction, lessons learned
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -18,305 +19,290 @@ import structlog
 logger = structlog.get_logger()
 
 
+class IRPhase(str, Enum):
+    DETECTION = "detection"
+    CONTAINMENT = "containment"
+    EVIDENCE = "evidence"
+    ERADICATION = "eradication"
+    POST_INCIDENT = "post_incident"
+
+
 @dataclass
 class IRPattern:
     """An incident response pattern."""
-    pattern_id: str = ""
     name: str = ""
-    category: str = ""
-    severity: str = "medium"
+    phase: IRPhase = IRPhase.DETECTION
     description: str = ""
-    detection_strategy: str = ""
+    procedures: list[str] = field(default_factory=list)
+    indicators: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    checklists: list[str] = field(default_factory=list)
+    severity: str = "high"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.pattern_id,
-            "name": self.name[:25],
-            "category": self.category[:12],
+            "name": self.name,
+            "phase": self.phase.value,
+            "severity": self.severity,
+            "procedures": len(self.procedures),
         }
 
 
-IR_PATTERNS: list[dict[str, Any]] = [
-    {
-        "id": "ir-001", "name": "IR Lifecycle",
-        "category": "lifecycle", "severity": "medium",
-        "desc": "Incident response lifecycle.",
-        "detection": (
-            "INCIDENT RESPONSE LIFECYCLE:\n"
-            "NIST SP 800-61:\n"
-            "  1. PREPARATION:\n"
-            "    - IR plan and playbooks\n"
-            "    - Communication plan\n"
-            "    - Tool readiness\n"
-            "    - Jump bag / forensic kit\n"
-            "    - Contact lists (legal, PR, mgmt)\n"
-            "    - Practice (tabletop exercises)\n"
-            "  2. DETECTION & ANALYSIS:\n"
-            "    - Alert triage and classification\n"
-            "    - Severity assessment\n"
-            "    - Scope determination\n"
-            "    - Timeline construction\n"
-            "    - IOC identification\n"
-            "    - Affected systems inventory\n"
-            "  3. CONTAINMENT:\n"
-            "    - Short-term (isolate)\n"
-            "    - Long-term (remediate)\n"
-            "    - Evidence preservation\n"
-            "  4. ERADICATION:\n"
-            "    - Malware removal\n"
-            "    - Vulnerability patching\n"
-            "    - Account reset\n"
-            "    - System rebuild\n"
-            "  5. RECOVERY:\n"
-            "    - System restoration\n"
-            "    - Service validation\n"
-            "    - Monitoring enhancement\n"
-            "  6. LESSONS LEARNED:\n"
-            "    - Post-incident review\n"
-            "    - Process improvement\n"
-            "    - Detection enhancement\n"
-            "TOOLS:\n"
-            "  TheHive, RTIR, Cortex, SOAR platforms"
+IR_PATTERNS: list[IRPattern] = [
+    IRPattern(
+        name="Detection & Triage",
+        phase=IRPhase.DETECTION,
+        description=(
+            "Initial detection, alert analysis, severity classification, "
+            "and scoping of security incidents. Determine blast radius "
+            "and activate appropriate response level."
         ),
-        "tools": [],
-    },
-    {
-        "id": "ir-002", "name": "Containment Strategies",
-        "category": "containment", "severity": "high",
-        "desc": "Incident containment techniques.",
-        "detection": (
-            "CONTAINMENT STRATEGIES:\n"
-            "NETWORK:\n"
-            "  - VLAN isolation\n"
-            "  - Firewall rule insertion\n"
-            "    # Block malicious IPs/domains\n"
-            "    # Isolate compromised segments\n"
-            "  - DNS sinkhole (C2 domains)\n"
-            "  - Proxy block rules\n"
-            "  - BGP blackhole\n"
-            "ENDPOINT:\n"
-            "  - Network quarantine (EDR)\n"
-            "  - Process termination\n"
-            "  - Service disabling\n"
-            "  - Account lockout\n"
-            "  - USB blocking\n"
-            "  - Full disk encryption lock\n"
-            "IDENTITY:\n"
-            "  - Password reset (compromised accounts)\n"
-            "  - MFA enforcement\n"
-            "  - Token revocation\n"
-            "  - Session invalidation\n"
-            "  - Conditional access policies\n"
-            "  - Service account rotation\n"
-            "CLOUD:\n"
-            "  - Security group lockdown\n"
-            "  - IAM policy restriction\n"
-            "  - Instance isolation\n"
-            "  - API key rotation\n"
-            "  - S3 bucket policy\n"
-            "EMAIL:\n"
-            "  - Phishing URL blocking\n"
-            "  - Sender blocking\n"
-            "  - Attachment quarantine\n"
-            "TOOLS:\n"
-            "  CrowdStrike, SentinelOne, Carbon Black"
+        procedures=[
+            "Classify alert source (SIEM, EDR, IDS, user report, threat intel)",
+            "Determine alert fidelity (true positive, false positive, benign)",
+            "Assess severity using CVSS/org-specific severity matrix",
+            "Identify affected systems, users, and data scope",
+            "Check for related alerts across time window (correlation)",
+            "Determine if incident is ongoing or historical",
+            "Activate incident response team at appropriate level",
+            "Create incident ticket with initial findings and timeline",
+        ],
+        indicators=[
+            "Multiple failed login attempts followed by success",
+            "Unusual process execution (powershell, certutil, bitsadmin)",
+            "Outbound connections to known C2 infrastructure",
+            "Large data transfers outside business hours",
+            "New scheduled tasks or services created",
+            "Registry run key modifications",
+        ],
+        tools=["splunk", "elastic", "crowdstrike", "sentinel", "velociraptor"],
+        commands=[
+            "splunk search 'index=security sourcetype=WinEventLog EventCode=4625 | stats count by src_ip'",
+            "elastic query: {\"query\":{\"range\":{\"@timestamp\":{\"gte\":\"now-1h\"}}}}",
+            "velociraptor collect Windows.System.Pslist",
+            "crowdstrike falcon search /detects",
+            "grep -rn 'CRITICAL\\|ALERT' /var/log/syslog | tail -50",
+        ],
+        checklists=[
+            "Alert received and acknowledged within SLA",
+            "Initial severity assessment completed",
+            "Affected scope identified (systems, users, data)",
+            "Incident response team notified",
+            "Incident ticket created with timeline",
+        ],
+        severity="high",
+    ),
+    IRPattern(
+        name="Containment Strategies",
+        phase=IRPhase.CONTAINMENT,
+        description=(
+            "Short-term and long-term containment: network isolation, "
+            "account disabling, firewall rule deployment, DNS sinkholing, "
+            "and controlled environment for monitoring adversary."
         ),
-        "tools": [],
-    },
-    {
-        "id": "ir-003", "name": "Evidence Collection",
-        "category": "evidence", "severity": "medium",
-        "desc": "Digital evidence collection.",
-        "detection": (
-            "EVIDENCE COLLECTION:\n"
-            "ORDER OF VOLATILITY:\n"
-            "  1. CPU registers, cache\n"
-            "  2. Routing table, ARP cache, processes\n"
-            "  3. Memory (RAM)\n"
-            "  4. Temporary file systems\n"
-            "  5. Disk\n"
-            "  6. Remote logging, monitoring\n"
-            "  7. Physical config, topology\n"
-            "  8. Archival media\n"
-            "MEMORY:\n"
-            "  # LiME (Linux)\n"
-            "  insmod lime.ko path=/tmp/mem.lime format=lime\n"
-            "  # WinPmem (Windows)\n"
-            "  winpmem_mini.exe mem.raw\n"
-            "  # DumpIt\n"
-            "DISK:\n"
-            "  # Write-blocker (hardware preferred)\n"
-            "  # dd with hash verification\n"
-            "  dc3dd if=/dev/sda of=image.raw hash=sha256\n"
-            "NETWORK:\n"
-            "  # Full packet capture\n"
-            "  tcpdump -i eth0 -w evidence.pcap\n"
-            "  # NetFlow records\n"
-            "  # Proxy/firewall logs\n"
-            "LOGS:\n"
-            "  - Windows: evtx files\n"
-            "  - Linux: /var/log/*\n"
-            "  - Application: web server, DB\n"
-            "  - Cloud: CloudTrail, Activity Log\n"
-            "CHAIN OF CUSTODY:\n"
-            "  - Document every transfer\n"
-            "  - Hash all evidence\n"
-            "  - Timestamp everything\n"
-            "  - Secure storage\n"
-            "TOOLS:\n"
-            "  LiME, WinPmem, dc3dd, FTK Imager"
+        procedures=[
+            "Isolate affected hosts from network (disable port or VLAN change)",
+            "Disable compromised user accounts and revoke sessions",
+            "Block malicious IPs/domains at firewall/proxy/DNS",
+            "Deploy emergency firewall rules to segment affected network",
+            "Sinkhole C2 domains to monitor beacon attempts",
+            "Quarantine malicious files across all endpoints via EDR",
+            "Reset credentials for affected and potentially affected accounts",
+            "Preserve system state before containment actions for forensics",
+        ],
+        indicators=[
+            "Continued C2 beaconing after initial detection",
+            "Lateral movement attempts from compromised host",
+            "Data staging or exfiltration in progress",
+            "Additional hosts showing compromise indicators",
+            "Adversary attempting to escalate privileges",
+            "Persistence mechanisms being deployed",
+        ],
+        tools=["crowdstrike", "sentinel", "paloalto", "cisco-ise", "iptables"],
+        commands=[
+            "iptables -I INPUT -s MALICIOUS_IP -j DROP",
+            "iptables -I OUTPUT -d MALICIOUS_IP -j DROP",
+            "crowdstrike contain-host --host-id <id>",
+            "net user COMPROMISED_USER /active:no /domain",
+            "dnsmasq --address=/malicious-domain.com/127.0.0.1",
+            "ip link set eth0 down  # network isolation",
+        ],
+        checklists=[
+            "Affected hosts isolated from production network",
+            "Compromised accounts disabled and sessions revoked",
+            "Malicious IPs/domains blocked at perimeter",
+            "EDR containment actions deployed",
+            "Evidence preserved before containment changes",
+        ],
+        severity="critical",
+    ),
+    IRPattern(
+        name="Evidence Collection",
+        phase=IRPhase.EVIDENCE,
+        description=(
+            "Forensic evidence collection with chain of custody: "
+            "memory acquisition, disk imaging, log preservation, "
+            "network capture, and artifact collection."
         ),
-        "tools": [],
-    },
-    {
-        "id": "ir-004", "name": "Root Cause Analysis",
-        "category": "rca", "severity": "medium",
-        "desc": "Root cause analysis techniques.",
-        "detection": (
-            "ROOT CAUSE ANALYSIS:\n"
-            "TIMELINE:\n"
-            "  - Plaso/log2timeline\n"
-            "    # Create super-timeline from all sources\n"
-            "  - Correlate:\n"
-            "    # Network events\n"
-            "    # Endpoint events\n"
-            "    # Authentication events\n"
-            "    # Application events\n"
-            "    # Cloud events\n"
-            "INITIAL ACCESS:\n"
-            "  - Phishing email analysis\n"
-            "  - Exploit identification\n"
-            "  - Credential source\n"
-            "  - Supply chain compromise\n"
-            "  - Insider threat\n"
-            "LATERAL MOVEMENT:\n"
-            "  - RDP/SSH session tracking\n"
-            "  - PsExec/WMI/WinRM\n"
-            "  - Pass-the-hash/ticket\n"
-            "  - Service account abuse\n"
-            "  - SMB/admin shares\n"
-            "PERSISTENCE:\n"
-            "  - Scheduled tasks/cron\n"
-            "  - Registry run keys\n"
-            "  - Service creation\n"
-            "  - Web shells\n"
-            "  - Bootkit/rootkit\n"
-            "  - Account creation\n"
-            "IMPACT:\n"
-            "  - Data access/exfiltration\n"
-            "  - System modification\n"
-            "  - Privilege escalation path\n"
-            "  - Ransomware deployment\n"
-            "TOOLS:\n"
-            "  Plaso, Autopsy, Volatility, KAPE"
+        procedures=[
+            "Acquire volatile memory before shutdown (RAM dump)",
+            "Create forensic disk image (bit-for-bit copy)",
+            "Collect and preserve relevant log sources",
+            "Capture network traffic from affected segments",
+            "Document chain of custody for all evidence",
+            "Hash all evidence files (SHA256) for integrity",
+            "Collect browser artifacts, email headers, file metadata",
+            "Preserve cloud audit logs and API activity logs",
+        ],
+        indicators=[
+            "Memory contains running malware processes",
+            "Disk artifacts show deleted files or wiped logs",
+            "Network captures show C2 protocol patterns",
+            "Log gaps indicating log tampering or deletion",
+            "Browser history showing phishing site access",
+            "Email headers with spoofed sender addresses",
+        ],
+        tools=["volatility3", "autopsy", "ftk-imager", "wireshark",
+               "velociraptor", "kape"],
+        commands=[
+            "winpmem_mini.exe memdump.raw",
+            "dc3dd if=/dev/sda of=disk.dd hash=sha256 log=imaging.log",
+            "volatility3 -f memdump.raw windows.pslist.PsList",
+            "volatility3 -f memdump.raw windows.netscan.NetScan",
+            "sha256sum evidence_* > hashes.txt",
+            "tcpdump -i eth0 -w capture.pcap -c 100000",
+        ],
+        checklists=[
+            "Memory dump acquired before system shutdown",
+            "Disk image created with hash verification",
+            "All relevant logs collected and preserved",
+            "Network capture from affected segments",
+            "Chain of custody documentation complete",
+            "Evidence hashes recorded and verified",
+        ],
+        severity="high",
+    ),
+    IRPattern(
+        name="Eradication & Recovery",
+        phase=IRPhase.ERADICATION,
+        description=(
+            "Complete removal of adversary presence: malware removal, "
+            "persistence mechanism cleanup, system rebuilding, "
+            "credential rotation, and controlled restoration."
         ),
-        "tools": [],
-    },
-    {
-        "id": "ir-005", "name": "Recovery and Lessons Learned",
-        "category": "recovery", "severity": "medium",
-        "desc": "Recovery procedures and improvement.",
-        "detection": (
-            "RECOVERY & LESSONS LEARNED:\n"
-            "SYSTEM RECOVERY:\n"
-            "  - Rebuild from clean images\n"
-            "  - Restore from verified backups\n"
-            "  - Patch all vulnerabilities\n"
-            "  - Reset all credentials\n"
-            "  - Verify system integrity\n"
-            "  - Staged reconnection\n"
-            "VALIDATION:\n"
-            "  - Vulnerability scan (post-fix)\n"
-            "  - IOC sweep (re-scan)\n"
-            "  - Behavioral monitoring\n"
-            "  - User verification\n"
-            "  - Service health checks\n"
-            "MONITORING:\n"
-            "  - Enhanced logging\n"
-            "  - New detection rules\n"
-            "  - Threat hunting queries\n"
-            "  - Increased alert sensitivity\n"
-            "LESSONS LEARNED:\n"
-            "  - Conduct post-incident review\n"
-            "  - Document:\n"
-            "    # What happened\n"
-            "    # When detected\n"
-            "    # How contained\n"
-            "    # What worked / didn't work\n"
-            "    # Recommendations\n"
-            "  - Update:\n"
-            "    # IR playbooks\n"
-            "    # Detection rules\n"
-            "    # Security policies\n"
-            "    # Training materials\n"
-            "  - Track improvements\n"
-            "  - Metrics: MTTD, MTTR, MTTC\n"
-            "TOOLS:\n"
-            "  TheHive, RTIR, Jira, Wiki"
+        procedures=[
+            "Identify all persistence mechanisms (autoruns, scheduled tasks, services)",
+            "Remove malware from all affected systems",
+            "Clean registry modifications and startup entries",
+            "Remove unauthorized user accounts and SSH keys",
+            "Rotate all potentially compromised credentials",
+            "Rebuild compromised systems from known-good images",
+            "Patch vulnerabilities exploited in initial compromise",
+            "Restore data from verified clean backups",
+        ],
+        indicators=[
+            "All known malware samples removed and verified",
+            "No persistence mechanisms remaining",
+            "All compromised credentials rotated",
+            "Vulnerabilities patched on all affected systems",
+            "Systems rebuilt from clean images",
+            "Monitoring confirms no continued adversary activity",
+        ],
+        tools=["autoruns", "procmon", "yara", "crowdstrike",
+               "velociraptor", "ansible"],
+        commands=[
+            "autoruns -a -m -h -c > autoruns.csv",
+            "schtasks /query /fo CSV /v > scheduled_tasks.csv",
+            "yara -r malware_rules.yar / 2>/dev/null",
+            "find / -name 'authorized_keys' -exec cat {} +",
+            "find / -newer /tmp/incident_time -type f 2>/dev/null | head -100",
+            "chkrootkit",
+        ],
+        checklists=[
+            "All malware removed from all systems",
+            "All persistence mechanisms identified and removed",
+            "All compromised credentials rotated",
+            "Affected systems rebuilt or verified clean",
+            "Patches deployed for exploited vulnerabilities",
+            "Restored systems monitored for re-compromise",
+        ],
+        severity="critical",
+    ),
+    IRPattern(
+        name="Post-Incident Analysis",
+        phase=IRPhase.POST_INCIDENT,
+        description=(
+            "Root cause analysis, timeline reconstruction, lessons "
+            "learned, and process improvement after incident closure."
         ),
-        "tools": [],
-    },
+        procedures=[
+            "Reconstruct full incident timeline from all evidence",
+            "Identify root cause and initial attack vector",
+            "Map adversary TTPs to MITRE ATT&CK framework",
+            "Assess data exposure and regulatory impact",
+            "Document detection gaps and missed indicators",
+            "Identify process failures and improvement opportunities",
+            "Update detection rules based on incident IOCs",
+            "Conduct blameless post-mortem with all stakeholders",
+        ],
+        indicators=[
+            "Complete timeline from initial compromise to containment",
+            "Root cause identified with confidence level",
+            "All adversary TTPs mapped to MITRE ATT&CK",
+            "Data exposure scope fully assessed",
+            "Detection improvements implemented",
+            "Updated runbooks and procedures documented",
+        ],
+        tools=["mitre-attack-navigator", "timesketch", "plaso",
+               "misp", "opencti"],
+        commands=[
+            "plaso log2timeline --storage-file timeline.plaso /evidence/",
+            "psort.py -o l2tcsv -w timeline.csv timeline.plaso",
+            "misp-warninglist check <ioc_list>",
+            "grep -rn 'T[0-9][0-9][0-9][0-9]' incident_report.md",
+            "# Generate MITRE ATT&CK Navigator layer from TTPs",
+        ],
+        checklists=[
+            "Full incident timeline documented",
+            "Root cause analysis completed",
+            "Adversary TTPs mapped to ATT&CK",
+            "Data exposure assessment complete",
+            "Lessons learned documented",
+            "Detection and response improvements planned",
+            "Post-mortem meeting conducted",
+        ],
+        severity="medium",
+    ),
 ]
 
 
-class IncidentResponseKB:
-    """Incident response knowledge base.
+def build_incident_response_prompt(
+    focus_phase: IRPhase | None = None,
+    max_patterns: int = 5,
+) -> str:
+    """Build LLM prompt with incident response knowledge."""
+    lines = ["## Incident Response Knowledge\n"]
 
-    Provides IR patterns injected
-    into agent prompts.
-    """
+    patterns = IR_PATTERNS
+    if focus_phase:
+        patterns = [p for p in patterns if p.phase == focus_phase]
 
-    def __init__(self) -> None:
-        self._patterns: dict[str, IRPattern] = {}
-        self._log = logger.bind(component="ir_kb")
-        self._load_patterns()
+    for pattern in patterns[:max_patterns]:
+        lines.append(f"### {pattern.name} [{pattern.severity}]")
+        lines.append(pattern.description)
+        lines.append("\nProcedures:")
+        for proc in pattern.procedures[:4]:
+            lines.append(f"  - {proc}")
+        lines.append("\nIndicators:")
+        for indicator in pattern.indicators[:3]:
+            lines.append(f"  - {indicator}")
+        lines.append("\nCommands:")
+        for cmd in pattern.commands[:3]:
+            lines.append(f"  $ {cmd}")
+        lines.append("\nChecklist:")
+        for item in pattern.checklists[:3]:
+            lines.append(f"  [ ] {item}")
+        lines.append("")
 
-    def _load_patterns(self) -> None:
-        """Load IR patterns."""
-        for data in IR_PATTERNS:
-            pattern = IRPattern(
-                pattern_id=data["id"],
-                name=data["name"],
-                category=data.get("category", ""),
-                severity=data.get("severity", "medium"),
-                description=data.get("desc", ""),
-                detection_strategy=data.get("detection", ""),
-                tools=data.get("tools", []),
-            )
-            self._patterns[pattern.pattern_id] = pattern
-
-    def get_by_category(self, category: str) -> list[IRPattern]:
-        """Get patterns by category."""
-        return [
-            p for p in self._patterns.values()
-            if p.category.lower() == category.lower()
-        ]
-
-    def build_ir_prompt(
-        self,
-        categories: list[str] | None = None,
-        max_patterns: int = 4,
-    ) -> str:
-        """Build IR prompt."""
-        lines = ["## Incident Response\n"]
-        count = 0
-        for pattern in self._patterns.values():
-            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
-                continue
-            if count >= max_patterns:
-                break
-            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
-            lines.append(pattern.detection_strategy)
-            lines.append("")
-            count += 1
-        return "\n".join(lines)
-
-    def get_stats(self) -> dict[str, Any]:
-        cat_counts: dict[str, int] = {}
-        for p in self._patterns.values():
-            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
-        return {
-            "patterns": len(self._patterns),
-            "by_category": cat_counts,
-        }
+    return "\n".join(lines)
