@@ -1,20 +1,17 @@
-"""Prompt assembler — builds optimal LLM prompts from all KBs.
+"""Dynamic prompt assembler — loads KBs and composes optimal prompts.
 
-This is the critical integration layer that takes:
-1. Task intent
-2. Current phase
-3. Target info
-4. Memory/findings
-5. Available KB patterns
-...and assembles the OPTIMAL prompt for the LLM.
-
-The agent's intelligence comes from what knowledge
-gets injected into the LLM's context window.
+Wires together:
+1. KB Registry → selects relevant KBs based on intent/tags
+2. Prompt Templates → role-specific system prompts + phase instructions
+3. Knowledge Graph → entity context from discovered graph
+4. Experience Replay → past lessons for similar tasks
+5. Strategy Optimizer → best strategies from bandit algorithms
+6. LLM Connection Engine → model-specific context limits
 """
 
 from __future__ import annotations
 
-import time
+import importlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,391 +20,270 @@ import structlog
 logger = structlog.get_logger()
 
 
-# All KB domains with their module references
-KB_REGISTRY: dict[str, dict[str, Any]] = {
-    # Web vulnerabilities
-    "web_vuln": {
-        "module": "advanced_strategy_kb",
-        "builder": "build_strategy_prompt",
-        "tags": ["web", "owasp", "injection", "auth"],
-    },
-    "xss": {
-        "module": "xss_deep_kb",
-        "builder": "build_xss_prompt",
-        "tags": ["web", "xss", "scripting", "client"],
-    },
-    "ssrf": {
-        "module": "ssrf_deep_kb",
-        "builder": "build_ssrf_prompt",
-        "tags": ["web", "ssrf", "server", "metadata"],
-    },
-    "sqli": {
-        "module": "sqli_kb",
-        "builder": "build_sqli_prompt",
-        "tags": ["web", "sql", "injection", "database"],
-    },
-    "deserialization": {
-        "module": "deserialization_kb",
-        "builder": "build_deser_prompt",
-        "tags": ["web", "rce", "deserialization"],
-    },
-    "api_gateway": {
-        "module": "api_gateway_kb",
-        "builder": "build_apigateway_prompt",
-        "tags": ["web", "api", "rest", "graphql"],
-    },
-    "web_cache": {
-        "module": "web_cache_cdn_kb",
-        "builder": "build_webcache_prompt",
-        "tags": ["web", "cache", "cdn", "poisoning"],
-    },
-    # Network
-    "network_attack": {
-        "module": "network_attack_kb",
-        "builder": "build_network_attack_prompt",
-        "tags": ["network", "mitm", "dns", "arp"],
-    },
-    "active_directory": {
-        "module": "active_directory_kb",
-        "builder": "build_ad_prompt",
-        "tags": ["network", "ad", "windows", "kerberos"],
-    },
-    # Identity
-    "identity_sso": {
-        "module": "identity_sso_kb",
-        "builder": "build_identity_prompt",
-        "tags": ["identity", "saml", "oauth", "sso"],
-    },
-    # Cloud
-    "cloud_native": {
-        "module": "cloud_native_kb",
-        "builder": "build_cloud_native_prompt",
-        "tags": ["cloud", "aws", "azure", "gcp"],
-    },
-    # DevSecOps
-    "devsecops": {
-        "module": "devsecops_kb",
-        "builder": "build_devsecops_prompt",
-        "tags": ["cicd", "pipeline", "iac", "supply_chain"],
-    },
-    # Exploitation
-    "privesc": {
-        "module": "privesc_deep_kb",
-        "builder": "build_privesc_prompt",
-        "tags": ["exploit", "privesc", "linux", "windows"],
-    },
-    "binary_exploit": {
-        "module": "binary_exploit_kb",
-        "builder": "build_binary_exploit_prompt",
-        "tags": ["exploit", "binary", "rop", "heap"],
-    },
-    # Mobile
-    "mobile_security": {
-        "module": "mobile_security_kb",
-        "builder": "build_mobile_prompt",
-        "tags": ["mobile", "android", "ios", "app"],
-    },
-    # IoT/ICS
-    "iot_ics": {
-        "module": "iot_ics_kb",
-        "builder": "build_iot_ics_prompt",
-        "tags": ["iot", "ics", "scada", "firmware"],
-    },
-    # Blockchain
-    "blockchain": {
-        "module": "blockchain_kb",
-        "builder": "build_blockchain_prompt",
-        "tags": ["blockchain", "smart_contract", "defi"],
-    },
-    # Email/Social
-    "email_phishing": {
-        "module": "email_phishing_kb",
-        "builder": "build_email_prompt",
-        "tags": ["email", "phishing", "social"],
-    },
-    # Compliance
-    "compliance": {
-        "module": "compliance_deep_kb",
-        "builder": "build_compliance_prompt",
-        "tags": ["compliance", "pci", "hipaa", "nist"],
-    },
-    # Incident Response
-    "incident_response": {
-        "module": "incident_response_kb",
-        "builder": "build_ir_prompt",
-        "tags": ["incident", "forensics", "response"],
-    },
-}
-
-# Phase → most relevant KB domains
-PHASE_KB_RELEVANCE: dict[str, list[str]] = {
-    "recon": ["network_attack", "active_directory", "cloud_native"],
-    "enumeration": ["web_vuln", "api_gateway", "network_attack"],
-    "scanning": [
-        "web_vuln", "xss", "ssrf", "sqli", "deserialization",
-        "api_gateway", "network_attack", "cloud_native",
-    ],
-    "analysis": [
-        "web_vuln", "xss", "ssrf", "sqli", "privesc",
-        "identity_sso", "compliance",
-    ],
-    "exploitation": [
-        "privesc", "binary_exploit", "deserialization",
-        "xss", "ssrf", "sqli", "active_directory",
-    ],
-    "post_exploit": [
-        "privesc", "active_directory", "network_attack",
-    ],
-    "validation": ["web_vuln", "compliance"],
-    "reporting": ["compliance", "incident_response"],
-}
-
-# Target type → most relevant KB domains
-TARGET_KB_RELEVANCE: dict[str, list[str]] = {
-    "web": ["web_vuln", "xss", "ssrf", "sqli", "deserialization", "api_gateway", "web_cache"],
-    "api": ["api_gateway", "web_vuln", "sqli", "identity_sso"],
-    "network": ["network_attack", "active_directory", "privesc"],
-    "cloud": ["cloud_native", "devsecops", "identity_sso"],
-    "mobile": ["mobile_security", "api_gateway"],
-    "iot": ["iot_ics"],
-    "blockchain": ["blockchain"],
-    "ad": ["active_directory", "identity_sso", "privesc"],
-}
-
-
-@dataclass
-class PromptSection:
-    """A section of the assembled prompt."""
-    name: str = ""
-    content: str = ""
-    token_count: int = 0
-    priority: int = 5
-    source_kb: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name[:15],
-            "tokens": self.token_count,
-            "pri": self.priority,
-        }
-
-
 @dataclass
 class AssembledPrompt:
-    """A fully assembled prompt."""
-    sections: list[PromptSection] = field(default_factory=list)
-    total_tokens: int = 0
-    max_tokens: int = 4096
-    kb_domains_used: list[str] = field(default_factory=list)
-    assembled_at: float = field(default_factory=time.time)
+    """A fully assembled prompt ready for LLM."""
+    system_prompt: str = ""
+    user_instruction: str = ""
+    kb_context: str = ""
+    experience_context: str = ""
+    strategy_context: str = ""
+    graph_context: str = ""
+    output_format: str = ""
+    total_tokens_estimate: int = 0
+    model_id: str = ""
+    kbs_loaded: list[str] = field(default_factory=list)
+    truncated: bool = False
 
     @property
-    def text(self) -> str:
-        return "\n\n".join(s.content for s in self.sections if s.content)
+    def full_system(self) -> str:
+        """Full system prompt with all context."""
+        parts = [self.system_prompt]
+        if self.kb_context:
+            parts.append(self.kb_context)
+        if self.experience_context:
+            parts.append(self.experience_context)
+        if self.strategy_context:
+            parts.append(self.strategy_context)
+        if self.graph_context:
+            parts.append(self.graph_context)
+        return "\n\n".join(parts)
+
+    @property
+    def full_user(self) -> str:
+        """Full user message with instruction and format."""
+        parts = [self.user_instruction]
+        if self.output_format:
+            parts.append(self.output_format)
+        return "\n\n".join(parts)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "sections": len(self.sections),
-            "tokens": self.total_tokens,
-            "kbs": len(self.kb_domains_used),
+            "model": self.model_id[:12],
+            "kbs": len(self.kbs_loaded),
+            "tokens_est": self.total_tokens_estimate,
+            "truncated": self.truncated,
+            "system_len": len(self.system_prompt),
+            "kb_len": len(self.kb_context),
         }
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate (1 token ~ 4 chars)."""
+    return len(text) // 4
+
+
+def _load_kb_prompt(module_path: str, func_name: str) -> str:
+    """Dynamically load a KB module and call its build prompt function."""
+    try:
+        mod = importlib.import_module(module_path)
+        build_func = getattr(mod, func_name, None)
+        if build_func and callable(build_func):
+            return build_func()
+        return ""
+    except (ImportError, AttributeError) as exc:
+        logger.warning("kb_load_failed", module=module_path, error=str(exc))
+        return ""
 
 
 class PromptAssembler:
-    """Assemble optimal prompts from all knowledge.
+    """Assembles optimal prompts from all agent components."""
 
-    Selects the right KB domains, compresses
-    them to fit the token budget, and produces
-    the best possible prompt for the LLM.
-    """
-
-    def __init__(self, default_max_tokens: int = 4096) -> None:
-        self._default_max = default_max_tokens
-        self._assemblies = 0
-        self._log = logger.bind(component="assembler")
-
-    def select_kb_domains(
-        self,
-        intent: str = "",
-        phase: str = "",
-        target_type: str = "",
-        explicit_domains: list[str] | None = None,
-    ) -> list[str]:
-        """Select relevant KB domains for the task."""
-        domains: list[str] = []
-
-        # Explicit domains first
-        if explicit_domains:
-            domains.extend(explicit_domains)
-
-        # Phase-relevant domains
-        if phase:
-            phase_domains = PHASE_KB_RELEVANCE.get(phase, [])
-            for d in phase_domains:
-                if d not in domains:
-                    domains.append(d)
-
-        # Target-relevant domains
-        if target_type:
-            target_domains = TARGET_KB_RELEVANCE.get(target_type, [])
-            for d in target_domains:
-                if d not in domains:
-                    domains.append(d)
-
-        # If nothing selected, use general web+network
-        if not domains:
-            domains = ["web_vuln", "network_attack", "privesc"]
-
-        return domains
+    def __init__(self, max_context_tokens: int = 8192) -> None:
+        self._max_context = max_context_tokens
+        self._assembly_count = 0
+        self._log = logger.bind(component="prompt_assembler")
 
     def assemble(
         self,
-        system_prompt: str = "",
-        task_description: str = "",
-        target_info: str = "",
-        memory_context: str = "",
-        findings_context: str = "",
-        reasoning_context: str = "",
+        role: str = "coordinator",
+        phase: str = "planning",
+        intent: str = "",
+        user_input: str = "",
         kb_domains: list[str] | None = None,
-        phase: str = "",
-        target_type: str = "",
-        max_tokens: int = 0,
+        model_context_size: int = 8192,
+        include_experience: bool = True,
+        include_strategy: bool = True,
+        include_graph: bool = True,
     ) -> AssembledPrompt:
-        """Assemble a complete prompt."""
-        self._assemblies += 1
-        budget = max_tokens or self._default_max
+        """Assemble a full prompt from all components."""
+        self._assembly_count += 1
+        max_ctx = min(self._max_context, model_context_size)
 
-        sections: list[PromptSection] = []
+        # 1. Get role system prompt
+        system_prompt = self._get_role_prompt(role)
 
-        # System prompt (highest priority)
-        if system_prompt:
-            sections.append(PromptSection(
-                name="system",
-                content=system_prompt,
-                token_count=len(system_prompt) // 4,
-                priority=10,
-            ))
+        # 2. Get phase instruction
+        instruction = self._get_phase_instruction(phase, user_input)
 
-        # Task description
-        if task_description:
-            sections.append(PromptSection(
-                name="task",
-                content=f"## Task\n{task_description}",
-                token_count=len(task_description) // 4,
-                priority=9,
-            ))
-
-        # Target info
-        if target_info:
-            sections.append(PromptSection(
-                name="target",
-                content=f"## Target\n{target_info}",
-                token_count=len(target_info) // 4,
-                priority=8,
-            ))
-
-        # Findings context
-        if findings_context:
-            sections.append(PromptSection(
-                name="findings",
-                content=f"## Current Findings\n{findings_context}",
-                token_count=len(findings_context) // 4,
-                priority=7,
-            ))
-
-        # Reasoning context
-        if reasoning_context:
-            sections.append(PromptSection(
-                name="reasoning",
-                content=reasoning_context,
-                token_count=len(reasoning_context) // 4,
-                priority=6,
-            ))
-
-        # Memory context
-        if memory_context:
-            sections.append(PromptSection(
-                name="memory",
-                content=f"## Memory\n{memory_context}",
-                token_count=len(memory_context) // 4,
-                priority=5,
-            ))
-
-        # Knowledge base sections
-        selected_domains = kb_domains or self.select_kb_domains(
-            phase=phase, target_type=target_type,
+        # 3. Load KB context
+        kb_context, loaded_kbs = self._load_kb_context(
+            kb_domains or [], max_kb_tokens=max_ctx // 3,
         )
-        domains_used: list[str] = []
 
-        for domain in selected_domains:
-            kb_info = KB_REGISTRY.get(domain)
-            if not kb_info:
-                continue
+        # 4. Load experience context
+        experience_ctx = ""
+        if include_experience:
+            experience_ctx = self._get_experience_context(intent)
 
-            # Generate placeholder KB content reference
-            builder = kb_info.get("builder", "")
-            kb_header = f"[KB: {domain} via {builder}]"
+        # 5. Load strategy context
+        strategy_ctx = ""
+        if include_strategy:
+            strategy_ctx = self._get_strategy_context(intent)
 
-            sections.append(PromptSection(
-                name=f"kb_{domain}",
-                content=kb_header,
-                token_count=50,
-                priority=4,
-                source_kb=domain,
-            ))
-            domains_used.append(domain)
+        # 6. Load graph context
+        graph_ctx = ""
+        if include_graph:
+            graph_ctx = self._get_graph_context()
 
-        # Sort by priority (highest first)
-        sections.sort(key=lambda s: s.priority, reverse=True)
+        # 7. Get output format
+        output_fmt = self._get_output_format(phase)
 
-        # Trim to budget
-        total = 0
-        kept: list[PromptSection] = []
-        for section in sections:
-            if total + section.token_count <= budget:
-                kept.append(section)
-                total += section.token_count
-            elif section.priority >= 8:
-                # High priority sections always included
-                kept.append(section)
-                total += section.token_count
+        # 8. Calculate total and truncate if needed
+        total = (
+            _estimate_tokens(system_prompt)
+            + _estimate_tokens(instruction)
+            + _estimate_tokens(kb_context)
+            + _estimate_tokens(experience_ctx)
+            + _estimate_tokens(strategy_ctx)
+            + _estimate_tokens(graph_ctx)
+            + _estimate_tokens(output_fmt)
+        )
+
+        truncated = False
+        if total > max_ctx * 0.8:
+            # Truncate KB context first (largest component)
+            excess = total - int(max_ctx * 0.75)
+            chars_to_remove = excess * 4
+            if len(kb_context) > chars_to_remove:
+                kb_context = kb_context[:len(kb_context) - chars_to_remove]
+                truncated = True
+            # Then truncate experience
+            elif experience_ctx:
+                experience_ctx = experience_ctx[:len(experience_ctx) // 2]
+                truncated = True
 
         result = AssembledPrompt(
-            sections=kept,
-            total_tokens=total,
-            max_tokens=budget,
-            kb_domains_used=domains_used,
+            system_prompt=system_prompt,
+            user_instruction=instruction,
+            kb_context=kb_context,
+            experience_context=experience_ctx,
+            strategy_context=strategy_ctx,
+            graph_context=graph_ctx,
+            output_format=output_fmt,
+            total_tokens_estimate=_estimate_tokens(
+                system_prompt + instruction + kb_context + experience_ctx + strategy_ctx + graph_ctx + output_fmt
+            ),
+            kbs_loaded=loaded_kbs,
+            truncated=truncated,
         )
 
         return result
 
-    def get_all_kb_domains(self) -> list[str]:
-        """Get all registered KB domains."""
-        return list(KB_REGISTRY.keys())
+    def _get_role_prompt(self, role: str) -> str:
+        """Get role-specific system prompt."""
+        try:
+            from recursec.agents.prompt_templates import ROLE_SYSTEM_PROMPTS, PromptRole
+            role_enum = PromptRole(role)
+            return ROLE_SYSTEM_PROMPTS.get(role_enum, f"You are a {role} security agent.")
+        except (ImportError, ValueError):
+            return f"You are a {role} security agent. Think step-by-step."
 
-    def get_kb_tags(self, domain: str) -> list[str]:
-        """Get tags for a KB domain."""
-        info = KB_REGISTRY.get(domain)
-        return info.get("tags", []) if info else []
+    def _get_phase_instruction(self, phase: str, user_input: str) -> str:
+        """Get phase-specific instruction."""
+        try:
+            from recursec.agents.prompt_templates import PHASE_INSTRUCTIONS, PromptPhase
+            phase_enum = PromptPhase(phase)
+            instruction = PHASE_INSTRUCTIONS.get(phase_enum, "Execute this phase.")
+        except (ImportError, ValueError):
+            instruction = "Execute this phase of the security assessment."
 
-    def search_kb_by_tag(self, tag: str) -> list[str]:
-        """Find KB domains by tag."""
-        results: list[str] = []
-        for domain, info in KB_REGISTRY.items():
-            if tag.lower() in [t.lower() for t in info.get("tags", [])]:
-                results.append(domain)
-        return results
+        if user_input:
+            instruction = f"Task: {user_input}\n\n{instruction}"
+        return instruction
 
-    def build_assembler_prompt(self) -> str:
-        """Build assembler stats for LLM."""
-        lines = ["## Prompt Assembly\n"]
-        lines.append(f"KBs available: {len(KB_REGISTRY)}")
-        lines.append(f"Assemblies: {self._assemblies}")
-        lines.append(f"Domains: {', '.join(list(KB_REGISTRY.keys())[:8])}")
-        return "\n".join(lines)
+    def _load_kb_context(
+        self, domains: list[str], max_kb_tokens: int = 2000,
+    ) -> tuple[str, list[str]]:
+        """Load knowledge base context for selected domains."""
+        try:
+            from recursec.agents.kb_registry import KB_REGISTRY
+        except ImportError:
+            return "", []
+
+        loaded: list[str] = []
+        parts: list[str] = []
+        current_tokens = 0
+
+        # Sort by priority (highest first)
+        sorted_domains = sorted(
+            [d for d in domains if d in KB_REGISTRY],
+            key=lambda d: KB_REGISTRY[d].priority,
+            reverse=True,
+        )
+
+        for domain in sorted_domains:
+            if current_tokens >= max_kb_tokens:
+                break
+            entry = KB_REGISTRY[domain]
+            kb_text = _load_kb_prompt(entry.module_path, entry.build_func_name)
+            if kb_text:
+                tokens = _estimate_tokens(kb_text)
+                if current_tokens + tokens <= max_kb_tokens:
+                    parts.append(kb_text)
+                    loaded.append(domain)
+                    current_tokens += tokens
+                else:
+                    # Partial load
+                    remaining = (max_kb_tokens - current_tokens) * 4
+                    parts.append(kb_text[:remaining])
+                    loaded.append(f"{domain}(partial)")
+                    break
+
+        return "\n\n".join(parts), loaded
+
+    def _get_experience_context(self, intent: str) -> str:
+        """Get experience replay context."""
+        try:
+            from recursec.agents.experience_replay import ExperienceReplay
+            replay = ExperienceReplay()
+            return replay.build_experience_prompt()
+        except ImportError:
+            return ""
+
+    def _get_strategy_context(self, intent: str) -> str:
+        """Get strategy optimizer context."""
+        try:
+            from recursec.agents.strategy_optimizer import StrategyOptimizer
+            optimizer = StrategyOptimizer()
+            return optimizer.build_optimizer_prompt()
+        except ImportError:
+            return ""
+
+    def _get_graph_context(self) -> str:
+        """Get knowledge graph context."""
+        try:
+            from recursec.agents.knowledge_graph import KnowledgeGraph
+            graph = KnowledgeGraph()
+            return graph.build_graph_prompt()
+        except ImportError:
+            return ""
+
+    def _get_output_format(self, phase: str) -> str:
+        """Get output format for a phase."""
+        try:
+            from recursec.agents.prompt_templates import OUTPUT_FORMATS, OutputFormat
+            if phase in ("tool_execution", "tool_selection"):
+                return OUTPUT_FORMATS.get(OutputFormat.TOOL_CALL, "")
+            if phase == "reporting":
+                return OUTPUT_FORMATS.get(OutputFormat.MARKDOWN, "")
+            return OUTPUT_FORMATS.get(OutputFormat.STRUCTURED, "")
+        except ImportError:
+            return "Respond with structured findings."
 
     def get_stats(self) -> dict[str, Any]:
+        """Get assembler statistics."""
         return {
-            "kb_domains": len(KB_REGISTRY),
-            "assemblies": self._assemblies,
+            "assemblies": self._assembly_count,
+            "max_context": self._max_context,
         }
