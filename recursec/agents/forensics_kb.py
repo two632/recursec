@@ -1,321 +1,47 @@
-"""Digital forensics knowledge base.
-
-Deep knowledge about digital forensics:
-1. Memory forensics
-2. Disk forensics
-3. Network forensics
-4. Malware analysis
-5. Anti-forensics detection
-"""
-
+"""Digital forensics knowledge base — memory, disk, network, mobile forensics."""
 from __future__ import annotations
-
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
-
 import structlog
-
 logger = structlog.get_logger()
 
+class ForensicsType(str, Enum):
+    MEMORY = "memory"
+    DISK = "disk"
+    NETWORK = "network"
+    MOBILE = "mobile"
+    MALWARE = "malware"
 
 @dataclass
 class ForensicsPattern:
-    """A forensics pattern."""
-    pattern_id: str = ""
     name: str = ""
-    category: str = ""
-    severity: str = "high"
+    forensics_type: ForensicsType = ForensicsType.MEMORY
     description: str = ""
-    detection_strategy: str = ""
+    methodology: list[str] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
-
+    commands: list[str] = field(default_factory=list)
+    severity: str = "high"
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.pattern_id,
-            "name": self.name[:25],
-            "category": self.category[:12],
-        }
+        return {"name": self.name, "type": self.forensics_type.value, "severity": self.severity}
 
-
-FORENSICS_PATTERNS: list[dict[str, Any]] = [
-    {
-        "id": "for-001", "name": "Memory Forensics",
-        "category": "memory", "severity": "high",
-        "desc": "Memory acquisition and analysis.",
-        "detection": (
-            "MEMORY FORENSICS:\n"
-            "ACQUISITION:\n"
-            "  Linux:\n"
-            "    # LiME (Linux Memory Extractor)\n"
-            "    insmod lime.ko 'path=/tmp/mem.lime format=lime'\n"
-            "    # /proc/kcore\n"
-            "    # AVML (Acquire Volatile Memory for Linux)\n"
-            "  Windows:\n"
-            "    # WinPmem\n"
-            "    # DumpIt\n"
-            "    # FTK Imager\n"
-            "    # Magnet RAM Capture\n"
-            "  macOS:\n"
-            "    # osxpmem\n"
-            "    # MacQuisition\n"
-            "ANALYSIS (Volatility 3):\n"
-            "  Process:\n"
-            "    # vol -f mem.raw windows.pslist\n"
-            "    # vol -f mem.raw windows.pstree\n"
-            "    # vol -f mem.raw windows.cmdline\n"
-            "    # vol -f mem.raw windows.dlllist\n"
-            "    # vol -f mem.raw linux.pslist\n"
-            "  Network:\n"
-            "    # vol -f mem.raw windows.netscan\n"
-            "    # vol -f mem.raw windows.netstat\n"
-            "  Registry:\n"
-            "    # vol -f mem.raw windows.registry.hivelist\n"
-            "    # vol -f mem.raw windows.registry.printkey\n"
-            "  Malware:\n"
-            "    # vol -f mem.raw windows.malfind\n"
-            "    # vol -f mem.raw windows.hollowprocesses\n"
-            "    # vol -f mem.raw yarascan\n"
-            "TOOLS:\n"
-            "  Volatility3, Rekall, LiME, WinPmem"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "for-002", "name": "Disk Forensics",
-        "category": "disk", "severity": "high",
-        "desc": "Disk image acquisition and analysis.",
-        "detection": (
-            "DISK FORENSICS:\n"
-            "ACQUISITION:\n"
-            "  # dd if=/dev/sda of=disk.img bs=4M\n"
-            "  # dc3dd if=/dev/sda of=disk.img hash=md5\n"
-            "  # ewfacquire /dev/sda (E01 format)\n"
-            "  # FTK Imager (GUI)\n"
-            "FILESYSTEM:\n"
-            "  # Autopsy (GUI)\n"
-            "  # The Sleuth Kit (CLI)\n"
-            "    fls -r -m / disk.img (file listing)\n"
-            "    icat disk.img INODE (extract file)\n"
-            "    tsk_recover disk.img output/ (recover)\n"
-            "  # ext4: debugfs, extundelete\n"
-            "  # NTFS: ntfsundelete, ntfs-3g\n"
-            "ARTIFACTS:\n"
-            "  Windows:\n"
-            "    - MFT ($MFT)\n"
-            "    - Registry hives\n"
-            "    - Event logs (evtx)\n"
-            "    - Prefetch files\n"
-            "    - Jump lists\n"
-            "    - ShellBags\n"
-            "    - USB device history\n"
-            "    - Browser history\n"
-            "  Linux:\n"
-            "    - /var/log/ (auth, syslog, messages)\n"
-            "    - /etc/passwd, /etc/shadow\n"
-            "    - ~/.bash_history\n"
-            "    - /tmp\n"
-            "    - Cron jobs\n"
-            "    - SSH keys and known_hosts\n"
-            "TOOLS:\n"
-            "  Autopsy, TSK, Plaso, KAPE, X-Ways"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "for-003", "name": "Network Forensics",
-        "category": "network", "severity": "medium",
-        "desc": "Network traffic analysis.",
-        "detection": (
-            "NETWORK FORENSICS:\n"
-            "CAPTURE:\n"
-            "  # tcpdump -i eth0 -w capture.pcap\n"
-            "  # dumpcap -i eth0 -w capture.pcap\n"
-            "  # Network TAP (full duplex)\n"
-            "  # SPAN port (switch mirror)\n"
-            "ANALYSIS:\n"
-            "  Wireshark/tshark:\n"
-            "    # tshark -r cap.pcap -Y 'http'\n"
-            "    # tshark -r cap.pcap -Y 'dns'\n"
-            "    # tshark -r cap.pcap -qz conv,tcp\n"
-            "    # Protocol hierarchy statistics\n"
-            "  NetworkMiner:\n"
-            "    # File extraction\n"
-            "    # Credential capture\n"
-            "    # Host profiling\n"
-            "  Zeek (Bro):\n"
-            "    # Connection logs (conn.log)\n"
-            "    # DNS queries (dns.log)\n"
-            "    # HTTP transactions (http.log)\n"
-            "    # SSL/TLS (ssl.log)\n"
-            "    # File hashes (files.log)\n"
-            "INDICATORS:\n"
-            "  - C2 beaconing patterns\n"
-            "    # Regular interval connections\n"
-            "    # Jitter analysis\n"
-            "  - DNS tunneling\n"
-            "    # Long subdomain names\n"
-            "    # High query volume\n"
-            "  - Data exfiltration\n"
-            "    # Large outbound transfers\n"
-            "    # Unusual protocols\n"
-            "TOOLS:\n"
-            "  Wireshark, Zeek, NetworkMiner, Moloch/Arkime"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "for-004", "name": "Malware Analysis",
-        "category": "malware", "severity": "critical",
-        "desc": "Static and dynamic malware analysis.",
-        "detection": (
-            "MALWARE ANALYSIS:\n"
-            "STATIC:\n"
-            "  - File identification\n"
-            "    # file malware.exe\n"
-            "    # sha256sum malware.exe\n"
-            "    # ssdeep malware.exe (fuzzy hash)\n"
-            "  - String extraction\n"
-            "    # strings -a malware.exe\n"
-            "    # FLOSS (FireEye Labs Obfuscated\n"
-            "    #   String Solver)\n"
-            "  - PE analysis\n"
-            "    # pestudio, pefile (Python)\n"
-            "    # Import table, sections\n"
-            "    # Entropy analysis\n"
-            "  - Disassembly\n"
-            "    # Ghidra, IDA Pro, Radare2\n"
-            "    # Control flow analysis\n"
-            "    # Function identification\n"
-            "DYNAMIC:\n"
-            "  - Sandbox execution\n"
-            "    # Cuckoo Sandbox\n"
-            "    # ANY.RUN\n"
-            "    # Joe Sandbox\n"
-            "  - API monitoring\n"
-            "    # Process Monitor (Windows)\n"
-            "    # strace/ltrace (Linux)\n"
-            "  - Network monitoring\n"
-            "    # FakeNet-NG\n"
-            "    # INetSim\n"
-            "  - Registry/file monitoring\n"
-            "YARA RULES:\n"
-            "  - Pattern matching\n"
-            "    # rule malware_detect {\n"
-            "    #   strings: $s1 = 'malicious'\n"
-            "    #   condition: $s1\n"
-            "    # }\n"
-            "TOOLS:\n"
-            "  Ghidra, Cuckoo, YARA, Radare2, FLOSS"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "for-005", "name": "Anti-Forensics Detection",
-        "category": "anti_forensics", "severity": "high",
-        "desc": "Detecting anti-forensics techniques.",
-        "detection": (
-            "ANTI-FORENSICS DETECTION:\n"
-            "DATA DESTRUCTION:\n"
-            "  - Secure deletion detection\n"
-            "    # Check for shred, srm, wipe usage\n"
-            "    # MFT entry analysis\n"
-            "    # Journal analysis\n"
-            "  - Timestamp manipulation\n"
-            "    # Timestomp detection\n"
-            "    # $SI vs $FN timestamps\n"
-            "    # Timeline anomalies\n"
-            "  - Log tampering\n"
-            "    # Missing log entries\n"
-            "    # Log gaps\n"
-            "    # Event log clearing events\n"
-            "HIDING:\n"
-            "  - Alternate Data Streams (NTFS)\n"
-            "    # dir /r\n"
-            "    # streams.exe (Sysinternals)\n"
-            "  - Steganography\n"
-            "    # StegDetect, zsteg\n"
-            "    # Entropy analysis\n"
-            "  - Slack space hiding\n"
-            "    # Data in file slack\n"
-            "    # Inter-partition gaps\n"
-            "  - Rootkits\n"
-            "    # chkrootkit, rkhunter\n"
-            "    # Cross-view detection\n"
-            "OBFUSCATION:\n"
-            "  - Encryption detection\n"
-            "    # High entropy files\n"
-            "    # Known encryption headers\n"
-            "  - Packing detection\n"
-            "    # UPX, Themida\n"
-            "    # Entropy per section\n"
-            "  - Process injection\n"
-            "    # Hollow process detection\n"
-            "    # DLL injection artifacts\n"
-            "TOOLS:\n"
-            "  Autopsy, Plaso, KAPE, timestomp-detect"
-        ),
-        "tools": [],
-    },
+FORENSICS_PATTERNS: list[ForensicsPattern] = [
+    ForensicsPattern(name="Memory Forensics", forensics_type=ForensicsType.MEMORY, description="Volatile memory analysis: process listing, DLL injection detection, rootkit discovery, credential extraction, network connections, command history.", methodology=["Acquire memory dump (winpmem, LiME, DumpIt)", "Identify OS profile/symbol table", "List processes and detect anomalies (hidden, injected)", "Scan for malware signatures and injected code", "Extract network connections and DNS cache", "Recover credentials from LSASS, registry hives", "Analyze kernel modules for rootkits", "Timeline analysis of memory artifacts"], artifacts=["Process list (including hidden)", "DLL list and injected code regions", "Network connections (TCP, UDP, raw)", "Open file handles", "Registry hives in memory", "Cached credentials (NTLM hashes)", "Command history (cmd, PowerShell)"], tools=["volatility3", "rekall", "winpmem", "lime"], commands=["vol3 -f memory.dmp windows.pslist", "vol3 -f memory.dmp windows.malfind", "vol3 -f memory.dmp windows.netscan", "vol3 -f memory.dmp windows.hashdump"], severity="high"),
+    ForensicsPattern(name="Disk Forensics", forensics_type=ForensicsType.DISK, description="Disk image analysis: file recovery, timeline generation, artifact extraction, deleted file recovery, registry analysis, browser forensics.", methodology=["Create forensic image (dd, FTK Imager, ewfacquire)", "Verify image hash integrity", "Mount image read-only", "Extract filesystem timeline (MFT, journal)", "Recover deleted files and slack space", "Analyze registry hives for user activity", "Extract browser history, downloads, cache", "Analyze prefetch files for execution history", "Check for encryption (BitLocker, LUKS)"], artifacts=["$MFT (Master File Table) entries", "NTFS journal ($UsnJrnl, $LogFile)", "Prefetch files (C:\\Windows\\Prefetch)", "Registry hives (SYSTEM, SAM, SOFTWARE, NTUSER)", "Browser databases (Chrome History, Firefox places.sqlite)", "Recent documents and LNK files", "Recycle Bin ($I and $R files)", "Volume Shadow Copies"], tools=["autopsy", "sleuthkit", "ftk-imager", "plaso"], commands=["fls -r -m / image.dd", "icat image.dd inode_number > recovered_file", "log2timeline.py plaso.dump image.dd", "psort.py -o l2tcsv plaso.dump"], severity="high"),
+    ForensicsPattern(name="Network Forensics", forensics_type=ForensicsType.NETWORK, description="Network traffic analysis: packet capture analysis, flow analysis, protocol reconstruction, C2 detection, data exfiltration detection.", methodology=["Capture network traffic (tcpdump, Wireshark)", "Analyze flow data (NetFlow, sFlow)", "Reconstruct sessions and extract files", "Identify C2 beaconing patterns", "Detect data exfiltration (DNS, HTTPS, ICMP)", "Analyze SSL/TLS certificates and JA3 hashes", "Correlate with threat intelligence feeds", "Timeline network events with system events"], artifacts=["PCAP files", "NetFlow records", "DNS query logs", "HTTP request/response pairs", "TLS certificates and JA3/JA3S hashes", "Extracted files from streams", "Beaconing patterns (interval, jitter)"], tools=["wireshark", "zeek", "suricata", "networkminer"], commands=["tshark -r capture.pcap -Y 'http.request' -T fields -e http.host -e http.request.uri", "zeek -r capture.pcap", "suricata -r capture.pcap -l /tmp/suricata/"], severity="high"),
+    ForensicsPattern(name="Mobile Forensics", forensics_type=ForensicsType.MOBILE, description="Mobile device forensics: iOS/Android data extraction, app analysis, communication recovery, location tracking, cloud data.", methodology=["Preserve device state (airplane mode, Faraday bag)", "Identify device model and OS version", "Logical acquisition (backup-based extraction)", "Physical acquisition (chip-off, JTAG, ISP)", "Parse application databases (SQLite)", "Recover deleted messages and media", "Extract location data (GPS, WiFi, cell tower)", "Analyze cloud accounts (iCloud, Google)"], artifacts=["SMS/MMS messages and iMessage", "WhatsApp/Telegram/Signal databases", "Call history and contacts", "GPS coordinates and location history", "Photos with EXIF metadata", "Application data and preferences", "Browser history and bookmarks", "Keychain/credential stores"], tools=["mvt", "andriller", "aleapp", "ileapp"], commands=["mvt-android check-adb", "mvt-ios check-backup --output /tmp/mvt/ backup/", "aleapp -t csv -i android_extraction/ -o /tmp/aleapp/"], severity="high"),
+    ForensicsPattern(name="Malware Analysis", forensics_type=ForensicsType.MALWARE, description="Malware analysis: static analysis, dynamic analysis, behavioral analysis, network traffic analysis, code reverse engineering.", methodology=["Triage: file type, hashes, VirusTotal check", "Static analysis: strings, imports, PE headers, signatures", "Behavioral analysis: sandbox execution (AnyRun, Cuckoo)", "Dynamic analysis: debug and trace execution", "Network analysis: capture C2 traffic in sandbox", "Code analysis: decompile and reverse engineer", "Unpack/deobfuscate if packed/encrypted", "Write YARA rules for detection"], artifacts=["File hashes (MD5, SHA256)", "Imported functions and libraries", "Embedded strings and URLs", "Network indicators (C2 IPs, domains)", "Dropped files and registry changes", "Mutex names and named pipes", "PE compilation timestamp", "Code signing certificate"], tools=["ghidra", "ida-free", "radare2", "cuckoo", "yara"], commands=["strings malware.exe | head -100", "rabin2 -I malware.exe", "radare2 -A malware.exe -c 'afl'", "yara rules.yar /path/to/scan/"], severity="high"),
 ]
 
-
-class ForensicsKB:
-    """Digital forensics knowledge base.
-
-    Provides forensics patterns injected
-    into agent prompts.
-    """
-
-    def __init__(self) -> None:
-        self._patterns: dict[str, ForensicsPattern] = {}
-        self._log = logger.bind(component="forensics_kb")
-        self._load_patterns()
-
-    def _load_patterns(self) -> None:
-        """Load forensics patterns."""
-        for data in FORENSICS_PATTERNS:
-            pattern = ForensicsPattern(
-                pattern_id=data["id"],
-                name=data["name"],
-                category=data.get("category", ""),
-                severity=data.get("severity", "high"),
-                description=data.get("desc", ""),
-                detection_strategy=data.get("detection", ""),
-                tools=data.get("tools", []),
-            )
-            self._patterns[pattern.pattern_id] = pattern
-
-    def get_by_category(self, category: str) -> list[ForensicsPattern]:
-        """Get patterns by category."""
-        return [
-            p for p in self._patterns.values()
-            if p.category.lower() == category.lower()
-        ]
-
-    def build_forensics_prompt(
-        self,
-        categories: list[str] | None = None,
-        max_patterns: int = 4,
-    ) -> str:
-        """Build forensics prompt."""
-        lines = ["## Digital Forensics\n"]
-        count = 0
-        for pattern in self._patterns.values():
-            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
-                continue
-            if count >= max_patterns:
-                break
-            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
-            lines.append(pattern.detection_strategy)
-            lines.append("")
-            count += 1
-        return "\n".join(lines)
-
-    def get_stats(self) -> dict[str, Any]:
-        cat_counts: dict[str, int] = {}
-        for p in self._patterns.values():
-            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
-        return {
-            "patterns": len(self._patterns),
-            "by_category": cat_counts,
-        }
+def build_forensics_prompt(focus_type: ForensicsType | None = None, max_patterns: int = 5) -> str:
+    lines = ["## Digital Forensics Knowledge\n"]
+    patterns = FORENSICS_PATTERNS if not focus_type else [p for p in FORENSICS_PATTERNS if p.forensics_type == focus_type]
+    for p in patterns[:max_patterns]:
+        lines.append(f"### {p.name} [{p.severity}]")
+        lines.append(p.description)
+        lines.append("\nMethodology:")
+        for m in p.methodology[:4]:
+            lines.append(f"  - {m}")
+        lines.append("")
+    return "\n".join(lines)
