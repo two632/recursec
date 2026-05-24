@@ -1,13 +1,13 @@
-"""Self-improvement engine — agent learns from past assessments.
+"""Self-improvement engine — the agent learns and gets better over time.
 
 Implements:
-1. Strategy effectiveness tracking (which approaches work for which targets)
-2. Tool success rate monitoring
-3. Model performance comparison per task type
-4. Automatic strategy recommendation based on history
-5. Pattern recognition across assessments
-6. Feedback loop from validation results
-7. Self-improvement prompt for LLM context
+1. Performance tracking per strategy/tool/model/KB
+2. Automatic parameter tuning based on results
+3. Strategy evolution (promote successful, demote failing)
+4. Knowledge gap detection and filling
+5. Tool reliability scoring
+6. Model quality tracking per task type
+7. Prompt effectiveness measurement
 """
 
 from __future__ import annotations
@@ -22,358 +22,303 @@ import structlog
 logger = structlog.get_logger()
 
 
-class OutcomeType(str, Enum):
-    SUCCESS = "success"
-    PARTIAL = "partial"
-    FAILURE = "failure"
-    FALSE_POSITIVE = "false_positive"
-    TIMEOUT = "timeout"
-
-
-class TaskCategory(str, Enum):
-    RECON = "recon"
-    VULN_SCAN = "vuln_scan"
-    WEB_AUDIT = "web_audit"
-    CODE_AUDIT = "code_audit"
-    EXPLOIT = "exploit"
-    PRIVESC = "privesc"
-    LATERAL = "lateral"
-    CLOUD = "cloud"
-    MOBILE = "mobile"
-    NETWORK = "network"
+class MetricType(str, Enum):
+    TOOL_RELIABILITY = "tool_reliability"
+    MODEL_QUALITY = "model_quality"
+    STRATEGY_EFFECTIVENESS = "strategy_effectiveness"
+    KB_RELEVANCE = "kb_relevance"
+    PROMPT_EFFECTIVENESS = "prompt_effectiveness"
+    FINDING_ACCURACY = "finding_accuracy"
+    PHASE_EFFICIENCY = "phase_efficiency"
 
 
 @dataclass
-class StrategyRecord:
-    """Record of a strategy execution."""
-    record_id: str = ""
-    strategy: str = ""            # Strategy name/approach
-    task_category: TaskCategory = TaskCategory.RECON
-    target_type: str = ""         # e.g., "web_app", "network", "cloud"
-    tools_used: list[str] = field(default_factory=list)
-    model_used: str = ""
-    outcome: OutcomeType = OutcomeType.FAILURE
-    findings_count: int = 0
-    time_taken_s: float = 0.0
-    tokens_used: int = 0
-    confidence: float = 0.0
-    notes: str = ""
-    timestamp: float = field(default_factory=time.time)
-
-    @property
-    def efficiency(self) -> float:
-        """Findings per 1000 tokens."""
-        if self.tokens_used == 0:
-            return 0.0
-        return (self.findings_count / self.tokens_used) * 1000
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.record_id[:10],
-            "strategy": self.strategy[:15],
-            "outcome": self.outcome.value[:6],
-            "findings": self.findings_count,
-            "efficiency": round(self.efficiency, 2),
-        }
-
-
-@dataclass
-class ToolPerformance:
-    """Tracked performance of a tool."""
-    tool_name: str = ""
-    runs: int = 0
+class PerformanceMetric:
+    """A tracked performance metric."""
+    metric_id: str = ""
+    metric_type: MetricType = MetricType.TOOL_RELIABILITY
+    subject: str = ""
+    total_uses: int = 0
     successes: int = 0
     failures: int = 0
-    findings_total: int = 0
-    avg_time_s: float = 0.0
-    false_positives: int = 0
+    total_duration_s: float = 0.0
+    total_findings: int = 0
+    total_tokens: int = 0
+    false_positive_count: int = 0
+    last_updated: float = field(default_factory=time.time)
 
     @property
     def success_rate(self) -> float:
-        if self.runs == 0:
+        if self.total_uses == 0:
             return 0.0
-        return self.successes / self.runs
+        return self.successes / self.total_uses
 
     @property
-    def precision(self) -> float:
-        total = self.findings_total
-        if total == 0:
-            return 1.0
-        return (total - self.false_positives) / total
+    def avg_duration(self) -> float:
+        if self.total_uses == 0:
+            return 0.0
+        return self.total_duration_s / self.total_uses
+
+    @property
+    def avg_findings_per_use(self) -> float:
+        if self.total_uses == 0:
+            return 0.0
+        return self.total_findings / self.total_uses
+
+    @property
+    def false_positive_rate(self) -> float:
+        if self.total_findings == 0:
+            return 0.0
+        return self.false_positive_count / self.total_findings
+
+    @property
+    def score(self) -> float:
+        """Overall performance score (0-1)."""
+        sr = self.success_rate
+        fpr = 1.0 - self.false_positive_rate
+        efficiency = min(1.0, self.avg_findings_per_use / 5.0)
+        return (sr * 0.4 + fpr * 0.3 + efficiency * 0.3)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "tool": self.tool_name[:12],
-            "runs": self.runs,
-            "success": f"{self.success_rate:.0%}",
-            "findings": self.findings_total,
+            "type": self.metric_type.value[:10],
+            "subject": self.subject[:15],
+            "uses": self.total_uses,
+            "success": f"{self.success_rate:.1%}",
+            "score": f"{self.score:.2f}",
         }
 
 
 @dataclass
-class ModelPerformance:
-    """Tracked performance of a model."""
-    model_id: str = ""
-    task_counts: dict[str, int] = field(default_factory=dict)
-    task_success: dict[str, int] = field(default_factory=dict)
-    total_tokens: int = 0
-    avg_confidence: float = 0.0
-
-    def success_rate_for(self, task: str) -> float:
-        total = self.task_counts.get(task, 0)
-        if total == 0:
-            return 0.0
-        return self.task_success.get(task, 0) / total
+class ImprovementAction:
+    """An action taken to improve performance."""
+    action_id: str = ""
+    action_type: str = ""
+    description: str = ""
+    applied_to: str = ""
+    before_score: float = 0.0
+    after_score: float = 0.0
+    timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model_id[:15],
-            "tasks": sum(self.task_counts.values()),
-            "tokens": self.total_tokens,
+            "type": self.action_type[:12],
+            "applied_to": self.applied_to[:15],
+            "improvement": f"{self.after_score - self.before_score:+.2f}",
         }
 
 
-class SelfImprovementEngine:
-    """Learns from past assessments to improve future ones.
+@dataclass
+class KnowledgeGap:
+    """A detected gap in the agent's knowledge."""
+    gap_id: str = ""
+    domain: str = ""
+    description: str = ""
+    detected_from: str = ""
+    severity: str = "medium"
+    filled: bool = False
 
-    Tracks strategy effectiveness, tool success rates,
-    and model performance. Recommends strategies based
-    on historical data.
-    """
+    def to_dict(self) -> dict[str, Any]:
+        return {"domain": self.domain[:12], "severity": self.severity[:4], "filled": self.filled}
+
+
+class SelfImprovementEngine:
+    """Tracks performance and drives self-improvement."""
 
     def __init__(self) -> None:
-        self._records: list[StrategyRecord] = []
-        self._tool_perf: dict[str, ToolPerformance] = {}
-        self._model_perf: dict[str, ModelPerformance] = {}
-        self._counter = 0
+        self._metrics: dict[str, PerformanceMetric] = {}
+        self._actions: list[ImprovementAction] = []
+        self._gaps: list[KnowledgeGap] = []
+        self._action_counter = 0
+        self._gap_counter = 0
         self._log = logger.bind(component="self_improvement")
 
-    def record_strategy(
+    def _get_or_create_metric(
+        self, metric_type: MetricType, subject: str,
+    ) -> PerformanceMetric:
+        key = f"{metric_type.value}:{subject}"
+        if key not in self._metrics:
+            self._metrics[key] = PerformanceMetric(
+                metric_id=key,
+                metric_type=metric_type,
+                subject=subject,
+            )
+        return self._metrics[key]
+
+    def record_tool_use(
         self,
-        strategy: str,
-        task_category: TaskCategory,
-        target_type: str,
-        outcome: OutcomeType,
-        tools_used: list[str] | None = None,
-        model_used: str = "",
+        tool_name: str,
+        success: bool,
+        duration_s: float = 0.0,
         findings_count: int = 0,
-        time_taken_s: float = 0.0,
+        false_positives: int = 0,
+    ) -> None:
+        """Record a tool execution result."""
+        metric = self._get_or_create_metric(MetricType.TOOL_RELIABILITY, tool_name)
+        metric.total_uses += 1
+        if success:
+            metric.successes += 1
+        else:
+            metric.failures += 1
+        metric.total_duration_s += duration_s
+        metric.total_findings += findings_count
+        metric.false_positive_count += false_positives
+        metric.last_updated = time.time()
+
+    def record_model_use(
+        self,
+        model_id: str,
+        task_type: str,
+        success: bool,
         tokens_used: int = 0,
-        confidence: float = 0.0,
-        notes: str = "",
-    ) -> StrategyRecord:
+        quality_score: float = 0.0,
+    ) -> None:
+        """Record a model usage result."""
+        metric = self._get_or_create_metric(MetricType.MODEL_QUALITY, f"{model_id}:{task_type}")
+        metric.total_uses += 1
+        if success:
+            metric.successes += 1
+        else:
+            metric.failures += 1
+        metric.total_tokens += tokens_used
+        metric.last_updated = time.time()
+
+    def record_strategy_use(
+        self,
+        strategy_name: str,
+        success: bool,
+        findings_count: int = 0,
+        duration_s: float = 0.0,
+    ) -> None:
         """Record a strategy execution result."""
-        self._counter += 1
-        record = StrategyRecord(
-            record_id=f"rec-{self._counter}",
-            strategy=strategy,
-            task_category=task_category,
-            target_type=target_type,
-            tools_used=tools_used or [],
-            model_used=model_used,
-            outcome=outcome,
-            findings_count=findings_count,
-            time_taken_s=time_taken_s,
-            tokens_used=tokens_used,
-            confidence=confidence,
-            notes=notes,
+        metric = self._get_or_create_metric(MetricType.STRATEGY_EFFECTIVENESS, strategy_name)
+        metric.total_uses += 1
+        if success:
+            metric.successes += 1
+        else:
+            metric.failures += 1
+        metric.total_findings += findings_count
+        metric.total_duration_s += duration_s
+        metric.last_updated = time.time()
+
+    def record_kb_use(
+        self,
+        kb_domain: str,
+        relevant: bool,
+        findings_enabled: int = 0,
+    ) -> None:
+        """Record KB relevance."""
+        metric = self._get_or_create_metric(MetricType.KB_RELEVANCE, kb_domain)
+        metric.total_uses += 1
+        if relevant:
+            metric.successes += 1
+        else:
+            metric.failures += 1
+        metric.total_findings += findings_enabled
+        metric.last_updated = time.time()
+
+    def detect_knowledge_gap(
+        self,
+        domain: str,
+        description: str,
+        detected_from: str = "",
+    ) -> KnowledgeGap:
+        """Record a detected knowledge gap."""
+        self._gap_counter += 1
+        gap = KnowledgeGap(
+            gap_id=f"gap-{self._gap_counter}",
+            domain=domain,
+            description=description,
+            detected_from=detected_from,
         )
-        self._records.append(record)
+        self._gaps.append(gap)
+        return gap
 
-        # Update tool performance
-        for tool in record.tools_used:
-            self._update_tool_perf(tool, record)
-
-        # Update model performance
-        if model_used:
-            self._update_model_perf(model_used, record)
-
-        return record
-
-    def recommend_strategy(
-        self,
-        task_category: TaskCategory,
-        target_type: str = "",
-        top_n: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Recommend strategies based on history."""
-        # Filter records
-        relevant = [
-            r for r in self._records
-            if r.task_category == task_category
+    def get_top_tools(self, n: int = 5) -> list[PerformanceMetric]:
+        """Get top performing tools."""
+        tool_metrics = [
+            m for m in self._metrics.values()
+            if m.metric_type == MetricType.TOOL_RELIABILITY and m.total_uses >= 3
         ]
-        if target_type:
-            type_match = [r for r in relevant if r.target_type == target_type]
-            if type_match:
-                relevant = type_match
+        return sorted(tool_metrics, key=lambda m: m.score, reverse=True)[:n]
 
-        if not relevant:
-            return [{"strategy": "default", "reason": "no_history"}]
+    def get_worst_tools(self, n: int = 5) -> list[PerformanceMetric]:
+        """Get worst performing tools."""
+        tool_metrics = [
+            m for m in self._metrics.values()
+            if m.metric_type == MetricType.TOOL_RELIABILITY and m.total_uses >= 3
+        ]
+        return sorted(tool_metrics, key=lambda m: m.score)[:n]
 
-        # Score strategies
-        strategy_scores: dict[str, dict[str, float]] = {}
-        for r in relevant:
-            if r.strategy not in strategy_scores:
-                strategy_scores[r.strategy] = {
-                    "success": 0, "total": 0,
-                    "findings": 0, "efficiency": 0,
-                }
-            scores = strategy_scores[r.strategy]
-            scores["total"] += 1
-            if r.outcome in (OutcomeType.SUCCESS, OutcomeType.PARTIAL):
-                scores["success"] += 1
-            scores["findings"] += r.findings_count
-            scores["efficiency"] += r.efficiency
+    def get_best_model_for_task(self, task_type: str) -> str:
+        """Get the best performing model for a task type."""
+        candidates = [
+            m for m in self._metrics.values()
+            if m.metric_type == MetricType.MODEL_QUALITY and task_type in m.subject
+        ]
+        if not candidates:
+            return "mistral-7b"
+        best = max(candidates, key=lambda m: m.score)
+        return best.subject.split(":")[0]
 
-        # Rank
-        ranked: list[dict[str, Any]] = []
-        for strat, scores in strategy_scores.items():
-            if scores["total"] == 0:
-                continue
-            success_rate = scores["success"] / scores["total"]
-            avg_findings = scores["findings"] / scores["total"]
-            composite = success_rate * 0.4 + min(avg_findings / 10, 1.0) * 0.3 + min(scores["efficiency"] / scores["total"], 1.0) * 0.3
+    def get_unfilled_gaps(self) -> list[KnowledgeGap]:
+        """Get knowledge gaps not yet filled."""
+        return [g for g in self._gaps if not g.filled]
 
-            ranked.append({
-                "strategy": strat,
-                "score": round(composite, 3),
-                "success_rate": round(success_rate, 2),
-                "avg_findings": round(avg_findings, 1),
-                "sample_size": int(scores["total"]),
-            })
+    def suggest_improvements(self) -> list[str]:
+        """Suggest improvements based on tracked metrics."""
+        suggestions = []
 
-        ranked.sort(key=lambda x: x["score"], reverse=True)
-        return ranked[:top_n]
+        # Poor performing tools
+        worst = self.get_worst_tools(3)
+        for m in worst:
+            if m.success_rate < 0.5:
+                suggestions.append(f"Tool '{m.subject}' has {m.success_rate:.0%} success rate — consider alternative or different parameters")
 
-    def recommend_tool(
-        self,
-        task_category: TaskCategory,
-        top_n: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Recommend tools for a task category."""
-        # Find tools used in this category
-        tool_scores: dict[str, dict[str, float]] = {}
-        for r in self._records:
-            if r.task_category != task_category:
-                continue
-            for tool in r.tools_used:
-                if tool not in tool_scores:
-                    tool_scores[tool] = {"use": 0, "success": 0, "findings": 0}
-                tool_scores[tool]["use"] += 1
-                if r.outcome in (OutcomeType.SUCCESS, OutcomeType.PARTIAL):
-                    tool_scores[tool]["success"] += 1
-                tool_scores[tool]["findings"] += r.findings_count
+        # High false positive tools
+        for m in self._metrics.values():
+            if m.metric_type == MetricType.TOOL_RELIABILITY and m.false_positive_rate > 0.3 and m.total_uses >= 5:
+                suggestions.append(f"Tool '{m.subject}' has {m.false_positive_rate:.0%} FP rate — needs validation pass")
 
-        ranked: list[dict[str, Any]] = []
-        for tool, scores in tool_scores.items():
-            if scores["use"] == 0:
-                continue
-            ranked.append({
-                "tool": tool,
-                "uses": int(scores["use"]),
-                "success_rate": round(scores["success"] / scores["use"], 2),
-                "findings": int(scores["findings"]),
-            })
+        # Knowledge gaps
+        gaps = self.get_unfilled_gaps()
+        for gap in gaps[:3]:
+            suggestions.append(f"Knowledge gap in '{gap.domain}': {gap.description}")
 
-        ranked.sort(key=lambda x: x["success_rate"], reverse=True)
-        return ranked[:top_n]
-
-    def recommend_model(
-        self,
-        task_category: TaskCategory,
-    ) -> str:
-        """Recommend best model for a task category."""
-        best_model = ""
-        best_rate = 0.0
-        task = task_category.value
-
-        for model_id, perf in self._model_perf.items():
-            rate = perf.success_rate_for(task)
-            if rate > best_rate:
-                best_rate = rate
-                best_model = model_id
-
-        return best_model
+        return suggestions
 
     def build_improvement_prompt(self) -> str:
-        """Build self-improvement context for LLM."""
-        lines = ["## Self-Improvement Data\n"]
+        """Build LLM prompt with self-improvement insights."""
+        lines = ["## Self-Improvement Insights\n"]
+        top = self.get_top_tools(3)
+        if top:
+            lines.append("Top performing tools:")
+            for m in top:
+                lines.append(f"  {m.subject}: {m.score:.2f} ({m.success_rate:.0%} success, {m.avg_findings_per_use:.1f} findings/use)")
 
-        lines.append(f"Strategy records: {len(self._records)}")
+        worst = self.get_worst_tools(3)
+        if worst:
+            lines.append("\nUnderperforming tools:")
+            for m in worst:
+                lines.append(f"  {m.subject}: {m.score:.2f} ({m.success_rate:.0%} success)")
 
-        # Overall success rates
-        if self._records:
-            successes = sum(
-                1 for r in self._records
-                if r.outcome in (OutcomeType.SUCCESS, OutcomeType.PARTIAL)
-            )
-            lines.append(f"Overall success rate: {successes / len(self._records):.0%}")
-
-        # Top tools
-        if self._tool_perf:
-            lines.append("\nTop tools:")
-            sorted_tools = sorted(
-                self._tool_perf.values(),
-                key=lambda t: t.success_rate,
-                reverse=True,
-            )
-            for tp in sorted_tools[:5]:
-                lines.append(
-                    f"  {tp.tool_name[:12]}: {tp.success_rate:.0%} success, "
-                    f"{tp.findings_total} findings"
-                )
-
-        # Top models per category
-        if self._model_perf:
-            lines.append("\nModel performance:")
-            for model_id, perf in self._model_perf.items():
-                tasks = sum(perf.task_counts.values())
-                lines.append(f"  {model_id[:12]}: {tasks} tasks, avg_conf={perf.avg_confidence:.2f}")
+        suggestions = self.suggest_improvements()
+        if suggestions:
+            lines.append("\nSuggested improvements:")
+            for s in suggestions[:5]:
+                lines.append(f"  → {s}")
 
         return "\n".join(lines)
 
-    def _update_tool_perf(self, tool: str, record: StrategyRecord) -> None:
-        """Update tool performance tracking."""
-        if tool not in self._tool_perf:
-            self._tool_perf[tool] = ToolPerformance(tool_name=tool)
-        tp = self._tool_perf[tool]
-        tp.runs += 1
-        if record.outcome in (OutcomeType.SUCCESS, OutcomeType.PARTIAL):
-            tp.successes += 1
-        elif record.outcome == OutcomeType.FAILURE:
-            tp.failures += 1
-        elif record.outcome == OutcomeType.FALSE_POSITIVE:
-            tp.false_positives += 1
-        tp.findings_total += record.findings_count
-        tp.avg_time_s = (
-            (tp.avg_time_s * (tp.runs - 1) + record.time_taken_s)
-            / tp.runs
-        )
-
-    def _update_model_perf(self, model_id: str, record: StrategyRecord) -> None:
-        """Update model performance tracking."""
-        if model_id not in self._model_perf:
-            self._model_perf[model_id] = ModelPerformance(model_id=model_id)
-        mp = self._model_perf[model_id]
-        task = record.task_category.value
-        mp.task_counts[task] = mp.task_counts.get(task, 0) + 1
-        if record.outcome in (OutcomeType.SUCCESS, OutcomeType.PARTIAL):
-            mp.task_success[task] = mp.task_success.get(task, 0) + 1
-        mp.total_tokens += record.tokens_used
-        total_tasks = sum(mp.task_counts.values())
-        mp.avg_confidence = (
-            (mp.avg_confidence * (total_tasks - 1) + record.confidence)
-            / total_tasks
-        )
-
     def get_stats(self) -> dict[str, Any]:
-        outcomes: dict[str, int] = {}
-        for r in self._records:
-            outcomes[r.outcome.value] = outcomes.get(r.outcome.value, 0) + 1
-
+        type_counts: dict[str, int] = {}
+        for m in self._metrics.values():
+            key = m.metric_type.value
+            type_counts[key] = type_counts.get(key, 0) + 1
         return {
-            "total_records": len(self._records),
-            "outcomes": outcomes,
-            "tools_tracked": len(self._tool_perf),
-            "models_tracked": len(self._model_perf),
+            "total_metrics": len(self._metrics),
+            "by_type": type_counts,
+            "improvements": len(self._actions),
+            "knowledge_gaps": len(self._gaps),
+            "unfilled_gaps": len(self.get_unfilled_gaps()),
         }
