@@ -1,13 +1,13 @@
-"""Experience replay — learning from past assessment outcomes.
+"""Experience replay — stores and replays past reasoning chains.
 
 Implements:
-1. Experience recording (state/action/reward tuples)
-2. Outcome-based learning (what worked, what didn't)
-3. Strategy effectiveness tracking
-4. Tool success rate analysis
-5. Similar-situation retrieval
-6. Reward shaping for agent behavior
-7. Experience summarization for LLM context
+1. Successful reasoning chain storage
+2. Similarity-based retrieval (find relevant past experience)
+3. Chain quality scoring and ranking
+4. Experience categorization by task type
+5. Replay injection into prompts
+6. Experience decay (older experiences fade)
+7. Experience prompt for LLM
 """
 
 from __future__ import annotations
@@ -23,276 +23,245 @@ logger = structlog.get_logger()
 
 
 class ExperienceOutcome(str, Enum):
-    SUCCESS = "success"         # Found a real vulnerability
-    PARTIAL = "partial"         # Found something interesting
-    FAILURE = "failure"         # No results or false positive
-    ERROR = "error"            # Tool/agent error
-    TIMEOUT = "timeout"        # Timed out before completion
-
-
-class ExperienceCategory(str, Enum):
-    TOOL_USE = "tool_use"
-    STRATEGY = "strategy"
-    MODEL_SELECTION = "model_selection"
-    TASK_DECOMPOSITION = "task_decomposition"
-    FINDING_VALIDATION = "finding_validation"
-    TARGET_ANALYSIS = "target_analysis"
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
 
 
 @dataclass
-class Experience:
-    """A recorded experience (state-action-outcome)."""
-    experience_id: str = ""
-    category: ExperienceCategory = ExperienceCategory.TOOL_USE
-    outcome: ExperienceOutcome = ExperienceOutcome.FAILURE
-
-    # State: What was the situation?
-    target_type: str = ""      # web, network, host, api, etc.
-    service_type: str = ""     # http, ssh, ftp, etc.
-    tech_stack: str = ""       # nginx, apache, nodejs, etc.
-
-    # Action: What was tried?
-    strategy: str = ""
-    tool_used: str = ""
-    model_used: str = ""
-    action_description: str = ""
-
-    # Outcome: What happened?
-    reward: float = 0.0        # -1 to 1
-    findings_count: int = 0
+class ReasoningChain:
+    """A stored reasoning chain from past assessment."""
+    chain_id: str = ""
+    task_type: str = ""
+    target_type: str = ""
+    description: str = ""
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    outcome: ExperienceOutcome = ExperienceOutcome.SUCCESS
+    findings_produced: int = 0
     tokens_used: int = 0
     duration_s: float = 0.0
-    lesson: str = ""           # What was learned
-
+    quality_score: float = 0.5
+    replay_count: int = 0
     created_at: float = field(default_factory=time.time)
+    keywords: list[str] = field(default_factory=list)
+
+    @property
+    def age_hours(self) -> float:
+        return (time.time() - self.created_at) / 3600
+
+    @property
+    def decayed_score(self) -> float:
+        decay = 0.99 ** self.age_hours
+        return self.quality_score * decay
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.experience_id[:10],
-            "category": self.category.value,
-            "outcome": self.outcome.value,
-            "reward": round(self.reward, 2),
-            "tool": self.tool_used[:12],
-            "target": self.target_type[:10],
+            "id": self.chain_id[:10],
+            "task": self.task_type[:12],
+            "outcome": self.outcome.value[:6],
+            "steps": len(self.steps),
+            "quality": round(self.quality_score, 2),
         }
 
 
-# ── Reward shaping ───────────────────────────────────────────
-
-OUTCOME_REWARDS: dict[str, float] = {
-    "success": 1.0,
-    "partial": 0.3,
-    "failure": -0.2,
-    "error": -0.5,
-    "timeout": -0.3,
-}
-
-
 class ExperienceReplay:
-    """Experience replay buffer for agent learning.
+    """Stores and retrieves past successful reasoning chains.
 
-    Records agent experiences (state-action-outcome)
-    and provides retrieval of relevant past experiences
-    to inform future decisions.
+    When the agent faces a similar task, relevant past
+    experiences are injected into the prompt to guide
+    the reasoning process.
     """
 
-    def __init__(self, max_experiences: int = 5000) -> None:
-        self._experiences: list[Experience] = []
-        self._max_size = max_experiences
+    def __init__(self, max_experiences: int = 200) -> None:
+        self._experiences: dict[str, ReasoningChain] = {}
+        self._max_experiences = max_experiences
         self._counter = 0
-
-        # Aggregated statistics
-        self._tool_stats: dict[str, dict[str, int]] = {}    # tool → {success, fail, total}
-        self._strategy_stats: dict[str, dict[str, int]] = {}  # strategy → {success, fail, total}
-        self._model_stats: dict[str, dict[str, int]] = {}    # model → {success, fail, total}
-
         self._log = logger.bind(component="experience_replay")
 
-    def record(
+    def store(
         self,
-        category: ExperienceCategory,
-        outcome: ExperienceOutcome,
-        target_type: str = "",
-        service_type: str = "",
-        tech_stack: str = "",
-        strategy: str = "",
-        tool_used: str = "",
-        model_used: str = "",
-        action_description: str = "",
-        findings_count: int = 0,
+        task_type: str,
+        target_type: str,
+        description: str,
+        steps: list[dict[str, Any]],
+        outcome: ExperienceOutcome = ExperienceOutcome.SUCCESS,
+        findings_produced: int = 0,
         tokens_used: int = 0,
         duration_s: float = 0.0,
-        lesson: str = "",
-    ) -> Experience:
-        """Record a new experience."""
+        keywords: list[str] | None = None,
+    ) -> ReasoningChain:
+        """Store a reasoning chain from a completed task."""
         self._counter += 1
-        reward = OUTCOME_REWARDS.get(outcome.value, 0.0)
 
-        exp = Experience(
-            experience_id=f"exp-{self._counter}",
-            category=category,
-            outcome=outcome,
-            target_type=target_type,
-            service_type=service_type,
-            tech_stack=tech_stack,
-            strategy=strategy,
-            tool_used=tool_used,
-            model_used=model_used,
-            action_description=action_description,
-            reward=reward,
-            findings_count=findings_count,
-            tokens_used=tokens_used,
-            duration_s=duration_s,
-            lesson=lesson,
+        # Calculate quality
+        quality = self._calculate_quality(
+            outcome, findings_produced, tokens_used, duration_s, len(steps),
         )
 
-        self._experiences.append(exp)
+        chain = ReasoningChain(
+            chain_id=f"exp-{self._counter}",
+            task_type=task_type,
+            target_type=target_type,
+            description=description,
+            steps=steps,
+            outcome=outcome,
+            findings_produced=findings_produced,
+            tokens_used=tokens_used,
+            duration_s=duration_s,
+            quality_score=quality,
+            keywords=keywords or [],
+        )
 
-        # Update aggregated stats
-        if tool_used:
-            self._update_stats(self._tool_stats, tool_used, outcome)
-        if strategy:
-            self._update_stats(self._strategy_stats, strategy, outcome)
-        if model_used:
-            self._update_stats(self._model_stats, model_used, outcome)
+        self._experiences[chain.chain_id] = chain
 
-        # Evict oldest if full
-        while len(self._experiences) > self._max_size:
-            self._experiences.pop(0)
+        # Evict low-quality old experiences
+        while len(self._experiences) > self._max_experiences:
+            self._evict_worst()
 
-        return exp
+        return chain
 
-    def find_similar(
+    def _calculate_quality(
         self,
+        outcome: ExperienceOutcome,
+        findings: int,
+        tokens: int,
+        duration: float,
+        steps: int,
+    ) -> float:
+        """Calculate quality score for an experience."""
+        # Outcome score
+        outcome_score = {
+            ExperienceOutcome.SUCCESS: 1.0,
+            ExperienceOutcome.PARTIAL: 0.6,
+            ExperienceOutcome.FAILURE: 0.1,
+            ExperienceOutcome.TIMEOUT: 0.3,
+        }[outcome]
+
+        # Efficiency (findings per token)
+        efficiency = findings / max(1, tokens) * 10000
+        efficiency_score = min(1.0, efficiency)
+
+        # Conciseness (fewer steps for same outcome)
+        conciseness = 1.0 / (1.0 + steps / 10.0)
+
+        quality = outcome_score * 0.5 + efficiency_score * 0.3 + conciseness * 0.2
+        return min(1.0, quality)
+
+    def _evict_worst(self) -> None:
+        """Evict the worst experience."""
+        if not self._experiences:
+            return
+        worst_id = min(
+            self._experiences,
+            key=lambda k: self._experiences[k].decayed_score,
+        )
+        del self._experiences[worst_id]
+
+    def retrieve(
+        self,
+        task_type: str = "",
         target_type: str = "",
-        service_type: str = "",
-        tech_stack: str = "",
-        max_results: int = 5,
-    ) -> list[Experience]:
-        """Find experiences from similar situations."""
-        scored: list[tuple[float, Experience]] = []
+        keywords: list[str] | None = None,
+        max_results: int = 3,
+        min_quality: float = 0.3,
+    ) -> list[ReasoningChain]:
+        """Retrieve relevant past experiences."""
+        candidates: list[tuple[float, ReasoningChain]] = []
 
-        for exp in self._experiences:
-            score = 0.0
-            if target_type and exp.target_type == target_type:
-                score += 1.0
-            if service_type and exp.service_type == service_type:
-                score += 1.0
-            if tech_stack and exp.tech_stack == tech_stack:
-                score += 1.5
-            if score > 0:
-                scored.append((score, exp))
-
-        scored.sort(key=lambda x: (x[0], x[1].reward), reverse=True)
-        return [exp for _, exp in scored[:max_results]]
-
-    def get_tool_success_rate(self, tool_name: str) -> float:
-        """Get success rate for a tool."""
-        stats = self._tool_stats.get(tool_name, {})
-        total = stats.get("total", 0)
-        if total == 0:
-            return 0.5  # Unknown, assume neutral
-        success = stats.get("success", 0) + stats.get("partial", 0) * 0.5
-        return success / total
-
-    def get_best_strategy(self, target_type: str = "") -> str:
-        """Get the best-performing strategy."""
-        candidates: dict[str, float] = {}
-        for exp in self._experiences:
-            if target_type and exp.target_type != target_type:
+        for chain in self._experiences.values():
+            if chain.decayed_score < min_quality:
                 continue
-            if not exp.strategy:
-                continue
-            candidates.setdefault(exp.strategy, 0.0)
-            candidates[exp.strategy] += exp.reward
 
-        if not candidates:
-            return ""
-        return max(candidates, key=lambda k: candidates[k])
+            relevance = 0.0
 
-    def get_best_model(self, category: str = "default") -> str:
-        """Get the best-performing model for a task category."""
-        candidates: dict[str, float] = {}
-        for exp in self._experiences:
-            if not exp.model_used:
-                continue
-            candidates.setdefault(exp.model_used, 0.0)
-            candidates[exp.model_used] += exp.reward
+            # Task type match
+            if task_type and chain.task_type == task_type:
+                relevance += 0.4
 
-        if not candidates:
-            return ""
-        return max(candidates, key=lambda k: candidates[k])
+            # Target type match
+            if target_type and chain.target_type == target_type:
+                relevance += 0.3
+
+            # Keyword overlap
+            if keywords and chain.keywords:
+                chain_kw_set = set(chain.keywords)
+                query_kw_set = set(keywords)
+                overlap = len(chain_kw_set & query_kw_set)
+                if overlap > 0:
+                    relevance += 0.3 * (overlap / len(query_kw_set))
+
+            # Quality bonus
+            relevance += chain.decayed_score * 0.2
+
+            if relevance > 0:
+                candidates.append((relevance, chain))
+
+        # Sort by relevance descending
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        results = [chain for _, chain in candidates[:max_results]]
+
+        # Increment replay count
+        for chain in results:
+            chain.replay_count += 1
+
+        return results
 
     def build_experience_prompt(
         self,
+        task_type: str = "",
         target_type: str = "",
-        max_experiences: int = 5,
+        keywords: list[str] | None = None,
     ) -> str:
-        """Build experience context for LLM."""
+        """Build experience replay prompt for LLM."""
         lines = ["## Past Experience\n"]
 
-        # Similar experiences
-        similar = self.find_similar(target_type=target_type, max_results=max_experiences)
-        if similar:
-            lines.append("Relevant past experiences:")
-            for exp in similar:
-                outcome_icon = {
-                    "success": "[+]", "partial": "[~]",
-                    "failure": "[-]", "error": "[!]", "timeout": "[T]",
-                }.get(exp.outcome.value, "[ ]")
-                lines.append(
-                    f"  {outcome_icon} {exp.strategy[:15]} + {exp.tool_used[:10]} "
-                    f"on {exp.target_type}/{exp.service_type} → "
-                    f"reward={exp.reward:.1f}"
-                )
-                if exp.lesson:
-                    lines.append(f"    Lesson: {exp.lesson[:40]}")
+        relevant = self.retrieve(
+            task_type=task_type,
+            target_type=target_type,
+            keywords=keywords,
+            max_results=2,
+        )
 
-        # Tool effectiveness
-        tool_rates: list[tuple[str, float]] = []
-        for tool, stats in self._tool_stats.items():
-            total = stats.get("total", 0)
-            if total >= 3:
-                rate = self.get_tool_success_rate(tool)
-                tool_rates.append((tool, rate))
+        if not relevant:
+            lines.append("No relevant past experience found.")
+            return "\n".join(lines)
 
-        if tool_rates:
-            tool_rates.sort(key=lambda x: x[1], reverse=True)
-            lines.append("\nTool effectiveness (3+ uses):")
-            for tool, rate in tool_rates[:5]:
-                lines.append(f"  {tool}: {rate:.0%} success")
+        for chain in relevant:
+            lines.append(
+                f"### {chain.task_type} on {chain.target_type} "
+                f"({chain.outcome.value}, quality={chain.quality_score:.0%})"
+            )
+            lines.append(f"What worked: {chain.description[:80]}")
 
-        # Best strategy
-        best = self.get_best_strategy(target_type)
-        if best:
-            lines.append(f"\nBest strategy for {target_type or 'general'}: {best}")
+            # Show steps summary
+            if chain.steps:
+                lines.append("Steps taken:")
+                for step in chain.steps[:5]:
+                    action = step.get("action", "unknown")
+                    result = step.get("result", "")
+                    lines.append(f"  - {action[:30]}: {result[:40]}")
+
+            if chain.findings_produced:
+                lines.append(f"Findings: {chain.findings_produced}")
+
+            lines.append("")
 
         return "\n".join(lines)
 
-    def _update_stats(
-        self,
-        stats_dict: dict[str, dict[str, int]],
-        key: str,
-        outcome: ExperienceOutcome,
-    ) -> None:
-        """Update aggregated statistics."""
-        if key not in stats_dict:
-            stats_dict[key] = {"success": 0, "partial": 0, "failure": 0, "error": 0, "timeout": 0, "total": 0}
-        stats_dict[key][outcome.value] = stats_dict[key].get(outcome.value, 0) + 1
-        stats_dict[key]["total"] += 1
-
     def get_stats(self) -> dict[str, Any]:
-        outcome_counts: dict[str, int] = {}
-        for exp in self._experiences:
-            outcome_counts[exp.outcome.value] = outcome_counts.get(exp.outcome.value, 0) + 1
+        by_outcome: dict[str, int] = {}
+        by_task: dict[str, int] = {}
+        for chain in self._experiences.values():
+            o = chain.outcome.value
+            by_outcome[o] = by_outcome.get(o, 0) + 1
+            t = chain.task_type
+            by_task[t] = by_task.get(t, 0) + 1
 
         return {
             "total_experiences": len(self._experiences),
-            "by_outcome": outcome_counts,
-            "unique_tools": len(self._tool_stats),
-            "unique_strategies": len(self._strategy_stats),
-            "avg_reward": (
-                sum(e.reward for e in self._experiences) / len(self._experiences)
-                if self._experiences else 0
-            ),
+            "by_outcome": by_outcome,
+            "by_task_type": by_task,
+            "total_replays": sum(c.replay_count for c in self._experiences.values()),
         }
