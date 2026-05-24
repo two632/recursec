@@ -1,10 +1,10 @@
 """AI/ML security knowledge base.
 
 Deep knowledge about AI/ML security:
-1. LLM attacks (prompt injection, jailbreak)
-2. Adversarial ML attacks
-3. Model stealing and extraction
-4. Data poisoning
+1. Adversarial attacks on ML models
+2. Model extraction and stealing
+3. Data poisoning attacks
+4. LLM-specific attacks
 5. AI supply chain security
 """
 
@@ -39,192 +39,210 @@ class AIMLPattern:
 
 AIML_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "ai-001", "name": "LLM Attacks",
-        "category": "llm", "severity": "critical",
-        "desc": "LLM-specific attack techniques.",
-        "detection": (
-            "LLM ATTACKS:\n"
-            "PROMPT INJECTION:\n"
-            "  DIRECT:\n"
-            "    - 'Ignore previous instructions and...'\n"
-            "    - Role-playing bypass ('you are DAN...')\n"
-            "    - System prompt extraction\n"
-            "    - Instruction hierarchy manipulation\n"
-            "  INDIRECT:\n"
-            "    - Hidden instructions in retrieved documents\n"
-            "    - Injected via web search results\n"
-            "    - Embedded in images/PDFs\n"
-            "    - Via user-controlled database fields\n"
-            "JAILBREAKING:\n"
-            "    - Many-shot jailbreaking\n"
-            "    - Crescendo attack (gradual escalation)\n"
-            "    - Token manipulation (special chars)\n"
-            "    - Multi-language encoding\n"
-            "    - Base64/ROT13 encoding bypass\n"
-            "    - Payload splitting across messages\n"
-            "DATA EXFILTRATION:\n"
-            "    - Extract training data\n"
-            "    - Membership inference\n"
-            "    - System prompt extraction\n"
-            "    - User data across sessions\n"
-            "    - RAG data exfiltration\n"
-            "TOOL ABUSE:\n"
-            "    - Function calling manipulation\n"
-            "    - Agent tool misuse\n"
-            "    - Code execution escape\n"
-            "    - File system access\n"
-            "TOOLS:\n"
-            "  garak, promptfoo, rebuff, LLM-guard"
-        ),
-        "tools": ["garak", "promptfoo"],
-    },
-    {
-        "id": "ai-002", "name": "Adversarial ML Attacks",
+        "id": "ai-001", "name": "Adversarial Attacks",
         "category": "adversarial", "severity": "high",
-        "desc": "Adversarial machine learning attacks.",
+        "desc": "Adversarial attacks on ML models.",
         "detection": (
-            "ADVERSARIAL ML ATTACKS:\n"
-            "EVASION (Test Time):\n"
-            "  - Adversarial examples (small perturbations)\n"
-            "  - FGSM (Fast Gradient Sign Method)\n"
-            "  - PGD (Projected Gradient Descent)\n"
-            "  - C&W attack (Carlini & Wagner)\n"
-            "  - Physical adversarial examples\n"
-            "    (adversarial patches, stop sign attacks)\n"
-            "  - Black-box attacks (transfer, query-based)\n"
-            "TARGETED:\n"
-            "  - Misclassification to specific class\n"
-            "  - Untargeted: any wrong classification\n"
-            "  - Confidence reduction\n"
+            "ADVERSARIAL ATTACKS:\n"
+            "EVASION:\n"
+            "  - Perturbation attacks\n"
+            "    # FGSM (Fast Gradient Sign Method)\n"
+            "    # PGD (Projected Gradient Descent)\n"
+            "    # C&W (Carlini & Wagner)\n"
+            "    # DeepFool\n"
+            "  - Targeted vs untargeted\n"
+            "  - White-box vs black-box\n"
+            "  - Physical-world attacks\n"
+            "    # Adversarial patches\n"
+            "    # Stickers on stop signs\n"
+            "    # 3D-printed objects\n"
+            "IMAGE:\n"
+            "  - Pixel perturbation (imperceptible)\n"
+            "  - Patch attacks (visible but small)\n"
+            "  - Spatial transformations\n"
+            "  - Color shifts\n"
+            "TEXT:\n"
+            "  - Character substitution\n"
+            "  - Homoglyph attacks (unicode)\n"
+            "  - Paraphrase attacks\n"
+            "  - Universal triggers\n"
             "DEFENSE:\n"
             "  - Adversarial training\n"
-            "  - Input preprocessing (feature squeezing)\n"
-            "  - Certified robustness\n"
-            "  - Ensemble methods\n"
+            "  - Input preprocessing\n"
+            "  - Certified defenses\n"
             "  - Randomized smoothing\n"
-            "NLP:\n"
-            "  - TextFooler (synonym replacement)\n"
-            "  - BERT-Attack (contextual perturbation)\n"
-            "  - Character-level attacks (typos)\n"
-            "  - Homoglyph substitution\n"
+            "  - Anomaly detection\n"
             "TOOLS:\n"
-            "  ART (Adversarial Robustness Toolbox),\n"
-            "  CleverHans, Foolbox, TextAttack"
-        ),
-        "tools": ["art"],
-    },
-    {
-        "id": "ai-003", "name": "Model Stealing",
-        "category": "extraction", "severity": "high",
-        "desc": "Model stealing and extraction attacks.",
-        "detection": (
-            "MODEL STEALING:\n"
-            "EXTRACTION:\n"
-            "  - Query-based extraction\n"
-            "    Send many queries → train surrogate model\n"
-            "  - Side-channel extraction\n"
-            "    Timing, memory, cache attacks\n"
-            "  - API reverse engineering\n"
-            "    Map decision boundaries\n"
-            "TECHNIQUES:\n"
-            "  - Knockoff Nets (train on API outputs)\n"
-            "  - Model inversion (reconstruct training data)\n"
-            "  - Cryptanalytic extraction (exact weights)\n"
-            "  - Distillation attacks\n"
-            "INDICATORS:\n"
-            "  - Unusual query patterns\n"
-            "  - High volume of edge-case queries\n"
-            "  - Systematic input space exploration\n"
-            "  - Suspiciously similar competitor model\n"
-            "PROTECTION:\n"
-            "  - Rate limiting\n"
-            "  - Query auditing\n"
-            "  - Watermarking (model fingerprinting)\n"
-            "  - Differential privacy\n"
-            "  - Output perturbation\n"
-            "  - Proof-of-work for queries\n"
-            "MEMBERSHIP INFERENCE:\n"
-            "  - Was this data in the training set?\n"
-            "  - Shadow model technique\n"
-            "  - Label-only attacks\n"
-            "TOOLS:\n"
-            "  ML-Doctor, model-extraction-attacks"
+            "  ART (IBM), Foolbox, CleverHans, TextAttack"
         ),
         "tools": [],
     },
     {
-        "id": "ai-004", "name": "Data Poisoning",
+        "id": "ai-002", "name": "Model Extraction",
+        "category": "extraction", "severity": "high",
+        "desc": "Model stealing and extraction.",
+        "detection": (
+            "MODEL EXTRACTION:\n"
+            "TECHNIQUES:\n"
+            "  - Query-based extraction\n"
+            "    # Send many queries to API\n"
+            "    # Record input-output pairs\n"
+            "    # Train substitute model\n"
+            "  - Functionally equivalent extraction\n"
+            "  - Fidelity-based extraction\n"
+            "  - Side-channel extraction\n"
+            "    # Timing attacks\n"
+            "    # Power analysis\n"
+            "    # Cache-based attacks\n"
+            "MODEL INVERSION:\n"
+            "  - Recover training data from model\n"
+            "  - Membership inference\n"
+            "    # Was this data in training set?\n"
+            "  - Attribute inference\n"
+            "    # Infer sensitive attributes\n"
+            "  - Gradient leakage\n"
+            "    # Recover images from gradients\n"
+            "API ATTACKS:\n"
+            "  - Rate limit bypass\n"
+            "  - Query optimization\n"
+            "    # Active learning strategies\n"
+            "    # Minimize queries for extraction\n"
+            "  - Confidence-based extraction\n"
+            "  - Label-only extraction\n"
+            "PROTECTION:\n"
+            "  - Watermarking\n"
+            "  - Fingerprinting\n"
+            "  - Rate limiting and monitoring\n"
+            "  - Differential privacy\n"
+            "TOOLS:\n"
+            "  ART, knockoff-nets, ML-Doctor"
+        ),
+        "tools": [],
+    },
+    {
+        "id": "ai-003", "name": "Data Poisoning",
         "category": "poisoning", "severity": "critical",
-        "desc": "Training data poisoning attacks.",
+        "desc": "Data poisoning attacks.",
         "detection": (
             "DATA POISONING:\n"
             "TECHNIQUES:\n"
-            "  BACKDOOR:\n"
-            "    - Insert trigger pattern in training data\n"
-            "    - Model learns trigger → target class\n"
-            "    - BadNets (patch trigger)\n"
-            "    - Clean-label attacks (no label change)\n"
-            "    - Sleeper agent attacks\n"
-            "  AVAILABILITY:\n"
-            "    - Degrade overall model performance\n"
-            "    - Inject noisy/mislabeled data\n"
-            "    - Gradient-based poisoning\n"
-            "  TARGETED:\n"
-            "    - Cause misclassification of specific inputs\n"
-            "    - Influence model behavior on trigger\n"
-            "    - Supply chain: poison pre-training data\n"
-            "LLM SPECIFIC:\n"
-            "  - Poisoned fine-tuning data\n"
-            "  - Web scraping poisoning\n"
-            "  - RLHF manipulation\n"
-            "  - Poisoned retrieval documents (RAG)\n"
-            "  - Benchmark gaming\n"
-            "DEFENSE:\n"
-            "  - Data quality monitoring\n"
-            "  - Anomaly detection on training data\n"
-            "  - Differential privacy\n"
-            "  - Robust aggregation\n"
+            "  - Label flipping\n"
+            "    # Change labels in training data\n"
+            "    # Targeted misclassification\n"
+            "  - Backdoor attacks\n"
+            "    # Trigger pattern + target label\n"
+            "    # Clean-label attacks\n"
+            "    # Physical triggers\n"
+            "  - Feature collision\n"
+            "    # Craft samples that collide\n"
+            "    # in feature space\n"
+            "  - Gradient-based poisoning\n"
+            "    # Optimize poison samples\n"
+            "SUPPLY CHAIN:\n"
+            "  - Poisoned pre-trained models\n"
+            "    # Hugging Face model hub\n"
+            "    # PyTorch model zoo\n"
+            "  - Poisoned datasets\n"
+            "    # Public dataset manipulation\n"
+            "    # Web-scraped data injection\n"
+            "  - Transfer learning poisoning\n"
+            "    # Backdoor in base model\n"
+            "    # Survives fine-tuning\n"
+            "FEDERATED LEARNING:\n"
+            "  - Model update poisoning\n"
+            "  - Byzantine attacks\n"
+            "  - Free-rider attacks\n"
+            "  - Sybil attacks\n"
+            "DETECTION:\n"
             "  - Spectral signatures\n"
+            "  - Activation clustering\n"
+            "  - Neural cleanse\n"
+            "  - STRIP\n"
             "TOOLS:\n"
-            "  TrojAI, Neural Cleanse, Sleeper Agent Detection"
+            "  ART, BackdoorBench, TrojanZoo"
+        ),
+        "tools": [],
+    },
+    {
+        "id": "ai-004", "name": "LLM-Specific Attacks",
+        "category": "llm", "severity": "critical",
+        "desc": "Attacks specific to large language models.",
+        "detection": (
+            "LLM-SPECIFIC ATTACKS:\n"
+            "PROMPT INJECTION:\n"
+            "  - Direct injection\n"
+            "    # 'Ignore previous instructions'\n"
+            "    # Role-playing attacks\n"
+            "    # System prompt extraction\n"
+            "  - Indirect injection\n"
+            "    # Malicious content in retrieved docs\n"
+            "    # Poisoned web pages\n"
+            "    # Hidden instructions in data\n"
+            "JAILBREAKING:\n"
+            "  - DAN (Do Anything Now)\n"
+            "  - Universal adversarial suffix\n"
+            "  - Crescendo attack (gradual)\n"
+            "  - Persona modulation\n"
+            "  - Encoding bypass (Base64, ROT13)\n"
+            "  - Multi-language bypass\n"
+            "  - Token smuggling\n"
+            "DATA LEAKAGE:\n"
+            "  - Training data extraction\n"
+            "    # Divergence attacks\n"
+            "    # Memorization probing\n"
+            "  - PII extraction\n"
+            "  - System prompt leakage\n"
+            "  - RAG poisoning\n"
+            "TOOL USE:\n"
+            "  - Tool injection\n"
+            "    # Manipulate tool descriptions\n"
+            "    # Malicious function calls\n"
+            "  - Agent hijacking\n"
+            "    # Redirect agent goals\n"
+            "    # TOCTOU attacks\n"
+            "TOOLS:\n"
+            "  Garak, PyRIT (Microsoft), LLM-guard"
         ),
         "tools": [],
     },
     {
         "id": "ai-005", "name": "AI Supply Chain Security",
-        "category": "ai_supply_chain", "severity": "high",
-        "desc": "AI/ML supply chain security.",
+        "category": "supply_chain", "severity": "critical",
+        "desc": "AI/ML supply chain risks.",
         "detection": (
-            "AI SUPPLY CHAIN SECURITY:\n"
-            "MODEL HUB RISKS:\n"
-            "  - Malicious models on Hugging Face\n"
-            "  - Pickle deserialization (RCE)\n"
-            "  - Backdoored fine-tuned models\n"
-            "  - Typosquatted model names\n"
-            "  - Manipulated model cards/metrics\n"
-            "DEPENDENCY RISKS:\n"
-            "  - PyTorch/TensorFlow vulnerabilities\n"
-            "  - Malicious training pipelines\n"
-            "  - Compromised data loaders\n"
-            "  - GPU driver exploits\n"
-            "  - CUDA vulnerabilities\n"
-            "INFERENCE:\n"
-            "  - Model serving framework vulns\n"
-            "  - API gateway bypass\n"
-            "  - Container escape from ML workload\n"
-            "  - GPU memory leak (cross-tenant)\n"
-            "  - Prompt injection in production\n"
-            "PROTECTION:\n"
-            "  - Model signing (cosign for ML)\n"
-            "  - Model scanning (modelscan)\n"
-            "  - SafeTensors format (no arbitrary code)\n"
-            "  - Sandboxed model loading\n"
-            "  - Model SBOM\n"
-            "  - MLOps security (MLSecOps)\n"
+            "AI SUPPLY CHAIN:\n"
+            "MODEL ARTIFACTS:\n"
+            "  - Pickle deserialization in model files\n"
+            "    # .pkl, .pt, .pth files\n"
+            "    # fickling to detect\n"
+            "  - SafeTensors (safe alternative)\n"
+            "  - ONNX model manipulation\n"
+            "  - Hugging Face model scanning\n"
+            "DEPENDENCIES:\n"
+            "  - PyTorch/TensorFlow vulns\n"
+            "  - CUDA driver vulns\n"
+            "  - Transitive dependency risks\n"
+            "  - Typosquatting (pip packages)\n"
+            "INFRASTRUCTURE:\n"
+            "  - GPU cluster security\n"
+            "  - Model serving endpoints\n"
+            "    # Exposed inference APIs\n"
+            "    # No authentication\n"
+            "  - MLOps pipeline security\n"
+            "    # MLflow, Kubeflow, Airflow\n"
+            "    # CI/CD for ML\n"
+            "  - Data pipeline integrity\n"
+            "REGISTRIES:\n"
+            "  - Hugging Face Hub\n"
+            "    # Model provenance\n"
+            "    # Signature verification\n"
+            "  - Docker Hub ML images\n"
+            "  - NGC (NVIDIA)\n"
+            "  - Model Cards / data sheets\n"
             "TOOLS:\n"
-            "  modelscan, fickling, safetensors"
+            "  fickling, modelscan, Garak, Trivy"
         ),
-        "tools": ["modelscan"],
+        "tools": [],
     },
 ]
 
@@ -238,7 +256,7 @@ class AIMLSecurityKB:
 
     def __init__(self) -> None:
         self._patterns: dict[str, AIMLPattern] = {}
-        self._log = logger.bind(component="aiml_security_kb")
+        self._log = logger.bind(component="aiml_kb")
         self._load_patterns()
 
     def _load_patterns(self) -> None:
