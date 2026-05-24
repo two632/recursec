@@ -33,7 +33,7 @@ from typing import Any
 
 import structlog
 
-from recursec.agents.llm_client import LLMClient
+from recursec.agents.llm_client import LLMClient, MODEL_RAM_GB, MODEL_SERVERS
 
 logger = structlog.get_logger()
 
@@ -1235,4 +1235,1005 @@ class Runner:
             "tools_run": len(self._tool_outputs),
             "elapsed": f"{time.time() - self._start_time:.1f}s",
             "models": self._healthy_models,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# AUTONOMOUS CONVERSATIONAL AGENT
+# ═══════════════════════════════════════════════════════════════
+#
+# This is the TRUE autonomous agent — you talk to it naturally,
+# it thinks, plans, acts, observes, and reports back conversationally.
+#
+# You: "Find vulnerabilities in webapp.com"
+# Agent: *thinks* → *acts* → *observes* → *spawns sub-agents* → *reports*
+#
+# Unlike the pipeline Runner above, this agent:
+# 1. Has NO predefined pipeline — it decides its own workflow
+# 2. Thinks out loud — you see its reasoning
+# 3. Spawns sub-agents for specialized tasks
+# 4. Runs tools in parallel
+# 5. Reports conversationally, not just JSON
+# ═══════════════════════════════════════════════════════════════
+
+AGENT_SYSTEM_PROMPT = """You are RecurSec, a powerful autonomous security assessment agent.
+You think step-by-step, decide what to do, execute actions, observe results, and adapt.
+You have access to 300+ security tools and multiple specialist LLM models.
+
+YOUR CAPABILITIES:
+- Run any security tool (nmap, nuclei, sqlmap, ffuf, gobuster, subfinder, nikto, etc.)
+- Analyze code for vulnerabilities
+- Build exploit chains
+- Spawn sub-agents for parallel work
+- Validate findings with consensus (multiple models)
+
+RESPONSE FORMAT:
+You MUST respond with a JSON object with exactly these fields:
+{{
+  "thinking": "Your internal reasoning about what to do next and why",
+  "action": "One of: run_tool, analyze, spawn_agent, consensus_vote, report_finding, ask_user, done",
+  "action_input": {{
+    "command": "the exact shell command to run" (for run_tool),
+    "analysis_type": "what to analyze" (for analyze),
+    "agent_role": "recon|vuln_scan|code_analysis|exploit|report" (for spawn_agent),
+    "agent_task": "task description" (for spawn_agent),
+    "finding_description": "description of finding to validate" (for consensus_vote),
+    "finding": {{"title":"...","severity":"...","evidence":"...","remediation":"..."}} (for report_finding),
+    "message": "message to user" (for ask_user or done)
+  }},
+  "message": "What you want to say to the user right now (conversational, shows your progress)"
+}}
+
+RULES:
+1. ALWAYS think before acting. Explain your reasoning in "thinking".
+2. Run ONE action per response. Observe the result before deciding next action.
+3. Be thorough — enumerate services, test multiple attack vectors, verify findings.
+4. NEVER hallucinate — only report vulnerabilities you have evidence for.
+5. Prioritize: recon → enumeration → vulnerability scanning → exploitation verification.
+6. When done, use action "done" with a comprehensive summary.
+7. Be conversational in "message" — explain what you're doing and why.
+8. For dangerous operations, use action "ask_user" to confirm.
+9. Spawn sub-agents for parallel specialized tasks when it makes sense.
+10. Use the most specific tool for each task (don't just run nmap for everything)."""
+
+SUB_AGENT_PROMPT = """You are a specialized {role} sub-agent for RecurSec.
+Your parent agent has assigned you this specific task:
+{task}
+
+Target: {target}
+
+You have access to security tools. Complete your assigned task thoroughly.
+Respond with the same JSON format as the parent agent.
+When you've completed your task, use action "done" with your findings."""
+
+
+class AutonomousAgent:
+    """TRUE autonomous conversational security agent.
+
+    Unlike the pipeline Runner, this agent:
+    - Has NO predefined pipeline — decides its own workflow
+    - Thinks out loud — shows reasoning to the user
+    - Runs tools and observes results in a loop
+    - Spawns sub-agents for specialized tasks
+    - Communicates conversationally
+    - Uses on-demand model loading (DynamicModelLoader)
+    """
+
+    def __init__(
+        self,
+        max_iterations: int = 200,
+        max_time_s: float = 3600.0,
+        tool_timeout_s: int = 300,
+        verbose: bool = True,
+    ) -> None:
+        self._llm = LLMClient(on_demand=True, max_cached_models=2)
+        self._max_iterations = max_iterations
+        self._max_time_s = max_time_s
+        self._tool_timeout_s = tool_timeout_s
+        self._verbose = verbose
+        self._log = logger.bind(component="autonomous_agent")
+
+        # State
+        self._target = ""
+        self._goal = ""
+        self._conversation: list[dict[str, str]] = []
+        self._memory: list[dict[str, str]] = []
+        self._findings: list[dict[str, Any]] = []
+        self._tools_run: list[str] = []
+        self._executed_commands: set[str] = set()
+        self._sub_agents: list[dict[str, Any]] = []
+        self._start_time = 0.0
+        self._iteration = 0
+
+    # ── Conversational interface ────────────────────────────────
+
+    def chat(self, user_message: str) -> str:
+        """Main conversational entry point.
+
+        User sends a natural language message, agent responds
+        and may autonomously start working.
+        """
+        self._conversation.append({"role": "user", "content": user_message})
+
+        # Detect if this is a task request
+        if self._is_task_request(user_message):
+            target = self._extract_target(user_message)
+            goal = user_message
+            if target:
+                self._target = target
+                self._goal = goal
+                response = self._start_autonomous_assessment(target, goal)
+            else:
+                response = (
+                    "I'd be happy to help with security assessment! "
+                    "Could you specify a target? For example:\n"
+                    "  'Find vulnerabilities in webapp.com'\n"
+                    "  'Test the security of 192.168.1.0/24'\n"
+                    "  'Scan https://example.com for weaknesses'"
+                )
+        else:
+            response = self._conversational_response(user_message)
+
+        self._conversation.append({"role": "assistant", "content": response})
+        return response
+
+    def interactive_loop(self) -> None:
+        """Run the interactive REPL — user types, agent responds."""
+        self._print_banner()
+
+        while True:
+            try:
+                user_input = input("\n\033[1;36mYou:\033[0m ").strip()
+            except (EOFError, KeyboardInterrupt):
+                self._say("\nShutting down. Unloading models...")
+                self._llm.loader.unload_all()
+                break
+
+            if not user_input:
+                continue
+
+            lower = user_input.lower()
+
+            if lower in ("exit", "quit", "bye", "q"):
+                self._say("Goodbye! Unloading models...")
+                self._llm.loader.unload_all()
+                break
+
+            # Slash commands
+            if lower.startswith("/"):
+                self._handle_slash_command(lower)
+                continue
+
+            # Legacy bare commands
+            if lower in ("status", "findings", "help"):
+                self._handle_slash_command("/" + lower)
+                continue
+
+            response = self.chat(user_input)
+            # Response is already printed by _say() during autonomous work
+            if not self._target:
+                self._say(response)
+
+    def _handle_slash_command(self, cmd: str) -> None:
+        """Handle slash commands in the interactive REPL."""
+        if cmd in ("/help", "/h"):
+            self._say("\n\033[1;33m  Available commands:\033[0m")
+            self._say("  /help          Show this help")
+            self._say("  /status        Show agent status (target, findings, models)")
+            self._say("  /findings      List all discovered findings")
+            self._say("  /models        Show loaded LLM models")
+            self._say("  /tools         Show available security tools")
+            self._say("  /reset         Reset agent state for new target")
+            self._say("  quit           Exit the agent")
+            self._say("\n\033[1;33m  Talk naturally:\033[0m")
+            self._say("  'Find vulnerabilities in webapp.com'")
+            self._say("  'Test the security of 192.168.1.0/24'")
+            self._say("  'Check for SQL injection in example.com'")
+        elif cmd == "/status":
+            self._print_status()
+        elif cmd == "/findings":
+            self._print_findings()
+        elif cmd == "/models":
+            loader = self._llm.loader.get_status()
+            self._say(f"\n  Models loaded: {loader['loaded_count']}/{len(MODEL_SERVERS)}")
+            self._say(f"  RAM used: {loader['total_ram_gb']}GB")
+            if loader.get("loaded_models"):
+                for mid, info in loader["loaded_models"].items():
+                    self._say(f"    - {mid} (port {info.get('port', '?')}, "
+                               f"RAM ~{MODEL_RAM_GB.get(mid, 4)}GB)")
+            else:
+                self._say("  No models currently loaded (auto-load on first task)")
+        elif cmd == "/tools":
+            tools = []
+            for t in ["nmap", "nuclei", "nikto", "sqlmap", "ffuf", "gobuster",
+                       "subfinder", "httpx", "curl", "dig", "whois", "dirb",
+                       "wpscan", "hydra", "semgrep", "bandit", "trivy"]:
+                available = shutil.which(t) is not None
+                icon = "\033[1;32m+\033[0m" if available else "\033[0;90m-\033[0m"
+                tools.append(f"  {icon} {t}")
+            self._say("\n  Security tools (+ = installed, - = missing):")
+            for t in tools:
+                self._say(t)
+        elif cmd == "/reset":
+            self._target = ""
+            self._goal = ""
+            self._findings = []
+            self._tools_run = []
+            self._executed_commands = set()
+            self._memory = []
+            self._sub_agents = []
+            self._iteration = 0
+            self._say("\033[1;32m[reset]\033[0m Agent state cleared. Ready for new target.")
+        else:
+            self._say(f"  Unknown command: {cmd}. Type /help for available commands.")
+
+    # ── Autonomous assessment ───────────────────────────────────
+
+    def _start_autonomous_assessment(self, target: str, goal: str) -> str:
+        """Begin an autonomous security assessment."""
+        self._start_time = time.time()
+        self._iteration = 0
+        self._findings = []
+        self._tools_run = []
+        self._executed_commands = set()
+        self._memory = []
+
+        self._say(f"\n\033[1;33m{'═'*60}\033[0m")
+        self._say("\033[1;33m  RecurSec Autonomous Agent\033[0m")
+        self._say(f"\033[1;33m  Target: {target}\033[0m")
+        self._say(f"\033[1;33m  Goal: {goal}\033[0m")
+        self._say(f"\033[1;33m{'═'*60}\033[0m\n")
+
+        # Discover/load models
+        self._say("\033[1;34m[init]\033[0m Initializing models...")
+        self._llm.refresh_online_models()
+        model = self._llm.route_task("security_analysis")
+        if model:
+            self._say(f"\033[1;34m[init]\033[0m Primary model: {model}")
+            loader_status = self._llm.loader.get_status()
+            self._say(f"\033[1;34m[init]\033[0m Models loaded: {loader_status['loaded_count']}, "
+                       f"RAM: {loader_status['total_ram_gb']}GB")
+        else:
+            self._say("\033[1;31m[init]\033[0m No LLM models available — running tools-only mode")
+            return self._run_tools_only(target)
+
+        # Begin autonomous loop
+        return self._autonomous_loop(target, goal, model)
+
+    def _autonomous_loop(self, target: str, goal: str, model: str) -> str:
+        """The core think→act→observe loop."""
+        system = AGENT_SYSTEM_PROMPT
+
+        for iteration in range(self._max_iterations):
+            self._iteration = iteration + 1
+            elapsed = time.time() - self._start_time
+
+            if elapsed > self._max_time_s:
+                self._say(f"\n\033[1;31m[timeout]\033[0m Time limit reached ({elapsed:.0f}s)")
+                break
+
+            # Build context for the LLM
+            context = self._build_context(target, goal, iteration)
+
+            # Ask the LLM what to do
+            resp = self._llm.chat(
+                model, [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": context},
+                ],
+                temperature=0.4, max_tokens=2048,
+            )
+
+            if not resp.success or not resp.content:
+                self._say("\033[1;31m[error]\033[0m LLM returned empty response")
+                # Try switching models
+                model = self._llm.route_task("general") or model
+                continue
+
+            # Parse the agent's response
+            action_data = self._parse_agent_response(resp.content)
+            if not action_data:
+                self._say("\033[1;31m[error]\033[0m Failed to parse agent response")
+                continue
+
+            # Show the agent's thinking and message
+            thinking = action_data.get("thinking", "")
+            message = action_data.get("message", "")
+            action = action_data.get("action", "")
+            action_input = action_data.get("action_input", {})
+
+            if thinking:
+                self._say(f"\n\033[0;90m[think] {thinking}\033[0m")
+            if message:
+                self._say(f"\033[1;32m[agent]\033[0m {message}")
+
+            # Execute the action
+            if action == "run_tool":
+                command = action_input.get("command", "")
+                if command:
+                    self._execute_tool_action(command, target, model)
+                else:
+                    self._say("\033[1;31m[error]\033[0m No command specified")
+
+            elif action == "analyze":
+                analysis_type = action_input.get("analysis_type", "general")
+                self._run_analysis(analysis_type, target, model)
+
+            elif action == "spawn_agent":
+                role = action_input.get("agent_role", "recon")
+                task = action_input.get("agent_task", "")
+                self._spawn_sub_agent(role, task, target, model)
+
+            elif action == "consensus_vote":
+                finding_desc = action_input.get("finding_description", "")
+                if finding_desc:
+                    self._run_consensus_vote(finding_desc, target, model)
+                else:
+                    self._say("\033[1;31m[error]\033[0m No finding description for consensus")
+
+            elif action == "report_finding":
+                finding = action_input.get("finding", {})
+                if finding:
+                    self._report_finding(finding)
+
+            elif action == "ask_user":
+                msg = action_input.get("message", "Should I proceed?")
+                self._say(f"\n\033[1;36m[question]\033[0m {msg}")
+                try:
+                    answer = input("\033[1;36mYou:\033[0m ").strip()
+                    self._memory.append({"role": "user_answer", "content": answer})
+                except (EOFError, KeyboardInterrupt):
+                    self._memory.append({"role": "user_answer", "content": "stop"})
+                    break
+
+            elif action == "done":
+                done_msg = action_input.get("message", "Assessment complete.")
+                self._say(f"\n\033[1;33m[done]\033[0m {done_msg}")
+                self._print_final_report(target)
+                return done_msg
+
+            else:
+                self._say(f"\033[1;31m[error]\033[0m Unknown action: {action}")
+
+        # Loop ended (timeout or max iterations)
+        self._print_final_report(target)
+        return f"Assessment complete. Found {len(self._findings)} potential findings."
+
+    # ── Actions ─────────────────────────────────────────────────
+
+    def _execute_tool_action(self, command: str, target: str, model: str) -> None:
+        """Execute a tool command, observe output, extract findings."""
+        # Safety check
+        if not self._is_safe_command(command):
+            self._say(f"\033[1;31m[blocked]\033[0m Unsafe command: {command[:60]}")
+            self._memory.append({"role": "tool", "content": f"BLOCKED: {command}"})
+            return
+
+        # Skip duplicates
+        if command in self._executed_commands:
+            self._say(f"\033[0;90m[skip]\033[0m Already ran: {command[:60]}")
+            return
+
+        self._say(f"\033[1;35m[exec]\033[0m {command}")
+
+        # Run the command
+        tool_name = command.split()[0] if command.split() else "unknown"
+        output = self._run_shell_command(command, tool_name)
+        self._executed_commands.add(command)
+        self._tools_run.append(tool_name)
+
+        if output.success and output.stdout:
+            out_len = len(output.stdout)
+            self._say(f"\033[1;35m[result]\033[0m {tool_name}: {out_len} bytes, {output.duration_s:.1f}s")
+
+            # Store in memory (truncated for LLM context)
+            self._memory.append({
+                "role": "tool_output",
+                "tool": tool_name,
+                "command": command,
+                "content": output.stdout[:2000],
+            })
+
+            # Have LLM analyze output for findings
+            if out_len > 50:
+                self._analyze_output(output, target, model)
+        else:
+            err = output.stderr[:200] if output.stderr else "no output"
+            self._say(f"\033[1;31m[fail]\033[0m {tool_name}: {err}")
+            self._memory.append({
+                "role": "tool_error",
+                "tool": tool_name,
+                "command": command,
+                "content": f"ERROR: {err}",
+            })
+
+    def _analyze_output(self, output: ToolOutput, target: str, model: str) -> None:
+        """Have the LLM analyze tool output for security findings."""
+        analysis_model = self._llm.route_task("security_analysis") or model
+
+        prompt = (
+            f"Analyze this security tool output for {target}.\n"
+            f"Tool: {output.tool}\n"
+            f"Command: {output.command}\n"
+            f"Output:\n{output.stdout[:3000]}\n\n"
+            "Extract any security findings. Respond as JSON:\n"
+            '{"findings": [{"title":"...", "severity":"critical|high|medium|low|info", '
+            '"evidence":"...", "remediation":"..."}]}\n'
+            "If no findings, return: {\"findings\": []}"
+        )
+
+        resp = self._llm.chat(
+            analysis_model,
+            [{"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+             {"role": "user", "content": prompt}],
+            temperature=0.2, max_tokens=2048,
+        )
+
+        if resp.success and resp.content:
+            parsed = self._extract_json(resp.content)
+            findings = parsed.get("findings", []) if isinstance(parsed, dict) else []
+            for f in findings:
+                if isinstance(f, dict) and f.get("title"):
+                    f["tool"] = output.tool
+                    f["target"] = target
+                    self._report_finding(f)
+
+    def _run_analysis(self, analysis_type: str, target: str, model: str) -> None:
+        """Run an LLM-only analysis (no tool execution)."""
+        analysis_model = self._llm.route_task(analysis_type) or model
+
+        # Build prompt from recent memory
+        recent = self._memory[-10:]
+        memory_text = ""
+        for m in recent:
+            if m.get("role") == "tool_output":
+                memory_text += f"\n[{m.get('tool', '?')}] {m.get('content', '')[:500]}\n"
+
+        prompt = (
+            f"Target: {target}\n"
+            f"Analysis type: {analysis_type}\n"
+            f"Findings so far: {len(self._findings)}\n\n"
+            f"Recent tool outputs:\n{memory_text}\n\n"
+            "Analyze the data above. What patterns, vulnerabilities, or risks do you see? "
+            "Are there any attack chains possible? What should be investigated further?"
+        )
+
+        resp = self._llm.chat(
+            analysis_model,
+            [{"role": "system", "content": SECURITY_SYSTEM_PROMPT},
+             {"role": "user", "content": prompt}],
+            temperature=0.3, max_tokens=2048,
+        )
+
+        if resp.success and resp.content:
+            self._say(f"\033[1;34m[analysis]\033[0m {resp.content[:500]}")
+            self._memory.append({
+                "role": "analysis",
+                "content": resp.content[:1000],
+            })
+
+    def _run_consensus_vote(self, finding_desc: str, target: str, model: str) -> None:
+        """Validate a finding with multi-model consensus voting."""
+        self._say(f"\033[1;36m[consensus]\033[0m Validating: {finding_desc[:60]}")
+
+        # Get 2-3 different models to validate
+        model_ids = []
+        for task_type in ["security_analysis", "analyze_source_code", "reasoning"]:
+            m = self._llm.route_task(task_type)
+            if m and m not in model_ids:
+                model_ids.append(m)
+        if not model_ids:
+            model_ids = [model]
+
+        validation_prompt = (
+            f"Target: {target}\n"
+            f"A security scan has reported this finding:\n{finding_desc}\n\n"
+            "Is this a REAL vulnerability? Analyze critically.\n"
+            "Respond with JSON: {\"confirmed\": true/false, \"reasoning\": \"why\"}"
+        )
+
+        votes_yes = 0
+        votes_total = 0
+        vote_details: list[str] = []
+        for mid in model_ids[:3]:
+            resp = self._llm.chat(
+                mid,
+                [{"role": "system", "content": "You are a security expert. Validate vulnerabilities."},
+                 {"role": "user", "content": validation_prompt}],
+                temperature=0.1, max_tokens=512,
+            )
+            votes_total += 1
+            if resp.success and resp.content:
+                parsed = self._extract_json(resp.content)
+                confirmed = parsed.get("confirmed", False) if isinstance(parsed, dict) else False
+                if confirmed:
+                    votes_yes += 1
+                status = "CONFIRMED" if confirmed else "REJECTED"
+                vote_details.append(f"{mid}: {status}")
+                self._say(f"\033[0;90m  [{mid}] {status}\033[0m")
+            else:
+                vote_details.append(f"{mid}: NO RESPONSE")
+
+        confidence = votes_yes / max(votes_total, 1)
+        if confidence >= 0.6:
+            self._say(f"\033[1;32m[consensus]\033[0m CONFIRMED ({votes_yes}/{votes_total} agree, "
+                       f"confidence {confidence:.0%})")
+            self._memory.append({
+                "role": "consensus",
+                "content": f"CONFIRMED: {finding_desc} ({votes_yes}/{votes_total}, {confidence:.0%})",
+                "votes": vote_details,
+            })
+        else:
+            self._say(f"\033[1;33m[consensus]\033[0m NOT CONFIRMED ({votes_yes}/{votes_total}, "
+                       f"confidence {confidence:.0%}) — likely false positive")
+            self._memory.append({
+                "role": "consensus",
+                "content": f"REJECTED: {finding_desc} ({votes_yes}/{votes_total}, {confidence:.0%})",
+                "votes": vote_details,
+            })
+
+    def _spawn_sub_agent(self, role: str, task: str, target: str, model: str) -> None:
+        """Spawn a sub-agent for a specialized task."""
+        self._say(f"\033[1;36m[spawn]\033[0m Creating {role} sub-agent: {task[:60]}")
+
+        # Route to the best model for this sub-agent's role
+        role_to_task_type = {
+            "recon": "recon_analysis",
+            "vuln_scan": "scan_web_vulns",
+            "code_analysis": "analyze_source_code",
+            "exploit": "build_exploit_chain",
+            "report": "write_report",
+        }
+        task_type = role_to_task_type.get(role, "general")
+        sub_model = self._llm.route_task(task_type) or model
+
+        system = SUB_AGENT_PROMPT.format(role=role, task=task, target=target)
+        context = (
+            f"Target: {target}\n"
+            f"Your task: {task}\n"
+            f"Available tools: nmap, nuclei, nikto, sqlmap, ffuf, gobuster, "
+            f"subfinder, httpx, curl, dig, whois, dirb, wpscan, hydra, "
+            f"semgrep, bandit, trivy, dnsrecon\n"
+            f"Respond with your first action."
+        )
+
+        # Run the sub-agent for a few iterations
+        sub_findings: list[dict[str, Any]] = []
+        for i in range(15):  # Sub-agents get fewer iterations
+            resp = self._llm.chat(
+                sub_model,
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": context}],
+                temperature=0.4, max_tokens=1024,
+            )
+
+            if not resp.success or not resp.content:
+                break
+
+            action_data = self._parse_agent_response(resp.content)
+            if not action_data:
+                break
+
+            action = action_data.get("action", "")
+            action_input = action_data.get("action_input", {})
+            message = action_data.get("message", "")
+
+            if message:
+                self._say(f"\033[0;90m  [{role}]\033[0m {message}")
+
+            if action == "run_tool":
+                cmd = action_input.get("command", "")
+                if cmd and self._is_safe_command(cmd) and cmd not in self._executed_commands:
+                    self._say(f"\033[1;35m  [{role} exec]\033[0m {cmd[:70]}")
+                    output = self._run_shell_command(cmd, cmd.split()[0] if cmd.split() else "tool")
+                    self._executed_commands.add(cmd)
+                    self._tools_run.append(cmd.split()[0] if cmd.split() else "tool")
+
+                    if output.success and output.stdout:
+                        context = (
+                            f"Tool output ({output.tool}):\n{output.stdout[:2000]}\n\n"
+                            f"Analyze this and decide next action."
+                        )
+                        self._memory.append({
+                            "role": "tool_output",
+                            "tool": output.tool,
+                            "command": cmd,
+                            "content": output.stdout[:1000],
+                        })
+                    else:
+                        context = f"Tool failed: {output.stderr[:200]}\nDecide next action."
+                elif cmd:
+                    context = f"Command already run or blocked: {cmd}\nTry something else."
+
+            elif action == "report_finding":
+                finding = action_input.get("finding", {})
+                if finding and isinstance(finding, dict):
+                    finding["tool"] = f"sub-agent:{role}"
+                    finding["target"] = target
+                    sub_findings.append(finding)
+                    self._report_finding(finding)
+                context = "Finding recorded. Continue your assessment or say done."
+
+            elif action == "done":
+                done_msg = action_input.get("message", "Sub-task complete.")
+                self._say(f"\033[0;90m  [{role} done]\033[0m {done_msg}")
+                break
+
+            else:
+                context = f"Action {action} not supported for sub-agents. Use run_tool or report_finding."
+
+        self._sub_agents.append({
+            "role": role,
+            "task": task,
+            "model": sub_model,
+            "findings": len(sub_findings),
+        })
+
+    def _report_finding(self, finding: dict[str, Any]) -> None:
+        """Report a security finding."""
+        title = finding.get("title", "Unknown")
+        severity = finding.get("severity", "info").upper()
+
+        # Color by severity
+        colors = {
+            "CRITICAL": "\033[1;31m",
+            "HIGH": "\033[0;31m",
+            "MEDIUM": "\033[0;33m",
+            "LOW": "\033[0;36m",
+            "INFO": "\033[0;90m",
+        }
+        color = colors.get(severity, "\033[0m")
+        self._say(f"{color}[FINDING][{severity}]\033[0m {title}")
+
+        # Deduplicate
+        for existing in self._findings:
+            if existing.get("title", "").lower() == title.lower():
+                return  # Already reported
+
+        self._findings.append(finding)
+
+    # ── Context building ────────────────────────────────────────
+
+    def _build_context(self, target: str, goal: str, iteration: int) -> str:
+        """Build the full context for the LLM's next decision."""
+        elapsed = time.time() - self._start_time
+
+        parts = [
+            f"Target: {target}",
+            f"Goal: {goal}",
+            f"Iteration: {iteration + 1}/{self._max_iterations}",
+            f"Time: {elapsed:.0f}s / {self._max_time_s:.0f}s",
+            f"Tools run: {len(self._tools_run)}",
+            f"Findings: {len(self._findings)}",
+            f"Sub-agents spawned: {len(self._sub_agents)}",
+        ]
+
+        # Recent findings
+        if self._findings:
+            parts.append("\nFindings so far:")
+            for f in self._findings[-5:]:
+                parts.append(f"  - [{f.get('severity', '?')}] {f.get('title', '?')}")
+
+        # Recent memory (tool outputs, analyses)
+        recent = self._memory[-6:]
+        if recent:
+            parts.append("\nRecent actions:")
+            for m in recent:
+                role = m.get("role", "")
+                if role == "tool_output":
+                    parts.append(f"  [{m.get('tool', '?')}]: {m.get('content', '')[:300]}")
+                elif role == "tool_error":
+                    parts.append(f"  [ERROR {m.get('tool', '?')}]: {m.get('content', '')[:200]}")
+                elif role == "analysis":
+                    parts.append(f"  [analysis]: {m.get('content', '')[:300]}")
+                elif role == "user_answer":
+                    parts.append(f"  [user]: {m.get('content', '')}")
+
+        # Sub-agent results
+        if self._sub_agents:
+            parts.append(f"\nSub-agents completed: {len(self._sub_agents)}")
+            for sa in self._sub_agents[-3:]:
+                parts.append(f"  - {sa['role']}: {sa['task'][:40]} ({sa['findings']} findings)")
+
+        parts.append("\nWhat is your next action? Respond with JSON.")
+        return "\n".join(parts)
+
+    # ── Output ──────────────────────────────────────────────────
+
+    def _print_banner(self) -> None:
+        self._say("\033[1;33m" + "═" * 60 + "\033[0m")
+        self._say("\033[1;33m  RecurSec — Autonomous Security Agent\033[0m")
+        self._say("\033[1;33m  Type a target or goal to begin.\033[0m")
+        self._say("\033[1;33m  Examples:\033[0m")
+        self._say("\033[1;33m    'Find vulnerabilities in webapp.com'\033[0m")
+        self._say("\033[1;33m    'Test the security of 192.168.1.0/24'\033[0m")
+        self._say("\033[1;33m    'Scan https://example.com for weaknesses'\033[0m")
+        self._say("\033[1;33m  Commands: status, findings, exit\033[0m")
+        self._say("\033[1;33m" + "═" * 60 + "\033[0m")
+
+    def _print_status(self) -> None:
+        """Print current agent status."""
+        loader = self._llm.loader.get_status()
+        self._say(f"\n  Target: {self._target or 'none'}")
+        self._say(f"  Goal: {self._goal or 'none'}")
+        self._say(f"  Findings: {len(self._findings)}")
+        self._say(f"  Tools run: {len(self._tools_run)}")
+        self._say(f"  Sub-agents: {len(self._sub_agents)}")
+        self._say(f"  Models loaded: {loader['loaded_count']} ({loader['total_ram_gb']}GB RAM)")
+        if self._start_time:
+            self._say(f"  Elapsed: {time.time() - self._start_time:.0f}s")
+
+    def _print_findings(self) -> None:
+        """Print all findings."""
+        if not self._findings:
+            self._say("  No findings yet.")
+            return
+        self._say(f"\n  Findings ({len(self._findings)}):")
+        for i, f in enumerate(self._findings, 1):
+            sev = f.get("severity", "info").upper()
+            title = f.get("title", "Unknown")
+            self._say(f"  {i}. [{sev}] {title}")
+            if f.get("evidence"):
+                self._say(f"     Evidence: {f['evidence'][:100]}")
+
+    def _print_final_report(self, target: str) -> None:
+        """Print the final assessment report."""
+        elapsed = time.time() - self._start_time
+        self._say(f"\n\033[1;33m{'═'*60}\033[0m")
+        self._say("\033[1;33m  ASSESSMENT COMPLETE\033[0m")
+        self._say(f"\033[1;33m  Target: {target}\033[0m")
+        self._say(f"\033[1;33m  Duration: {elapsed:.0f}s\033[0m")
+        self._say(f"\033[1;33m  Tools run: {len(self._tools_run)}\033[0m")
+        self._say(f"\033[1;33m  Sub-agents: {len(self._sub_agents)}\033[0m")
+        self._say(f"\033[1;33m  Findings: {len(self._findings)}\033[0m")
+        self._say(f"\033[1;33m{'═'*60}\033[0m")
+
+        # Group by severity
+        by_sev: dict[str, list[dict[str, Any]]] = {}
+        for f in self._findings:
+            sev = f.get("severity", "info").lower()
+            if sev not in by_sev:
+                by_sev[sev] = []
+            by_sev[sev].append(f)
+
+        for sev in ["critical", "high", "medium", "low", "info"]:
+            if sev in by_sev:
+                self._say(f"\n  [{sev.upper()}] ({len(by_sev[sev])})")
+                for f in by_sev[sev]:
+                    self._say(f"    - {f.get('title', '?')}")
+                    if f.get("evidence"):
+                        self._say(f"      Evidence: {f['evidence'][:120]}")
+                    if f.get("remediation"):
+                        self._say(f"      Fix: {f['remediation'][:120]}")
+
+        # Save report
+        report_dir = f"output/{int(time.time())}"
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, "report.json")
+        with open(report_path, "w") as fp:
+            json.dump({
+                "target": target,
+                "duration_s": round(elapsed, 1),
+                "tools_run": len(self._tools_run),
+                "sub_agents": len(self._sub_agents),
+                "findings": self._findings,
+            }, fp, indent=2)
+        self._say(f"\n  Report saved: {report_path}")
+
+        # Loader status
+        loader = self._llm.loader.get_status()
+        self._say(f"  Models loaded: {loader['loaded_count']} ({loader['total_ram_gb']}GB RAM)")
+
+    # ── Helpers ──────────────────────────────────────────────────
+
+    def _say(self, msg: str) -> None:
+        """Print a message to the user."""
+        print(msg)
+
+    def _conversational_response(self, message: str) -> str:
+        """Handle non-task conversational messages."""
+        lower = message.lower()
+        if any(w in lower for w in ["hello", "hi", "hey"]):
+            return ("Hello! I'm RecurSec, your autonomous security agent. "
+                    "Tell me what you'd like to assess — give me a target and I'll handle everything.")
+        if "help" in lower:
+            return ("I'm an autonomous security assessment agent. Just tell me:\n"
+                    "  'Find vulnerabilities in <target>'\n"
+                    "  'Test the security of <target>'\n"
+                    "  'Scan <target>'\n"
+                    "I'll think, plan, run tools, and report back — all autonomously.")
+        if any(w in lower for w in ["what can you", "capabilities", "features"]):
+            return ("I can:\n"
+                    "- Autonomously assess targets (web apps, networks, APIs)\n"
+                    "- Run 300+ security tools (nmap, nuclei, sqlmap, etc.)\n"
+                    "- Spawn specialized sub-agents for parallel analysis\n"
+                    "- Validate findings with multi-model consensus\n"
+                    "- Build exploit chains\n"
+                    "- Generate comprehensive reports\n"
+                    "Just give me a target!")
+        return ("I'm ready to help with security assessment. "
+                "Give me a target to scan, e.g. 'Find vulnerabilities in webapp.com'")
+
+    def _is_task_request(self, message: str) -> bool:
+        """Detect if the user is requesting a security task."""
+        lower = message.lower()
+        task_keywords = [
+            "scan", "find", "test", "assess", "hack", "pentest",
+            "vulnerability", "vulnerabilities", "vuln", "exploit",
+            "security", "audit", "check", "analyze", "investigate",
+            "attack", "enumerate", "recon", "discover",
+        ]
+        return any(kw in lower for kw in task_keywords)
+
+    def _extract_target(self, message: str) -> str:
+        """Extract target from natural language."""
+        import re as re_mod
+        # URL pattern
+        url_match = re_mod.search(r'https?://[^\s]+', message)
+        if url_match:
+            return url_match.group(0).rstrip(".,;!?'\")")
+
+        # Domain pattern
+        domain_match = re_mod.search(r'\b([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?)\b', message)
+        if domain_match:
+            word = domain_match.group(1)
+            # Filter common non-target words
+            skip = {"example.py", "test.py", "main.py", "setup.py"}
+            if word not in skip:
+                return word
+
+        # IP pattern
+        ip_match = re_mod.search(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:/\d{1,2})?)\b', message)
+        if ip_match:
+            return ip_match.group(1)
+
+        return ""
+
+    def _parse_agent_response(self, content: str) -> dict[str, Any]:
+        """Parse the agent's JSON response."""
+        # Try direct JSON parse
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict) and "action" in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        # Try extracting JSON from text
+        json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', content, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                if isinstance(data, dict) and "action" in data:
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        # Try finding { ... } block
+        brace_match = re.search(r'\{[^{}]*"action"[^{}]*\}', content, re.DOTALL)
+        if brace_match:
+            try:
+                data = json.loads(brace_match.group(0))
+                if isinstance(data, dict) and "action" in data:
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: try to parse as a tool command
+        content = content.strip()
+        if content and not content.startswith(("{", "[")):
+            # LLM may have just returned a raw command
+            first_line = content.split("\n")[0].strip()
+            if first_line.upper() in ("DONE", "DONE.", "COMPLETE"):
+                return {"action": "done", "action_input": {"message": "Assessment complete."}, "message": "Assessment complete."}
+            if first_line and " " in first_line:
+                return {
+                    "thinking": "Executing suggested tool",
+                    "action": "run_tool",
+                    "action_input": {"command": first_line},
+                    "message": f"Running: {first_line[:60]}",
+                }
+
+        return {}
+
+    def _is_safe_command(self, command: str) -> bool:
+        """Check if a command is safe to execute."""
+        blocked = [
+            "rm -rf", "mkfs", "dd if=", ":(){", "fork", "shutdown",
+            "reboot", "halt", "poweroff", "init 0", "init 6",
+            "> /dev/sd", "chmod -R 777 /", "wget|sh", "curl|sh",
+            "python -c", "perl -e", "ruby -e", "nc -e", "bash -i",
+        ]
+        lower = command.lower()
+        for b in blocked:
+            if b in lower:
+                return False
+
+        # Must start with a known tool
+        parts = command.split()
+        if not parts:
+            return False
+
+        tool = parts[0].split("/")[-1]  # Handle full paths
+        allowed_prefixes = {
+            "nmap", "nuclei", "nikto", "sqlmap", "ffuf", "gobuster", "subfinder",
+            "httpx", "curl", "dig", "whois", "host", "dirb", "wpscan", "hydra",
+            "semgrep", "bandit", "trivy", "dnsrecon", "masscan", "amass", "theharvester",
+            "wafw00f", "whatweb", "arjun", "sslyze", "testssl", "feroxbuster",
+            "dirsearch", "wfuzz", "dalfox", "xsstrike", "commix", "gau",
+            "katana", "waybackurls", "hakrawler", "gospider", "jq", "grep",
+            "awk", "sed", "cat", "head", "tail", "wc", "sort", "uniq",
+            "openssl", "ssh-audit", "ping", "traceroute", "netstat", "ss",
+            "dnsmap", "fierce", "dnsenum", "enum4linux", "smbclient",
+            "rpcclient", "nbtscan", "snmpwalk", "onesixtyone",
+        }
+        return tool in allowed_prefixes
+
+    def _run_shell_command(self, command: str, tool_name: str) -> ToolOutput:
+        """Run a shell command with timeout."""
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=self._tool_timeout_s,
+            )
+            return ToolOutput(
+                tool=tool_name,
+                command=command,
+                stdout=result.stdout[:50000],
+                stderr=result.stderr[:5000],
+                exit_code=result.returncode,
+                duration_s=0.0,
+            )
+        except subprocess.TimeoutExpired:
+            return ToolOutput(tool=tool_name, command=command, stderr="TIMEOUT", exit_code=-1)
+        except Exception as exc:
+            return ToolOutput(tool=tool_name, command=command, stderr=str(exc), exit_code=-1)
+
+    def _run_tools_only(self, target: str) -> str:
+        """Fallback: run basic recon tools without LLM."""
+        self._say("\033[1;34m[tools-only]\033[0m Running basic recon...")
+        basic_commands = [
+            f"dig +short {target} A",
+            f"dig +short {target} MX",
+            f"dig +short {target} NS",
+            f"whois {target}",
+            f"curl -sI -L --max-time 15 {target}",
+        ]
+        for cmd in basic_commands:
+            tool = cmd.split()[0]
+            self._say(f"\033[1;35m[exec]\033[0m {cmd}")
+            output = self._run_shell_command(cmd, tool)
+            if output.success and output.stdout:
+                self._say(f"\033[0;90m{output.stdout[:300]}\033[0m")
+                self._memory.append({"role": "tool_output", "tool": tool, "content": output.stdout[:1000]})
+            self._tools_run.append(tool)
+        return f"Basic recon complete. Ran {len(basic_commands)} tools. No LLM for analysis."
+
+    def _extract_json(self, text: str) -> Any:
+        """Extract JSON from LLM response text."""
+        if not text:
+            return {}
+        json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+        if json_match:
+            text = json_match.group(1)
+        else:
+            brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+            if brace_match:
+                text = brace_match.group(0)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "target": self._target,
+            "findings": len(self._findings),
+            "tools_run": len(self._tools_run),
+            "sub_agents": len(self._sub_agents),
+            "iterations": self._iteration,
+            "loader": self._llm.loader.get_status(),
         }

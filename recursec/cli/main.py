@@ -1,18 +1,21 @@
-"""RecurSec CLI — command-line interface for the autonomous security agent.
+"""RecurSec CLI — conversational autonomous security agent.
 
-Usage:
-    python -m recursec scan <target>                     Quick scan
-    python -m recursec scan <target> --deep              Deep comprehensive scan
-    python -m recursec scan <target> --stealth           Stealth mode
-    python -m recursec models                            List configured models
-    python -m recursec tools                             List available tools
-    python -m recursec health                            Check LLM server health
+DEFAULT: Interactive conversational agent (just run `recursec`)
+  You talk, the agent thinks, acts, and reports autonomously.
+
+ALTERNATIVE: Traditional pipeline scan
+  recursec scan <target>              Pipeline-based scan
+  recursec scan <target> --deep       Deep comprehensive scan
+
+UTILITIES:
+  recursec health                     Check LLM server status
+  recursec models                     List configured models
+  recursec tools                      List available tools
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 
 import structlog
 
@@ -22,7 +25,7 @@ from recursec.agents.llm_client import (
     MODEL_SERVERS,
     TASK_ROUTING,
 )
-from recursec.agents.runner import Runner, ScanConfig
+from recursec.agents.runner import AutonomousAgent, Runner, ScanConfig
 from recursec.agents.tool_executor import ToolExecutor
 
 logger = structlog.get_logger()
@@ -31,12 +34,25 @@ logger = structlog.get_logger()
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="recursec",
-        description="RecurSec — Autonomous Multi-Agent Security Assessment Framework",
+        description="RecurSec — Autonomous Conversational Security Agent",
+        epilog=(
+            "Default (no arguments): launches interactive agent\n"
+            "Example: recursec          → conversational agent\n"
+            "Example: recursec scan url → traditional pipeline scan"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # scan (the main command)
-    scan_parser = subparsers.add_parser("scan", help="Run a security assessment")
+    # agent (default — conversational autonomous agent)
+    agent_parser = subparsers.add_parser("agent", help="Launch conversational autonomous agent (default)")
+    agent_parser.add_argument("target", nargs="?", default="", help="Optional: target to assess immediately")
+    agent_parser.add_argument("--goal", "-g", default="", help="Assessment goal in natural language")
+    agent_parser.add_argument("--timeout", type=int, default=3600, help="Max time in seconds")
+    agent_parser.add_argument("--iterations", type=int, default=200, help="Max autonomous iterations")
+
+    # scan (traditional pipeline)
+    scan_parser = subparsers.add_parser("scan", help="Run pipeline-based security assessment")
     scan_parser.add_argument("target", help="Target to scan (URL, IP, domain)")
     scan_parser.add_argument("--goal", "-g", default="", help="Assessment goal")
     scan_parser.add_argument("--deep", action="store_true", help="Deep comprehensive scan")
@@ -63,8 +79,24 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cmd_agent(args: argparse.Namespace) -> None:
+    """Launch the conversational autonomous agent."""
+    agent = AutonomousAgent(
+        max_iterations=args.iterations,
+        max_time_s=float(args.timeout),
+    )
+
+    if args.target:
+        # Direct mode: user specified a target on the command line
+        goal = args.goal or f"Find all vulnerabilities in {args.target}"
+        agent.chat(goal if args.target in goal else f"{goal} — target: {args.target}")
+    else:
+        # Interactive mode: conversational REPL
+        agent.interactive_loop()
+
+
 def cmd_scan(args: argparse.Namespace) -> None:
-    """Run a security assessment."""
+    """Run a pipeline-based security assessment."""
     config = ScanConfig(
         target=args.target,
         goal=args.goal,
@@ -95,7 +127,7 @@ def cmd_models(_args: argparse.Namespace) -> None:
 
 def cmd_health(_args: argparse.Namespace) -> None:
     """Check which LLM servers are running."""
-    client = LLMClient(on_demand=False)  # Don't auto-load for health check
+    client = LLMClient(on_demand=False)
     print("\n  LLM Server Health Check (On-Demand Architecture)")
     print(f"  {'─'*60}")
 
@@ -118,9 +150,9 @@ def cmd_health(_args: argparse.Namespace) -> None:
         print("\n  Start 1-2 models for on-demand scanning:")
         print("    ./scripts/launch_models.sh whiterabbitneo")
         print("    ./scripts/launch_models.sh whiterabbitneo qwen-coder-14b")
-        print("\n  Or let the agent auto-load models:")
-        print("    python -m recursec scan https://target.com")
-        print("    (DynamicModelLoader starts models automatically)")
+        print("\n  Or just run the agent — it auto-loads models:")
+        print("    recursec")
+        print("    > Find vulnerabilities in webapp.com")
     elif healthy <= 3:
         print(f"\n  On-demand mode active: {healthy} model(s) loaded, {total - healthy} on disk")
     else:
@@ -141,7 +173,6 @@ def cmd_tools(_args: argparse.Namespace) -> None:
     print(f"\n  Security Tools ({len(available)}/{len(all_tools)} available):")
     print(f"  {'─'*60}")
 
-    # Group by category
     by_cat: dict[str, list] = {}
     for tool in all_tools:
         cat = tool.category.value
@@ -166,19 +197,18 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.command:
-        parser.print_help()
-        print("\nQuick start:")
-        print("  python -m recursec scan https://example.com")
-        print("  python -m recursec health")
-        print("  python -m recursec tools")
-        sys.exit(0)
+        # DEFAULT: launch the conversational autonomous agent
+        agent = AutonomousAgent()
+        agent.interactive_loop()
+        return
 
     handlers = {
+        "agent": cmd_agent,
         "scan": cmd_scan,
         "health": cmd_health,
         "models": cmd_models,
         "tools": cmd_tools,
-        "version": lambda _: print("RecurSec v1.0.0"),
+        "version": lambda _: print("RecurSec v1.1.0 — Autonomous Conversational Agent"),
     }
 
     handler = handlers.get(args.command)

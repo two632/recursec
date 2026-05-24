@@ -1,8 +1,22 @@
 # RecurSec
 
-**Recursive Multi-Agent Security Framework**
+**Autonomous Conversational Security Agent**
 
-Autonomous security testing with **true on-demand model loading**, 244+ tools, recursive agent spawning, and autonomous think-act loop. Everything runs locally — no cloud, no Ollama, no paid APIs.
+You talk, it hacks. RecurSec is a fully autonomous security agent that thinks, plans, acts, and reports — all through natural conversation. No commands to memorize, no pipeline flags. Just tell it what you want.
+
+```
+You: "Find vulnerabilities in webapp.com"
+
+Agent: [think] I should start with reconnaissance to map the attack surface...
+       [exec]  nmap -sV -sC webapp.com
+       [think] Found Apache 2.4.49, MySQL 5.7 on port 3306 — let me check for known CVEs...
+       [exec]  nuclei -u webapp.com -severity critical,high
+       [think] Path traversal vulnerability detected! Let me validate with another model...
+       [spawn] Creating vuln_scan sub-agent for SQL injection testing
+       [consensus] WhiteRabbitNeo: CONFIRMED | Qwen-Coder: CONFIRMED | DeepSeek: CONFIRMED
+       [FINDING][CRITICAL] Path Traversal in Apache 2.4.49 (CVE-2021-41773)
+       [done]  Found 3 critical, 2 high vulnerabilities. Full report saved.
+```
 
 **On-demand architecture:** 16 GGUF models on disk (~200GB). Only 1-2 loaded in RAM at a time (8-18GB). `DynamicModelLoader` starts/stops llama-server processes automatically. LRU cache evicts least-recently-used model when a new one is needed.
 
@@ -42,75 +56,64 @@ RecurSec is pre-configured for your exact GGUF models, with each model assigned 
 
 ## Quick Start
 
-### 1. Install Everything
+### 1. Install
 
 ```bash
 git clone <repo-url> ~/agent/recursec
 cd ~/agent/recursec
-
-# Full install (llama.cpp + tools + RecurSec)
-./scripts/install.sh --all
-
-# Or just RecurSec
 pip install -e .
+
+# Optional: full install with llama.cpp + all security tools
+./scripts/install.sh --all
 ```
 
-### 2. Launch Models (On-Demand Architecture)
+### 2. Talk to the Agent
 
 ```bash
-# OPTION A: Let the agent auto-load models (recommended)
-# DynamicModelLoader starts llama-server when a model is needed,
-# keeps max 2 cached (LRU eviction), stops servers when done.
-# Just run the scan — it handles everything:
-python -m recursec scan https://target.com
+# Launch the conversational agent (DEFAULT)
+python -m recursec
 
-# OPTION B: Pre-start 1-2 models for immediate availability
+# You'll see:
+# ════════════════════════════════════════
+#   RecurSec — Autonomous Security Agent
+#   Type a target or goal to begin.
+# ════════════════════════════════════════
+# You: Find vulnerabilities in webapp.com
+# [think] Starting with reconnaissance...
+# [exec]  nmap -sV -sC webapp.com
+# [agent] Found 5 open ports. Investigating services...
+# ...
+
+# Or specify a target directly:
+python -m recursec agent webapp.com
+python -m recursec agent https://target.com --goal "Test for SQL injection"
+```
+
+### 3. Other Commands
+
+```bash
+# Traditional pipeline scan (old-style, still available)
+python -m recursec scan https://target.com
+python -m recursec scan 192.168.1.0/24 --deep --stealth
+
+# Utilities
+python -m recursec health    # Check model status
+python -m recursec models    # List configured models
+python -m recursec tools     # List 244+ security tools
+```
+
+### 4. Model Management
+
+```bash
+# Models auto-load on demand. Or pre-start 1-2:
 ./scripts/launch_models.sh whiterabbitneo                   # 5GB RAM
 ./scripts/launch_models.sh whiterabbitneo qwen-coder-14b    # 13GB RAM
 
-# Check what's loaded:
-python -m recursec health
-
-# DON'T DO THIS (needs 80GB+ RAM):
-# ./scripts/launch_models.sh --all    # Loads all 16 models!
-```
-
-### 3. Run RecurSec
-
-```bash
-# Scan a target (autonomous mode — LLM decides what tools to run)
-python -m recursec scan https://target-site.com
-
-# Scan with more autonomous iterations
-python -m recursec scan https://target-site.com --iterations 200
-
-# Deep + stealth scan
-python -m recursec scan 192.168.1.0/24 --deep --stealth
-
-# Tools-only mode (no LLM loop)
-python -m recursec scan https://target-site.com --no-autonomous
-
-# Disable multi-model consensus voting
-python -m recursec scan https://target-site.com --no-consensus
-
-# Check LLM server health + routing status
-python -m recursec health
-
-# List all 244+ registered tools
-python -m recursec tools
-
-# List configured models
-python -m recursec models
-```
-
-### 4. Stop Models
-
-```bash
-# Stop all running model servers
+# Stop all
 ./scripts/launch_models.sh --stop
 
-# Check status
-./scripts/launch_models.sh --status
+# DON'T load all 16 (needs 80GB+ RAM):
+# ./scripts/launch_models.sh --all
 ```
 
 ---
