@@ -1,11 +1,11 @@
-"""Zero-day research knowledge base.
+"""Zero-day hunting knowledge base.
 
 Deep knowledge about zero-day discovery:
-1. Vulnerability research methodology
-2. Fuzzing techniques
-3. Binary exploitation patterns
-4. Web zero-day patterns
-5. Patch analysis and 1-day research
+1. Fuzzing strategies
+2. Code pattern analysis
+3. Vulnerability class hunting
+4. Patch diffing
+5. Variant analysis
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ logger = structlog.get_logger()
 
 @dataclass
 class ZeroDayPattern:
-    """A zero-day research pattern."""
+    """A zero-day hunting pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
@@ -37,235 +37,233 @@ class ZeroDayPattern:
         }
 
 
-ZD_PATTERNS: list[dict[str, Any]] = [
+ZERODAY_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "zd-001", "name": "Vulnerability Research Methodology",
-        "category": "methodology", "severity": "critical",
-        "desc": "Systematic vulnerability discovery.",
-        "detection": (
-            "VULNERABILITY RESEARCH METHODOLOGY:\n"
-            "ATTACK SURFACE ANALYSIS:\n"
-            "  1. Enumerate all entry points\n"
-            "  2. Map data flows\n"
-            "  3. Identify trust boundaries\n"
-            "  4. Find complex state machines\n"
-            "  5. Locate parser code\n"
-            "  6. Review authentication flows\n"
-            "  7. Check serialization/deserialization\n"
-            "VARIANT ANALYSIS:\n"
-            "  - Find similar bugs to known CVEs\n"
-            "  - CodeQL (GitHub) for semantic search\n"
-            "  - Semgrep custom rules\n"
-            "  - Pattern: same developer, same function class\n"
-            "  - Check adjacent functions\n"
-            "  # CodeQL query example\n"
-            "  # import cpp\n"
-            "  # from Function f\n"
-            "  # where f.getName().matches(\"%parse%\")\n"
-            "  # select f\n"
-            "CODE AUDIT TARGETS:\n"
-            "  - Memory management (malloc/free/realloc)\n"
-            "  - String operations (strcpy, sprintf)\n"
-            "  - Integer overflow/underflow\n"
-            "  - Format strings\n"
-            "  - Type confusion\n"
-            "  - Use-after-free\n"
-            "  - Double-free\n"
-            "  - Race conditions\n"
-            "  - Deserialization\n"
-            "  - Template injection\n"
-            "TOOLS:\n"
-            "  CodeQL, Semgrep, Ghidra, IDA Pro, AFL++"
-        ),
-        "tools": ["codeql", "semgrep"],
-    },
-    {
-        "id": "zd-002", "name": "Fuzzing Techniques",
+        "id": "zd-001", "name": "Fuzzing Strategies",
         "category": "fuzzing", "severity": "critical",
-        "desc": "Advanced fuzzing for vulnerability discovery.",
+        "desc": "Advanced fuzzing for zero-day discovery.",
         "detection": (
-            "FUZZING TECHNIQUES:\n"
+            "FUZZING STRATEGIES:\n"
             "COVERAGE-GUIDED:\n"
-            "  AFL++:\n"
-            "    # Compile with instrumentation\n"
-            "    afl-clang-fast target.c -o target_fuzz\n"
-            "    # Run fuzzer\n"
-            "    afl-fuzz -i input/ -o output/ -- ./target_fuzz @@\n"
-            "    # Persistent mode (faster)\n"
-            "    __AFL_FUZZ_INIT();\n"
-            "    while (__AFL_LOOP(1000)) { ... }\n"
-            "  LIBFUZZER:\n"
-            "    # In-process fuzzer (LLVM)\n"
-            "    extern \"C\" int LLVMFuzzerTestOneInput(\n"
-            "        const uint8_t *data, size_t size) { ... }\n"
-            "    # Compile: clang -fsanitize=fuzzer,address\n"
+            "  - AFL++ (state of the art)\n"
+            "    # afl-fuzz -i corpus -o findings -- ./target @@\n"
+            "    # Custom mutators\n"
+            "    # Persistent mode (10-100x speed)\n"
+            "    # QEMU mode (binary-only)\n"
+            "    # Frida mode (instrumentation)\n"
+            "  - LibFuzzer (in-process)\n"
+            "    # LLVMFuzzerTestOneInput\n"
+            "    # Sanitizer integration\n"
+            "  - Honggfuzz\n"
+            "    # Hardware-based coverage\n"
+            "    # Persistent fuzzing\n"
             "GRAMMAR-BASED:\n"
-            "  - Peach Fuzzer (protocol fuzzing)\n"
-            "  - Boofuzz (network protocol)\n"
-            "  - Dharma (grammar generation)\n"
-            "  - Domato (DOM fuzzing)\n"
+            "  - Domato (browser DOM)\n"
+            "  - Dharma (JS engine)\n"
+            "  - Nautilus (grammar-based AFL)\n"
+            "  - Fuzzilli (JS engine specific)\n"
+            "NETWORK:\n"
+            "  - boofuzz (network protocol)\n"
+            "  - AFLNet (network services)\n"
+            "  - Peach Fuzzer (model-based)\n"
+            "KERNEL:\n"
+            "  - Syzkaller (Linux kernel)\n"
+            "  - kAFL (OS-independent)\n"
+            "  - Trinity (syscall fuzzer)\n"
             "SANITIZERS:\n"
-            "  - AddressSanitizer (ASan): buffer overflow\n"
-            "  - MemorySanitizer (MSan): uninitialized read\n"
-            "  - UndefinedBehaviorSanitizer (UBSan)\n"
-            "  - ThreadSanitizer (TSan): data races\n"
-            "  # -fsanitize=address,undefined\n"
-            "STRATEGIES:\n"
-            "  - Corpus minimization (afl-cmin)\n"
-            "  - Dictionary-based fuzzing\n"
-            "  - Structure-aware fuzzing\n"
-            "  - Snapshot fuzzing (faster startup)\n"
-            "  - Kernel fuzzing (syzkaller)\n"
+            "  - AddressSanitizer (ASAN)\n"
+            "  - MemorySanitizer (MSAN)\n"
+            "  - UndefinedBehaviorSanitizer (UBSAN)\n"
+            "  - ThreadSanitizer (TSAN)\n"
             "TOOLS:\n"
-            "  AFL++, libFuzzer, Honggfuzz, syzkaller"
+            "  AFL++, LibFuzzer, Honggfuzz, Syzkaller"
         ),
-        "tools": ["afl++"],
+        "tools": [],
     },
     {
-        "id": "zd-003", "name": "Binary Exploitation Patterns",
-        "category": "binary", "severity": "critical",
-        "desc": "Binary exploitation techniques.",
+        "id": "zd-002", "name": "Code Pattern Analysis",
+        "category": "code_patterns", "severity": "high",
+        "desc": "Code patterns indicating vulnerabilities.",
         "detection": (
-            "BINARY EXPLOITATION:\n"
-            "MEMORY CORRUPTION:\n"
-            "  STACK:\n"
-            "    - Buffer overflow → RIP control\n"
-            "    - Return-to-libc (ret2libc)\n"
-            "    - ROP chains (Return Oriented Programming)\n"
-            "    - Stack canary bypass (leak/brute)\n"
-            "    - NX bypass via ROP\n"
-            "  HEAP:\n"
-            "    - Use-After-Free (UAF)\n"
-            "    - Heap overflow\n"
-            "    - Double free\n"
-            "    - Tcache poisoning (glibc 2.26+)\n"
-            "    - House of techniques\n"
-            "    - fastbin attack\n"
-            "    - unsorted bin attack\n"
-            "  FORMAT STRING:\n"
-            "    - %n write primitive\n"
-            "    - Read arbitrary memory\n"
-            "    - Write arbitrary memory\n"
-            "MITIGATIONS:\n"
-            "  - ASLR: Address Space Layout Randomization\n"
-            "  - NX/DEP: Non-executable stack\n"
-            "  - Stack canaries\n"
-            "  - PIE: Position Independent Executable\n"
-            "  - RELRO: Relocation Read-Only\n"
-            "  - CFI: Control Flow Integrity\n"
-            "  - Shadow stack\n"
-            "BYPASS:\n"
-            "  - ASLR: info leak, partial overwrite\n"
-            "  - Canary: format string leak, brute force\n"
-            "  - NX: ROP, JOP (Jump-Oriented)\n"
-            "  - PIE: partial overwrite, ASLR leak\n"
-            "TOOLS:\n"
-            "  pwntools, ROPgadget, GEF, peda, Ghidra"
-        ),
-        "tools": ["ghidra"],
-    },
-    {
-        "id": "zd-004", "name": "Web Zero-Day Patterns",
-        "category": "web_0day", "severity": "critical",
-        "desc": "Web application zero-day patterns.",
-        "detection": (
-            "WEB ZERO-DAY PATTERNS:\n"
-            "DESERIALIZATION:\n"
-            "  - Java: ysoserial gadget chains\n"
-            "  - Python: pickle/yaml deserialization\n"
-            "  - PHP: unserialize() → POP chains\n"
-            "  - .NET: BinaryFormatter, XmlSerializer\n"
-            "  - Ruby: Marshal.load()\n"
-            "TEMPLATE INJECTION:\n"
-            "  - SSTI (Server-Side Template Injection)\n"
-            "  - Jinja2: {{config.__class__.__init__.__globals__}}\n"
-            "  - Freemarker: <#assign ex=\"freemarker.template...\n"
-            "  - Thymeleaf: __${T(java.lang.Runtime)...\n"
-            "  - Detection: {{7*7}} = 49\n"
-            "PROTOTYPE POLLUTION:\n"
-            "  - JavaScript: __proto__, constructor.prototype\n"
-            "  - Server-side (Node.js) → RCE\n"
-            "  - Client-side → XSS, auth bypass\n"
+            "CODE PATTERN ANALYSIS:\n"
+            "MEMORY SAFETY:\n"
+            "  - Buffer overflow patterns\n"
+            "    # strcpy, strcat, sprintf (no bounds)\n"
+            "    # memcpy with user-controlled size\n"
+            "    # Array index without bounds check\n"
+            "  - Use-after-free patterns\n"
+            "    # Free then dereference\n"
+            "    # Callback after cleanup\n"
+            "    # Iterator invalidation\n"
+            "  - Double-free patterns\n"
+            "    # Error path cleanup\n"
+            "    # Shared ownership confusion\n"
+            "  - Integer overflow\n"
+            "    # Multiplication before allocation\n"
+            "    # Addition without overflow check\n"
+            "    # Signed/unsigned confusion\n"
+            "TYPE CONFUSION:\n"
+            "  - Union type mishandling\n"
+            "  - Variant/tagged union errors\n"
+            "  - Virtual table corruption\n"
+            "  - Serialization type mismatch\n"
             "RACE CONDITIONS:\n"
-            "  - TOCTOU (Time of Check to Time of Use)\n"
-            "  - Parallel requests to same endpoint\n"
-            "  - Database race (balance manipulation)\n"
-            "  - File operation races\n"
-            "EMERGING:\n"
-            "  - HTTP request smuggling\n"
-            "  - Cache poisoning / deception\n"
-            "  - WebSocket hijacking\n"
-            "  - GraphQL batching attacks\n"
-            "  - OAuth/OIDC flow manipulation\n"
+            "  - TOCTOU (Time of Check to Use)\n"
+            "  - Signal handler races\n"
+            "  - Lock ordering violations\n"
+            "  - Shared memory races\n"
+            "LOGIC BUGS:\n"
+            "  - Off-by-one errors\n"
+            "  - Integer truncation\n"
+            "  - Null pointer dereference\n"
+            "  - Resource exhaustion\n"
             "TOOLS:\n"
-            "  Burp Suite, custom scripts, turbo-intruder"
+            "  CodeQL, Semgrep, Coverity, Infer"
         ),
-        "tools": ["burp"],
+        "tools": [],
     },
     {
-        "id": "zd-005", "name": "Patch Analysis / 1-Day Research",
-        "category": "patch_analysis", "severity": "high",
-        "desc": "Analyzing patches to find 1-day exploits.",
+        "id": "zd-003", "name": "Vulnerability Class Hunting",
+        "category": "vuln_class", "severity": "critical",
+        "desc": "Hunting for specific vulnerability classes.",
         "detection": (
-            "PATCH ANALYSIS / 1-DAY:\n"
-            "METHODOLOGY:\n"
-            "  1. Monitor security advisories\n"
-            "  2. Obtain patch diff\n"
-            "  3. Identify vulnerable code path\n"
-            "  4. Understand root cause\n"
-            "  5. Write trigger/PoC\n"
-            "  6. Test on unpatched version\n"
-            "SOURCES:\n"
-            "  - CVE databases (NVD, MITRE)\n"
-            "  - Git commits (security fixes)\n"
-            "  - Vendor advisories\n"
-            "  - GitHub Security Advisories\n"
-            "  - Chrome/Firefox bug trackers\n"
-            "  - Linux kernel git log\n"
-            "TECHNIQUES:\n"
-            "  DIFF ANALYSIS:\n"
-            "    git diff v1.0..v1.0.1\n"
-            "    # Focus on: bounds checks added\n"
-            "    # Null pointer checks added\n"
-            "    # Sanitization added\n"
-            "    # Access control changes\n"
-            "  BINARY DIFF:\n"
-            "    - BinDiff (Ghidra/IDA plugin)\n"
-            "    - Diaphora (Ghidra/IDA)\n"
-            "    - Compare function graphs\n"
-            "    - Identify patched functions\n"
-            "  REGRESSION:\n"
-            "    - Build vulnerable version\n"
-            "    - Reproduce from advisory\n"
-            "    - Verify patch effectiveness\n"
-            "    - Check for incomplete fixes\n"
-            "N-DAY:\n"
-            "  - Known vuln, public PoC, unpatched\n"
-            "  - Shodan/Censys for version detection\n"
-            "  - Nuclei templates for detection\n"
+            "VULNERABILITY CLASS HUNTING:\n"
+            "WEB:\n"
+            "  - Prototype pollution (JS)\n"
+            "    # Object.prototype manipulation\n"
+            "    # __proto__ in JSON\n"
+            "  - Server-side template injection\n"
+            "    # ${7*7} → 49 (confirm SSTI)\n"
+            "  - Deserialization\n"
+            "    # Java: ObjectInputStream\n"
+            "    # PHP: unserialize()\n"
+            "    # Python: pickle.loads()\n"
+            "  - HTTP request smuggling\n"
+            "    # CL.TE, TE.CL, TE.TE\n"
+            "BINARY:\n"
+            "  - Heap overflow\n"
+            "    # Glibc ptmalloc exploitation\n"
+            "    # tcache poisoning\n"
+            "    # House of * techniques\n"
+            "  - Stack buffer overflow\n"
+            "    # ROP chain construction\n"
+            "    # Stack pivot\n"
+            "    # Return-to-libc\n"
+            "  - Format string\n"
+            "    # %n write-what-where\n"
+            "    # GOT overwrite\n"
+            "  - Kernel\n"
+            "    # Privilege escalation\n"
+            "    # Container escape\n"
+            "    # Namespace bypass\n"
+            "SUPPLY CHAIN:\n"
+            "  - Dependency confusion\n"
+            "  - Typosquatting\n"
+            "  - Build pipeline injection\n"
+            "  - Package maintainer takeover\n"
             "TOOLS:\n"
-            "  BinDiff, Diaphora, Ghidra, Git"
+            "  GDB, pwntools, ROPgadget, one_gadget"
         ),
-        "tools": ["ghidra"],
+        "tools": [],
+    },
+    {
+        "id": "zd-004", "name": "Patch Diffing",
+        "category": "patch_diff", "severity": "high",
+        "desc": "Finding vulnerabilities through patches.",
+        "detection": (
+            "PATCH DIFFING:\n"
+            "METHODOLOGY:\n"
+            "  1. Identify security patches\n"
+            "  2. Diff the patch (before/after)\n"
+            "  3. Understand the vulnerability\n"
+            "  4. Develop exploit for pre-patch\n"
+            "  5. Check for variants\n"
+            "SOURCES:\n"
+            "  - Vendor security advisories\n"
+            "  - Git commit history\n"
+            "  - CVE/NVD descriptions\n"
+            "  - Bug tracker entries\n"
+            "  - Changelog entries\n"
+            "BINARY DIFFING:\n"
+            "  - BinDiff (IDA Pro plugin)\n"
+            "  - Diaphora (IDA/Ghidra)\n"
+            "  - DarunGrim\n"
+            "  - Turbodiff\n"
+            "SOURCE DIFFING:\n"
+            "  - git diff COMMIT~1 COMMIT\n"
+            "  - GitHub compare view\n"
+            "  - Semantic diff tools\n"
+            "  - CodeQL for patch analysis\n"
+            "1-DAY EXPLOITATION:\n"
+            "  - Race condition: exploit before\n"
+            "    organization patches\n"
+            "  - Patch gap analysis\n"
+            "  - Variant identification\n"
+            "  - Regression testing\n"
+            "TOOLS:\n"
+            "  BinDiff, Diaphora, CodeQL, git"
+        ),
+        "tools": [],
+    },
+    {
+        "id": "zd-005", "name": "Variant Analysis",
+        "category": "variant", "severity": "critical",
+        "desc": "Finding variants of known vulnerabilities.",
+        "detection": (
+            "VARIANT ANALYSIS:\n"
+            "METHODOLOGY:\n"
+            "  1. Study known vulnerability\n"
+            "  2. Identify root cause pattern\n"
+            "  3. Create detection rules/queries\n"
+            "  4. Search codebase for pattern\n"
+            "  5. Verify each match\n"
+            "CODEQL:\n"
+            "  - Write queries for vuln patterns\n"
+            "    # import cpp\n"
+            "    # from FunctionCall fc\n"
+            "    # where fc.getTarget().getName() = \"strcpy\"\n"
+            "    # select fc, \"Unsafe strcpy call\"\n"
+            "  - LGTM (online CodeQL)\n"
+            "  - Custom queries for project\n"
+            "  - Taint tracking queries\n"
+            "SEMGREP:\n"
+            "  - Pattern matching rules\n"
+            "  - Taint mode\n"
+            "  - Custom rules\n"
+            "    # rules:\n"
+            "    # - id: unsafe-deserialization\n"
+            "    #   pattern: pickle.loads(...)\n"
+            "    #   severity: ERROR\n"
+            "STRATEGIES:\n"
+            "  - Same bug, different location\n"
+            "  - Same root cause, different code\n"
+            "  - Similar API misuse\n"
+            "  - Incomplete fix (partial patch)\n"
+            "  - Cross-project variants\n"
+            "  - Language-specific patterns\n"
+            "TOOLS:\n"
+            "  CodeQL, Semgrep, grep, Joern"
+        ),
+        "tools": [],
     },
 ]
 
 
 class ZeroDayKB:
-    """Zero-day research knowledge base.
+    """Zero-day hunting knowledge base.
 
-    Provides zero-day discovery patterns
+    Provides zero-day hunting patterns
     injected into agent prompts.
     """
 
     def __init__(self) -> None:
         self._patterns: dict[str, ZeroDayPattern] = {}
-        self._log = logger.bind(component="zero_day_kb")
+        self._log = logger.bind(component="zeroday_kb")
         self._load_patterns()
 
     def _load_patterns(self) -> None:
         """Load zero-day patterns."""
-        for data in ZD_PATTERNS:
+        for data in ZERODAY_PATTERNS:
             pattern = ZeroDayPattern(
                 pattern_id=data["id"],
                 name=data["name"],
@@ -289,8 +287,8 @@ class ZeroDayKB:
         categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
-        """Build zero-day research prompt."""
-        lines = ["## Zero-Day Research\n"]
+        """Build zero-day hunting prompt."""
+        lines = ["## Zero-Day Hunting\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
