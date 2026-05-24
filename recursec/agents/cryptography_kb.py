@@ -1,11 +1,11 @@
 """Cryptography security knowledge base.
 
-Deep knowledge about cryptographic vulnerabilities:
-1. Weak TLS/SSL configuration
-2. Padding oracle attacks
-3. Hash collision exploitation
-4. Key management flaws
-5. Cryptographic implementation errors
+Deep knowledge about cryptographic security:
+1. Symmetric encryption weaknesses
+2. Asymmetric/PKI vulnerabilities
+3. Hash function attacks
+4. TLS/SSL security
+5. Cryptographic implementation flaws
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ logger = structlog.get_logger()
 
 @dataclass
 class CryptoPattern:
-    """A cryptographic vulnerability pattern."""
+    """A cryptography security pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
@@ -39,172 +39,197 @@ class CryptoPattern:
 
 CRYPTO_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "crypto-001", "name": "Weak TLS Configuration",
-        "category": "tls", "severity": "high",
-        "desc": "Detecting weak TLS/SSL configurations.",
+        "id": "crypto-001", "name": "Symmetric Crypto Weaknesses",
+        "category": "symmetric", "severity": "high",
+        "desc": "Symmetric encryption vulnerabilities.",
         "detection": (
-            "WEAK TLS CONFIGURATION:\n"
-            "SCANNING:\n"
-            "  # testssl.sh — comprehensive TLS tester\n"
-            "  testssl.sh <host>:<port>\n"
-            "  testssl.sh --severity HIGH <host>\n"
-            "  # sslscan\n"
-            "  sslscan <host>:<port>\n"
-            "  # nmap NSE\n"
-            "  nmap --script ssl-enum-ciphers -p 443 <host>\n"
-            "VULNERABILITIES TO CHECK:\n"
-            "  SSL/TLS VERSION:\n"
-            "    - SSLv2, SSLv3: CRITICAL (DROWN, POODLE)\n"
-            "    - TLS 1.0: HIGH (BEAST)\n"
-            "    - TLS 1.1: MEDIUM (deprecated)\n"
-            "    - TLS 1.2: OK (with good ciphers)\n"
-            "    - TLS 1.3: BEST\n"
-            "  CIPHER SUITES:\n"
-            "    - NULL ciphers: No encryption\n"
-            "    - EXPORT ciphers: Weak (FREAK, Logjam)\n"
-            "    - RC4: Broken\n"
-            "    - DES/3DES: Weak (Sweet32)\n"
-            "    - CBC mode: Vulnerable (BEAST, Lucky13)\n"
-            "  KNOWN ATTACKS:\n"
-            "    - Heartbleed (CVE-2014-0160): Memory leak\n"
-            "    - ROBOT: RSA padding oracle\n"
-            "    - CRIME/BREACH: Compression oracle\n"
-            "    - Raccoon: DH timing attack\n"
-            "  CERTIFICATE ISSUES:\n"
-            "    - Self-signed certificates\n"
-            "    - Expired certificates\n"
-            "    - Wrong hostname\n"
-            "    - Weak signature (SHA-1, MD5)"
-        ),
-        "tools": ["testssl", "sslscan", "nmap"],
-    },
-    {
-        "id": "crypto-002", "name": "Padding Oracle Attacks",
-        "category": "padding_oracle", "severity": "critical",
-        "desc": "Exploiting CBC padding oracles.",
-        "detection": (
-            "PADDING ORACLE ATTACKS:\n"
-            "DETECTION:\n"
-            "  - Send valid encrypted data → observe response\n"
-            "  - Modify last byte of ciphertext block\n"
-            "  - Different error for padding vs application error = ORACLE\n"
-            "  - Timing differences can also reveal oracle\n"
-            "EXPLOITATION:\n"
-            "  # PadBuster — automated padding oracle\n"
-            "  padbuster <url> <encrypted_sample> <block_size>\n"
-            "  padbuster <url> <sample> 8 -encoding 0 -plaintext '<desired>'\n"
-            "  # Decrypt any ciphertext byte-by-byte\n"
-            "  # Forge new valid ciphertext without key\n"
-            "COMMON TARGETS:\n"
-            "  - ASP.NET ViewState (ScriptResource.axd)\n"
-            "  - Session cookies with CBC encryption\n"
-            "  - Encrypted tokens in URL parameters\n"
-            "  - Java serialized objects with CBC\n"
-            "  - XML Encryption (CBC mode)\n"
-            "INDICATORS:\n"
-            "  - 500 vs 200 status codes on modified ciphertext\n"
-            "  - 'Padding is invalid' error messages\n"
-            "  - Different response length for padding vs data errors\n"
-            "  - Timing difference > 10ms between error types"
-        ),
-        "tools": ["padbuster", "burp"],
-    },
-    {
-        "id": "crypto-003", "name": "JWT Vulnerabilities",
-        "category": "jwt", "severity": "critical",
-        "desc": "Exploiting JSON Web Token implementation flaws.",
-        "detection": (
-            "JWT VULNERABILITIES:\n"
-            "ALGORITHM CONFUSION:\n"
-            "  # Change 'alg' from RS256 to HS256\n"
-            "  # Use public key as HMAC secret\n"
-            "  # If server verifies HS256 with RSA public key → forge tokens\n"
-            "NONE ALGORITHM:\n"
-            "  # Change 'alg' to 'none' or 'None'\n"
-            "  # Remove signature\n"
-            "  # If server accepts → full bypass\n"
-            "  python3 -c \"import jwt; print(jwt.encode({'admin': True}, '', algorithm='none'))\"\n"
-            "KEY CONFUSION (jwk/jku/kid):\n"
-            "  # Embed attacker's public key in JWK header\n"
-            "  # Point JKU to attacker-controlled URL\n"
-            "  # KID injection (SQL injection, path traversal)\n"
-            "  # kid: ../../dev/null → HMAC with empty string\n"
-            "WEAK SECRETS:\n"
-            "  # Brute force HMAC secret\n"
-            "  hashcat -m 16500 <jwt> <wordlist>\n"
-            "  john --format=HMAC-SHA256 jwt.txt\n"
-            "  # Common weak secrets: 'secret', 'password', company name\n"
+            "SYMMETRIC ENCRYPTION WEAKNESSES:\n"
+            "WEAK ALGORITHMS:\n"
+            "  - DES (56-bit, brute-forceable)\n"
+            "  - 3DES (meet-in-the-middle, Sweet32)\n"
+            "  - RC4 (biased output, broken)\n"
+            "  - Blowfish (64-bit block, Sweet32)\n"
+            "MODE ISSUES:\n"
+            "  ECB (Electronic Codebook):\n"
+            "    - Same plaintext → same ciphertext\n"
+            "    - Pattern leakage (ECB penguin)\n"
+            "    - NEVER use for multi-block data\n"
+            "  CBC (Cipher Block Chaining):\n"
+            "    - Padding oracle (POODLE, Lucky13)\n"
+            "    - Bit-flipping attacks\n"
+            "    - IV reuse → known-plaintext\n"
+            "  CTR (Counter):\n"
+            "    - Nonce reuse → XOR plaintext recovery\n"
+            "    - No authentication (need AEAD)\n"
+            "  GCM:\n"
+            "    - Nonce reuse → key recovery\n"
+            "    - Short tags → forgery\n"
+            "    - AES-GCM-SIV for nonce misuse resistance\n"
+            "KEY MANAGEMENT:\n"
+            "  - Hardcoded keys in source\n"
+            "  - Key stored alongside ciphertext\n"
+            "  - No key rotation\n"
+            "  - Insufficient key derivation (no KDF)\n"
+            "  - PBKDF2, Argon2, scrypt for passwords\n"
             "TOOLS:\n"
-            "  jwt_tool <jwt> -T  # Tamper mode\n"
-            "  jwt_tool <jwt> -C -d wordlist.txt  # Crack secret\n"
-            "  jwt_tool <jwt> -X a  # Algorithm confusion"
+            "  CryptoLyzer, testssl.sh, openssl"
         ),
-        "tools": ["jwt_tool", "hashcat", "john"],
+        "tools": ["testssl", "openssl"],
     },
     {
-        "id": "crypto-004", "name": "Insecure Random Number Generation",
-        "category": "rng", "severity": "high",
-        "desc": "Exploiting weak random number generators.",
+        "id": "crypto-002", "name": "Asymmetric/PKI Vulnerabilities",
+        "category": "asymmetric", "severity": "critical",
+        "desc": "Asymmetric cryptography and PKI vulnerabilities.",
         "detection": (
-            "INSECURE RNG:\n"
-            "DETECTION:\n"
-            "  - Collect multiple tokens/session IDs\n"
-            "  - Check for patterns (sequential, time-based)\n"
-            "  - Statistical tests for randomness\n"
-            "COMMON WEAKNESSES:\n"
-            "  - Math.random() in JavaScript (not cryptographic)\n"
-            "  - Python random module (Mersenne Twister, predictable)\n"
-            "  - time() as seed → predictable if time known\n"
-            "  - Process ID as seed → limited entropy\n"
-            "  - Insufficient entropy sources\n"
-            "EXPLOITATION:\n"
-            "  SESSION PREDICTION:\n"
-            "    - Collect ~1000 session tokens\n"
-            "    - Analyze for Mersenne Twister state recovery\n"
-            "    - With 624 consecutive 32-bit outputs → predict all future\n"
-            "    - Tools: randcrack (Python Mersenne Twister cracker)\n"
-            "  CSRF TOKEN PREDICTION:\n"
-            "    - If based on time: predict from server time header\n"
-            "    - If sequential: predict from observed pattern\n"
-            "  PASSWORD RESET TOKENS:\n"
-            "    - Generate reset for attacker account\n"
-            "    - Generate reset for victim account\n"
-            "    - If tokens are sequential → derive victim's token"
+            "ASYMMETRIC/PKI VULNERABILITIES:\n"
+            "RSA:\n"
+            "  - Small key (< 2048 bits, factorable)\n"
+            "  - Low public exponent with no padding\n"
+            "  - Bleichenbacher attack (PKCS#1 v1.5)\n"
+            "  - ROCA (Return of Coppersmith's Attack)\n"
+            "  - Common factor attacks (shared p or q)\n"
+            "  - Wiener's attack (small private exponent)\n"
+            "  - Use RSA-OAEP, not PKCS#1 v1.5\n"
+            "ELLIPTIC CURVE:\n"
+            "  - Invalid curve attacks\n"
+            "  - Weak curves (NIST P-192)\n"
+            "  - Nonce reuse in ECDSA → key recovery\n"
+            "  - Minerva timing attack\n"
+            "  - Use Ed25519 or P-256\n"
+            "PKI:\n"
+            "  - Self-signed certificates in prod\n"
+            "  - Expired certificates\n"
+            "  - Weak signature (SHA-1, MD5)\n"
+            "  - Missing revocation checks (CRL, OCSP)\n"
+            "  - Certificate pinning bypass\n"
+            "  - Wildcard cert abuse\n"
+            "  - Subdomain takeover → cert issuance\n"
+            "KEY EXCHANGE:\n"
+            "  - Static DH (no forward secrecy)\n"
+            "  - Weak DH groups (Logjam)\n"
+            "  - Use ECDHE with X25519\n"
+            "TOOLS:\n"
+            "  RsaCtfTool, openssl, certipy"
         ),
-        "tools": ["burp", "custom-scripts"],
+        "tools": ["rsactftool", "openssl"],
     },
     {
-        "id": "crypto-005", "name": "Hash Function Exploitation",
-        "category": "hash", "severity": "high",
-        "desc": "Exploiting weak hash functions and hash-related vulnerabilities.",
+        "id": "crypto-003", "name": "Hash Function Attacks",
+        "category": "hashing", "severity": "high",
+        "desc": "Hash function vulnerabilities and attacks.",
         "detection": (
-            "HASH EXPLOITATION:\n"
-            "PASSWORD CRACKING:\n"
-            "  # Identify hash type\n"
-            "  hashid <hash>\n"
-            "  # hashcat modes\n"
-            "  hashcat -m 0 <hashes> <wordlist>   # MD5\n"
-            "  hashcat -m 100 <hashes> <wordlist>  # SHA-1\n"
-            "  hashcat -m 1400 <hashes> <wordlist> # SHA-256\n"
-            "  hashcat -m 3200 <hashes> <wordlist> # bcrypt\n"
-            "  hashcat -m 1800 <hashes> <wordlist> # SHA-512crypt\n"
-            "  # Rules for mutation\n"
-            "  hashcat -m 0 <hashes> <wordlist> -r rules/best64.rule\n"
-            "HASH LENGTH EXTENSION:\n"
-            "  - MD5, SHA-1, SHA-256 are vulnerable\n"
-            "  - If MAC = H(secret || message): can extend\n"
-            "  - Tool: hash_extender\n"
-            "  - hash_extender --data <known> --secret <len> --append <new>\n"
-            "TYPE JUGGLING (PHP):\n"
-            "  - md5('240610708') starts with '0e'\n"
-            "  - PHP loose comparison: '0e...' == '0e...' → true\n"
-            "  - '0' == 'string starting with 0e and digits only'\n"
-            "COLLISION ATTACKS:\n"
-            "  - MD5: Practical collision in seconds\n"
-            "  - SHA-1: SHAttered (first public collision 2017)\n"
-            "  - Can create two PDFs with same hash"
+            "HASH FUNCTION ATTACKS:\n"
+            "BROKEN HASHES:\n"
+            "  - MD5: Collision in seconds\n"
+            "  - SHA-1: SHAttered (collision found 2017)\n"
+            "  - CRC32: Not cryptographic\n"
+            "LENGTH EXTENSION:\n"
+            "  - MD5, SHA-1, SHA-256 vulnerable\n"
+            "  - Append data without knowing secret\n"
+            "  - H(secret||message) is vulnerable\n"
+            "  - Fix: Use HMAC instead\n"
+            "  - hashpump tool\n"
+            "PASSWORD HASHING:\n"
+            "  WEAK:\n"
+            "    - Plain MD5/SHA-1 (GPU crackable)\n"
+            "    - Unsalted hashes (rainbow tables)\n"
+            "    - Short salt (< 16 bytes)\n"
+            "  STRONG:\n"
+            "    - Argon2id (memory-hard, recommended)\n"
+            "    - bcrypt (CPU-hard, 72-byte limit)\n"
+            "    - scrypt (memory-hard)\n"
+            "    - PBKDF2 (NIST approved, high iterations)\n"
+            "CRACKING:\n"
+            "  hashcat -m 0 hashes.txt wordlist.txt  # MD5\n"
+            "  hashcat -m 1000 hashes.txt wordlist.txt  # NTLM\n"
+            "  hashcat -m 1800 hashes.txt wordlist.txt  # SHA-512crypt\n"
+            "  hashcat -m 3200 hashes.txt wordlist.txt  # bcrypt\n"
+            "  # Rules: hashcat -r best64.rule\n"
+            "  # Masks: hashcat -a 3 ?u?l?l?l?d?d?d?d\n"
+            "TOOLS:\n"
+            "  hashcat, john, hashpump, hash-identifier"
         ),
-        "tools": ["hashcat", "john", "hashid"],
+        "tools": ["hashcat", "john"],
+    },
+    {
+        "id": "crypto-004", "name": "TLS/SSL Security",
+        "category": "tls", "severity": "critical",
+        "desc": "TLS/SSL security assessment.",
+        "detection": (
+            "TLS/SSL SECURITY:\n"
+            "PROTOCOL:\n"
+            "  - SSLv2: Completely broken (DROWN)\n"
+            "  - SSLv3: Broken (POODLE)\n"
+            "  - TLS 1.0: Deprecated (BEAST)\n"
+            "  - TLS 1.1: Deprecated\n"
+            "  - TLS 1.2: OK with right ciphers\n"
+            "  - TLS 1.3: Recommended (no weak ciphers)\n"
+            "ATTACKS:\n"
+            "  - BEAST (TLS 1.0 CBC)\n"
+            "  - CRIME/BREACH (compression leak)\n"
+            "  - POODLE (SSLv3 padding oracle)\n"
+            "  - Heartbleed (OpenSSL buffer over-read)\n"
+            "  - ROBOT (Bleichenbacher on RSA)\n"
+            "  - SWEET32 (64-bit block ciphers)\n"
+            "  - Logjam (weak DH export)\n"
+            "  - FREAK (RSA export downgrade)\n"
+            "  - DROWN (SSLv2 cross-protocol)\n"
+            "  - Raccoon (DH key exchange timing)\n"
+            "TESTING:\n"
+            "  testssl.sh https://target.com\n"
+            "  sslyze target.com:443\n"
+            "  nmap --script ssl-enum-ciphers -p 443 target\n"
+            "  # Check: certificate, ciphers, protocol, vulns\n"
+            "BEST PRACTICE:\n"
+            "  - TLS 1.2+ only\n"
+            "  - ECDHE key exchange (forward secrecy)\n"
+            "  - AES-256-GCM or ChaCha20-Poly1305\n"
+            "  - HSTS with preload\n"
+            "  - Certificate Transparency\n"
+            "TOOLS:\n"
+            "  testssl.sh, sslyze, sslscan, nmap"
+        ),
+        "tools": ["testssl", "sslyze", "sslscan"],
+    },
+    {
+        "id": "crypto-005", "name": "Crypto Implementation Flaws",
+        "category": "implementation", "severity": "critical",
+        "desc": "Common cryptographic implementation flaws.",
+        "detection": (
+            "CRYPTO IMPLEMENTATION FLAWS:\n"
+            "RANDOMNESS:\n"
+            "  - Predictable PRNG (Math.random, rand())\n"
+            "  - Insufficient entropy source\n"
+            "  - Timestamp-seeded generators\n"
+            "  - Use: /dev/urandom, os.urandom, CSPRNG\n"
+            "TIMING ATTACKS:\n"
+            "  - String comparison timing (memcmp)\n"
+            "  - Use constant-time comparison\n"
+            "  - hmac.compare_digest() in Python\n"
+            "  - crypto.timingSafeEqual() in Node.js\n"
+            "PADDING:\n"
+            "  - PKCS#7 padding oracle\n"
+            "  - Invalid padding error vs decryption error\n"
+            "  - Use AEAD (GCM, ChaCha20-Poly1305)\n"
+            "COMMON MISTAKES:\n"
+            "  - Rolling your own crypto\n"
+            "  - ECB mode for multi-block\n"
+            "  - Static IV/nonce\n"
+            "  - Key in source code\n"
+            "  - Encrypt without MAC (use AEAD)\n"
+            "  - Using encryption for authentication\n"
+            "  - Base64 ≠ encryption\n"
+            "  - Obfuscation ≠ encryption\n"
+            "POST-QUANTUM:\n"
+            "  - RSA/ECDSA vulnerable to quantum\n"
+            "  - NIST PQC: CRYSTALS-Kyber (KEM)\n"
+            "  - CRYSTALS-Dilithium (signatures)\n"
+            "  - Harvest-now-decrypt-later threat\n"
+            "  - Hybrid schemes (classical + PQC)\n"
+            "TOOLS:\n"
+            "  CryptoLyzer, cfssl, OpenSSL"
+        ),
+        "tools": ["openssl"],
     },
 ]
 
@@ -212,7 +237,7 @@ CRYPTO_PATTERNS: list[dict[str, Any]] = [
 class CryptographyKB:
     """Cryptography security knowledge base.
 
-    Provides cryptographic vulnerability patterns
+    Provides crypto security patterns
     injected into agent prompts.
     """
 
@@ -247,8 +272,8 @@ class CryptographyKB:
         categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
-        """Build cryptography prompt."""
-        lines = ["## Cryptographic Vulnerability Patterns\n"]
+        """Build cryptography security prompt."""
+        lines = ["## Cryptography Security\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
