@@ -1,13 +1,12 @@
-"""Task decomposer — intelligent task breakdown for recursive agents.
+"""Task decomposer — recursive task breakdown into subtasks.
 
 Implements:
-1. Goal decomposition into sub-tasks
-2. Dependency graph between tasks
-3. Task priority and ordering (topological sort)
-4. Parallel task identification
-5. Task estimation (tokens, time)
-6. Dynamic re-planning when tasks fail
-7. Task context generation for agent spawning
+1. Hierarchical task decomposition
+2. Dependency graph between subtasks
+3. Parallelizable task identification
+4. Task priority and ordering
+5. Bounded recursion depth
+6. Decomposition prompt for LLM
 """
 
 from __future__ import annotations
@@ -24,12 +23,11 @@ logger = structlog.get_logger()
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
-    READY = "ready"           # All deps met, can start
-    IN_PROGRESS = "in_progress"
+    READY = "ready"        # All deps satisfied
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
-    BLOCKED = "blocked"
 
 
 class TaskPriority(str, Enum):
@@ -41,31 +39,21 @@ class TaskPriority(str, Enum):
 
 @dataclass
 class SubTask:
-    """A decomposed sub-task."""
+    """A decomposed subtask."""
     task_id: str = ""
     parent_id: str = ""
-    title: str = ""
+    name: str = ""
     description: str = ""
     status: TaskStatus = TaskStatus.PENDING
     priority: TaskPriority = TaskPriority.MEDIUM
-    agent_role: str = ""      # Role of agent to handle this
-    tool_hints: list[str] = field(default_factory=list)
-    dependencies: list[str] = field(default_factory=list)  # Task IDs that must complete first
+    agent_role: str = ""
+    tools_needed: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
     children: list[str] = field(default_factory=list)
-
-    # Estimation
-    estimated_tokens: int = 5000
-    estimated_duration_s: float = 60.0
-    actual_tokens: int = 0
-    actual_duration_s: float = 0.0
-
-    # Execution
-    assigned_agent: str = ""
+    depth: int = 0
+    estimated_tokens: int = 1000
     result: str = ""
-    error: str = ""
     findings_count: int = 0
-
-    created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
 
@@ -74,290 +62,338 @@ class SubTask:
         return len(self.children) == 0
 
     @property
-    def is_blocked(self) -> bool:
-        return self.status == TaskStatus.BLOCKED
+    def duration_s(self) -> float:
+        if self.completed_at and self.started_at:
+            return self.completed_at - self.started_at
+        return 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.task_id[:10],
-            "title": self.title[:25],
-            "status": self.status.value,
-            "priority": self.priority.value,
-            "role": self.agent_role[:10],
-            "deps": len(self.dependencies),
+            "name": self.name[:20],
+            "status": self.status.value[:6],
+            "depth": self.depth,
             "children": len(self.children),
+            "deps": len(self.dependencies),
         }
 
 
-# ── Task templates for common security operations ────────────
+@dataclass
+class TaskTree:
+    """A complete task decomposition tree."""
+    root_id: str = ""
+    root_task: str = ""
+    tasks: dict[str, SubTask] = field(default_factory=dict)
+    max_depth: int = 5
+    total_tokens_estimated: int = 0
+    created_at: float = field(default_factory=time.time)
 
-TASK_TEMPLATES: dict[str, list[dict[str, Any]]] = {
+    @property
+    def depth(self) -> int:
+        if not self.tasks:
+            return 0
+        return max(t.depth for t in self.tasks.values())
+
+    @property
+    def leaf_count(self) -> int:
+        return sum(1 for t in self.tasks.values() if t.is_leaf)
+
+    @property
+    def completion_ratio(self) -> float:
+        if not self.tasks:
+            return 0.0
+        completed = sum(
+            1 for t in self.tasks.values()
+            if t.status == TaskStatus.COMPLETED
+        )
+        return completed / len(self.tasks)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "root": self.root_task[:20],
+            "tasks": len(self.tasks),
+            "depth": self.depth,
+            "leaves": self.leaf_count,
+            "completion": f"{self.completion_ratio:.0%}",
+        }
+
+
+# ── Task decomposition templates ─────────────────────────────
+
+DECOMPOSITION_TEMPLATES: dict[str, list[dict[str, Any]]] = {
     "full_assessment": [
-        {"title": "Passive Reconnaissance", "role": "recon", "priority": "high",
-         "tools": ["subfinder", "amass", "theHarvester", "whois"], "deps": []},
-        {"title": "Active Reconnaissance", "role": "recon", "priority": "high",
-         "tools": ["nmap", "masscan", "httpx"], "deps": ["Passive Reconnaissance"]},
-        {"title": "Technology Fingerprinting", "role": "scanner", "priority": "medium",
-         "tools": ["whatweb", "wappalyzer"], "deps": ["Active Reconnaissance"]},
-        {"title": "Vulnerability Scanning", "role": "scanner", "priority": "high",
-         "tools": ["nuclei", "nikto"], "deps": ["Technology Fingerprinting"]},
-        {"title": "Web Application Testing", "role": "exploiter", "priority": "high",
-         "tools": ["sqlmap", "ffuf", "burpsuite"], "deps": ["Vulnerability Scanning"]},
-        {"title": "Authentication Testing", "role": "exploiter", "priority": "medium",
-         "tools": ["hydra", "jwt_tool"], "deps": ["Technology Fingerprinting"]},
-        {"title": "Exploitation", "role": "exploiter", "priority": "critical",
-         "tools": ["metasploit"], "deps": ["Web Application Testing"]},
-        {"title": "Finding Validation", "role": "validator", "priority": "high",
-         "tools": [], "deps": ["Exploitation", "Vulnerability Scanning"]},
-        {"title": "Report Generation", "role": "analyst", "priority": "medium",
-         "tools": [], "deps": ["Finding Validation"]},
+        {"name": "Recon", "role": "recon", "priority": "high", "tools": ["subfinder", "nmap", "httpx"]},
+        {"name": "Vulnerability Scan", "role": "vuln_scan", "priority": "high", "tools": ["nuclei", "nikto"], "deps": ["Recon"]},
+        {"name": "Web Audit", "role": "web_audit", "priority": "high", "tools": ["sqlmap", "ffuf"], "deps": ["Recon"]},
+        {"name": "Network Audit", "role": "network", "priority": "medium", "tools": ["nmap", "masscan"], "deps": ["Recon"]},
+        {"name": "Exploitation", "role": "exploit", "priority": "medium", "tools": ["metasploit"], "deps": ["Vulnerability Scan", "Web Audit"]},
+        {"name": "Validation", "role": "validator", "priority": "high", "deps": ["Exploitation"]},
+        {"name": "Report", "role": "reporter", "priority": "low", "deps": ["Validation"]},
     ],
     "web_assessment": [
-        {"title": "Subdomain Enumeration", "role": "recon", "priority": "high",
-         "tools": ["subfinder", "amass"], "deps": []},
-        {"title": "HTTP Probing", "role": "recon", "priority": "high",
-         "tools": ["httpx"], "deps": ["Subdomain Enumeration"]},
-        {"title": "Directory Fuzzing", "role": "scanner", "priority": "medium",
-         "tools": ["ffuf", "gobuster"], "deps": ["HTTP Probing"]},
-        {"title": "Vulnerability Scanning", "role": "scanner", "priority": "high",
-         "tools": ["nuclei"], "deps": ["HTTP Probing"]},
-        {"title": "SQL Injection Testing", "role": "exploiter", "priority": "high",
-         "tools": ["sqlmap"], "deps": ["Directory Fuzzing"]},
-        {"title": "XSS Testing", "role": "exploiter", "priority": "medium",
-         "tools": ["dalfox"], "deps": ["Directory Fuzzing"]},
+        {"name": "Web Recon", "role": "recon", "priority": "high", "tools": ["httpx", "ffuf", "gobuster"]},
+        {"name": "Spider/Crawl", "role": "web_audit", "priority": "high", "tools": ["gospider"], "deps": ["Web Recon"]},
+        {"name": "Injection Testing", "role": "web_audit", "priority": "high", "tools": ["sqlmap"], "deps": ["Spider/Crawl"]},
+        {"name": "Auth Testing", "role": "web_audit", "priority": "high", "deps": ["Web Recon"]},
+        {"name": "API Testing", "role": "web_audit", "priority": "medium", "deps": ["Web Recon"]},
+        {"name": "Validation", "role": "validator", "priority": "high", "deps": ["Injection Testing", "Auth Testing"]},
     ],
     "network_assessment": [
-        {"title": "Network Discovery", "role": "recon", "priority": "high",
-         "tools": ["nmap", "masscan"], "deps": []},
-        {"title": "Service Enumeration", "role": "scanner", "priority": "high",
-         "tools": ["nmap"], "deps": ["Network Discovery"]},
-        {"title": "Vulnerability Scanning", "role": "scanner", "priority": "high",
-         "tools": ["nmap", "nuclei"], "deps": ["Service Enumeration"]},
-        {"title": "Exploitation", "role": "exploiter", "priority": "critical",
-         "tools": ["metasploit"], "deps": ["Vulnerability Scanning"]},
+        {"name": "Port Scan", "role": "recon", "priority": "high", "tools": ["nmap", "masscan"]},
+        {"name": "Service Enum", "role": "recon", "priority": "high", "tools": ["nmap"], "deps": ["Port Scan"]},
+        {"name": "Vuln Scan", "role": "vuln_scan", "priority": "high", "tools": ["nuclei", "nmap"], "deps": ["Service Enum"]},
+        {"name": "Protocol Tests", "role": "network", "priority": "medium", "deps": ["Service Enum"]},
+        {"name": "Exploitation", "role": "exploit", "priority": "medium", "deps": ["Vuln Scan"]},
+    ],
+    "cloud_assessment": [
+        {"name": "Cloud Recon", "role": "cloud", "priority": "high", "tools": ["prowler"]},
+        {"name": "IAM Review", "role": "cloud", "priority": "high", "deps": ["Cloud Recon"]},
+        {"name": "Storage Audit", "role": "cloud", "priority": "high", "deps": ["Cloud Recon"]},
+        {"name": "Network Review", "role": "cloud", "priority": "medium", "deps": ["Cloud Recon"]},
+        {"name": "Serverless Audit", "role": "cloud", "priority": "medium", "deps": ["Cloud Recon"]},
     ],
 }
 
 
 class TaskDecomposer:
-    """Decomposes goals into sub-tasks with dependencies.
+    """Recursive task breakdown into subtasks.
 
-    Creates a directed acyclic graph of tasks,
-    identifies parallelism opportunities, and
-    supports dynamic re-planning.
+    Decomposes high-level security tasks into
+    hierarchical subtasks with dependencies,
+    enabling parallel and ordered execution.
     """
 
-    def __init__(self) -> None:
-        self._tasks: dict[str, SubTask] = {}
-        self._counter = 0
+    def __init__(self, max_depth: int = 5) -> None:
+        self._trees: dict[str, TaskTree] = {}
+        self._task_counter = 0
+        self._max_depth = max_depth
         self._log = logger.bind(component="task_decomposer")
 
-    def decompose_from_template(
+    def decompose(
         self,
-        template_name: str,
-        parent_id: str = "",
-    ) -> list[SubTask]:
-        """Decompose a goal using a predefined template."""
-        template = TASK_TEMPLATES.get(template_name, [])
-        if not template:
-            return []
+        task: str,
+        template: str = "full_assessment",
+    ) -> TaskTree:
+        """Decompose a task using a template."""
+        self._task_counter += 1
+        root_id = f"task-{self._task_counter}"
 
-        # Create tasks
-        tasks: list[SubTask] = []
-        title_to_id: dict[str, str] = {}
-
-        for tmpl in template:
-            self._counter += 1
-            task = SubTask(
-                task_id=f"task-{self._counter}",
-                parent_id=parent_id,
-                title=tmpl["title"],
-                priority=TaskPriority(tmpl.get("priority", "medium")),
-                agent_role=tmpl.get("role", ""),
-                tool_hints=tmpl.get("tools", []),
-            )
-            self._tasks[task.task_id] = task
-            tasks.append(task)
-            title_to_id[task.title] = task.task_id
-
-        # Resolve dependencies
-        for i, tmpl in enumerate(template):
-            task = tasks[i]
-            for dep_title in tmpl.get("deps", []):
-                dep_id = title_to_id.get(dep_title)
-                if dep_id:
-                    task.dependencies.append(dep_id)
-
-        # Update readiness
-        self._update_readiness()
-        return tasks
-
-    def add_task(
-        self,
-        title: str,
-        description: str = "",
-        parent_id: str = "",
-        priority: TaskPriority = TaskPriority.MEDIUM,
-        agent_role: str = "",
-        tool_hints: list[str] | None = None,
-        dependencies: list[str] | None = None,
-        estimated_tokens: int = 5000,
-        estimated_duration_s: float = 60.0,
-    ) -> SubTask:
-        """Add a custom task."""
-        self._counter += 1
-        task = SubTask(
-            task_id=f"task-{self._counter}",
-            parent_id=parent_id,
-            title=title,
-            description=description,
-            priority=priority,
-            agent_role=agent_role,
-            tool_hints=tool_hints or [],
-            dependencies=dependencies or [],
-            estimated_tokens=estimated_tokens,
-            estimated_duration_s=estimated_duration_s,
+        tree = TaskTree(
+            root_id=root_id,
+            root_task=task,
+            max_depth=self._max_depth,
         )
-        self._tasks[task.task_id] = task
-        self._update_readiness()
-        return task
 
-    def start_task(self, task_id: str, agent_id: str = "") -> bool:
-        """Mark a task as started."""
-        task = self._tasks.get(task_id)
-        if not task or task.status != TaskStatus.READY:
-            return False
+        # Create root task
+        root = SubTask(
+            task_id=root_id,
+            name=task[:50],
+            description=task,
+            status=TaskStatus.RUNNING,
+            priority=TaskPriority.CRITICAL,
+            agent_role="coordinator",
+            depth=0,
+        )
+        tree.tasks[root_id] = root
 
-        task.status = TaskStatus.IN_PROGRESS
-        task.assigned_agent = agent_id
-        task.started_at = time.time()
-        return True
+        # Apply template
+        template_tasks = DECOMPOSITION_TEMPLATES.get(template, [])
+        name_to_id: dict[str, str] = {}
+
+        for spec in template_tasks:
+            self._task_counter += 1
+            tid = f"task-{self._task_counter}"
+            name_to_id[spec["name"]] = tid
+
+            # Resolve dependency IDs
+            dep_ids = []
+            for dep_name in spec.get("deps", []):
+                if dep_name in name_to_id:
+                    dep_ids.append(name_to_id[dep_name])
+
+            sub = SubTask(
+                task_id=tid,
+                parent_id=root_id,
+                name=spec["name"],
+                description=spec["name"],
+                priority=TaskPriority(spec.get("priority", "medium")),
+                agent_role=spec.get("role", ""),
+                tools_needed=spec.get("tools", []),
+                dependencies=dep_ids,
+                depth=1,
+            )
+
+            # Set status
+            if not dep_ids:
+                sub.status = TaskStatus.READY
+
+            tree.tasks[tid] = sub
+            root.children.append(tid)
+
+        # Estimate tokens
+        tree.total_tokens_estimated = len(tree.tasks) * 2000
+
+        self._trees[root_id] = tree
+        return tree
+
+    def add_subtask(
+        self,
+        tree_id: str,
+        parent_id: str,
+        name: str,
+        agent_role: str = "",
+        tools: list[str] | None = None,
+        dependencies: list[str] | None = None,
+    ) -> SubTask | None:
+        """Add a subtask to an existing tree."""
+        tree = self._trees.get(tree_id)
+        if not tree:
+            return None
+
+        parent = tree.tasks.get(parent_id)
+        if not parent:
+            return None
+
+        new_depth = parent.depth + 1
+        if new_depth > tree.max_depth:
+            return None
+
+        self._task_counter += 1
+        tid = f"task-{self._task_counter}"
+
+        sub = SubTask(
+            task_id=tid,
+            parent_id=parent_id,
+            name=name,
+            description=name,
+            agent_role=agent_role,
+            tools_needed=tools or [],
+            dependencies=dependencies or [],
+            depth=new_depth,
+        )
+
+        if not sub.dependencies:
+            sub.status = TaskStatus.READY
+
+        tree.tasks[tid] = sub
+        parent.children.append(tid)
+
+        return sub
 
     def complete_task(
         self,
+        tree_id: str,
         task_id: str,
         result: str = "",
         findings_count: int = 0,
-        tokens_used: int = 0,
-    ) -> bool:
-        """Mark a task as completed."""
-        task = self._tasks.get(task_id)
+    ) -> list[str]:
+        """Mark a task as completed. Returns newly ready task IDs."""
+        tree = self._trees.get(tree_id)
+        if not tree:
+            return []
+
+        task = tree.tasks.get(task_id)
         if not task:
-            return False
+            return []
 
         task.status = TaskStatus.COMPLETED
         task.result = result
         task.findings_count = findings_count
-        task.actual_tokens = tokens_used
-        task.completed_at = time.time()
-        task.actual_duration_s = task.completed_at - task.started_at
-
-        self._update_readiness()
-        return True
-
-    def fail_task(self, task_id: str, error: str = "") -> bool:
-        """Mark a task as failed."""
-        task = self._tasks.get(task_id)
-        if not task:
-            return False
-
-        task.status = TaskStatus.FAILED
-        task.error = error
         task.completed_at = time.time()
 
-        self._update_readiness()
-        return True
+        # Check if any tasks are now ready
+        newly_ready: list[str] = []
+        for t in tree.tasks.values():
+            if t.status != TaskStatus.PENDING:
+                continue
+            if all(
+                tree.tasks.get(dep, SubTask()).status == TaskStatus.COMPLETED
+                for dep in t.dependencies
+            ):
+                t.status = TaskStatus.READY
+                newly_ready.append(t.task_id)
 
-    def get_ready_tasks(self) -> list[SubTask]:
-        """Get tasks ready for execution."""
-        return [t for t in self._tasks.values() if t.status == TaskStatus.READY]
+        return newly_ready
 
-    def get_parallel_groups(self) -> list[list[SubTask]]:
-        """Identify groups of tasks that can run in parallel."""
-        ready = self.get_ready_tasks()
+    def get_ready_tasks(self, tree_id: str) -> list[SubTask]:
+        """Get all tasks ready for execution."""
+        tree = self._trees.get(tree_id)
+        if not tree:
+            return []
+        return [t for t in tree.tasks.values() if t.status == TaskStatus.READY]
+
+    def get_parallel_groups(self, tree_id: str) -> list[list[str]]:
+        """Get groups of tasks that can run in parallel."""
+        ready = self.get_ready_tasks(tree_id)
         if not ready:
             return []
-        return [ready]  # All ready tasks can run in parallel
 
-    def replan_after_failure(self, failed_task_id: str) -> list[SubTask]:
-        """Re-plan after a task failure."""
-        failed = self._tasks.get(failed_task_id)
-        if not failed:
-            return []
+        # Group by no mutual dependencies
+        groups: list[list[str]] = []
+        assigned: set[str] = set()
 
-        # Skip dependent tasks
-        affected: list[SubTask] = []
-        for task in self._tasks.values():
-            if failed_task_id in task.dependencies:
-                if task.status in (TaskStatus.PENDING, TaskStatus.READY):
-                    task.status = TaskStatus.SKIPPED
-                    affected.append(task)
+        for task in ready:
+            if task.task_id in assigned:
+                continue
 
-        return affected
+            group = [task.task_id]
+            assigned.add(task.task_id)
 
-    def build_task_prompt(self, max_tasks: int = 10) -> str:
-        """Build task context for LLM."""
+            for other in ready:
+                if other.task_id in assigned:
+                    continue
+                # Can run in parallel if no dependency between them
+                if (task.task_id not in other.dependencies
+                        and other.task_id not in task.dependencies):
+                    group.append(other.task_id)
+                    assigned.add(other.task_id)
+
+            groups.append(group)
+
+        return groups
+
+    def build_decomposition_prompt(self, tree_id: str = "") -> str:
+        """Build task decomposition context for LLM."""
         lines = ["## Task Decomposition\n"]
 
-        status_counts: dict[str, int] = {}
-        for t in self._tasks.values():
-            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
+        if tree_id and tree_id in self._trees:
+            tree = self._trees[tree_id]
+            lines.append(f"Task: {tree.root_task[:30]}")
+            lines.append(
+                f"Subtasks: {len(tree.tasks)} | "
+                f"Depth: {tree.depth} | "
+                f"Completion: {tree.completion_ratio:.0%}"
+            )
 
-        lines.append(f"Tasks: {len(self._tasks)} | " + " ".join(
-            f"{k}={v}" for k, v in status_counts.items()
-        ))
+            # Ready tasks
+            ready = self.get_ready_tasks(tree_id)
+            if ready:
+                lines.append(f"\nReady ({len(ready)}):")
+                for t in ready[:5]:
+                    lines.append(f"  → {t.name} [{t.agent_role}]")
 
-        ready = self.get_ready_tasks()
-        if ready:
-            lines.append(f"\nReady to execute ({len(ready)}):")
-            for t in ready[:max_tasks]:
-                tools = ",".join(t.tool_hints[:3]) if t.tool_hints else "none"
-                lines.append(
-                    f"  [{t.priority.value[0].upper()}] {t.title[:25]} "
-                    f"(role={t.agent_role}, tools={tools})"
-                )
+            # Running tasks
+            running = [t for t in tree.tasks.values() if t.status == TaskStatus.RUNNING]
+            if running:
+                lines.append(f"Running ({len(running)}):")
+                for t in running[:3]:
+                    lines.append(f"  ⋯ {t.name}")
 
-        in_progress = [t for t in self._tasks.values() if t.status == TaskStatus.IN_PROGRESS]
-        if in_progress:
-            lines.append(f"\nIn progress ({len(in_progress)}):")
-            for t in in_progress[:5]:
-                elapsed = time.time() - t.started_at if t.started_at else 0
-                lines.append(f"  {t.title[:25]} ({elapsed:.0f}s)")
+        else:
+            lines.append(f"Active trees: {len(self._trees)}")
 
         return "\n".join(lines)
 
-    def _update_readiness(self) -> None:
-        """Update task readiness based on dependency status."""
-        for task in self._tasks.values():
-            if task.status != TaskStatus.PENDING:
-                continue
-
-            if not task.dependencies:
-                task.status = TaskStatus.READY
-                continue
-
-            all_deps_met = True
-            any_dep_failed = False
-            for dep_id in task.dependencies:
-                dep = self._tasks.get(dep_id)
-                if not dep or dep.status != TaskStatus.COMPLETED:
-                    all_deps_met = False
-                if dep and dep.status in (TaskStatus.FAILED, TaskStatus.SKIPPED):
-                    any_dep_failed = True
-
-            if any_dep_failed:
-                task.status = TaskStatus.BLOCKED
-            elif all_deps_met:
-                task.status = TaskStatus.READY
-
     def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = {}
-        for t in self._tasks.values():
-            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
+        total_tasks = sum(len(t.tasks) for t in self._trees.values())
+        completed = sum(
+            sum(1 for st in t.tasks.values() if st.status == TaskStatus.COMPLETED)
+            for t in self._trees.values()
+        )
 
         return {
-            "total_tasks": len(self._tasks),
-            "by_status": status_counts,
-            "ready": len(self.get_ready_tasks()),
-            "total_findings": sum(t.findings_count for t in self._tasks.values()),
+            "trees": len(self._trees),
+            "total_tasks": total_tasks,
+            "completed": completed,
+            "max_depth": max((t.depth for t in self._trees.values()), default=0),
         }
