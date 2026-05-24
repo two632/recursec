@@ -1,13 +1,12 @@
-"""Output parser — parses LLM responses into structured data.
+"""Output parser intelligence — structured LLM response parsing.
 
 Implements:
-1. JSON extraction from LLM output
-2. Finding extraction from free text
-3. Tool command extraction
-4. Structured response parsing
-5. Confidence score extraction
-6. Action plan parsing
-7. Error-tolerant parsing with fallbacks
+1. Multi-format response parsing (JSON, YAML, Markdown, freetext)
+2. Tool call extraction
+3. Finding extraction from responses
+4. Confidence extraction
+5. Action plan parsing
+6. Fallback parsing strategies
 """
 
 from __future__ import annotations
@@ -23,375 +22,283 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ParsedType(str, Enum):
+class ResponseFormat(str, Enum):
+    JSON = "json"
+    YAML = "yaml"
+    MARKDOWN = "markdown"
+    FREETEXT = "freetext"
+    TOOL_CALL = "tool_call"
+    CODE_BLOCK = "code_block"
+
+
+class ParsedItemType(str, Enum):
     FINDING = "finding"
-    TOOL_COMMAND = "tool_command"
+    TOOL_CALL = "tool_call"
+    ACTION = "action"
     ANALYSIS = "analysis"
-    PLAN = "plan"
-    VERDICT = "verdict"
-    RAW_TEXT = "raw_text"
-    ERROR = "error"
+    QUESTION = "question"
+    CODE = "code"
 
 
 @dataclass
-class ParsedFinding:
-    """A finding extracted from LLM output."""
+class ParsedItem:
+    """A parsed item from LLM response."""
+    item_type: ParsedItemType = ParsedItemType.ANALYSIS
+    content: str = ""
+    structured: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.5
+    source_format: ResponseFormat = ResponseFormat.FREETEXT
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.item_type.value[:8],
+            "content": self.content[:25],
+            "conf": f"{self.confidence:.2f}",
+        }
+
+
+@dataclass
+class ToolCallParsed:
+    """A parsed tool call from LLM response."""
+    tool_name: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    raw_command: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool": self.tool_name[:15],
+            "args": len(self.arguments),
+        }
+
+
+@dataclass
+class FindingParsed:
+    """A parsed finding from LLM response."""
     title: str = ""
     severity: str = "medium"
+    finding_type: str = ""
     description: str = ""
-    cwe: str = ""
-    cve: str = ""
     evidence: str = ""
-    confidence: float = 0.5
     remediation: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "title": self.title[:30],
-            "severity": self.severity,
-            "cwe": self.cwe[:10],
-            "confidence": round(self.confidence, 2),
-        }
-
-
-@dataclass
-class ParsedCommand:
-    """A tool command extracted from LLM output."""
-    tool: str = ""
-    command: str = ""
-    args: list[str] = field(default_factory=list)
-    purpose: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tool": self.tool[:10],
-            "command": self.command[:30],
-        }
-
-
-@dataclass
-class ParsedPlan:
-    """An action plan extracted from LLM output."""
-    steps: list[str] = field(default_factory=list)
-    tools: list[str] = field(default_factory=list)
-    rationale: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "steps": len(self.steps),
-            "tools": self.tools[:5],
-        }
-
-
-@dataclass
-class ParseResult:
-    """Result of parsing LLM output."""
-    parsed_type: ParsedType = ParsedType.RAW_TEXT
-    findings: list[ParsedFinding] = field(default_factory=list)
-    commands: list[ParsedCommand] = field(default_factory=list)
-    plan: ParsedPlan | None = None
-    raw_text: str = ""
-    json_data: dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "type": self.parsed_type.value,
-            "findings": len(self.findings),
-            "commands": len(self.commands),
-            "confidence": round(self.confidence, 2),
+            "title": self.title[:20],
+            "severity": self.severity[:6],
+            "conf": f"{self.confidence:.2f}",
         }
 
 
-# ── Parsing patterns ─────────────────────────────────────────
+# Severity keywords for extraction
+SEVERITY_KEYWORDS: dict[str, list[str]] = {
+    "critical": ["critical", "rce", "remote code execution", "unauthenticated"],
+    "high": ["high", "sqli", "sql injection", "xss", "ssrf", "auth bypass"],
+    "medium": ["medium", "information disclosure", "misconfig"],
+    "low": ["low", "informational", "best practice"],
+    "info": ["info", "note", "observation"],
+}
 
-SEVERITY_PATTERNS = re.compile(
-    r"\b(critical|high|medium|low|info(?:rmational)?)\b",
-    re.IGNORECASE,
-)
-
-CWE_PATTERN = re.compile(r"CWE-(\d+)")
-CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,}")
-
-TOOL_COMMAND_PATTERNS = [
-    re.compile(r"```(?:bash|sh|shell)?\s*\n(.*?)```", re.DOTALL),
-    re.compile(r"\$\s+(.+)"),
-    re.compile(r"(?:run|execute|use):\s*(.+)", re.IGNORECASE),
+# Tool patterns
+TOOL_CALL_PATTERNS = [
+    r'```(?:bash|sh|shell)?\s*\n((?:nmap|nuclei|sqlmap|ffuf|gobuster|nikto|masscan|hydra|curl|wget|dig|whois|subfinder|amass|httpx|wpscan|burp|metasploit|hashcat|john)\b[^\n]*)',
+    r'(?:Run|Execute|Use):\s*((?:nmap|nuclei|sqlmap|ffuf|gobuster)\s+[^\n]+)',
+    r'(?:TOOL|COMMAND|ACTION):\s*([^\n]+)',
 ]
 
-FINDING_HEADER_PATTERNS = [
-    re.compile(r"(?:finding|vulnerability|issue)\s*(?:\d+)?[:]\s*(.+)", re.IGNORECASE),
-    re.compile(r"\*\*(?:Finding|Vulnerability)[:]\*\*\s*(.+)", re.IGNORECASE),
-    re.compile(r"#{1,3}\s*(?:Finding|Vulnerability)\s*\d*[:]\s*(.+)", re.IGNORECASE),
-]
-
-PLAN_STEP_PATTERN = re.compile(r"(?:step\s+)?(\d+)[.)]\s*(.+)", re.IGNORECASE)
-
-CONFIDENCE_PATTERNS = [
-    re.compile(r"confidence[:]\s*(\d+(?:\.\d+)?)\s*%?", re.IGNORECASE),
-    re.compile(r"(\d+(?:\.\d+)?)\s*%?\s*confiden(?:ce|t)", re.IGNORECASE),
+# Finding patterns
+FINDING_PATTERNS = [
+    r'(?:FINDING|VULNERABILITY|VULN|BUG):\s*([^\n]+)',
+    r'(?:Critical|High|Medium|Low):\s*([^\n]+)',
+    r'(?:CVE-\d{4}-\d+)[^\n]*',
 ]
 
 
 class OutputParser:
-    """Parses LLM responses into structured data.
+    """Parse LLM responses into structured data.
 
-    Extracts findings, tool commands, action plans,
-    and other structured data from LLM text output.
+    Extracts findings, tool calls, actions,
+    and analysis from model outputs.
     """
 
     def __init__(self) -> None:
-        self._log = logger.bind(component="output_parser")
+        self._parse_count = 0
+        self._success_count = 0
+        self._log = logger.bind(component="parser")
 
-    def parse(self, text: str) -> ParseResult:
-        """Parse LLM output into structured data."""
-        result = ParseResult(raw_text=text)
+    def parse(self, response: str) -> list[ParsedItem]:
+        """Parse an LLM response into structured items."""
+        self._parse_count += 1
+        items: list[ParsedItem] = []
 
         # Try JSON first
-        json_data = self._extract_json(text)
-        if json_data:
-            result.json_data = json_data
-            result.confidence = 0.9
-            self._parse_json_response(json_data, result)
-            return result
+        json_items = self._try_json(response)
+        if json_items:
+            items.extend(json_items)
+            self._success_count += 1
+            return items
+
+        # Extract tool calls
+        tool_calls = self.extract_tool_calls(response)
+        for tc in tool_calls:
+            items.append(ParsedItem(
+                item_type=ParsedItemType.TOOL_CALL,
+                content=tc.raw_command,
+                structured={"tool": tc.tool_name, "args": tc.arguments},
+                source_format=ResponseFormat.TOOL_CALL,
+            ))
 
         # Extract findings
-        findings = self._extract_findings(text)
-        if findings:
-            result.findings = findings
-            result.parsed_type = ParsedType.FINDING
-            result.confidence = 0.7
+        findings = self.extract_findings(response)
+        for finding in findings:
+            items.append(ParsedItem(
+                item_type=ParsedItemType.FINDING,
+                content=finding.title,
+                structured=finding.to_dict(),
+                confidence=finding.confidence,
+                source_format=ResponseFormat.FREETEXT,
+            ))
 
-        # Extract commands
-        commands = self._extract_commands(text)
-        if commands:
-            result.commands = commands
-            if not findings:
-                result.parsed_type = ParsedType.TOOL_COMMAND
-                result.confidence = 0.8
+        # Extract code blocks
+        code_blocks = self._extract_code_blocks(response)
+        for block in code_blocks:
+            items.append(ParsedItem(
+                item_type=ParsedItemType.CODE,
+                content=block[:100],
+                structured={"code": block},
+                source_format=ResponseFormat.CODE_BLOCK,
+            ))
 
-        # Extract plan
-        plan = self._extract_plan(text)
-        if plan and plan.steps:
-            result.plan = plan
-            if not findings and not commands:
-                result.parsed_type = ParsedType.PLAN
-                result.confidence = 0.7
+        # If nothing structured, treat as analysis
+        if not items:
+            items.append(ParsedItem(
+                item_type=ParsedItemType.ANALYSIS,
+                content=response[:200],
+                source_format=ResponseFormat.FREETEXT,
+            ))
 
-        return result
+        self._success_count += 1
+        return items
 
-    def _extract_json(self, text: str) -> dict[str, Any] | None:
-        """Extract JSON from text."""
-        # Try full text
-        try:
-            return json.loads(text.strip())
-        except json.JSONDecodeError:
-            pass
+    def _try_json(self, text: str) -> list[ParsedItem]:
+        """Try to parse as JSON."""
+        items: list[ParsedItem] = []
 
-        # Try JSON code block
-        match = re.search(r"```(?:json)?\s*\n({.*?})\s*\n```", text, re.DOTALL)
-        if match:
+        # Try full text as JSON
+        stripped = text.strip()
+        if stripped.startswith('{') or stripped.startswith('['):
             try:
-                return json.loads(match.group(1))
+                data = json.loads(stripped)
+                items.append(ParsedItem(
+                    item_type=ParsedItemType.ANALYSIS,
+                    content=str(data)[:100],
+                    structured=data if isinstance(data, dict) else {"data": data},
+                    source_format=ResponseFormat.JSON,
+                ))
+                return items
             except json.JSONDecodeError:
                 pass
 
-        # Try finding JSON object in text
-        brace_start = text.find("{")
-        if brace_start >= 0:
-            depth = 0
-            for i in range(brace_start, len(text)):
-                if text[i] == "{":
-                    depth += 1
-                elif text[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            return json.loads(text[brace_start:i + 1])
-                        except json.JSONDecodeError:
-                            break
-
-        return None
-
-    def _parse_json_response(
-        self,
-        data: dict[str, Any],
-        result: ParseResult,
-    ) -> None:
-        """Parse a JSON response."""
-        # Check for findings
-        if "findings" in data:
-            for f_data in data["findings"]:
-                finding = ParsedFinding(
-                    title=f_data.get("title", ""),
-                    severity=f_data.get("severity", "medium"),
-                    description=f_data.get("description", ""),
-                    cwe=f_data.get("cwe", ""),
-                    cve=f_data.get("cve", ""),
-                    confidence=f_data.get("confidence", 0.5),
-                )
-                result.findings.append(finding)
-            result.parsed_type = ParsedType.FINDING
-
-        elif "verdict" in data:
-            result.parsed_type = ParsedType.VERDICT
-
-        elif "steps" in data or "plan" in data:
-            steps = data.get("steps", data.get("plan", []))
-            result.plan = ParsedPlan(
-                steps=[str(s) for s in steps],
-            )
-            result.parsed_type = ParsedType.PLAN
-
-    def _extract_findings(self, text: str) -> list[ParsedFinding]:
-        """Extract findings from free text."""
-        findings = []
-
-        for pattern in FINDING_HEADER_PATTERNS:
-            for match in pattern.finditer(text):
-                title = match.group(1).strip()
-                # Get surrounding text for context
-                start = match.start()
-                end = min(len(text), start + 500)
-                context = text[start:end]
-
-                finding = ParsedFinding(title=title)
-
-                # Extract severity
-                sev_match = SEVERITY_PATTERNS.search(context)
-                if sev_match:
-                    sev = sev_match.group(1).lower()
-                    if sev == "informational":
-                        sev = "info"
-                    finding.severity = sev
-
-                # Extract CWE
-                cwe_match = CWE_PATTERN.search(context)
-                if cwe_match:
-                    finding.cwe = f"CWE-{cwe_match.group(1)}"
-
-                # Extract CVE
-                cve_match = CVE_PATTERN.search(context)
-                if cve_match:
-                    finding.cve = cve_match.group(0)
-
-                # Extract confidence
-                for conf_pat in CONFIDENCE_PATTERNS:
-                    conf_match = conf_pat.search(context)
-                    if conf_match:
-                        val = float(conf_match.group(1))
-                        finding.confidence = val / 100 if val > 1 else val
-                        break
-
-                findings.append(finding)
-
-        return findings
-
-    def _extract_commands(self, text: str) -> list[ParsedCommand]:
-        """Extract tool commands from text."""
-        commands = []
-
-        for pattern in TOOL_COMMAND_PATTERNS:
-            for match in pattern.finditer(text):
-                cmd_text = match.group(1).strip()
-                for line in cmd_text.split("\n"):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-
-                    tool = self._identify_tool(line)
-                    if tool:
-                        commands.append(ParsedCommand(
-                            tool=tool,
-                            command=line,
-                        ))
-
-        return commands
-
-    def _identify_tool(self, command: str) -> str:
-        """Identify the tool from a command string."""
-        tools = [
-            "nmap", "masscan", "nuclei", "nikto", "sqlmap", "dalfox",
-            "ffuf", "gobuster", "feroxbuster", "subfinder", "amass",
-            "httpx", "hydra", "crackmapexec", "enum4linux", "testssl",
-            "wpscan", "trufflehog", "gitleaks", "semgrep", "bandit",
-            "trivy", "grype", "curl", "dig", "whois", "searchsploit",
-        ]
-
-        cmd_lower = command.lower()
-        for tool in tools:
-            if tool in cmd_lower:
-                return tool
-
-        return ""
-
-    def _extract_plan(self, text: str) -> ParsedPlan:
-        """Extract an action plan from text."""
-        plan = ParsedPlan()
-
-        for match in PLAN_STEP_PATTERN.finditer(text):
-            step = match.group(2).strip()
-            if step:
-                plan.steps.append(step)
-
-        return plan
-
-    def parse_tool_output(
-        self,
-        tool: str,
-        output: str,
-    ) -> list[ParsedFinding]:
-        """Parse tool output into findings."""
-        if tool == "nuclei":
-            return self._parse_nuclei(output)
-        elif tool == "nmap":
-            return self._parse_nmap(output)
-        return []
-
-    def _parse_nuclei(self, output: str) -> list[ParsedFinding]:
-        """Parse nuclei output."""
-        findings = []
-        for line in output.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-
-            # Try JSON line
+        # Try extracting JSON blocks
+        json_pattern = r'```json\s*\n(.*?)\n```'
+        matches = re.findall(json_pattern, text, re.DOTALL)
+        for match in matches:
             try:
-                data = json.loads(line)
-                findings.append(ParsedFinding(
-                    title=data.get("info", {}).get("name", ""),
-                    severity=data.get("info", {}).get("severity", "medium"),
-                    description=data.get("matched-at", ""),
-                    cve=data.get("info", {}).get("classification", {}).get("cve-id", ""),
+                data = json.loads(match)
+                items.append(ParsedItem(
+                    item_type=ParsedItemType.ANALYSIS,
+                    content=str(data)[:100],
+                    structured=data if isinstance(data, dict) else {"data": data},
+                    source_format=ResponseFormat.JSON,
                 ))
             except json.JSONDecodeError:
-                # Text format: [severity] [template-id] [protocol] matched-at
-                match = re.match(r"\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(.*)", line)
-                if match:
-                    findings.append(ParsedFinding(
-                        title=match.group(2),
-                        severity=match.group(1).lower(),
-                        description=match.group(4),
+                continue
+
+        return items
+
+    def extract_tool_calls(self, response: str) -> list[ToolCallParsed]:
+        """Extract tool calls from response."""
+        calls: list[ToolCallParsed] = []
+
+        for pattern in TOOL_CALL_PATTERNS:
+            matches = re.findall(pattern, response, re.MULTILINE)
+            for match in matches:
+                command = match.strip()
+                parts = command.split()
+                if parts:
+                    tool_name = parts[0]
+                    args_str = " ".join(parts[1:]) if len(parts) > 1 else ""
+                    calls.append(ToolCallParsed(
+                        tool_name=tool_name,
+                        arguments={"raw_args": args_str},
+                        raw_command=command,
                     ))
 
-        return findings
+        return calls
 
-    def _parse_nmap(self, output: str) -> list[ParsedFinding]:
-        """Parse nmap output for open ports."""
-        findings = []
-        port_pattern = re.compile(r"(\d+)/(\w+)\s+open\s+(\S+)(?:\s+(.+))?")
+    def extract_findings(self, response: str) -> list[FindingParsed]:
+        """Extract findings from response."""
+        findings: list[FindingParsed] = []
 
-        for match in port_pattern.finditer(output):
-            port = match.group(1)
-            protocol = match.group(2)
-            service = match.group(3)
-            version = match.group(4) or ""
-
-            findings.append(ParsedFinding(
-                title=f"Open port {port}/{protocol}: {service}",
-                severity="info",
-                description=f"Service: {service} {version}".strip(),
-            ))
+        for pattern in FINDING_PATTERNS:
+            matches = re.findall(pattern, response, re.MULTILINE)
+            for match in matches:
+                severity = self._detect_severity(match)
+                findings.append(FindingParsed(
+                    title=match.strip()[:60],
+                    severity=severity,
+                    confidence=0.6,
+                ))
 
         return findings
+
+    def _detect_severity(self, text: str) -> str:
+        """Detect severity from text."""
+        lower = text.lower()
+        for severity, keywords in SEVERITY_KEYWORDS.items():
+            if any(kw in lower for kw in keywords):
+                return severity
+        return "medium"
+
+    def _extract_code_blocks(self, text: str) -> list[str]:
+        """Extract code blocks from response."""
+        pattern = r'```(?:\w*)\s*\n(.*?)\n```'
+        matches = re.findall(pattern, text, re.DOTALL)
+        return matches
+
+    def extract_confidence(self, response: str) -> float:
+        """Extract confidence from response."""
+        patterns = [
+            r'confidence:\s*(\d+(?:\.\d+)?)',
+            r'(\d+(?:\.\d+)?)\s*%?\s*confident',
+            r'certainty:\s*(\d+(?:\.\d+)?)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, response, re.IGNORECASE)
+            if match:
+                value = float(match.group(1))
+                if value > 1.0:
+                    value /= 100.0
+                return min(1.0, max(0.0, value))
+
+        return 0.5
+
+    def build_parser_prompt(self) -> str:
+        """Build parser stats for LLM."""
+        lines = ["## Parser\n"]
+        lines.append(f"Parsed: {self._parse_count}")
+        if self._parse_count > 0:
+            rate = self._success_count / self._parse_count
+            lines.append(f"Success: {rate:.0%}")
+        return "\n".join(lines)
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "parsed": self._parse_count,
+            "success": self._success_count,
+            "rate": (
+                f"{self._success_count / self._parse_count:.0%}"
+                if self._parse_count > 0 else "0%"
+            ),
+        }
