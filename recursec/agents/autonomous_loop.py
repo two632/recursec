@@ -1,19 +1,19 @@
-"""Autonomous loop — the infinite reasoning loop.
+"""Autonomous execution loop — runs the agent 24/7.
 
-Drives the agent's 24/7 autonomous operation:
-1. Continuous task generation
-2. Dynamic priority adjustment
-3. Backoff/retry on failures
-4. Convergence detection → stop or expand
-5. Self-initiated exploration
-6. Resource budget management
-7. Multi-phase cycling
+This is the daemon that:
+1. Accepts tasks from queue
+2. Runs the full pipeline for each task
+3. Learns from results
+4. Schedules recurring scans
+5. Monitors for changes
+6. Self-heals on errors
+7. Reports findings in real-time
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -25,361 +25,202 @@ logger = structlog.get_logger()
 class LoopState(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
+    PROCESSING = "processing"
+    WAITING = "waiting"
     PAUSED = "paused"
-    BACKOFF = "backoff"
-    EXPANDING = "expanding"  # Found something, go deeper
-    CONVERGING = "converging"  # Diminishing returns
-    COMPLETING = "completing"
+    ERROR = "error"
     STOPPED = "stopped"
 
 
-class ActionType(str, Enum):
-    SCAN = "scan"
-    ANALYZE = "analyze"
-    EXPLOIT = "exploit"
-    VALIDATE = "validate"
-    EXPAND = "expand"         # Broaden scope
-    DEEPEN = "deepen"         # Go deeper on existing
-    CORRELATE = "correlate"
-    REFLECT = "reflect"
-    REPORT = "report"
-    IDLE = "idle"
-
-
-class TriggerCondition(str, Enum):
-    NEW_FINDING = "new_finding"
-    PHASE_COMPLETE = "phase_complete"
-    NO_PROGRESS = "no_progress"
-    TIME_ELAPSED = "time_elapsed"
-    TOKEN_LOW = "token_low"
-    HIGH_SEVERITY = "high_severity"
-    COVERAGE_GAP = "coverage_gap"
-    ERROR = "error"
+class TaskSource(str, Enum):
+    USER = "user"
+    SCHEDULE = "schedule"
+    CHANGE_DETECTION = "change_detection"
+    FOLLOW_UP = "follow_up"
+    SELF_IMPROVEMENT = "self_improvement"
 
 
 @dataclass
-class LoopIteration:
-    """A single loop iteration."""
-    iteration_id: int = 0
-    action: ActionType = ActionType.IDLE
-    trigger: TriggerCondition = TriggerCondition.TIME_ELAPSED
-    started_at: float = 0.0
-    completed_at: float = 0.0
-    findings_before: int = 0
-    findings_after: int = 0
-    tokens_used: int = 0
-    success: bool = True
-    note: str = ""
-
-    @property
-    def duration_s(self) -> float:
-        if self.completed_at:
-            return self.completed_at - self.started_at
-        return 0.0
-
-    @property
-    def new_findings(self) -> int:
-        return self.findings_after - self.findings_before
+class QueuedTask:
+    """A task in the execution queue."""
+    task_id: str = ""
+    description: str = ""
+    target: str = ""
+    source: TaskSource = TaskSource.USER
+    priority: int = 5
+    scheduled_at: float = 0.0
+    max_retries: int = 3
+    retries: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "iter": self.iteration_id,
-            "action": self.action.value[:8],
-            "trigger": self.trigger.value[:10],
-            "new": self.new_findings,
-            "ok": self.success,
+            "id": self.task_id[:8],
+            "desc": self.description[:20],
+            "source": self.source.value[:8],
+            "priority": self.priority,
         }
 
 
 @dataclass
-class LoopConfig:
-    """Configuration for the autonomous loop."""
-    max_iterations: int = 1000
-    max_duration_s: float = 86400.0  # 24 hours
-    max_tokens: int = 500000
-    backoff_initial_s: float = 5.0
-    backoff_max_s: float = 300.0
-    backoff_multiplier: float = 2.0
-    convergence_window: int = 10
-    convergence_threshold: float = 0.1
-    expansion_trigger: int = 3       # New findings to trigger expansion
-    reflection_interval: int = 20    # Reflect every N iterations
-    idle_timeout_s: float = 30.0
+class ScheduledScan:
+    """A recurring scheduled scan."""
+    scan_id: str = ""
+    description: str = ""
+    target: str = ""
+    interval_s: float = 86400.0
+    last_run: float = 0.0
+    next_run: float = 0.0
+    enabled: bool = True
+    task_type: str = "web_vuln_scan"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "max_iter": self.max_iterations,
-            "max_time": f"{self.max_duration_s / 3600:.0f}h",
-            "max_tokens": self.max_tokens,
+            "id": self.scan_id[:8],
+            "target": self.target[:15],
+            "interval": f"{self.interval_s / 3600:.0f}h",
+            "enabled": self.enabled,
         }
 
 
-# Action selection rules based on state
-STATE_ACTIONS: dict[LoopState, list[ActionType]] = {
-    LoopState.STARTING: [ActionType.SCAN],
-    LoopState.RUNNING: [
-        ActionType.SCAN, ActionType.ANALYZE,
-        ActionType.EXPLOIT, ActionType.VALIDATE,
-    ],
-    LoopState.EXPANDING: [
-        ActionType.EXPAND, ActionType.DEEPEN,
-        ActionType.SCAN,
-    ],
-    LoopState.CONVERGING: [
-        ActionType.CORRELATE, ActionType.REFLECT,
-        ActionType.REPORT,
-    ],
-    LoopState.COMPLETING: [
-        ActionType.REPORT, ActionType.VALIDATE,
-    ],
-}
+@dataclass
+class LoopStats:
+    """Statistics for the autonomous loop."""
+    tasks_completed: int = 0
+    tasks_failed: int = 0
+    total_findings: int = 0
+    total_runtime_s: float = 0.0
+    errors: list[str] = field(default_factory=list)
+    uptime_start: float = field(default_factory=time.time)
 
-# Trigger → recommended action
-TRIGGER_ACTION_MAP: dict[TriggerCondition, ActionType] = {
-    TriggerCondition.NEW_FINDING: ActionType.VALIDATE,
-    TriggerCondition.PHASE_COMPLETE: ActionType.ANALYZE,
-    TriggerCondition.NO_PROGRESS: ActionType.EXPAND,
-    TriggerCondition.TIME_ELAPSED: ActionType.SCAN,
-    TriggerCondition.TOKEN_LOW: ActionType.REPORT,
-    TriggerCondition.HIGH_SEVERITY: ActionType.DEEPEN,
-    TriggerCondition.COVERAGE_GAP: ActionType.SCAN,
-    TriggerCondition.ERROR: ActionType.REFLECT,
-}
+    @property
+    def uptime_s(self) -> float:
+        return time.time() - self.uptime_start
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "completed": self.tasks_completed,
+            "failed": self.tasks_failed,
+            "findings": self.total_findings,
+            "uptime": f"{self.uptime_s / 3600:.1f}h",
+            "errors": len(self.errors),
+        }
 
 
 class AutonomousLoop:
-    """The autonomous reasoning loop.
+    """The 24/7 autonomous execution loop."""
 
-    Drives continuous, self-directed operation.
-    The agent keeps working until converged,
-    budget exhausted, or explicitly stopped.
-    """
-
-    def __init__(self, config: LoopConfig | None = None) -> None:
-        self._config = config or LoopConfig()
-        self._state = LoopState.STARTING
-        self._iterations: list[LoopIteration] = []
-        self._current_iter = 0
-        self._total_tokens = 0
-        self._total_findings = 0
-        self._started_at = 0.0
-        self._backoff_s = self._config.backoff_initial_s
-        self._consecutive_empty = 0
-        self._log = logger.bind(component="auto_loop")
-
-    def start(self) -> None:
-        """Start the autonomous loop."""
-        self._state = LoopState.RUNNING
-        self._started_at = time.time()
-
-    def should_continue(self) -> bool:
-        """Check if the loop should continue."""
-        if self._state == LoopState.STOPPED:
-            return False
-
-        if self._current_iter >= self._config.max_iterations:
-            return False
-
-        elapsed = time.time() - self._started_at if self._started_at else 0
-        if elapsed >= self._config.max_duration_s:
-            return False
-
-        if self._total_tokens >= self._config.max_tokens:
-            return False
-
-        return True
-
-    def detect_trigger(self) -> TriggerCondition:
-        """Detect what triggered this iteration."""
-        # Check recent findings
-        recent = self._iterations[-3:] if len(self._iterations) >= 3 else self._iterations
-        recent_findings = sum(i.new_findings for i in recent)
-
-        if recent_findings > 0:
-            # Found something → validate
-            return TriggerCondition.NEW_FINDING
-
-        # Check convergence
-        if self._is_converging():
-            return TriggerCondition.NO_PROGRESS
-
-        # Check token budget
-        token_pct = self._total_tokens / max(1, self._config.max_tokens)
-        if token_pct > 0.8:
-            return TriggerCondition.TOKEN_LOW
-
-        # Default: time elapsed
-        return TriggerCondition.TIME_ELAPSED
-
-    def select_action(
-        self,
-        trigger: TriggerCondition | None = None,
-    ) -> ActionType:
-        """Select the next action based on state and trigger."""
-        if trigger is None:
-            trigger = self.detect_trigger()
-
-        # Check if we should reflect
-        if (
-            self._current_iter > 0
-            and self._current_iter % self._config.reflection_interval == 0
-        ):
-            return ActionType.REFLECT
-
-        # Trigger-specific action
-        recommended = TRIGGER_ACTION_MAP.get(trigger, ActionType.SCAN)
-
-        # State-allowed actions
-        allowed = STATE_ACTIONS.get(self._state, [ActionType.SCAN])
-
-        if recommended in allowed:
-            return recommended
-
-        # Fallback to first allowed
-        return allowed[0] if allowed else ActionType.SCAN
-
-    def begin_iteration(self) -> LoopIteration:
-        """Start a new loop iteration."""
-        self._current_iter += 1
-        trigger = self.detect_trigger()
-        action = self.select_action(trigger)
-
-        iteration = LoopIteration(
-            iteration_id=self._current_iter,
-            action=action,
-            trigger=trigger,
-            started_at=time.time(),
-            findings_before=self._total_findings,
-        )
-
-        return iteration
-
-    def end_iteration(
-        self,
-        iteration: LoopIteration,
-        findings_added: int = 0,
-        tokens_used: int = 0,
-        success: bool = True,
-    ) -> None:
-        """Complete a loop iteration."""
-        iteration.completed_at = time.time()
-        iteration.findings_after = self._total_findings + findings_added
-        iteration.tokens_used = tokens_used
-        iteration.success = success
-
-        self._total_findings += findings_added
-        self._total_tokens += tokens_used
-        self._iterations.append(iteration)
-
-        # Update state based on results
-        self._update_state(iteration)
-
-    def _update_state(self, iteration: LoopIteration) -> None:
-        """Update loop state based on latest iteration."""
-        if not iteration.success:
-            # Backoff on failure
-            self._backoff_s = min(
-                self._backoff_s * self._config.backoff_multiplier,
-                self._config.backoff_max_s,
-            )
-            self._state = LoopState.BACKOFF
-            return
-
-        # Reset backoff on success
-        self._backoff_s = self._config.backoff_initial_s
-
-        if iteration.new_findings >= self._config.expansion_trigger:
-            # Found a lot → expand
-            self._state = LoopState.EXPANDING
-            self._consecutive_empty = 0
-        elif iteration.new_findings > 0:
-            # Found something → keep going
-            self._state = LoopState.RUNNING
-            self._consecutive_empty = 0
-        else:
-            # Nothing found
-            self._consecutive_empty += 1
-
-            if self._is_converging():
-                self._state = LoopState.CONVERGING
-
-    def _is_converging(self) -> bool:
-        """Check if the loop is converging (diminishing returns)."""
-        window = self._config.convergence_window
-        if len(self._iterations) < window:
-            return False
-
-        recent = self._iterations[-window:]
-        total_new = sum(i.new_findings for i in recent)
-
-        rate = total_new / window
-        return rate < self._config.convergence_threshold
-
-    def stop(self) -> None:
-        """Stop the loop."""
+    def __init__(self) -> None:
         self._state = LoopState.STOPPED
+        self._task_queue: list[QueuedTask] = []
+        self._schedules: list[ScheduledScan] = []
+        self._stats = LoopStats()
+        self._task_counter = 0
+        self._schedule_counter = 0
+        self._log = logger.bind(component="autonomous_loop")
 
-    def get_elapsed_s(self) -> float:
-        """Get elapsed time."""
-        if self._started_at:
-            return time.time() - self._started_at
-        return 0.0
+    @property
+    def state(self) -> LoopState:
+        return self._state
 
-    def get_progress(self) -> dict[str, Any]:
-        """Get loop progress."""
-        elapsed = self.get_elapsed_s()
+    def enqueue_task(
+        self,
+        description: str,
+        target: str = "",
+        source: TaskSource = TaskSource.USER,
+        priority: int = 5,
+        metadata: dict[str, Any] | None = None,
+    ) -> QueuedTask:
+        """Add a task to the execution queue."""
+        self._task_counter += 1
+        task = QueuedTask(
+            task_id=f"qtask-{self._task_counter}",
+            description=description,
+            target=target,
+            source=source,
+            priority=priority,
+            metadata=metadata or {},
+        )
+        self._task_queue.append(task)
+        # Sort by priority (highest first)
+        self._task_queue.sort(key=lambda t: t.priority, reverse=True)
+        return task
 
+    def dequeue_task(self) -> QueuedTask | None:
+        """Get the next task from the queue."""
+        if not self._task_queue:
+            return None
+        return self._task_queue.pop(0)
+
+    def add_schedule(
+        self,
+        description: str,
+        target: str,
+        interval_hours: float = 24.0,
+        task_type: str = "web_vuln_scan",
+    ) -> ScheduledScan:
+        """Add a recurring scheduled scan."""
+        self._schedule_counter += 1
+        scan = ScheduledScan(
+            scan_id=f"sched-{self._schedule_counter}",
+            description=description,
+            target=target,
+            interval_s=interval_hours * 3600,
+            next_run=time.time() + interval_hours * 3600,
+            task_type=task_type,
+        )
+        self._schedules.append(scan)
+        return scan
+
+    def check_schedules(self) -> list[QueuedTask]:
+        """Check for due scheduled scans and enqueue them."""
+        now = time.time()
+        tasks = []
+        for scan in self._schedules:
+            if scan.enabled and now >= scan.next_run:
+                task = self.enqueue_task(
+                    description=scan.description,
+                    target=scan.target,
+                    source=TaskSource.SCHEDULE,
+                    priority=3,
+                )
+                scan.last_run = now
+                scan.next_run = now + scan.interval_s
+                tasks.append(task)
+        return tasks
+
+    def record_completion(self, findings_count: int = 0) -> None:
+        """Record a task completion."""
+        self._stats.tasks_completed += 1
+        self._stats.total_findings += findings_count
+
+    def record_failure(self, error: str) -> None:
+        """Record a task failure."""
+        self._stats.tasks_failed += 1
+        self._stats.errors.append(error)
+        if len(self._stats.errors) > 100:
+            self._stats.errors = self._stats.errors[-50:]
+
+    def get_queue_size(self) -> int:
+        """Get current queue size."""
+        return len(self._task_queue)
+
+    def get_stats(self) -> dict[str, Any]:
         return {
             "state": self._state.value,
-            "iteration": self._current_iter,
-            "max_iterations": self._config.max_iterations,
-            "findings": self._total_findings,
-            "tokens": self._total_tokens,
-            "elapsed": f"{elapsed / 60:.0f}min",
-            "converging": self._is_converging(),
+            "queue_size": len(self._task_queue),
+            "schedules": len(self._schedules),
+            "active_schedules": sum(1 for s in self._schedules if s.enabled),
+            **self._stats.to_dict(),
         }
 
     def build_loop_prompt(self) -> str:
-        """Build loop state for LLM."""
-        progress = self.get_progress()
-        lines = ["## Autonomous Loop\n"]
-        lines.append(f"State: {progress['state']}")
-        lines.append(f"Iteration: {progress['iteration']}/{progress['max_iterations']}")
-        lines.append(f"Findings: {progress['findings']}")
-        lines.append(f"Tokens: {progress['tokens']}")
-        lines.append(f"Elapsed: {progress['elapsed']}")
-
-        if self._iterations:
-            last = self._iterations[-1]
-            lines.append(f"\nLast action: {last.action.value}")
-            lines.append(f"Last trigger: {last.trigger.value}")
-            lines.append(f"Last new findings: {last.new_findings}")
-
-        if self._is_converging():
-            lines.append("\nWARNING: Convergence detected")
-            lines.append("Consider: expand scope or complete")
-
+        """Build LLM prompt with loop state."""
+        stats = self.get_stats()
+        lines = ["## Autonomous Loop Status"]
+        lines.append(f"State: {stats['state']}")
+        lines.append(f"Queue: {stats['queue_size']} tasks")
+        lines.append(f"Completed: {stats['completed']}")
+        lines.append(f"Findings: {stats['findings']}")
+        lines.append(f"Uptime: {stats.get('uptime', '0h')}")
         return "\n".join(lines)
-
-    def get_stats(self) -> dict[str, Any]:
-        action_counts: dict[str, int] = {}
-        for i in self._iterations:
-            action_counts[i.action.value] = (
-                action_counts.get(i.action.value, 0) + 1
-            )
-
-        trigger_counts: dict[str, int] = {}
-        for i in self._iterations:
-            trigger_counts[i.trigger.value] = (
-                trigger_counts.get(i.trigger.value, 0) + 1
-            )
-
-        return {
-            "state": self._state.value,
-            "iterations": self._current_iter,
-            "findings": self._total_findings,
-            "tokens": self._total_tokens,
-            "elapsed_s": self.get_elapsed_s(),
-            "by_action": action_counts,
-            "by_trigger": trigger_counts,
-        }
