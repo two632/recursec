@@ -90,7 +90,11 @@ class RecurSecEngine:
             installed = sum(1 for v in results.values() if v)
             logger.info("tools_auto_installed", installed=installed, failed=len(results) - installed)
 
-        # 3. Initialize LLM models
+        # 3. Register LLM models with router (on-demand — NOT all loaded)
+        # Models are registered but NOT started. The router connects to
+        # servers that are already running. DynamicModelLoader in
+        # llm_client.py handles actual start/stop of llama-server processes.
+        registered = 0
         for model_cfg in self.config.models:
             await self.router.add_model(ModelConfig(
                 name=model_cfg.name,
@@ -104,6 +108,7 @@ class RecurSecEngine:
                 weight=model_cfg.weight,
                 **model_cfg.extra,
             ))
+            registered += 1
 
         # 4. Initialize safety guard
         if self.config.safety.enabled:
@@ -117,17 +122,20 @@ class RecurSecEngine:
                 self.vector_memory = VectorMemory(self.embedder)
             logger.info("embedding", status="online" if embed_ok else "offline")
 
-        # Health check all models
+        # Health check — only check which models are already running
+        # (on-demand architecture: most models are NOT running at startup)
         health = await self.router.health_check_all()
         healthy = sum(1 for v in health.values() if v)
         logger.info(
             "engine_initialized",
-            models=len(self.config.models),
-            models_healthy=healthy,
+            models_registered=registered,
+            models_online=healthy,
+            models_on_disk=registered - healthy,
             tools_total=self.tools.count(),
             tools_available=self.tools.count_available(),
             safety="enabled" if self.config.safety.enabled else "disabled",
             embedding="enabled" if self.vector_memory else "disabled",
+            note="on-demand: models load when first requested",
         )
 
     async def submit_task(

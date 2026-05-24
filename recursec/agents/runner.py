@@ -230,20 +230,26 @@ class Runner:
         target_type = self._detect_target_type(target)
         self._print(f"[*] Target type: {target_type.value}")
 
-        # Step 2: Discover online LLM servers (on-demand — only 1-2 may be up)
+        # Step 2: Discover/load LLM servers (on-demand architecture)
         self._phase = ScanPhase.INIT
         self._print("[*] Discovering online LLM servers...")
         self._healthy_models = self._llm.refresh_online_models()
+        loader_status = self._llm.loader.get_status()
+        self._print(f"[*] Loader: max_cached={loader_status['max_cached']}, "
+                     f"loaded={loader_status['loaded_count']}, "
+                     f"RAM={loader_status['total_ram_gb']}GB")
         if self._healthy_models:
             self._print(f"[+] {len(self._healthy_models)} model(s) online: {', '.join(self._healthy_models)}")
-            # Smart-route to best security model
-            self._primary_model = self._llm.route_task("security_analysis")
+        # Smart-route to best security model (loads on-demand if GGUF exists)
+        self._primary_model = self._llm.route_task("security_analysis")
+        if self._primary_model:
             self._print(f"[+] Primary model (security): {self._primary_model}")
             predicted = self._llm.predict_next_model()
             if predicted:
                 self._print(f"[*] Predicted next model: {predicted}")
         else:
-            self._print("[!] No LLM servers online — running tools-only mode")
+            self._print("[!] No LLM models available — running tools-only mode")
+            self._print("[!] To enable LLM: place GGUF files in ~/agent/models/gguf/")
 
         # Step 3: Recon
         self._phase = ScanPhase.RECON

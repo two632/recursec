@@ -2,7 +2,9 @@
 
 **Recursive Multi-Agent Security Framework**
 
-Autonomous security testing with unlimited local LLMs, 244+ tools, recursive agent spawning, and autonomous think-act loop. Everything runs locally — no cloud, no Ollama, no paid APIs.
+Autonomous security testing with **true on-demand model loading**, 244+ tools, recursive agent spawning, and autonomous think-act loop. Everything runs locally — no cloud, no Ollama, no paid APIs.
+
+**On-demand architecture:** 16 GGUF models on disk (~200GB). Only 1-2 loaded in RAM at a time (8-18GB). `DynamicModelLoader` starts/stops llama-server processes automatically. LRU cache evicts least-recently-used model when a new one is needed.
 
 ```
  ____  ____  ____  _  _  ____  ____  ____  ____
@@ -53,24 +55,24 @@ cd ~/agent/recursec
 pip install -e .
 ```
 
-### 2. Launch Models (On-Demand — NOT All 16 at Once)
+### 2. Launch Models (On-Demand Architecture)
 
 ```bash
-# On-demand architecture: load only 1-2 models at a time (8-16GB RAM)
-# NOT all 16 (which would need 120GB+ RAM)
+# OPTION A: Let the agent auto-load models (recommended)
+# DynamicModelLoader starts llama-server when a model is needed,
+# keeps max 2 cached (LRU eviction), stops servers when done.
+# Just run the scan — it handles everything:
+python -m recursec scan https://target.com
 
-# Start WhiteRabbitNeo (security brain — handles 80% of tasks)
-./scripts/launch_models.sh whiterabbitneo
+# OPTION B: Pre-start 1-2 models for immediate availability
+./scripts/launch_models.sh whiterabbitneo                   # 5GB RAM
+./scripts/launch_models.sh whiterabbitneo qwen-coder-14b    # 13GB RAM
 
-# Optionally start a second model for consensus voting
-./scripts/launch_models.sh qwen-coder-14b
+# Check what's loaded:
+python -m recursec health
 
-# Smart router picks best model per task type:
-# scan_web_vulns → WhiteRabbitNeo (primary)
-# analyze_code → Qwen-Coder-14B
-# build_exploit → DeepSeek-R1
-# quick_triage → Phi-3.5-mini
-# If primary model isn't loaded, router falls back to whatever IS online
+# DON'T DO THIS (needs 80GB+ RAM):
+# ./scripts/launch_models.sh --all    # Loads all 16 models!
 ```
 
 ### 3. Run RecurSec
@@ -101,10 +103,14 @@ python -m recursec tools
 python -m recursec models
 ```
 
-### 4. Stop Everything
+### 4. Stop Models
 
 ```bash
-./scripts/stop_models.sh
+# Stop all running model servers
+./scripts/launch_models.sh --stop
+
+# Check status
+./scripts/launch_models.sh --status
 ```
 
 ---
@@ -117,7 +123,20 @@ python -m recursec models
 │  WhiteRabbitNeo • Qwen-Coder • CodeLlama • DeepSeek-R1          │
 │  Hermes • Llama • Dolphin • Mistral • Yi-200K • Phi             │
 │  FunctionGemma • Llama-Guard • Nomic-Embed (+ 3 more)           │
-│  Only 1-2 loaded in RAM at a time (8-16GB max)                   │
+│  Max 2 loaded in RAM at a time (8-18GB) via LRU cache           │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────┐
+│         DYNAMIC MODEL LOADER (DynamicModelLoader)                │
+│                                                                   │
+│  ensure_loaded(model_id):                                         │
+│    1. Already running? → update last_used, return                │
+│    2. Cache full (>2)? → kill LRU server (SIGTERM + SIGKILL)    │
+│    3. Start llama-server subprocess for GGUF file                │
+│    4. Poll /health until 200 OK (up to 60s timeout)             │
+│    5. Cache: {model_id → {pid, port, loaded_at, last_used}}     │
+│                                                                   │
+│  RAM: ~8-18GB (2 models) instead of 80-120GB (16 models)        │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -129,10 +148,10 @@ python -m recursec models
 │  quick_triage → Phi-3.5-mini (primary)                           │
 │  write_report → Hermes-14B (primary)                             │
 │                                                                   │
-│  Each task type has: primary + fallbacks + consensus pool        │
-│  Falls back to whatever model IS online if primary isn't         │
+│  On-demand: starts primary model if not running                  │
+│  Falls back to already-loaded model if primary unavailable       │
 │  Task batching: groups tasks by model to minimize swaps          │
-│  Predictive preloading: anticipates next model needed            │
+│  Deterministic selection (NOT weighted random)                   │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
             ┌───────────────────┼───────────────────┐
@@ -189,10 +208,13 @@ TASK BATCHING (minimizes model swaps):
 ## Features
 
 ### Core
-- **Unlimited LLMs** — add any number, hot-add/remove at runtime via API
+- **True on-demand loading** — `DynamicModelLoader` starts/stops llama-server processes automatically
+- **LRU cache** — max 2 models in RAM (8-18GB), evicts least-recently-used when full
+- **Smart routing** — 22 task types, deterministic model selection (no random), fallback chains
+- **Consensus voting** — 2-3 models validate critical findings, reduces false positives ~60%
+- **Task batching** — groups tasks by model to minimize load/unload cycles
+- **244+ security tools** — auto-detected, installable via CLI or API
 - **6 inference backends** — vLLM, llama.cpp, SGLang, LiteLLM, Ollama, any OpenAI-compatible
-- **Intelligent routing** — task-type matching, load balancing, weighted selection, automatic fallbacks
-- **215+ security tools** — auto-detected, installable via CLI or API
 - **15 specialized agents** — each a domain expert with its own system prompt and tool preferences
 
 ### Security Intelligence
@@ -293,7 +315,7 @@ recursec/
 │   └── cli.py                 # Typer CLI
 ├── scripts/
 │   ├── install.sh             # Full installation script
-│   ├── launch_models.sh       # Start all 16 llama.cpp servers
+│   ├── launch_models.sh       # On-demand model launcher (1-2 at a time)
 │   └── stop_models.sh         # Stop all model servers
 ├── docker/
 │   ├── Dockerfile             # Kali Linux + all tools

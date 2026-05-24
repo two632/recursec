@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 
 import structlog
 
-from recursec.agents.llm_client import LLMClient, MODEL_SERVERS, TASK_ROUTING
+from recursec.agents.llm_client import (
+    LLMClient,
+    MODEL_RAM_GB,
+    MODEL_SERVERS,
+    TASK_ROUTING,
+)
 from recursec.agents.runner import Runner, ScanConfig
 from recursec.agents.tool_executor import ToolExecutor
 
@@ -91,31 +95,40 @@ def cmd_models(_args: argparse.Namespace) -> None:
 
 def cmd_health(_args: argparse.Namespace) -> None:
     """Check which LLM servers are running."""
-    client = LLMClient()
+    client = LLMClient(on_demand=False)  # Don't auto-load for health check
     print("\n  LLM Server Health Check (On-Demand Architecture)")
     print(f"  {'─'*60}")
 
     healthy = 0
+    total_ram = 0.0
     total = len(MODEL_SERVERS)
     for model_id, info in MODEL_SERVERS.items():
-        start = time.time()
         is_healthy = client.check_health(model_id)
-        latency = (time.time() - start) * 1000
-        status = "ONLINE" if is_healthy else "OFFLINE"
+        ram = MODEL_RAM_GB.get(model_id, 4.0)
+        status = f"ONLINE  ~{ram:.0f}GB RAM" if is_healthy else "on disk"
         icon = "●" if is_healthy else "○"
-        print(f"  {icon} {model_id:<20} {info['name']:<28} port:{info['port']:<6} {status} ({latency:.0f}ms)")
+        print(f"  {icon} {model_id:<20} {info['name']:<28} port:{info['port']:<6} {status}")
         if is_healthy:
             healthy += 1
+            total_ram += ram
 
-    print(f"\n  {healthy}/{total} models online")
+    print(f"\n  {healthy}/{total} models loaded in RAM ({total_ram:.0f}GB)")
+    print(f"  {total - healthy}/{total} models on disk (0GB RAM)")
     if healthy == 0:
-        print("  Start 1-2 models for on-demand scanning:")
+        print("\n  Start 1-2 models for on-demand scanning:")
         print("    ./scripts/launch_models.sh whiterabbitneo")
-        print("    ./scripts/launch_models.sh qwen-coder-14b")
-    elif healthy < 3:
-        print(f"  On-demand mode: {healthy} model(s) loaded, others available on disk")
+        print("    ./scripts/launch_models.sh whiterabbitneo qwen-coder-14b")
+        print("\n  Or let the agent auto-load models:")
+        print("    python -m recursec scan https://target.com")
+        print("    (DynamicModelLoader starts models automatically)")
+    elif healthy <= 3:
+        print(f"\n  On-demand mode active: {healthy} model(s) loaded, {total - healthy} on disk")
+    else:
+        print(f"\n  WARNING: {healthy} models loaded — consider using on-demand mode")
+        print("  Stop all: ./scripts/launch_models.sh --stop")
     print(f"\n  Smart Routing: {len(TASK_ROUTING)} task types configured")
-    print("  Consensus voting: available when 2+ models online")
+    print(f"  Consensus voting: {'ready' if healthy >= 2 else 'needs 2+ models'}")
+    print("  DynamicModelLoader: max_cached=2, auto-loads from disk")
     print()
 
 

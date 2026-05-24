@@ -1,9 +1,13 @@
-"""Intelligent model router — routes tasks to the best LLM based on task type, load, and capability."""
+"""Intelligent model router — routes tasks to the best LLM based on task type, load, and capability.
+
+UPDATED: Now uses the smart routing table from llm_client.TASK_ROUTING
+instead of weighted random selection. Models are selected deterministically
+based on task type → primary model → fallback chain.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import random
 import time
 from typing import Any
 
@@ -122,13 +126,19 @@ class ModelRouter:
             logger.info("model_removed", name=name)
 
     def _select_model(self, task_type: str = "general", prefer_model: str | None = None) -> ModelConfig | None:
-        """Select the best model for the given task type."""
+        """Select the best model for the given task type.
+
+        Uses deterministic priority-based selection (NOT weighted random):
+        1. Preferred model (if specified and healthy)
+        2. Highest-priority model matching this task type
+        3. Any healthy model in fallback chain
+        """
         if prefer_model and prefer_model in self._models:
             config = self._models[prefer_model]
             if config.backend and config.backend.is_healthy and config._active_requests < config.max_concurrent:
                 return config
 
-        # Find models that match this task type
+        # Find healthy models that match this task type, sorted by priority
         candidates = []
         model_names = self._task_type_map.get(task_type, []) or self._task_type_map.get("general", [])
 
@@ -152,18 +162,10 @@ class ModelRouter:
         if not candidates:
             return None
 
-        # Weighted selection among candidates
-        total_weight = sum(c.weight for c in candidates)
-        if total_weight <= 0:
-            return candidates[0]
-
-        r = random.uniform(0, total_weight)
-        cumulative = 0.0
-        for c in candidates:
-            cumulative += c.weight
-            if r <= cumulative:
-                return c
-        return candidates[-1]
+        # Deterministic: pick lowest priority number (highest priority)
+        # then lowest active requests (least loaded)
+        candidates.sort(key=lambda c: (c.priority, c._active_requests))
+        return candidates[0]
 
     async def generate(
         self,

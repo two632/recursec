@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# ─── RecurSec Model Launcher ───
-# Launches all configured GGUF models on llama.cpp servers.
-# Each model gets its own port (8100-8115) and GPU layer allocation.
+# ─── RecurSec Model Launcher (On-Demand Architecture) ───
+# Launches individual GGUF models on llama.cpp servers.
+# DEFAULT: launch ZERO models. Specify which ones you need.
+# The agent's DynamicModelLoader can also start models automatically.
 #
 # Usage:
-#   ./scripts/launch_models.sh                    # Launch all models
-#   ./scripts/launch_models.sh --model whiterabbit # Launch specific model
+#   ./scripts/launch_models.sh whiterabbitneo      # Launch one model (recommended)
+#   ./scripts/launch_models.sh whiterabbitneo qwen-coder-14b  # Launch two (for consensus)
 #   ./scripts/launch_models.sh --status            # Check running status
 #   ./scripts/launch_models.sh --stop              # Stop all models
+#   ./scripts/launch_models.sh --all               # Launch ALL models (NOT recommended, needs 80GB+ RAM)
 
 set -euo pipefail
 
@@ -150,7 +152,7 @@ wait_for_ready() {
 
 # ─── Main ───
 
-case "${1:-all}" in
+case "${1:-help}" in
     --status|-s)
         check_status
         ;;
@@ -172,8 +174,9 @@ case "${1:-all}" in
         IFS='|' read -r _ port _ _ _ <<< "${MODEL_CONFIG[$name]}"
         wait_for_ready "$name" "$port"
         ;;
-    all|--all)
-        echo "═══ RecurSec Model Launcher ═══"
+    --all)
+        echo "═══ RecurSec Model Launcher (ALL MODELS — needs 80GB+ RAM!) ═══"
+        echo "⚠️  WARNING: This loads ALL 16 models. Use individual model names for on-demand."
         echo "Models dir: $MODELS_DIR"
         echo "Llama.cpp:  $LLAMA_CPP"
         echo ""
@@ -196,7 +199,7 @@ case "${1:-all}" in
         # Wait for all to be ready
         for name in $(echo "${!MODEL_CONFIG[@]}" | tr ' ' '\n' | sort); do
             IFS='|' read -r _ port _ _ _ <<< "${MODEL_CONFIG[$name]}"
-            local pid_file="$PID_DIR/${name}.pid"
+            pid_file="$PID_DIR/${name}.pid"
             if [ -f "$pid_file" ]; then
                 wait_for_ready "$name" "$port" 120 &
             fi
@@ -205,22 +208,61 @@ case "${1:-all}" in
         echo ""
         echo "═══ All models launched ═══"
         ;;
-    --help|-h)
-        echo "RecurSec Model Launcher"
+    --help|-h|help)
+        echo "RecurSec Model Launcher (On-Demand Architecture)"
         echo ""
         echo "Usage:"
-        echo "  $0                  Launch all models"
-        echo "  $0 --status         Show model status"
-        echo "  $0 --stop           Stop all models"
-        echo "  $0 --model NAME     Launch specific model"
+        echo "  $0 whiterabbitneo                       Launch one model (~5GB RAM)"
+        echo "  $0 whiterabbitneo qwen-coder-14b        Launch two models (~13GB RAM)"
+        echo "  $0 --status                             Show model status"
+        echo "  $0 --stop                               Stop all models"
+        echo "  $0 --all                                Launch ALL 16 (needs 80GB+ RAM!)"
+        echo ""
+        echo "Recommended for 32GB RAM:"
+        echo "  $0 whiterabbitneo                       Security specialist (5GB)"
+        echo "  $0 whiterabbitneo qwen-coder-14b        + Code analysis (13GB total)"
+        echo "  $0 whiterabbitneo phi-3.5-mini           + Fast triage (7GB total)"
+        echo ""
+        echo "Available models:"
+        for name in $(echo "${!MODEL_CONFIG[@]}" | tr ' ' '\n' | sort); do
+            echo "  $name"
+        done
         echo ""
         echo "Environment:"
         echo "  RECURSEC_MODELS_DIR  Path to GGUF models (default: ~/agent/models/gguf)"
         echo "  RECURSEC_LLAMA_CPP   Path to llama-server binary"
         echo "  RECURSEC_LOG_DIR     Log directory (default: /tmp/recursec-models)"
+        echo ""
+        echo "NOTE: The agent can also auto-load models on demand via DynamicModelLoader."
+        echo "      You only need to manually start models for immediate availability."
         ;;
     *)
-        echo "Unknown option: $1. Use --help for usage."
-        exit 1
+        # Treat positional arguments as model names to launch
+        for name in "$@"; do
+            if [ -z "${MODEL_CONFIG[$name]:-}" ]; then
+                echo "Unknown model: $name"
+                echo "Available: $(echo "${!MODEL_CONFIG[*]}" | tr ' ' '\n' | sort | tr '\n' ' ')"
+                exit 1
+            fi
+        done
+
+        if [ ! -x "$LLAMA_CPP" ]; then
+            echo "ERROR: llama-server not found at $LLAMA_CPP"
+            echo "Build llama.cpp first or set RECURSEC_LLAMA_CPP"
+            exit 1
+        fi
+
+        echo "═══ RecurSec On-Demand Model Launcher ═══"
+        echo "Loading $# model(s)..."
+        echo ""
+
+        for name in "$@"; do
+            launch_model "$name"
+            IFS='|' read -r _ port _ _ _ <<< "${MODEL_CONFIG[$name]}"
+            wait_for_ready "$name" "$port" 120
+        done
+
+        echo ""
+        echo "═══ $# model(s) ready ═══"
         ;;
 esac
