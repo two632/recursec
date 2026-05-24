@@ -1,193 +1,226 @@
 #!/usr/bin/env bash
-# ══════════════════════════════════════════════════════════════════
-# RecurSec Model Launcher — starts all 16 llama.cpp servers
-# ══════════════════════════════════════════════════════════════════
+# ─── RecurSec Model Launcher ───
+# Launches all configured GGUF models on llama.cpp servers.
+# Each model gets its own port (8100-8115) and GPU layer allocation.
 #
 # Usage:
-#   ./scripts/launch_models.sh [MODELS_DIR] [GPU_LAYERS]
-#
-# Defaults:
-#   MODELS_DIR = ~/agent/models/gguf
-#   GPU_LAYERS = 99 (offload everything to GPU)
-#
-# Each model runs on a separate port (8100-8115)
-# All expose OpenAI-compatible /v1/chat/completions
-#
-# Requirements:
-#   - llama-server (from llama.cpp) in PATH
-#   - GGUF models in MODELS_DIR
-# ══════════════════════════════════════════════════════════════════
+#   ./scripts/launch_models.sh                    # Launch all models
+#   ./scripts/launch_models.sh --model whiterabbit # Launch specific model
+#   ./scripts/launch_models.sh --status            # Check running status
+#   ./scripts/launch_models.sh --stop              # Stop all models
 
 set -euo pipefail
 
-MODELS_DIR="${1:-$HOME/agent/models/gguf}"
-GPU_LAYERS="${2:-99}"
-LLAMA_SERVER="${LLAMA_SERVER:-llama-server}"
-LOG_DIR="${HOME}/agent/logs"
-PID_DIR="${HOME}/agent/pids"
+# ─── Configuration ───
+MODELS_DIR="${RECURSEC_MODELS_DIR:-$HOME/agent/models/gguf}"
+LLAMA_CPP="${RECURSEC_LLAMA_CPP:-$HOME/llama.cpp/build/bin/llama-server}"
+LOG_DIR="${RECURSEC_LOG_DIR:-/tmp/recursec-models}"
+PID_DIR="${RECURSEC_PID_DIR:-/tmp/recursec-pids}"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
-# Verify llama-server exists
-if ! command -v "$LLAMA_SERVER" &>/dev/null; then
-    echo "ERROR: llama-server not found. Install llama.cpp first:"
-    echo "  git clone https://github.com/ggerganov/llama.cpp && cd llama.cpp"
-    echo "  cmake -B build -DGGML_CUDA=ON && cmake --build build --config Release -j"
-    echo "  sudo cp build/bin/llama-server /usr/local/bin/"
-    exit 1
-fi
-
-# ── Model Definitions ──────────────────────────────────────────
-# Format: PORT:CONTEXT:PARALLEL:MODEL_FILE:DESCRIPTION
-# CONTEXT = context window size
-# PARALLEL = number of parallel request slots
-MODELS=(
-    # ── Security Brain (PRIMARY) ────────────────────────────
-    "8100:8192:4:WhiteRabbitNeo-7B-v1.5a-Q4_K_M.gguf:security-brain"
-
-    # ── Code Analysis ───────────────────────────────────────
-    "8101:8192:4:Qwen2.5-Coder-14B-Instruct-Q3_K_M.gguf:code-large"
-    "8102:8192:4:Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf:code-medium"
-    "8103:8192:4:codellama-13b-instruct.Q3_K_M.gguf:code-exploit"
-    "8104:8192:4:codellama-7b.Q4_K_M.gguf:code-fast"
-
-    # ── Reasoning ───────────────────────────────────────────
-    "8105:8192:4:DeepSeek-R1-Distill-Qwen-7B-q4_k_m.gguf:reasoning"
-    "8106:8192:4:deepseek-math-7b-instruct-q4_k_m.gguf:math-reasoning"
-
-    # ── General Purpose ─────────────────────────────────────
-    "8107:8192:4:Hermes-4-14B-IQ2_M.gguf:general-large"
-    "8108:8192:4:Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf:general-medium"
-    "8109:8192:4:dolphin-2.9-llama3-8b.Q4_K_M.gguf:general-uncensored"
-    "8110:8192:4:Mistral-7B-Instruct-v0.3-Q4_K_M.gguf:general-fast"
-
-    # ── Long Context ────────────────────────────────────────
-    "8111:131072:2:Yi-9B-200K.Q5_K_M.gguf:long-context"
-
-    # ── Fast / Small ────────────────────────────────────────
-    "8112:4096:8:Phi-3.5-mini-instruct-Q4_K_M.gguf:fast-small"
-
-    # ── Function Calling (ultra-fast tool router) ───────────
-    "8113:2048:16:functiongemma-270m-it-BF16.gguf:function-router"
-
-    # ── Safety Guardrail ────────────────────────────────────
-    "8114:4096:8:llama-guard-3-1b-q4_k_m.gguf:safety-guard"
-
-    # ── Embedding (for RAG / memory) ────────────────────────
-    "8115:2048:8:nomic-embed-text-v1.5.f32.gguf:embedding"
+# Model definitions: name|file|port|ctx|threads|gpu_layers
+declare -A MODEL_CONFIG
+MODEL_CONFIG=(
+    ["whiterabbit"]="WhiteRabbitNeo-7B-v1.5a-Q4_K_M.gguf|8100|4096|4|99"
+    ["mistral"]="Mistral-7B-Instruct-v0.3-Q4_K_M.gguf|8101|8192|4|99"
+    ["qwen-coder-14b"]="Qwen2.5-Coder-14B-Instruct-Q3_K_M.gguf|8102|8192|4|99"
+    ["qwen-coder-7b"]="Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf|8103|8192|4|99"
+    ["deepseek-r1"]="DeepSeek-R1-Distill-Qwen-7B-q4_k_m.gguf|8104|8192|4|99"
+    ["hermes-4-14b"]="Hermes-4-14B-IQ2_M.gguf|8105|4096|4|99"
+    ["llama-3.1-8b"]="Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf|8106|8192|4|99"
+    ["codellama-13b"]="codellama-13b-instruct.Q3_K_M.gguf|8107|4096|4|99"
+    ["codellama-7b"]="codellama-7b.Q4_K_M.gguf|8108|4096|4|99"
+    ["dolphin"]="dolphin-2.9-llama3-8b.Q4_K_M.gguf|8109|8192|4|99"
+    ["phi-3.5-mini"]="Phi-3.5-mini-instruct-Q4_K_M.gguf|8110|4096|4|99"
+    ["deepseek-math"]="deepseek-math-7b-instruct-q4_k_m.gguf|8111|4096|4|99"
+    ["yi-9b-200k"]="Yi-9B-200K.Q5_K_M.gguf|8112|32768|4|99"
+    ["functiongemma"]="functiongemma-270m-it-BF16.gguf|8113|2048|2|99"
+    ["llama-guard"]="llama-guard-3-1b-q4_k_m.gguf|8114|2048|2|99"
+    ["nomic-embed"]="nomic-embed-text-v1.5.f32.gguf|8115|8192|2|99"
 )
 
-echo "══════════════════════════════════════════════════════════════════"
-echo " RecurSec Model Launcher"
-echo " Models: ${#MODELS[@]}"
-echo " Directory: $MODELS_DIR"
-echo " GPU Layers: $GPU_LAYERS"
-echo "══════════════════════════════════════════════════════════════════"
-echo ""
+# ─── Functions ───
 
-stop_all() {
-    echo ""
-    echo "Stopping all models..."
-    for pidfile in "$PID_DIR"/*.pid; do
-        if [ -f "$pidfile" ]; then
-            pid=$(cat "$pidfile")
-            if kill -0 "$pid" 2>/dev/null; then
-                kill "$pid"
-                echo "  Stopped PID $pid"
-            fi
-            rm -f "$pidfile"
-        fi
-    done
-    echo "All models stopped."
-    exit 0
+launch_model() {
+    local name="$1"
+    local config="${MODEL_CONFIG[$name]}"
+    IFS='|' read -r file port ctx threads gpu <<< "$config"
+
+    local model_path="$MODELS_DIR/$file"
+    local log_file="$LOG_DIR/${name}.log"
+    local pid_file="$PID_DIR/${name}.pid"
+
+    if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        echo "  [RUNNING] $name (port $port, PID $(cat "$pid_file"))"
+        return 0
+    fi
+
+    if [ ! -f "$model_path" ]; then
+        echo "  [SKIP] $name — model file not found: $model_path"
+        return 1
+    fi
+
+    local embed_flag=""
+    if [ "$name" = "nomic-embed" ]; then
+        embed_flag="--embedding"
+    fi
+
+    echo "  [STARTING] $name on port $port (ctx=$ctx, threads=$threads, gpu=$gpu)..."
+
+    "$LLAMA_CPP" \
+        --model "$model_path" \
+        --port "$port" \
+        --ctx-size "$ctx" \
+        --threads "$threads" \
+        --n-gpu-layers "$gpu" \
+        --parallel 4 \
+        --cont-batching \
+        --flash-attn \
+        $embed_flag \
+        > "$log_file" 2>&1 &
+
+    local pid=$!
+    echo "$pid" > "$pid_file"
+    echo "  [OK] $name started (PID $pid)"
+    return 0
 }
 
-trap stop_all SIGINT SIGTERM
-
-# Launch each model
-LAUNCHED=0
-FAILED=0
-
-for entry in "${MODELS[@]}"; do
-    IFS=':' read -r PORT CTX PARALLEL FILE DESC <<< "$entry"
-    MODEL_PATH="$MODELS_DIR/$FILE"
-
-    if [ ! -f "$MODEL_PATH" ]; then
-        echo "[SKIP] $FILE — not found"
-        ((FAILED++))
-        continue
-    fi
-
-    # Check if port is already in use
-    if ss -tlnp 2>/dev/null | grep -q ":$PORT "; then
-        echo "[SKIP] Port $PORT already in use (maybe $DESC is already running?)"
-        ((LAUNCHED++))
-        continue
-    fi
-
-    # Special flags for embedding model
-    EXTRA_FLAGS=""
-    if [[ "$DESC" == "embedding" ]]; then
-        EXTRA_FLAGS="--embedding"
-    fi
-
-    echo -n "[STARTING] $DESC ($FILE) on port $PORT ... "
-
-    $LLAMA_SERVER \
-        --model "$MODEL_PATH" \
-        --host 0.0.0.0 \
-        --port "$PORT" \
-        --ctx-size "$CTX" \
-        --n-gpu-layers "$GPU_LAYERS" \
-        --parallel "$PARALLEL" \
-        --flash-attn \
-        --cont-batching \
-        --metrics \
-        $EXTRA_FLAGS \
-        > "$LOG_DIR/$DESC.log" 2>&1 &
-
-    PID=$!
-    echo "$PID" > "$PID_DIR/$DESC.pid"
-
-    # Wait a moment and check if it started
-    sleep 1
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "OK (PID $PID)"
-        ((LAUNCHED++))
+stop_model() {
+    local name="$1"
+    local pid_file="$PID_DIR/${name}.pid"
+    if [ -f "$pid_file" ]; then
+        local pid
+        pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            echo "  [STOPPED] $name (PID $pid)"
+        else
+            echo "  [DEAD] $name (PID $pid was not running)"
+        fi
+        rm -f "$pid_file"
     else
-        echo "FAILED (check $LOG_DIR/$DESC.log)"
-        ((FAILED++))
+        echo "  [NOT RUNNING] $name"
     fi
-done
+}
 
-echo ""
-echo "══════════════════════════════════════════════════════════════════"
-echo " Launched: $LAUNCHED / ${#MODELS[@]}"
-echo " Failed:   $FAILED"
-echo ""
-echo " Ports:"
-echo "   8100 — WhiteRabbitNeo (Security Brain)"
-echo "   8101 — Qwen2.5-Coder-14B (Code Large)"
-echo "   8102 — Qwen2.5-Coder-7B (Code Medium)"
-echo "   8103 — CodeLlama-13B (Exploit Code)"
-echo "   8104 — CodeLlama-7B (Code Fast)"
-echo "   8105 — DeepSeek-R1 (Reasoning)"
-echo "   8106 — DeepSeek-Math (Math Reasoning)"
-echo "   8107 — Hermes-4-14B (General Large)"
-echo "   8108 — Llama-3.1-8B (General Medium)"
-echo "   8109 — Dolphin-2.9 (Uncensored)"
-echo "   8110 — Mistral-7B (General Fast)"
-echo "   8111 — Yi-9B-200K (Long Context)"
-echo "   8112 — Phi-3.5-mini (Fast Small)"
-echo "   8113 — FunctionGemma (Tool Router)"
-echo "   8114 — Llama-Guard-3 (Safety)"
-echo "   8115 — Nomic-Embed (Embedding/RAG)"
-echo ""
-echo " Logs: $LOG_DIR/"
-echo " PIDs: $PID_DIR/"
-echo ""
-echo " Press Ctrl+C to stop all models"
-echo "══════════════════════════════════════════════════════════════════"
+check_status() {
+    echo "═══ RecurSec Model Status ═══"
+    local running=0 stopped=0 missing=0
+    for name in $(echo "${!MODEL_CONFIG[@]}" | tr ' ' '\n' | sort); do
+        local config="${MODEL_CONFIG[$name]}"
+        IFS='|' read -r file port _ _ _ <<< "$config"
+        local pid_file="$PID_DIR/${name}.pid"
+        local model_path="$MODELS_DIR/$file"
 
-# Keep running
-wait
+        if [ ! -f "$model_path" ]; then
+            printf "  %-18s [MISSING]  port %-5s  %s\n" "$name" "$port" "$file"
+            ((missing++)) || true
+        elif [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+            # Quick health check
+            local health
+            health=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://127.0.0.1:$port/health" 2>/dev/null || echo "000")
+            printf "  %-18s [RUNNING]  port %-5s  PID %-6s  HTTP %s\n" "$name" "$port" "$(cat "$pid_file")" "$health"
+            ((running++)) || true
+        else
+            printf "  %-18s [STOPPED]  port %-5s\n" "$name" "$port"
+            ((stopped++)) || true
+        fi
+    done
+    echo "───────────────────────────────"
+    echo "  Running: $running | Stopped: $stopped | Missing: $missing | Total: ${#MODEL_CONFIG[@]}"
+}
+
+wait_for_ready() {
+    local name="$1" port="$2" max_wait="${3:-60}"
+    local waited=0
+    while [ "$waited" -lt "$max_wait" ]; do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://127.0.0.1:$port/health" 2>/dev/null || echo "000")
+        if [ "$code" = "200" ]; then
+            echo "  [READY] $name on port $port (${waited}s)"
+            return 0
+        fi
+        sleep 2
+        ((waited+=2))
+    done
+    echo "  [TIMEOUT] $name on port $port after ${max_wait}s"
+    return 1
+}
+
+# ─── Main ───
+
+case "${1:-all}" in
+    --status|-s)
+        check_status
+        ;;
+    --stop)
+        echo "═══ Stopping all RecurSec models ═══"
+        for name in "${!MODEL_CONFIG[@]}"; do
+            stop_model "$name"
+        done
+        ;;
+    --model|-m)
+        name="${2:-}"
+        if [ -z "$name" ] || [ -z "${MODEL_CONFIG[$name]:-}" ]; then
+            echo "Unknown model: $name"
+            echo "Available: ${!MODEL_CONFIG[*]}"
+            exit 1
+        fi
+        echo "═══ Launching $name ═══"
+        launch_model "$name"
+        IFS='|' read -r _ port _ _ _ <<< "${MODEL_CONFIG[$name]}"
+        wait_for_ready "$name" "$port"
+        ;;
+    all|--all)
+        echo "═══ RecurSec Model Launcher ═══"
+        echo "Models dir: $MODELS_DIR"
+        echo "Llama.cpp:  $LLAMA_CPP"
+        echo ""
+
+        if [ ! -x "$LLAMA_CPP" ]; then
+            echo "ERROR: llama-server not found at $LLAMA_CPP"
+            echo "Build llama.cpp first or set RECURSEC_LLAMA_CPP"
+            exit 1
+        fi
+
+        launched=0
+        for name in $(echo "${!MODEL_CONFIG[@]}" | tr ' ' '\n' | sort); do
+            if launch_model "$name"; then
+                ((launched++)) || true
+            fi
+        done
+        echo ""
+        echo "Launched $launched/${#MODEL_CONFIG[@]} models. Waiting for readiness..."
+
+        # Wait for all to be ready
+        for name in $(echo "${!MODEL_CONFIG[@]}" | tr ' ' '\n' | sort); do
+            IFS='|' read -r _ port _ _ _ <<< "${MODEL_CONFIG[$name]}"
+            local pid_file="$PID_DIR/${name}.pid"
+            if [ -f "$pid_file" ]; then
+                wait_for_ready "$name" "$port" 120 &
+            fi
+        done
+        wait
+        echo ""
+        echo "═══ All models launched ═══"
+        ;;
+    --help|-h)
+        echo "RecurSec Model Launcher"
+        echo ""
+        echo "Usage:"
+        echo "  $0                  Launch all models"
+        echo "  $0 --status         Show model status"
+        echo "  $0 --stop           Stop all models"
+        echo "  $0 --model NAME     Launch specific model"
+        echo ""
+        echo "Environment:"
+        echo "  RECURSEC_MODELS_DIR  Path to GGUF models (default: ~/agent/models/gguf)"
+        echo "  RECURSEC_LLAMA_CPP   Path to llama-server binary"
+        echo "  RECURSEC_LOG_DIR     Log directory (default: /tmp/recursec-models)"
+        ;;
+    *)
+        echo "Unknown option: $1. Use --help for usage."
+        exit 1
+        ;;
+esac
