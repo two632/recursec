@@ -1,13 +1,15 @@
-"""Prompt assembler — intelligent prompt construction from all modules.
+"""Prompt assembler — assembles all KBs into LLM prompts.
+
+Master orchestrator that selects and composes
+relevant knowledge bases into final LLM prompts
+based on assessment phase, target type, and context.
 
 Implements:
-1. Section-based prompt assembly (system, context, knowledge, task, tools, history)
-2. Token budget allocation across sections
-3. Priority-based section inclusion
-4. Dynamic knowledge injection based on task type
-5. Model-specific prompt formatting
-6. Prompt caching for repeated patterns
-7. Prompt quality scoring
+1. Phase-based KB selection
+2. Token budget management across KBs
+3. Priority-based knowledge injection
+4. Dynamic prompt composition
+5. Context-aware assembly
 """
 
 from __future__ import annotations
@@ -22,250 +24,314 @@ import structlog
 logger = structlog.get_logger()
 
 
-class PromptSection(str, Enum):
-    SYSTEM = "system"
-    ROLE = "role"
-    CONTEXT = "context"
-    KNOWLEDGE = "knowledge"
-    TASK = "task"
-    TOOLS = "tools"
-    FINDINGS = "findings"
-    HISTORY = "history"
-    REASONING = "reasoning"
-    CONSTRAINTS = "constraints"
-    OUTPUT_FORMAT = "output_format"
+class AssessmentPhase(str, Enum):
+    PLANNING = "planning"
+    RECON = "recon"
+    ENUMERATION = "enumeration"
+    VULN_SCAN = "vuln_scan"
+    WEB_AUDIT = "web_audit"
+    API_AUDIT = "api_audit"
+    CODE_AUDIT = "code_audit"
+    EXPLOITATION = "exploitation"
+    POST_EXPLOIT = "post_exploit"
+    LATERAL_MOVE = "lateral_move"
+    PRIVESC = "privesc"
+    CLOUD_AUDIT = "cloud_audit"
+    CONTAINER_AUDIT = "container_audit"
+    NETWORK_AUDIT = "network_audit"
+    WIRELESS = "wireless"
+    SOCIAL_ENG = "social_eng"
+    REPORTING = "reporting"
+    VALIDATION = "validation"
 
 
-class PromptPriority(str, Enum):
-    CRITICAL = "critical"     # Always included (system, task)
-    HIGH = "high"            # Included if space (knowledge, tools)
-    MEDIUM = "medium"        # Included if space (history, findings)
-    LOW = "low"              # Trimmed first (verbose context)
-    OPTIONAL = "optional"    # Only if abundant space
+class TargetType(str, Enum):
+    WEB_APP = "web_app"
+    API = "api"
+    NETWORK = "network"
+    CLOUD = "cloud"
+    INTERNAL = "internal"
+    MOBILE = "mobile"
+    IOT = "iot"
+    CODE = "code"
+    WIRELESS = "wireless"
+    CONTAINER = "container"
+    ACTIVE_DIRECTORY = "active_directory"
+    GENERAL = "general"
+
+
+# Phase → relevant KB modules (by build_*_prompt method name suffix)
+PHASE_KB_MAP: dict[str, list[str]] = {
+    "planning": ["mitre", "redteam", "compliance"],
+    "recon": ["osint", "target_profile", "network_protocol"],
+    "enumeration": ["osint", "network_protocol", "linux", "winsec"],
+    "vuln_scan": ["web", "api", "network_protocol", "cloud"],
+    "web_audit": ["web", "webadv", "api", "business_logic"],
+    "api_audit": ["api", "webadv", "authentication"],
+    "code_audit": ["supply_chain", "aiml"],
+    "exploitation": ["postexploit", "redteam", "webadv"],
+    "post_exploit": ["postexploit", "lateral_movement", "data_exfiltration"],
+    "lateral_move": ["lateral_movement", "active_directory", "winsec"],
+    "privesc": ["linux", "winsec", "container"],
+    "cloud_audit": ["cloud", "container", "kubernetes"],
+    "container_audit": ["container", "kubernetes", "supply_chain"],
+    "network_audit": ["network_protocol", "wireless"],
+    "wireless": ["wireless"],
+    "social_eng": ["socialeng", "osint"],
+    "reporting": ["compliance", "mitre"],
+    "validation": ["web", "network_protocol"],
+}
+
+# Target type → additional KB modules
+TARGET_KB_MAP: dict[str, list[str]] = {
+    "web_app": ["web", "webadv", "authentication", "business_logic"],
+    "api": ["api", "authentication", "graphql"],
+    "network": ["network_protocol", "wireless"],
+    "cloud": ["cloud", "container", "kubernetes"],
+    "internal": ["active_directory", "lateral_movement", "winsec", "linux"],
+    "mobile": ["mobile", "api"],
+    "iot": ["iot", "firmware", "wireless"],
+    "code": ["supply_chain", "aiml"],
+    "wireless": ["wireless", "network_protocol"],
+    "container": ["container", "kubernetes", "supply_chain"],
+    "active_directory": ["active_directory", "winsec", "lateral_movement"],
+    "general": ["web", "network_protocol", "osint"],
+}
 
 
 @dataclass
-class PromptBlock:
-    """A block of content for prompt assembly."""
-    section: PromptSection = PromptSection.CONTEXT
-    priority: PromptPriority = PromptPriority.MEDIUM
+class PromptSection:
+    """A section of the assembled prompt."""
+    name: str = ""
     content: str = ""
+    priority: int = 0       # Higher = more important
     token_estimate: int = 0
-    source: str = ""          # Module that generated this
-    max_tokens: int = 0       # 0 = no limit
+    source_kb: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "section": self.section.value,
-            "priority": self.priority.value,
+            "name": self.name[:15],
             "tokens": self.token_estimate,
-            "source": self.source[:15],
+            "priority": self.priority,
         }
 
 
 @dataclass
 class AssembledPrompt:
-    """A fully assembled prompt."""
-    prompt_id: str = ""
-    blocks_included: list[PromptBlock] = field(default_factory=list)
-    blocks_excluded: list[PromptBlock] = field(default_factory=list)
+    """A fully assembled prompt for LLM."""
+    system_prompt: str = ""
+    knowledge_context: str = ""
+    memory_context: str = ""
+    task_context: str = ""
+    reasoning_context: str = ""
     total_tokens: int = 0
-    max_tokens: int = 0
-    fill_ratio: float = 0.0
-    model_id: str = ""
+    sections_included: list[str] = field(default_factory=list)
+    sections_truncated: list[str] = field(default_factory=list)
     assembled_at: float = field(default_factory=time.time)
 
-    @property
-    def text(self) -> str:
-        parts = []
-        for block in self.blocks_included:
-            parts.append(block.content)
-        return "\n\n".join(parts)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.prompt_id[:10],
-            "included": len(self.blocks_included),
-            "excluded": len(self.blocks_excluded),
-            "tokens": self.total_tokens,
-            "fill": f"{self.fill_ratio:.0%}",
-            "model": self.model_id[:15],
-        }
-
-
-# ── Role templates ───────────────────────────────────────────
-
-ROLE_TEMPLATES: dict[str, str] = {
-    "security_analyst": (
-        "You are an expert security analyst specializing in penetration testing "
-        "and vulnerability assessment. Analyze findings systematically, validate "
-        "vulnerabilities with evidence, and assess risk accurately. Never report "
-        "false positives — every finding must be backed by concrete evidence."
-    ),
-    "exploit_developer": (
-        "You are an expert exploit developer. Analyze vulnerabilities to determine "
-        "exploitability, develop proof-of-concept code, and validate exploitation "
-        "paths. Focus on reliability and minimizing collateral impact."
-    ),
-    "recon_specialist": (
-        "You are an expert reconnaissance specialist. Enumerate attack surfaces "
-        "thoroughly, discover hidden assets, and map technology stacks. Use both "
-        "passive and active techniques as appropriate for the scope."
-    ),
-    "code_auditor": (
-        "You are an expert code security auditor. Identify vulnerabilities in "
-        "source code using pattern matching, data flow analysis, and security "
-        "best practices. Focus on high-impact issues: injection, auth bypass, "
-        "crypto weaknesses, and unsafe deserialization."
-    ),
-    "planner": (
-        "You are a strategic security assessment planner. Decompose complex "
-        "targets into phases, select optimal tools and strategies, allocate "
-        "resources efficiently, and adapt plans based on findings."
-    ),
-    "validator": (
-        "You are a finding validator. Your job is to critically evaluate reported "
-        "vulnerabilities, check for false positives, verify evidence, and confirm "
-        "or reject findings. Be skeptical — demand proof."
-    ),
-}
-
-
-# ── Token estimation ─────────────────────────────────────────
-
-def estimate_tokens(text: str) -> int:
-    """Estimate tokens (rough: 1 token ≈ 4 chars)."""
-    return len(text) // 4
+    def to_full_prompt(self) -> str:
+        """Assemble into full prompt string."""
+        parts = [self.system_prompt]
+        if self.knowledge_context:
+            parts.append(self.knowledge_context)
+        if self.memory_context:
+            parts.append(self.memory_context)
+        if self.task_context:
+            parts.append(self.task_context)
+        if self.reasoning_context:
+            parts.append(self.reasoning_context)
+        return "\n\n---\n\n".join(parts)
 
 
 class PromptAssembler:
-    """Assembles prompts from multiple module outputs.
+    """Master prompt assembler.
 
-    Takes blocks from knowledge bases, reasoning engines,
-    tool outputs, etc., and assembles them into a
-    coherent prompt that fits within model context limits.
+    Selects relevant KBs based on phase and target,
+    manages token budgets, and composes final prompts
+    for LLM inference.
     """
 
-    def __init__(self, default_max_tokens: int = 4096) -> None:
-        self._default_max = default_max_tokens
-        self._cache: dict[str, AssembledPrompt] = {}
-        self._counter = 0
+    def __init__(
+        self,
+        max_tokens: int = 4096,
+        knowledge_budget_pct: float = 0.30,
+        memory_budget_pct: float = 0.15,
+        task_budget_pct: float = 0.20,
+        system_budget_pct: float = 0.10,
+        reasoning_budget_pct: float = 0.25,
+    ) -> None:
+        self._max_tokens = max_tokens
+        self._knowledge_budget = int(max_tokens * knowledge_budget_pct)
+        self._memory_budget = int(max_tokens * memory_budget_pct)
+        self._task_budget = int(max_tokens * task_budget_pct)
+        self._system_budget = int(max_tokens * system_budget_pct)
+        self._reasoning_budget = int(max_tokens * reasoning_budget_pct)
+        self._kb_builders: dict[str, Any] = {}
+        self._assembly_count = 0
         self._log = logger.bind(component="prompt_assembler")
+
+    def register_kb(self, kb_name: str, builder: Any) -> None:
+        """Register a KB builder (must have build_*_prompt method)."""
+        self._kb_builders[kb_name] = builder
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count (~4 chars per token)."""
+        return len(text) // 4
+
+    def _select_kbs(
+        self,
+        phase: AssessmentPhase,
+        target_type: TargetType = TargetType.GENERAL,
+    ) -> list[str]:
+        """Select relevant KBs for phase and target."""
+        kb_names: list[str] = []
+
+        # Phase-based selection
+        phase_kbs = PHASE_KB_MAP.get(phase.value, [])
+        kb_names.extend(phase_kbs)
+
+        # Target-based selection
+        target_kbs = TARGET_KB_MAP.get(target_type.value, [])
+        for kb in target_kbs:
+            if kb not in kb_names:
+                kb_names.append(kb)
+
+        return kb_names
+
+    def _build_kb_section(
+        self,
+        kb_name: str,
+        max_tokens: int,
+    ) -> PromptSection | None:
+        """Build a section from a registered KB."""
+        builder = self._kb_builders.get(kb_name)
+        if not builder:
+            return None
+
+        # Try to find the build method
+        method_names = [
+            f"build_{kb_name}_prompt",
+            f"build_{kb_name.replace('_', '')}_prompt",
+        ]
+
+        content = ""
+        for method_name in method_names:
+            method = getattr(builder, method_name, None)
+            if method and callable(method):
+                try:
+                    content = method(max_patterns=3)
+                except TypeError:
+                    try:
+                        content = method()
+                    except Exception:
+                        continue
+                break
+
+        if not content:
+            return None
+
+        tokens = self._estimate_tokens(content)
+
+        # Truncate if over budget
+        if tokens > max_tokens:
+            char_budget = max_tokens * 4
+            content = content[:char_budget] + "\n[truncated]"
+            tokens = max_tokens
+
+        return PromptSection(
+            name=kb_name,
+            content=content,
+            priority=5,
+            token_estimate=tokens,
+            source_kb=kb_name,
+        )
 
     def assemble(
         self,
-        blocks: list[PromptBlock],
-        max_tokens: int = 0,
-        model_id: str = "",
-        role: str = "",
+        phase: AssessmentPhase,
+        target_type: TargetType = TargetType.GENERAL,
+        target: str = "",
+        task: str = "",
+        memory_context: str = "",
+        reasoning_context: str = "",
+        system_additions: str = "",
     ) -> AssembledPrompt:
-        """Assemble a prompt from blocks."""
-        self._counter += 1
-        budget = max_tokens or self._default_max
+        """Assemble a complete prompt."""
+        self._assembly_count += 1
 
-        # Add role block if specified
-        if role and role in ROLE_TEMPLATES:
-            role_content = ROLE_TEMPLATES[role]
-            role_block = PromptBlock(
-                section=PromptSection.ROLE,
-                priority=PromptPriority.CRITICAL,
-                content=role_content,
-                token_estimate=estimate_tokens(role_content),
-                source="role_template",
-            )
-            blocks = [role_block] + blocks
+        prompt = AssembledPrompt()
 
-        # Estimate tokens for blocks without estimates
-        for block in blocks:
-            if block.token_estimate == 0:
-                block.token_estimate = estimate_tokens(block.content)
+        # 1. System prompt
+        system_parts = [
+            "You are an autonomous security assessment agent.",
+            f"Phase: {phase.value}",
+            f"Target type: {target_type.value}",
+        ]
+        if target:
+            system_parts.append(f"Target: {target}")
+        if system_additions:
+            system_parts.append(system_additions)
+        prompt.system_prompt = "\n".join(system_parts)
 
-        # Sort by priority (critical first)
-        prio_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "optional": 4}
-        sorted_blocks = sorted(
-            blocks,
-            key=lambda b: prio_order.get(b.priority.value, 5),
-        )
+        # 2. Knowledge context from KBs
+        kb_names = self._select_kbs(phase, target_type)
+        knowledge_parts = []
+        remaining_budget = self._knowledge_budget
 
-        # Pack blocks within budget
-        included: list[PromptBlock] = []
-        excluded: list[PromptBlock] = []
-        tokens_used = 0
+        per_kb_budget = remaining_budget // max(1, len(kb_names))
 
-        for block in sorted_blocks:
-            block_tokens = block.token_estimate
-            if block.max_tokens:
-                block_tokens = min(block_tokens, block.max_tokens)
+        for kb_name in kb_names:
+            section = self._build_kb_section(kb_name, per_kb_budget)
+            if section:
+                knowledge_parts.append(section.content)
+                remaining_budget -= section.token_estimate
+                prompt.sections_included.append(kb_name)
 
-            if tokens_used + block_tokens <= budget:
-                included.append(block)
-                tokens_used += block_tokens
-            else:
-                # Try trimming
-                remaining = budget - tokens_used
-                if remaining > 100 and block.priority.value in ("critical", "high"):
-                    trimmed = block.content[:remaining * 4]
-                    trimmed_block = PromptBlock(
-                        section=block.section,
-                        priority=block.priority,
-                        content=trimmed,
-                        token_estimate=remaining,
-                        source=block.source,
-                    )
-                    included.append(trimmed_block)
-                    tokens_used += remaining
-                else:
-                    excluded.append(block)
+                if remaining_budget <= 0:
+                    break
 
-        # Sort included by section order
-        section_order = {s: i for i, s in enumerate(PromptSection)}
-        included.sort(key=lambda b: section_order.get(b.section, 99))
+        prompt.knowledge_context = "\n\n".join(knowledge_parts)
 
-        result = AssembledPrompt(
-            prompt_id=f"prompt-{self._counter}",
-            blocks_included=included,
-            blocks_excluded=excluded,
-            total_tokens=tokens_used,
-            max_tokens=budget,
-            fill_ratio=tokens_used / budget if budget else 0,
-            model_id=model_id,
-        )
+        # 3. Memory context
+        if memory_context:
+            tokens = self._estimate_tokens(memory_context)
+            if tokens > self._memory_budget:
+                char_budget = self._memory_budget * 4
+                memory_context = memory_context[:char_budget] + "\n[truncated]"
+            prompt.memory_context = memory_context
 
-        return result
+        # 4. Task context
+        if task:
+            prompt.task_context = f"## Current Task\n\n{task}"
 
-    def create_block(
-        self,
-        section: PromptSection,
-        content: str,
-        priority: PromptPriority = PromptPriority.MEDIUM,
-        source: str = "",
-        max_tokens: int = 0,
-    ) -> PromptBlock:
-        """Create a prompt block."""
-        return PromptBlock(
-            section=section,
-            priority=priority,
-            content=content,
-            token_estimate=estimate_tokens(content),
-            source=source,
-            max_tokens=max_tokens,
-        )
+        # 5. Reasoning context
+        if reasoning_context:
+            prompt.reasoning_context = reasoning_context
+
+        # Calculate total tokens
+        prompt.total_tokens = self._estimate_tokens(prompt.to_full_prompt())
+
+        return prompt
 
     def build_assembler_prompt(self) -> str:
-        """Build assembler stats for context."""
-        lines = ["## Prompt Assembly\n"]
-        lines.append(f"Prompts assembled: {self._counter}")
-        lines.append(f"Default budget: {self._default_max} tokens")
+        """Build assembler stats for LLM."""
+        lines = ["## Prompt Assembler\n"]
+        lines.append(f"Registered KBs: {len(self._kb_builders)}")
+        lines.append(f"Assemblies: {self._assembly_count}")
+        lines.append(f"Max tokens: {self._max_tokens}")
+        lines.append(f"Knowledge budget: {self._knowledge_budget}")
 
-        lines.append("\nAvailable roles:")
-        for role_name in ROLE_TEMPLATES:
-            lines.append(f"  - {role_name}")
+        if self._kb_builders:
+            lines.append("\nAvailable KBs:")
+            for name in sorted(self._kb_builders.keys()):
+                lines.append(f"  - {name}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         return {
-            "prompts_assembled": self._counter,
-            "default_max_tokens": self._default_max,
-            "roles_available": list(ROLE_TEMPLATES.keys()),
+            "registered_kbs": len(self._kb_builders),
+            "assemblies": self._assembly_count,
+            "max_tokens": self._max_tokens,
+            "kb_names": sorted(self._kb_builders.keys()),
         }
