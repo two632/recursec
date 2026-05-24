@@ -1,17 +1,18 @@
-"""Recursive task decomposer — bounded recursion.
+"""Recursive task decomposition engine.
 
-Implements the core recursive multi-agent pattern:
-1. Task → sub-task decomposition
-2. Bounded recursion with depth limits
-3. Token budget tracking per level
-4. Result aggregation from children
-5. Convergence detection
-6. Decomposition prompt for LLM
+Decomposes complex security tasks into sub-tasks recursively:
+1. Takes a high-level goal and breaks it into atomic sub-tasks
+2. Each sub-task can be further decomposed (bounded recursion)
+3. Maps sub-tasks to optimal tools, models, and KBs
+4. Tracks dependencies between sub-tasks
+5. Generates execution plans that the workflow engine can run
+6. Learns from past decompositions to improve future ones
+
+This is the "divide and conquer" brain of the agent.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -21,426 +22,244 @@ import structlog
 logger = structlog.get_logger()
 
 
-class TaskStatus(str, Enum):
-    PENDING = "pending"
-    DECOMPOSING = "decomposing"
-    EXECUTING = "executing"
-    WAITING = "waiting"        # Waiting for children
-    AGGREGATING = "aggregating"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    TIMEOUT = "timeout"
-    DEPTH_LIMIT = "depth_limit"
+class TaskGranularity(str, Enum):
+    STRATEGIC = "strategic"
+    TACTICAL = "tactical"
+    OPERATIONAL = "operational"
+    ATOMIC = "atomic"
 
 
-class DecompositionStrategy(str, Enum):
-    PARALLEL = "parallel"     # All sub-tasks run simultaneously
-    SEQUENTIAL = "sequential" # Sub-tasks run in order
-    PIPELINE = "pipeline"     # Output of one feeds into next
-    COMPETITIVE = "competitive"  # Multiple agents, best wins
-    HIERARCHICAL = "hierarchical"  # Manager → workers
+class TaskDomain(str, Enum):
+    RECON = "recon"
+    SCANNING = "scanning"
+    ENUMERATION = "enumeration"
+    EXPLOITATION = "exploitation"
+    POST_EXPLOIT = "post_exploit"
+    ANALYSIS = "analysis"
+    VALIDATION = "validation"
+    REPORTING = "reporting"
 
 
 @dataclass
-class TaskNode:
-    """A node in the recursive task tree."""
+class SubTask:
+    """A sub-task produced by decomposition."""
     task_id: str = ""
-    parent_id: str = ""
-    depth: int = 0
     description: str = ""
-    role: str = ""
-    model: str = ""
-    status: TaskStatus = TaskStatus.PENDING
-    strategy: DecompositionStrategy = DecompositionStrategy.SEQUENTIAL
+    domain: TaskDomain = TaskDomain.RECON
+    granularity: TaskGranularity = TaskGranularity.ATOMIC
+    parent_id: str = ""
     children: list[str] = field(default_factory=list)
-    result: str = ""
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    token_budget: int = 4096
-    tokens_used: int = 0
-    timeout_s: float = 300.0
-    started_at: float = 0.0
-    completed_at: float = 0.0
-    error: str = ""
-
-    @property
-    def duration_s(self) -> float:
-        if self.completed_at:
-            return self.completed_at - self.started_at
-        if self.started_at:
-            return time.time() - self.started_at
-        return 0.0
+    dependencies: list[str] = field(default_factory=list)
+    tools: list[str] = field(default_factory=list)
+    model_id: str = ""
+    kb_domains: list[str] = field(default_factory=list)
+    estimated_duration_s: float = 60.0
+    depth: int = 0
+    max_depth: int = 4
+    priority: int = 5
 
     @property
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
     @property
-    def is_terminal(self) -> bool:
-        return self.status in (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.TIMEOUT,
-            TaskStatus.DEPTH_LIMIT,
-        )
+    def can_decompose(self) -> bool:
+        return self.depth < self.max_depth and self.granularity != TaskGranularity.ATOMIC
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.task_id[:8],
+            "desc": self.description[:25],
+            "domain": self.domain.value[:6],
+            "granularity": self.granularity.value[:6],
             "depth": self.depth,
-            "status": self.status.value[:8],
             "children": len(self.children),
-            "findings": len(self.findings),
+            "tools": len(self.tools),
         }
 
 
-# Decomposition rules: task type → sub-tasks
+# Decomposition rules: how to break down strategic tasks
 DECOMPOSITION_RULES: dict[str, list[dict[str, Any]]] = {
-    "full_assessment": [
-        {"desc": "Passive reconnaissance", "role": "recon"},
-        {"desc": "Active enumeration", "role": "scanner"},
-        {"desc": "Vulnerability scanning", "role": "scanner"},
-        {"desc": "Analysis and correlation", "role": "analyst"},
-        {"desc": "Exploitation attempts", "role": "exploiter"},
-        {"desc": "Validation of findings", "role": "validator"},
-        {"desc": "Report generation", "role": "reporter"},
+    "full_security_assessment": [
+        {"desc": "Passive reconnaissance", "domain": "recon", "granularity": "tactical", "tools": ["theHarvester", "subfinder", "whois"], "kb": ["dns", "advanced_discovery"]},
+        {"desc": "Active reconnaissance", "domain": "recon", "granularity": "tactical", "tools": ["nmap", "masscan"], "kb": ["network"]},
+        {"desc": "Vulnerability scanning", "domain": "scanning", "granularity": "tactical", "tools": ["nuclei", "nikto"], "kb": ["web_vuln"]},
+        {"desc": "Deep vulnerability analysis", "domain": "analysis", "granularity": "tactical", "model": "whiterabbit", "kb": ["web_vuln", "business_logic"]},
+        {"desc": "Exploitation validation", "domain": "exploitation", "granularity": "tactical", "tools": ["sqlmap", "metasploit"], "kb": ["evasion"]},
+        {"desc": "Post-exploitation assessment", "domain": "post_exploit", "granularity": "tactical", "kb": ["lateral_movement", "privesc"]},
+        {"desc": "Report generation", "domain": "reporting", "granularity": "operational", "model": "hermes-4-14b"},
     ],
-    "web_pentest": [
-        {"desc": "Web technology fingerprinting", "role": "recon"},
-        {"desc": "Directory and endpoint enumeration", "role": "web"},
-        {"desc": "Automated vulnerability scanning", "role": "scanner"},
-        {"desc": "Manual testing (auth, logic, injection)", "role": "web"},
-        {"desc": "Exploit validation", "role": "validator"},
+    "passive_recon": [
+        {"desc": "DNS enumeration", "domain": "recon", "granularity": "operational", "tools": ["dig", "host"], "kb": ["dns"]},
+        {"desc": "Subdomain discovery", "domain": "recon", "granularity": "operational", "tools": ["subfinder", "amass"], "kb": ["dns"]},
+        {"desc": "WHOIS lookup", "domain": "recon", "granularity": "atomic", "tools": ["whois"]},
+        {"desc": "Certificate transparency", "domain": "recon", "granularity": "atomic", "tools": ["crt.sh"]},
+        {"desc": "Wayback Machine crawl", "domain": "recon", "granularity": "atomic", "tools": ["waybackurls"]},
+        {"desc": "Technology fingerprinting", "domain": "recon", "granularity": "operational", "tools": ["whatweb", "wappalyzer"]},
+        {"desc": "OSINT gathering", "domain": "recon", "granularity": "operational", "tools": ["theHarvester"], "kb": ["advanced_discovery"]},
+    ],
+    "active_recon": [
+        {"desc": "Host discovery", "domain": "recon", "granularity": "atomic", "tools": ["nmap"]},
+        {"desc": "Full port scan", "domain": "scanning", "granularity": "atomic", "tools": ["masscan", "nmap"]},
+        {"desc": "Service version detection", "domain": "enumeration", "granularity": "atomic", "tools": ["nmap"]},
+        {"desc": "OS fingerprinting", "domain": "enumeration", "granularity": "atomic", "tools": ["nmap"]},
+        {"desc": "Script scanning", "domain": "scanning", "granularity": "atomic", "tools": ["nmap"]},
+    ],
+    "web_vuln_assessment": [
+        {"desc": "Directory enumeration", "domain": "scanning", "granularity": "operational", "tools": ["ffuf", "gobuster"]},
+        {"desc": "Injection testing", "domain": "scanning", "granularity": "tactical", "tools": ["sqlmap", "nuclei"], "kb": ["web_vuln"]},
+        {"desc": "XSS testing", "domain": "scanning", "granularity": "operational", "tools": ["dalfox", "nuclei"], "kb": ["xss"]},
+        {"desc": "Authentication testing", "domain": "scanning", "granularity": "operational", "tools": ["hydra", "nuclei"], "kb": ["business_logic"]},
+        {"desc": "Business logic testing", "domain": "analysis", "granularity": "operational", "model": "whiterabbit", "kb": ["business_logic"]},
+        {"desc": "API testing", "domain": "scanning", "granularity": "operational", "tools": ["nuclei", "ffuf"], "kb": ["api_gateway"]},
+        {"desc": "SSRF testing", "domain": "scanning", "granularity": "operational", "tools": ["nuclei"], "kb": ["ssrf"]},
     ],
     "network_pentest": [
-        {"desc": "Host discovery and port scanning", "role": "recon"},
-        {"desc": "Service enumeration", "role": "network"},
-        {"desc": "Vulnerability assessment", "role": "scanner"},
-        {"desc": "Exploitation", "role": "exploiter"},
-        {"desc": "Privilege escalation", "role": "exploiter"},
-        {"desc": "Lateral movement", "role": "network"},
+        {"desc": "Network mapping", "domain": "recon", "granularity": "operational", "tools": ["nmap", "masscan"]},
+        {"desc": "Service enumeration", "domain": "enumeration", "granularity": "operational", "tools": ["nmap"]},
+        {"desc": "SMB enumeration", "domain": "enumeration", "granularity": "atomic", "tools": ["crackmapexec", "enum4linux"]},
+        {"desc": "LDAP enumeration", "domain": "enumeration", "granularity": "atomic", "tools": ["ldapsearch"], "kb": ["active_directory"]},
+        {"desc": "SNMP enumeration", "domain": "enumeration", "granularity": "atomic", "tools": ["snmpwalk"]},
+        {"desc": "Vulnerability exploitation", "domain": "exploitation", "granularity": "tactical", "tools": ["metasploit"], "kb": ["network"]},
+        {"desc": "Lateral movement", "domain": "post_exploit", "granularity": "tactical", "kb": ["lateral_movement"]},
     ],
-    "code_audit": [
-        {"desc": "Static analysis with tools", "role": "code_auditor"},
-        {"desc": "Dependency vulnerability check", "role": "scanner"},
-        {"desc": "Manual code review (critical paths)", "role": "code_auditor"},
-        {"desc": "Finding validation", "role": "validator"},
-    ],
-    "recon": [
-        {"desc": "Subdomain enumeration", "role": "recon"},
-        {"desc": "Port scanning", "role": "recon"},
-        {"desc": "Technology detection", "role": "recon"},
-        {"desc": "OSINT gathering", "role": "osint"},
-    ],
-    "exploit": [
-        {"desc": "Vulnerability confirmation", "role": "validator"},
-        {"desc": "Payload preparation", "role": "exploiter"},
-        {"desc": "Exploitation attempt", "role": "exploiter"},
-        {"desc": "Post-exploitation", "role": "exploiter"},
-    ],
-}
-
-# Model selection for roles at different depths
-DEPTH_MODEL_PREFERENCE: dict[int, dict[str, str]] = {
-    0: {  # Root level — use best models
-        "coordinator": "DeepSeek-R1",
-        "planner": "Hermes-4-14B",
-        "recon": "Mistral-7B",
-        "scanner": "WhiteRabbitNeo-7B",
-        "web": "WhiteRabbitNeo-7B",
-        "analyst": "DeepSeek-R1",
-        "exploiter": "WhiteRabbitNeo-7B",
-        "validator": "Qwen2.5-Coder-14B",
-        "code_auditor": "Qwen2.5-Coder-14B",
-    },
-    1: {  # Level 1 — use good models
-        "recon": "Phi-3.5-mini",
-        "scanner": "Dolphin-2.9",
-        "web": "Dolphin-2.9",
-        "analyst": "Hermes-4-14B",
-        "exploiter": "Dolphin-2.9",
-        "validator": "Qwen2.5-Coder-7B",
-        "code_auditor": "CodeLlama-13B",
-    },
-    2: {  # Level 2 — use fast models
-        "recon": "Phi-3.5-mini",
-        "scanner": "Phi-3.5-mini",
-        "web": "Qwen2.5-Coder-7B",
-        "analyst": "Mistral-7B",
-        "exploiter": "CodeLlama-7B",
-        "validator": "Phi-3.5-mini",
-        "code_auditor": "CodeLlama-7B",
-    },
 }
 
 
 class RecursiveDecomposer:
-    """Recursively decompose tasks with bounded depth.
+    """Recursively decomposes tasks into sub-tasks."""
 
-    Core of the recursive multi-agent architecture:
-    parent agents spawn children, children may
-    spawn grandchildren, results flow back up.
-    """
-
-    def __init__(
-        self,
-        max_depth: int = 3,
-        max_children: int = 8,
-        total_token_budget: int = 100000,
-    ) -> None:
-        self._tasks: dict[str, TaskNode] = {}
+    def __init__(self, max_depth: int = 4) -> None:
+        self._tasks: dict[str, SubTask] = {}
         self._task_counter = 0
         self._max_depth = max_depth
-        self._max_children = max_children
-        self._total_budget = total_token_budget
-        self._total_tokens_used = 0
-        self._log = logger.bind(component="decomposer")
-
-    def create_root(
-        self,
-        description: str,
-        task_type: str = "full_assessment",
-        strategy: DecompositionStrategy = DecompositionStrategy.SEQUENTIAL,
-    ) -> TaskNode:
-        """Create the root task node."""
-        self._task_counter += 1
-        root = TaskNode(
-            task_id=f"t-{self._task_counter}",
-            depth=0,
-            description=description,
-            role="coordinator",
-            model="DeepSeek-R1",
-            status=TaskStatus.DECOMPOSING,
-            strategy=strategy,
-            token_budget=self._total_budget,
-        )
-        self._tasks[root.task_id] = root
-        return root
+        self._log = logger.bind(component="recursive_decomposer")
 
     def decompose(
         self,
-        parent_id: str,
-        task_type: str = "",
-    ) -> list[TaskNode]:
-        """Decompose a task into sub-tasks."""
-        parent = self._tasks.get(parent_id)
-        if not parent:
-            return []
-
-        # Check depth limit
-        if parent.depth >= self._max_depth:
-            parent.status = TaskStatus.DEPTH_LIMIT
-            return []
-
-        # Get decomposition rules
-        sub_tasks_data = DECOMPOSITION_RULES.get(task_type, [])
-        if not sub_tasks_data:
-            # If no rules, task is a leaf
-            parent.status = TaskStatus.EXECUTING
-            return []
-
-        # Create child tasks
-        children: list[TaskNode] = []
-        child_budget = parent.token_budget // max(1, len(sub_tasks_data))
-        depth_models = DEPTH_MODEL_PREFERENCE.get(
-            parent.depth + 1,
-            DEPTH_MODEL_PREFERENCE.get(2, {}),
+        description: str,
+        domain: TaskDomain = TaskDomain.RECON,
+        target: str = "",
+        depth: int = 0,
+        parent_id: str = "",
+    ) -> SubTask:
+        """Decompose a task recursively."""
+        self._task_counter += 1
+        task = SubTask(
+            task_id=f"subtask-{self._task_counter}",
+            description=description,
+            domain=domain,
+            parent_id=parent_id,
+            depth=depth,
+            max_depth=self._max_depth,
         )
 
-        for data in sub_tasks_data[:self._max_children]:
-            self._task_counter += 1
-            role = data.get("role", "scanner")
-            child = TaskNode(
-                task_id=f"t-{self._task_counter}",
-                parent_id=parent_id,
-                depth=parent.depth + 1,
-                description=data.get("desc", ""),
-                role=role,
-                model=depth_models.get(role, "Mistral-7B"),
-                token_budget=child_budget,
-            )
-            self._tasks[child.task_id] = child
-            parent.children.append(child.task_id)
-            children.append(child)
+        # Determine granularity
+        if depth == 0:
+            task.granularity = TaskGranularity.STRATEGIC
+        elif depth == 1:
+            task.granularity = TaskGranularity.TACTICAL
+        elif depth == 2:
+            task.granularity = TaskGranularity.OPERATIONAL
+        else:
+            task.granularity = TaskGranularity.ATOMIC
 
-        parent.status = TaskStatus.WAITING
-        return children
+        self._tasks[task.task_id] = task
 
-    def start_task(self, task_id: str) -> None:
-        """Mark a task as started."""
-        task = self._tasks.get(task_id)
-        if task:
-            task.status = TaskStatus.EXECUTING
-            task.started_at = time.time()
+        # Try to find matching decomposition rules
+        rule_key = self._match_rule(description, domain)
+        if rule_key and task.can_decompose:
+            rules = DECOMPOSITION_RULES[rule_key]
+            for rule in rules:
+                child = self.decompose(
+                    description=rule["desc"],
+                    domain=TaskDomain(rule.get("domain", "recon")),
+                    target=target,
+                    depth=depth + 1,
+                    parent_id=task.task_id,
+                )
+                child.tools = rule.get("tools", [])
+                child.model_id = rule.get("model", "")
+                child.kb_domains = rule.get("kb", [])
+                task.children.append(child.task_id)
 
-    def complete_task(
-        self,
-        task_id: str,
-        result: str = "",
-        findings: list[dict[str, Any]] | None = None,
-        tokens_used: int = 0,
-    ) -> None:
-        """Mark a task as completed."""
-        task = self._tasks.get(task_id)
-        if not task:
-            return
+        return task
 
-        task.status = TaskStatus.COMPLETED
-        task.result = result
-        task.findings = findings or []
-        task.tokens_used = tokens_used
-        task.completed_at = time.time()
-        self._total_tokens_used += tokens_used
+    def _match_rule(self, description: str, domain: TaskDomain) -> str:
+        """Match a task description to decomposition rules."""
+        desc_lower = description.lower()
+        # Direct keyword matching
+        for rule_key in DECOMPOSITION_RULES:
+            rule_words = rule_key.replace("_", " ").split()
+            if all(word in desc_lower for word in rule_words):
+                return rule_key
 
-        # Check if parent can aggregate
-        if task.parent_id:
-            self._check_parent_ready(task.parent_id)
-
-    def fail_task(self, task_id: str, error: str = "") -> None:
-        """Mark a task as failed."""
-        task = self._tasks.get(task_id)
-        if task:
-            task.status = TaskStatus.FAILED
-            task.error = error
-            task.completed_at = time.time()
-
-            if task.parent_id:
-                self._check_parent_ready(task.parent_id)
-
-    def _check_parent_ready(self, parent_id: str) -> None:
-        """Check if parent's children are all done."""
-        parent = self._tasks.get(parent_id)
-        if not parent:
-            return
-
-        all_done = all(
-            self._tasks.get(cid, TaskNode()).is_terminal
-            for cid in parent.children
-        )
-
-        if all_done:
-            parent.status = TaskStatus.AGGREGATING
-
-    def aggregate(self, task_id: str) -> dict[str, Any]:
-        """Aggregate results from children."""
-        task = self._tasks.get(task_id)
-        if not task:
-            return {}
-
-        all_findings: list[dict[str, Any]] = []
-        all_results: list[str] = []
-        total_tokens = 0
-        child_count = 0
-        success_count = 0
-
-        for child_id in task.children:
-            child = self._tasks.get(child_id)
-            if not child:
-                continue
-
-            child_count += 1
-            if child.status == TaskStatus.COMPLETED:
-                success_count += 1
-                all_findings.extend(child.findings)
-                if child.result:
-                    all_results.append(child.result)
-            total_tokens += child.tokens_used
-
-        task.findings = all_findings
-        task.tokens_used = total_tokens
-        task.result = "\n---\n".join(all_results)
-        task.status = TaskStatus.COMPLETED
-        task.completed_at = time.time()
-
-        return {
-            "findings": len(all_findings),
-            "children": child_count,
-            "succeeded": success_count,
-            "tokens": total_tokens,
+        # Domain-based matching
+        domain_rules = {
+            TaskDomain.RECON: "passive_recon",
+            TaskDomain.SCANNING: "web_vuln_assessment",
+            TaskDomain.EXPLOITATION: "network_pentest",
         }
+        if domain in domain_rules:
+            return domain_rules[domain]
+        return ""
 
-    def get_ready_tasks(self) -> list[TaskNode]:
-        """Get tasks ready for execution."""
-        return [
-            t for t in self._tasks.values()
-            if t.status == TaskStatus.PENDING and t.is_leaf
-        ]
+    def get_execution_plan(self, root_task_id: str) -> list[list[SubTask]]:
+        """Get a layered execution plan from a decomposed task tree."""
+        root = self._tasks.get(root_task_id)
+        if not root:
+            return []
 
-    def get_aggregatable(self) -> list[TaskNode]:
-        """Get tasks ready for aggregation."""
-        return [
-            t for t in self._tasks.values()
-            if t.status == TaskStatus.AGGREGATING
-        ]
+        # Collect all leaf tasks
+        leaves = self._collect_leaves(root_task_id)
+        if not leaves:
+            return [[root]]
 
-    def get_tree_depth(self) -> int:
-        """Get current max depth of the task tree."""
-        if not self._tasks:
-            return 0
-        return max(t.depth for t in self._tasks.values())
+        # Group by depth (deeper = later)
+        depth_groups: dict[int, list[SubTask]] = {}
+        for task in leaves:
+            depth_groups.setdefault(task.depth, []).append(task)
 
-    def is_converged(self) -> bool:
-        """Check if all tasks are terminal."""
-        return all(t.is_terminal for t in self._tasks.values())
+        # Return ordered layers
+        return [depth_groups[d] for d in sorted(depth_groups.keys())]
 
-    def build_decomposition_prompt(self) -> str:
-        """Build decomposition state for LLM."""
-        lines = ["## Task Tree\n"]
-
-        total = len(self._tasks)
-        completed = sum(
-            1 for t in self._tasks.values()
-            if t.status == TaskStatus.COMPLETED
-        )
-        pending = sum(
-            1 for t in self._tasks.values()
-            if t.status == TaskStatus.PENDING
-        )
-        executing = sum(
-            1 for t in self._tasks.values()
-            if t.status == TaskStatus.EXECUTING
-        )
-
-        lines.append(f"Tasks: {total} (done={completed}, pending={pending}, exec={executing})")
-        lines.append(f"Depth: {self.get_tree_depth()}/{self._max_depth}")
-        lines.append(f"Tokens: {self._total_tokens_used}/{self._total_budget}")
-        lines.append(f"Converged: {self.is_converged()}")
-
-        # Show top-level tasks
-        roots = [t for t in self._tasks.values() if not t.parent_id]
-        for root in roots[:1]:
-            lines.append(f"\nRoot: {root.description[:25]}")
-            for child_id in root.children[:5]:
-                child = self._tasks.get(child_id)
-                if child:
-                    status_mark = {
-                        TaskStatus.COMPLETED: "done",
-                        TaskStatus.FAILED: "FAIL",
-                        TaskStatus.EXECUTING: "...",
-                        TaskStatus.PENDING: "wait",
-                    }.get(child.status, child.status.value[:4])
-                    lines.append(
-                        f"  [{status_mark}] {child.description[:25]} "
-                        f"({child.role[:6]})"
-                    )
-
-        return "\n".join(lines)
+    def _collect_leaves(self, task_id: str) -> list[SubTask]:
+        """Collect all leaf tasks from a tree."""
+        task = self._tasks.get(task_id)
+        if not task:
+            return []
+        if task.is_leaf:
+            return [task]
+        leaves = []
+        for child_id in task.children:
+            leaves.extend(self._collect_leaves(child_id))
+        return leaves
 
     def get_stats(self) -> dict[str, Any]:
-        status_counts: dict[str, int] = {}
-        for t in self._tasks.values():
-            status_counts[t.status.value] = (
-                status_counts.get(t.status.value, 0) + 1
-            )
-
-        total_findings = sum(
-            len(t.findings) for t in self._tasks.values()
-        )
-
+        atomic = sum(1 for t in self._tasks.values() if t.is_leaf)
         return {
-            "tasks": len(self._tasks),
-            "depth": self.get_tree_depth(),
-            "tokens_used": self._total_tokens_used,
-            "findings": total_findings,
-            "converged": self.is_converged(),
-            "by_status": status_counts,
+            "total_tasks": len(self._tasks),
+            "atomic_tasks": atomic,
+            "max_depth_used": max((t.depth for t in self._tasks.values()), default=0),
+            "rules": list(DECOMPOSITION_RULES.keys()),
         }
+
+    def build_decomposition_prompt(self, root_task_id: str = "") -> str:
+        """Build LLM prompt showing the decomposition tree."""
+        if not root_task_id or root_task_id not in self._tasks:
+            return f"## Task Decomposer\nAvailable rules: {', '.join(DECOMPOSITION_RULES.keys())}"
+
+        lines = ["## Task Decomposition"]
+        self._build_tree_lines(root_task_id, lines, indent=0)
+        return "\n".join(lines)
+
+    def _build_tree_lines(self, task_id: str, lines: list[str], indent: int) -> None:
+        task = self._tasks.get(task_id)
+        if not task:
+            return
+        prefix = "  " * indent + ("└─ " if indent > 0 else "")
+        tools_str = f" [{', '.join(task.tools)}]" if task.tools else ""
+        model_str = f" model={task.model_id}" if task.model_id else ""
+        lines.append(f"{prefix}{task.description}{tools_str}{model_str}")
+        for child_id in task.children:
+            self._build_tree_lines(child_id, lines, indent + 1)
