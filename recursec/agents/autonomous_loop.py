@@ -1,19 +1,19 @@
-"""Autonomous loop controller — main agent execution loop.
+"""Autonomous loop — the infinite reasoning loop.
 
-Implements:
-1. Observe-Orient-Decide-Act (OODA) loop
-2. Phase-based execution controller
-3. Convergence-aware loop termination
-4. Budget enforcement per iteration
-5. Dynamic strategy selection
-6. Self-reflection between iterations
-7. Graceful degradation on failures
+Drives the agent's 24/7 autonomous operation:
+1. Continuous task generation
+2. Dynamic priority adjustment
+3. Backoff/retry on failures
+4. Convergence detection → stop or expand
+5. Self-initiated exploration
+6. Resource budget management
+7. Multi-phase cycling
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -22,285 +22,364 @@ import structlog
 logger = structlog.get_logger()
 
 
-class LoopPhase(str, Enum):
-    OBSERVE = "observe"       # Gather information
-    ORIENT = "orient"         # Analyze situation
-    DECIDE = "decide"         # Choose action
-    ACT = "act"              # Execute action
-    REFLECT = "reflect"      # Self-evaluate
-
-
 class LoopState(str, Enum):
-    IDLE = "idle"
+    STARTING = "starting"
     RUNNING = "running"
     PAUSED = "paused"
-    CONVERGED = "converged"
-    BUDGET_EXHAUSTED = "budget_exhausted"
-    ERROR = "error"
-    COMPLETED = "completed"
+    BACKOFF = "backoff"
+    EXPANDING = "expanding"  # Found something, go deeper
+    CONVERGING = "converging"  # Diminishing returns
+    COMPLETING = "completing"
+    STOPPED = "stopped"
 
 
-class StopReason(str, Enum):
-    CONVERGENCE = "convergence"
-    BUDGET = "budget"
-    TIME = "time"
-    USER = "user"
+class ActionType(str, Enum):
+    SCAN = "scan"
+    ANALYZE = "analyze"
+    EXPLOIT = "exploit"
+    VALIDATE = "validate"
+    EXPAND = "expand"         # Broaden scope
+    DEEPEN = "deepen"         # Go deeper on existing
+    CORRELATE = "correlate"
+    REFLECT = "reflect"
+    REPORT = "report"
+    IDLE = "idle"
+
+
+class TriggerCondition(str, Enum):
+    NEW_FINDING = "new_finding"
+    PHASE_COMPLETE = "phase_complete"
+    NO_PROGRESS = "no_progress"
+    TIME_ELAPSED = "time_elapsed"
+    TOKEN_LOW = "token_low"
+    HIGH_SEVERITY = "high_severity"
+    COVERAGE_GAP = "coverage_gap"
     ERROR = "error"
-    MAX_ITERATIONS = "max_iterations"
 
 
 @dataclass
 class LoopIteration:
-    """A single iteration of the OODA loop."""
+    """A single loop iteration."""
     iteration_id: int = 0
-    phase: LoopPhase = LoopPhase.OBSERVE
-    strategy_used: str = ""
-    tool_used: str = ""
-    findings_this_iter: int = 0
+    action: ActionType = ActionType.IDLE
+    trigger: TriggerCondition = TriggerCondition.TIME_ELAPSED
+    started_at: float = 0.0
+    completed_at: float = 0.0
+    findings_before: int = 0
+    findings_after: int = 0
     tokens_used: int = 0
-    duration_s: float = 0.0
-    confidence: float = 0.5
-    reflection: str = ""
-    error: str = ""
-    started_at: float = field(default_factory=time.time)
+    success: bool = True
+    note: str = ""
+
+    @property
+    def duration_s(self) -> float:
+        if self.completed_at:
+            return self.completed_at - self.started_at
+        return 0.0
+
+    @property
+    def new_findings(self) -> int:
+        return self.findings_after - self.findings_before
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "iter": self.iteration_id,
-            "phase": self.phase.value,
-            "strategy": self.strategy_used[:15],
-            "findings": self.findings_this_iter,
-            "tokens": self.tokens_used,
+            "action": self.action.value[:8],
+            "trigger": self.trigger.value[:10],
+            "new": self.new_findings,
+            "ok": self.success,
         }
 
 
 @dataclass
 class LoopConfig:
     """Configuration for the autonomous loop."""
-    max_iterations: int = 100
-    token_budget: int = 500000
-    time_budget_s: float = 14400.0    # 4 hours
-    convergence_window: int = 5       # No new findings in N iters
-    min_confidence: float = 0.3
-    reflection_interval: int = 5      # Reflect every N iterations
-    strategy_switch_threshold: int = 3  # Switch after N unproductive iters
+    max_iterations: int = 1000
+    max_duration_s: float = 86400.0  # 24 hours
+    max_tokens: int = 500000
+    backoff_initial_s: float = 5.0
+    backoff_max_s: float = 300.0
+    backoff_multiplier: float = 2.0
+    convergence_window: int = 10
+    convergence_threshold: float = 0.1
+    expansion_trigger: int = 3       # New findings to trigger expansion
+    reflection_interval: int = 20    # Reflect every N iterations
+    idle_timeout_s: float = 30.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "max_iters": self.max_iterations,
-            "token_budget": self.token_budget,
-            "time_budget_s": self.time_budget_s,
-            "convergence_window": self.convergence_window,
+            "max_iter": self.max_iterations,
+            "max_time": f"{self.max_duration_s / 3600:.0f}h",
+            "max_tokens": self.max_tokens,
         }
 
 
-@dataclass
-class LoopStatus:
-    """Current status of the autonomous loop."""
-    state: LoopState = LoopState.IDLE
-    current_iteration: int = 0
-    total_findings: int = 0
-    total_tokens: int = 0
-    started_at: float = 0.0
-    elapsed_s: float = 0.0
-    current_strategy: str = ""
-    consecutive_empty: int = 0    # Iterations with no findings
-    stop_reason: StopReason | None = None
+# Action selection rules based on state
+STATE_ACTIONS: dict[LoopState, list[ActionType]] = {
+    LoopState.STARTING: [ActionType.SCAN],
+    LoopState.RUNNING: [
+        ActionType.SCAN, ActionType.ANALYZE,
+        ActionType.EXPLOIT, ActionType.VALIDATE,
+    ],
+    LoopState.EXPANDING: [
+        ActionType.EXPAND, ActionType.DEEPEN,
+        ActionType.SCAN,
+    ],
+    LoopState.CONVERGING: [
+        ActionType.CORRELATE, ActionType.REFLECT,
+        ActionType.REPORT,
+    ],
+    LoopState.COMPLETING: [
+        ActionType.REPORT, ActionType.VALIDATE,
+    ],
+}
 
-    @property
-    def findings_per_iteration(self) -> float:
-        if self.current_iteration == 0:
-            return 0.0
-        return self.total_findings / self.current_iteration
-
-    @property
-    def tokens_per_finding(self) -> float:
-        if self.total_findings == 0:
-            return float('inf')
-        return self.total_tokens / self.total_findings
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "state": self.state.value,
-            "iteration": self.current_iteration,
-            "findings": self.total_findings,
-            "tokens": self.total_tokens,
-            "elapsed_s": round(self.elapsed_s, 1),
-            "f_per_iter": round(self.findings_per_iteration, 2),
-            "empty_streak": self.consecutive_empty,
-        }
+# Trigger → recommended action
+TRIGGER_ACTION_MAP: dict[TriggerCondition, ActionType] = {
+    TriggerCondition.NEW_FINDING: ActionType.VALIDATE,
+    TriggerCondition.PHASE_COMPLETE: ActionType.ANALYZE,
+    TriggerCondition.NO_PROGRESS: ActionType.EXPAND,
+    TriggerCondition.TIME_ELAPSED: ActionType.SCAN,
+    TriggerCondition.TOKEN_LOW: ActionType.REPORT,
+    TriggerCondition.HIGH_SEVERITY: ActionType.DEEPEN,
+    TriggerCondition.COVERAGE_GAP: ActionType.SCAN,
+    TriggerCondition.ERROR: ActionType.REFLECT,
+}
 
 
-# ── Strategy pool ────────────────────────────────────────────
+class AutonomousLoop:
+    """The autonomous reasoning loop.
 
-STRATEGY_POOL: list[dict[str, Any]] = [
-    {"name": "passive_recon", "phase": "recon", "tools": ["subfinder", "httpx", "dig"]},
-    {"name": "active_recon", "phase": "recon", "tools": ["nmap", "masscan"]},
-    {"name": "web_vuln_scan", "phase": "scanning", "tools": ["nuclei", "nikto"]},
-    {"name": "dir_discovery", "phase": "scanning", "tools": ["ffuf", "gobuster"]},
-    {"name": "sqli_testing", "phase": "exploitation", "tools": ["sqlmap"]},
-    {"name": "ssl_assessment", "phase": "scanning", "tools": ["testssl"]},
-    {"name": "auth_testing", "phase": "exploitation", "tools": ["hydra"]},
-    {"name": "code_audit", "phase": "analysis", "tools": ["semgrep", "bandit"]},
-    {"name": "api_testing", "phase": "exploitation", "tools": ["ffuf", "nuclei"]},
-    {"name": "manual_analysis", "phase": "analysis", "tools": []},
-]
-
-
-class AutonomousLoopController:
-    """Controls the main autonomous execution loop.
-
-    Implements OODA (Observe-Orient-Decide-Act) with
-    convergence detection, budget enforcement,
-    dynamic strategy selection, and self-reflection.
+    Drives continuous, self-directed operation.
+    The agent keeps working until converged,
+    budget exhausted, or explicitly stopped.
     """
 
     def __init__(self, config: LoopConfig | None = None) -> None:
         self._config = config or LoopConfig()
-        self._status = LoopStatus()
+        self._state = LoopState.STARTING
         self._iterations: list[LoopIteration] = []
-        self._strategies_tried: dict[str, int] = {}
-        self._strategy_idx = 0
-        self._log = logger.bind(component="autonomous_loop")
+        self._current_iter = 0
+        self._total_tokens = 0
+        self._total_findings = 0
+        self._started_at = 0.0
+        self._backoff_s = self._config.backoff_initial_s
+        self._consecutive_empty = 0
+        self._log = logger.bind(component="auto_loop")
 
-    def start(self) -> LoopStatus:
-        """Initialize the loop."""
-        self._status.state = LoopState.RUNNING
-        self._status.started_at = time.time()
-        self._status.current_strategy = STRATEGY_POOL[0]["name"]
-        return self._status
+    def start(self) -> None:
+        """Start the autonomous loop."""
+        self._state = LoopState.RUNNING
+        self._started_at = time.time()
 
     def should_continue(self) -> bool:
         """Check if the loop should continue."""
-        if self._status.state != LoopState.RUNNING:
+        if self._state == LoopState.STOPPED:
             return False
 
-        # Max iterations
-        if self._status.current_iteration >= self._config.max_iterations:
-            self._stop(StopReason.MAX_ITERATIONS)
+        if self._current_iter >= self._config.max_iterations:
             return False
 
-        # Token budget
-        if self._status.total_tokens >= self._config.token_budget:
-            self._stop(StopReason.BUDGET)
+        elapsed = time.time() - self._started_at if self._started_at else 0
+        if elapsed >= self._config.max_duration_s:
             return False
 
-        # Time budget
-        elapsed = time.time() - self._status.started_at
-        if elapsed >= self._config.time_budget_s:
-            self._stop(StopReason.TIME)
+        if self._total_tokens >= self._config.max_tokens:
             return False
-
-        # Convergence
-        if self._status.consecutive_empty >= self._config.convergence_window:
-            # Try switching strategy before giving up
-            if not self._switch_strategy():
-                self._stop(StopReason.CONVERGENCE)
-                return False
-            self._status.consecutive_empty = 0
 
         return True
 
+    def detect_trigger(self) -> TriggerCondition:
+        """Detect what triggered this iteration."""
+        # Check recent findings
+        recent = self._iterations[-3:] if len(self._iterations) >= 3 else self._iterations
+        recent_findings = sum(i.new_findings for i in recent)
+
+        if recent_findings > 0:
+            # Found something → validate
+            return TriggerCondition.NEW_FINDING
+
+        # Check convergence
+        if self._is_converging():
+            return TriggerCondition.NO_PROGRESS
+
+        # Check token budget
+        token_pct = self._total_tokens / max(1, self._config.max_tokens)
+        if token_pct > 0.8:
+            return TriggerCondition.TOKEN_LOW
+
+        # Default: time elapsed
+        return TriggerCondition.TIME_ELAPSED
+
+    def select_action(
+        self,
+        trigger: TriggerCondition | None = None,
+    ) -> ActionType:
+        """Select the next action based on state and trigger."""
+        if trigger is None:
+            trigger = self.detect_trigger()
+
+        # Check if we should reflect
+        if (
+            self._current_iter > 0
+            and self._current_iter % self._config.reflection_interval == 0
+        ):
+            return ActionType.REFLECT
+
+        # Trigger-specific action
+        recommended = TRIGGER_ACTION_MAP.get(trigger, ActionType.SCAN)
+
+        # State-allowed actions
+        allowed = STATE_ACTIONS.get(self._state, [ActionType.SCAN])
+
+        if recommended in allowed:
+            return recommended
+
+        # Fallback to first allowed
+        return allowed[0] if allowed else ActionType.SCAN
+
     def begin_iteration(self) -> LoopIteration:
-        """Start a new iteration."""
-        self._status.current_iteration += 1
+        """Start a new loop iteration."""
+        self._current_iter += 1
+        trigger = self.detect_trigger()
+        action = self.select_action(trigger)
+
         iteration = LoopIteration(
-            iteration_id=self._status.current_iteration,
-            strategy_used=self._status.current_strategy,
+            iteration_id=self._current_iter,
+            action=action,
+            trigger=trigger,
+            started_at=time.time(),
+            findings_before=self._total_findings,
         )
+
         return iteration
 
-    def end_iteration(self, iteration: LoopIteration) -> None:
-        """End an iteration and update status."""
-        iteration.duration_s = time.time() - iteration.started_at
+    def end_iteration(
+        self,
+        iteration: LoopIteration,
+        findings_added: int = 0,
+        tokens_used: int = 0,
+        success: bool = True,
+    ) -> None:
+        """Complete a loop iteration."""
+        iteration.completed_at = time.time()
+        iteration.findings_after = self._total_findings + findings_added
+        iteration.tokens_used = tokens_used
+        iteration.success = success
+
+        self._total_findings += findings_added
+        self._total_tokens += tokens_used
         self._iterations.append(iteration)
 
-        self._status.total_findings += iteration.findings_this_iter
-        self._status.total_tokens += iteration.tokens_used
-        self._status.elapsed_s = time.time() - self._status.started_at
+        # Update state based on results
+        self._update_state(iteration)
 
-        if iteration.findings_this_iter > 0:
-            self._status.consecutive_empty = 0
+    def _update_state(self, iteration: LoopIteration) -> None:
+        """Update loop state based on latest iteration."""
+        if not iteration.success:
+            # Backoff on failure
+            self._backoff_s = min(
+                self._backoff_s * self._config.backoff_multiplier,
+                self._config.backoff_max_s,
+            )
+            self._state = LoopState.BACKOFF
+            return
+
+        # Reset backoff on success
+        self._backoff_s = self._config.backoff_initial_s
+
+        if iteration.new_findings >= self._config.expansion_trigger:
+            # Found a lot → expand
+            self._state = LoopState.EXPANDING
+            self._consecutive_empty = 0
+        elif iteration.new_findings > 0:
+            # Found something → keep going
+            self._state = LoopState.RUNNING
+            self._consecutive_empty = 0
         else:
-            self._status.consecutive_empty += 1
+            # Nothing found
+            self._consecutive_empty += 1
 
-        # Track strategy usage
-        strategy = iteration.strategy_used
-        self._strategies_tried[strategy] = self._strategies_tried.get(strategy, 0) + 1
+            if self._is_converging():
+                self._state = LoopState.CONVERGING
 
-        # Check if strategy is exhausted
-        if self._strategies_tried.get(strategy, 0) >= self._config.strategy_switch_threshold:
-            if self._status.consecutive_empty >= 2:
-                self._switch_strategy()
+    def _is_converging(self) -> bool:
+        """Check if the loop is converging (diminishing returns)."""
+        window = self._config.convergence_window
+        if len(self._iterations) < window:
+            return False
 
-    def should_reflect(self) -> bool:
-        """Check if it's time for self-reflection."""
-        return (
-            self._status.current_iteration > 0
-            and self._status.current_iteration % self._config.reflection_interval == 0
-        )
+        recent = self._iterations[-window:]
+        total_new = sum(i.new_findings for i in recent)
 
-    def get_next_strategy(self) -> dict[str, Any]:
-        """Get the current strategy details."""
-        for s in STRATEGY_POOL:
-            if s["name"] == self._status.current_strategy:
-                return s
-        return STRATEGY_POOL[0]
+        rate = total_new / window
+        return rate < self._config.convergence_threshold
+
+    def stop(self) -> None:
+        """Stop the loop."""
+        self._state = LoopState.STOPPED
+
+    def get_elapsed_s(self) -> float:
+        """Get elapsed time."""
+        if self._started_at:
+            return time.time() - self._started_at
+        return 0.0
+
+    def get_progress(self) -> dict[str, Any]:
+        """Get loop progress."""
+        elapsed = self.get_elapsed_s()
+
+        return {
+            "state": self._state.value,
+            "iteration": self._current_iter,
+            "max_iterations": self._config.max_iterations,
+            "findings": self._total_findings,
+            "tokens": self._total_tokens,
+            "elapsed": f"{elapsed / 60:.0f}min",
+            "converging": self._is_converging(),
+        }
 
     def build_loop_prompt(self) -> str:
-        """Build loop status context for LLM."""
-        s = self._status
-        lines = [
-            "## Autonomous Loop Status\n",
-            f"State: {s.state.value}",
-            f"Iteration: {s.current_iteration}/{self._config.max_iterations}",
-            f"Findings: {s.total_findings} ({s.findings_per_iteration:.1f}/iter)",
-            f"Tokens: {s.total_tokens}/{self._config.token_budget}",
-            f"Time: {s.elapsed_s:.0f}s/{self._config.time_budget_s:.0f}s",
-            f"Strategy: {s.current_strategy}",
-            f"Empty streak: {s.consecutive_empty}/{self._config.convergence_window}",
-        ]
+        """Build loop state for LLM."""
+        progress = self.get_progress()
+        lines = ["## Autonomous Loop\n"]
+        lines.append(f"State: {progress['state']}")
+        lines.append(f"Iteration: {progress['iteration']}/{progress['max_iterations']}")
+        lines.append(f"Findings: {progress['findings']}")
+        lines.append(f"Tokens: {progress['tokens']}")
+        lines.append(f"Elapsed: {progress['elapsed']}")
 
-        if self.should_reflect():
-            lines.append("\n** Time to reflect on progress and adjust strategy **")
+        if self._iterations:
+            last = self._iterations[-1]
+            lines.append(f"\nLast action: {last.action.value}")
+            lines.append(f"Last trigger: {last.trigger.value}")
+            lines.append(f"Last new findings: {last.new_findings}")
 
-        if s.consecutive_empty >= 2:
-            lines.append(f"\nWARNING: No new findings for {s.consecutive_empty} iterations")
-            lines.append("Consider switching strategy or deepening current approach")
+        if self._is_converging():
+            lines.append("\nWARNING: Convergence detected")
+            lines.append("Consider: expand scope or complete")
 
         return "\n".join(lines)
 
-    def _switch_strategy(self) -> bool:
-        """Switch to next untried or least-tried strategy."""
-        sorted_strategies = sorted(
-            STRATEGY_POOL,
-            key=lambda s: self._strategies_tried.get(s["name"], 0),
-        )
-
-        for s in sorted_strategies:
-            if s["name"] != self._status.current_strategy:
-                count = self._strategies_tried.get(s["name"], 0)
-                if count < self._config.strategy_switch_threshold:
-                    self._status.current_strategy = s["name"]
-                    self._log.info(
-                        "strategy_switch",
-                        new_strategy=s["name"],
-                        prev_uses=count,
-                    )
-                    return True
-        return False
-
-    def _stop(self, reason: StopReason) -> None:
-        """Stop the loop."""
-        self._status.state = LoopState.COMPLETED
-        self._status.stop_reason = reason
-        self._status.elapsed_s = time.time() - self._status.started_at
-
     def get_stats(self) -> dict[str, Any]:
+        action_counts: dict[str, int] = {}
+        for i in self._iterations:
+            action_counts[i.action.value] = (
+                action_counts.get(i.action.value, 0) + 1
+            )
+
+        trigger_counts: dict[str, int] = {}
+        for i in self._iterations:
+            trigger_counts[i.trigger.value] = (
+                trigger_counts.get(i.trigger.value, 0) + 1
+            )
+
         return {
-            "iterations": self._status.current_iteration,
-            "findings": self._status.total_findings,
-            "tokens": self._status.total_tokens,
-            "strategies_tried": dict(self._strategies_tried),
-            "stop_reason": self._status.stop_reason.value if self._status.stop_reason else None,
+            "state": self._state.value,
+            "iterations": self._current_iter,
+            "findings": self._total_findings,
+            "tokens": self._total_tokens,
+            "elapsed_s": self.get_elapsed_s(),
+            "by_action": action_counts,
+            "by_trigger": trigger_counts,
         }
