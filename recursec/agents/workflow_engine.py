@@ -1,12 +1,13 @@
-"""Workflow engine — state-machine-based assessment execution.
+"""Workflow engine — dependency-aware parallel task execution.
 
-Implements:
-1. Workflow definition (phases, transitions)
-2. Phase execution with pre/post conditions
-3. Adaptive phase ordering
-4. Workflow checkpointing and resume
-5. Cross-phase data flow
-6. Workflow prompt for LLM
+Manages complex multi-step security workflows:
+1. Define workflows as directed acyclic graphs (DAGs)
+2. Automatically parallelize independent steps
+3. Handle dependencies between steps
+4. Conditional branching based on results
+5. Retry failed steps with backoff
+6. Checkpoint/resume for long-running workflows
+7. Dynamic step insertion based on findings
 """
 
 from __future__ import annotations
@@ -21,327 +22,324 @@ import structlog
 logger = structlog.get_logger()
 
 
-class PhaseType(str, Enum):
-    RECON = "recon"
-    ENUMERATION = "enumeration"
-    VULN_SCAN = "vuln_scan"
-    WEB_AUDIT = "web_audit"
-    EXPLOITATION = "exploitation"
-    POST_EXPLOIT = "post_exploit"
-    LATERAL_MOVE = "lateral_move"
-    PRIVESC = "privesc"
-    DATA_COLLECTION = "data_collection"
-    REPORTING = "reporting"
-    VALIDATION = "validation"
-    CLEANUP = "cleanup"
-
-
-class PhaseStatus(str, Enum):
+class StepStatus(str, Enum):
     PENDING = "pending"
+    READY = "ready"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
-    PAUSED = "paused"
+
+
+class StepType(str, Enum):
+    TOOL = "tool"
+    LLM_REASONING = "llm_reasoning"
+    ANALYSIS = "analysis"
+    DECISION = "decision"
+    SPAWN_AGENT = "spawn_agent"
+    CHECKPOINT = "checkpoint"
+    CONDITIONAL = "conditional"
 
 
 @dataclass
-class PhaseResult:
-    """Output from a completed phase."""
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    targets_discovered: list[str] = field(default_factory=list)
-    credentials_found: int = 0
-    vulns_found: int = 0
-    tokens_used: int = 0
-    duration_s: float = 0.0
-    notes: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "findings": len(self.findings),
-            "targets": len(self.targets_discovered),
-            "vulns": self.vulns_found,
-            "tokens": self.tokens_used,
-        }
-
-
-@dataclass
-class WorkflowPhase:
-    """A phase in a workflow."""
-    phase_id: str = ""
-    phase_type: PhaseType = PhaseType.RECON
+class WorkflowStep:
+    """A single step in a workflow."""
+    step_id: str = ""
     name: str = ""
-    status: PhaseStatus = PhaseStatus.PENDING
-    depends_on: list[str] = field(default_factory=list)
-    agent_role: str = ""
-    tools_needed: list[str] = field(default_factory=list)
-    preconditions: list[str] = field(default_factory=list)
-    result: PhaseResult | None = None
+    step_type: StepType = StepType.TOOL
+    tool_name: str = ""
+    tool_args: dict[str, Any] = field(default_factory=dict)
+    dependencies: list[str] = field(default_factory=list)
+    status: StepStatus = StepStatus.PENDING
+    result: dict[str, Any] = field(default_factory=dict)
     started_at: float = 0.0
     completed_at: float = 0.0
+    retries: int = 0
+    max_retries: int = 2
+    timeout_s: float = 300.0
+    condition: str = ""
+    on_success: list[str] = field(default_factory=list)
+    on_failure: list[str] = field(default_factory=list)
+    model_id: str = ""
+    kb_domains: list[str] = field(default_factory=list)
 
     @property
     def duration_s(self) -> float:
-        if self.started_at == 0:
-            return 0.0
-        end = self.completed_at if self.completed_at > 0 else time.time()
-        return end - self.started_at
+        if self.completed_at and self.started_at:
+            return self.completed_at - self.started_at
+        return 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.phase_id[:10],
-            "type": self.phase_type.value[:8],
+            "id": self.step_id[:8],
+            "name": self.name[:15],
+            "type": self.step_type.value[:6],
             "status": self.status.value[:6],
-            "deps": len(self.depends_on),
+            "deps": len(self.dependencies),
         }
 
 
 @dataclass
 class Workflow:
-    """A complete assessment workflow."""
+    """A complete workflow with steps and dependencies."""
     workflow_id: str = ""
     name: str = ""
-    target: str = ""
-    phases: list[WorkflowPhase] = field(default_factory=list)
-    current_phase_idx: int = -1
-    status: PhaseStatus = PhaseStatus.PENDING
+    description: str = ""
+    steps: dict[str, WorkflowStep] = field(default_factory=dict)
+    status: StepStatus = StepStatus.PENDING
     created_at: float = field(default_factory=time.time)
-    checkpoint: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def progress(self) -> float:
-        if not self.phases:
-            return 0.0
-        completed = sum(1 for p in self.phases if p.status == PhaseStatus.COMPLETED)
-        return completed / len(self.phases)
-
-    @property
-    def total_findings(self) -> int:
-        return sum(
-            len(p.result.findings)
-            for p in self.phases
-            if p.result
-        )
+    started_at: float = 0.0
+    completed_at: float = 0.0
+    findings: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        statuses = {}
+        for step in self.steps.values():
+            key = step.status.value
+            statuses[key] = statuses.get(key, 0) + 1
         return {
-            "id": self.workflow_id[:10],
-            "name": self.name[:20],
-            "target": self.target[:15],
-            "progress": f"{self.progress:.0%}",
-            "findings": self.total_findings,
+            "id": self.workflow_id[:8],
+            "name": self.name[:15],
+            "steps": len(self.steps),
+            "statuses": statuses,
+            "findings": len(self.findings),
         }
 
 
-# ── Pre-built workflow templates ──────────────────────────────
-
+# Predefined workflow templates
 WORKFLOW_TEMPLATES: dict[str, list[dict[str, Any]]] = {
-    "full_pentest": [
-        {"type": "recon", "name": "Passive Recon", "role": "osint", "tools": ["subfinder", "amass", "theHarvester"]},
-        {"type": "enumeration", "name": "Active Enumeration", "role": "recon", "tools": ["nmap", "masscan"], "deps": ["phase-1"]},
-        {"type": "vuln_scan", "name": "Vulnerability Scanning", "role": "vuln_scan", "tools": ["nuclei", "nikto", "nessus"], "deps": ["phase-2"]},
-        {"type": "web_audit", "name": "Web Application Audit", "role": "web_audit", "tools": ["burpsuite", "sqlmap", "ffuf"], "deps": ["phase-2"]},
-        {"type": "exploitation", "name": "Exploitation", "role": "exploit", "tools": ["metasploit"], "deps": ["phase-3", "phase-4"]},
-        {"type": "post_exploit", "name": "Post-Exploitation", "role": "exploit", "tools": ["mimikatz", "bloodhound"], "deps": ["phase-5"]},
-        {"type": "lateral_move", "name": "Lateral Movement", "role": "network", "tools": ["crackmapexec"], "deps": ["phase-6"]},
-        {"type": "privesc", "name": "Privilege Escalation", "role": "exploit", "tools": ["linpeas", "winpeas"], "deps": ["phase-5"]},
-        {"type": "validation", "name": "Finding Validation", "role": "validator", "deps": ["phase-5", "phase-7", "phase-8"]},
-        {"type": "reporting", "name": "Report Generation", "role": "reporter", "deps": ["phase-9"]},
+    "web_full_scan": [
+        {"id": "recon_dns", "name": "DNS Recon", "type": "tool", "tool": "dig", "deps": []},
+        {"id": "recon_sub", "name": "Subdomain Enum", "type": "tool", "tool": "subfinder", "deps": []},
+        {"id": "recon_tech", "name": "Tech Fingerprint", "type": "tool", "tool": "whatweb", "deps": []},
+        {"id": "port_scan", "name": "Port Scan", "type": "tool", "tool": "nmap", "deps": ["recon_dns"]},
+        {"id": "web_scan", "name": "Web Vuln Scan", "type": "tool", "tool": "nuclei", "deps": ["recon_tech"]},
+        {"id": "dir_fuzz", "name": "Directory Fuzz", "type": "tool", "tool": "ffuf", "deps": ["recon_tech"]},
+        {"id": "analyze", "name": "Analyze Results", "type": "llm_reasoning", "model": "whiterabbit", "deps": ["port_scan", "web_scan", "dir_fuzz"]},
+        {"id": "deep_scan", "name": "Deep Scan", "type": "conditional", "condition": "findings > 0", "deps": ["analyze"]},
+        {"id": "sqli_test", "name": "SQLi Test", "type": "tool", "tool": "sqlmap", "deps": ["deep_scan"]},
+        {"id": "report", "name": "Generate Report", "type": "llm_reasoning", "model": "hermes-4-14b", "deps": ["sqli_test", "analyze"]},
     ],
-    "web_pentest": [
-        {"type": "recon", "name": "Web Recon", "role": "recon", "tools": ["subfinder", "httpx"]},
-        {"type": "enumeration", "name": "Content Discovery", "role": "web_audit", "tools": ["ffuf", "gobuster"], "deps": ["phase-1"]},
-        {"type": "vuln_scan", "name": "Web Vuln Scan", "role": "vuln_scan", "tools": ["nuclei", "nikto"], "deps": ["phase-1"]},
-        {"type": "web_audit", "name": "Manual Testing", "role": "web_audit", "tools": ["burpsuite", "sqlmap", "xsstrike"], "deps": ["phase-2", "phase-3"]},
-        {"type": "exploitation", "name": "Web Exploitation", "role": "exploit", "deps": ["phase-4"]},
-        {"type": "validation", "name": "Validation", "role": "validator", "deps": ["phase-5"]},
-        {"type": "reporting", "name": "Report", "role": "reporter", "deps": ["phase-6"]},
+    "network_pentest": [
+        {"id": "host_disc", "name": "Host Discovery", "type": "tool", "tool": "nmap", "deps": []},
+        {"id": "port_scan", "name": "Full Port Scan", "type": "tool", "tool": "masscan", "deps": ["host_disc"]},
+        {"id": "svc_enum", "name": "Service Enum", "type": "tool", "tool": "nmap", "deps": ["port_scan"]},
+        {"id": "vuln_scan", "name": "Vuln Scan", "type": "tool", "tool": "nuclei", "deps": ["svc_enum"]},
+        {"id": "smb_enum", "name": "SMB Enum", "type": "tool", "tool": "crackmapexec", "deps": ["svc_enum"]},
+        {"id": "analyze", "name": "Analyze", "type": "llm_reasoning", "model": "whiterabbit", "deps": ["vuln_scan", "smb_enum"]},
+        {"id": "exploit", "name": "Exploit", "type": "spawn_agent", "deps": ["analyze"]},
+        {"id": "report", "name": "Report", "type": "llm_reasoning", "model": "hermes-4-14b", "deps": ["exploit"]},
     ],
-    "internal_pentest": [
-        {"type": "recon", "name": "Network Discovery", "role": "recon", "tools": ["nmap", "arp-scan"]},
-        {"type": "enumeration", "name": "Service Enumeration", "role": "recon", "tools": ["nmap"], "deps": ["phase-1"]},
-        {"type": "vuln_scan", "name": "Vulnerability Assessment", "role": "vuln_scan", "tools": ["nuclei", "nessus"], "deps": ["phase-2"]},
-        {"type": "exploitation", "name": "Initial Access", "role": "exploit", "deps": ["phase-3"]},
-        {"type": "privesc", "name": "Privilege Escalation", "role": "exploit", "tools": ["linpeas", "winpeas"], "deps": ["phase-4"]},
-        {"type": "lateral_move", "name": "Lateral Movement", "role": "network", "tools": ["crackmapexec", "bloodhound"], "deps": ["phase-5"]},
-        {"type": "post_exploit", "name": "Domain Dominance", "role": "exploit", "tools": ["mimikatz"], "deps": ["phase-6"]},
-        {"type": "validation", "name": "Validation", "role": "validator", "deps": ["phase-4", "phase-5", "phase-6", "phase-7"]},
-        {"type": "reporting", "name": "Report", "role": "reporter", "deps": ["phase-8"]},
+    "code_review": [
+        {"id": "clone", "name": "Clone Repo", "type": "tool", "tool": "git", "deps": []},
+        {"id": "secrets", "name": "Secret Scan", "type": "tool", "tool": "gitleaks", "deps": ["clone"]},
+        {"id": "sast", "name": "SAST Scan", "type": "tool", "tool": "semgrep", "deps": ["clone"]},
+        {"id": "deps", "name": "Dep Scan", "type": "tool", "tool": "trivy", "deps": ["clone"]},
+        {"id": "llm_review", "name": "LLM Code Review", "type": "llm_reasoning", "model": "qwen-coder-14b", "deps": ["clone"], "kb": ["advanced_discovery"]},
+        {"id": "analyze", "name": "Correlate", "type": "llm_reasoning", "model": "deepseek-r1", "deps": ["secrets", "sast", "deps", "llm_review"]},
+        {"id": "report", "name": "Report", "type": "llm_reasoning", "model": "hermes-4-14b", "deps": ["analyze"]},
     ],
 }
 
 
 class WorkflowEngine:
-    """State-machine-based assessment workflow execution.
-
-    Manages workflow phases, dependencies, data flow,
-    and checkpointing for security assessments.
-    """
+    """Executes workflows with dependency management."""
 
     def __init__(self) -> None:
         self._workflows: dict[str, Workflow] = {}
         self._workflow_counter = 0
-        self._log = logger.bind(component="workflow")
+        self._log = logger.bind(component="workflow_engine")
 
-    def create_workflow(
+    def create_from_template(
         self,
-        name: str = "",
+        template_name: str,
         target: str = "",
-        template: str = "full_pentest",
-    ) -> Workflow:
-        """Create a workflow from template."""
+        name: str = "",
+    ) -> Workflow | None:
+        """Create a workflow from a template."""
+        template = WORKFLOW_TEMPLATES.get(template_name)
+        if not template:
+            return None
+
         self._workflow_counter += 1
-        wf_id = f"wf-{self._workflow_counter}"
-
-        phases_data = WORKFLOW_TEMPLATES.get(template, [])
-        phases: list[WorkflowPhase] = []
-
-        for i, spec in enumerate(phases_data):
-            phase = WorkflowPhase(
-                phase_id=f"phase-{i + 1}",
-                phase_type=PhaseType(spec["type"]),
-                name=spec.get("name", spec["type"]),
-                agent_role=spec.get("role", ""),
-                tools_needed=spec.get("tools", []),
-                depends_on=spec.get("deps", []),
-            )
-            phases.append(phase)
-
         workflow = Workflow(
-            workflow_id=wf_id,
-            name=name or template,
-            target=target,
-            phases=phases,
+            workflow_id=f"wf-{self._workflow_counter}",
+            name=name or template_name,
+            description=f"Auto-generated from template '{template_name}' for target '{target}'",
         )
 
-        self._workflows[wf_id] = workflow
+        for step_def in template:
+            step = WorkflowStep(
+                step_id=step_def["id"],
+                name=step_def["name"],
+                step_type=StepType(step_def["type"]),
+                tool_name=step_def.get("tool", ""),
+                dependencies=step_def.get("deps", []),
+                tool_args={"target": target} if target else {},
+                model_id=step_def.get("model", ""),
+                kb_domains=step_def.get("kb", []),
+                condition=step_def.get("condition", ""),
+            )
+            workflow.steps[step.step_id] = step
+
+        self._workflows[workflow.workflow_id] = workflow
         return workflow
 
-    def get_ready_phases(self, workflow_id: str) -> list[WorkflowPhase]:
-        """Get phases whose dependencies are met."""
-        wf = self._workflows.get(workflow_id)
-        if not wf:
+    def create_custom(
+        self,
+        name: str,
+        steps: list[dict[str, Any]],
+    ) -> Workflow:
+        """Create a custom workflow."""
+        self._workflow_counter += 1
+        workflow = Workflow(
+            workflow_id=f"wf-{self._workflow_counter}",
+            name=name,
+        )
+        for step_def in steps:
+            step = WorkflowStep(
+                step_id=step_def.get("id", f"step-{len(workflow.steps)}"),
+                name=step_def.get("name", ""),
+                step_type=StepType(step_def.get("type", "tool")),
+                tool_name=step_def.get("tool", ""),
+                dependencies=step_def.get("deps", []),
+                tool_args=step_def.get("args", {}),
+                model_id=step_def.get("model", ""),
+                kb_domains=step_def.get("kb", []),
+            )
+            workflow.steps[step.step_id] = step
+        self._workflows[workflow.workflow_id] = workflow
+        return workflow
+
+    def get_ready_steps(self, workflow_id: str) -> list[WorkflowStep]:
+        """Get steps whose dependencies are all completed."""
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
             return []
 
         ready = []
-        completed_ids = {p.phase_id for p in wf.phases if p.status == PhaseStatus.COMPLETED}
-
-        for phase in wf.phases:
-            if phase.status != PhaseStatus.PENDING:
+        for step in workflow.steps.values():
+            if step.status != StepStatus.PENDING:
                 continue
-            deps_met = all(d in completed_ids for d in phase.depends_on)
+            deps_met = all(
+                workflow.steps.get(dep_id, WorkflowStep()).status == StepStatus.COMPLETED
+                for dep_id in step.dependencies
+            )
             if deps_met:
-                ready.append(phase)
-
+                step.status = StepStatus.READY
+                ready.append(step)
         return ready
 
-    def start_phase(self, workflow_id: str, phase_id: str) -> bool:
-        """Mark a phase as started."""
-        wf = self._workflows.get(workflow_id)
-        if not wf:
-            return False
-
-        for phase in wf.phases:
-            if phase.phase_id == phase_id:
-                phase.status = PhaseStatus.RUNNING
-                phase.started_at = time.time()
-                return True
-        return False
-
-    def complete_phase(
+    def complete_step(
         self,
         workflow_id: str,
-        phase_id: str,
-        result: PhaseResult | None = None,
-        status: PhaseStatus = PhaseStatus.COMPLETED,
-    ) -> list[WorkflowPhase]:
-        """Complete a phase and return newly ready phases."""
-        wf = self._workflows.get(workflow_id)
-        if not wf:
-            return []
+        step_id: str,
+        result: dict[str, Any],
+        findings: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Mark a step as completed."""
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return
+        step = workflow.steps.get(step_id)
+        if not step:
+            return
+        step.status = StepStatus.COMPLETED
+        step.result = result
+        step.completed_at = time.time()
+        if findings:
+            workflow.findings.extend(findings)
 
-        for phase in wf.phases:
-            if phase.phase_id == phase_id:
-                phase.status = status
-                phase.completed_at = time.time()
-                phase.result = result
-                break
-
-        # Check if workflow is complete
+        # Check if workflow is done
         all_done = all(
-            p.status in (PhaseStatus.COMPLETED, PhaseStatus.SKIPPED, PhaseStatus.FAILED)
-            for p in wf.phases
+            s.status in (StepStatus.COMPLETED, StepStatus.SKIPPED)
+            for s in workflow.steps.values()
         )
         if all_done:
-            wf.status = PhaseStatus.COMPLETED
+            workflow.status = StepStatus.COMPLETED
+            workflow.completed_at = time.time()
 
-        return self.get_ready_phases(workflow_id)
+    def fail_step(
+        self,
+        workflow_id: str,
+        step_id: str,
+        error: str,
+    ) -> bool:
+        """Mark a step as failed. Returns True if retryable."""
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return False
+        step = workflow.steps.get(step_id)
+        if not step:
+            return False
+        step.retries += 1
+        if step.retries <= step.max_retries:
+            step.status = StepStatus.PENDING
+            return True
+        step.status = StepStatus.FAILED
+        step.result = {"error": error}
+        return False
 
-    def checkpoint(self, workflow_id: str) -> dict[str, Any]:
-        """Create a checkpoint for resume."""
-        wf = self._workflows.get(workflow_id)
-        if not wf:
-            return {}
+    def add_dynamic_step(
+        self,
+        workflow_id: str,
+        after_step_id: str,
+        new_step: dict[str, Any],
+    ) -> WorkflowStep | None:
+        """Dynamically add a step based on findings."""
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return None
+        step = WorkflowStep(
+            step_id=new_step.get("id", f"dyn-{len(workflow.steps)}"),
+            name=new_step.get("name", "Dynamic step"),
+            step_type=StepType(new_step.get("type", "tool")),
+            tool_name=new_step.get("tool", ""),
+            dependencies=[after_step_id],
+            tool_args=new_step.get("args", {}),
+        )
+        workflow.steps[step.step_id] = step
+        return step
 
+    def get_execution_order(self, workflow_id: str) -> list[list[str]]:
+        """Get topologically sorted execution layers (parallel groups)."""
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return []
+
+        layers: list[list[str]] = []
+        completed: set[str] = set()
+
+        while len(completed) < len(workflow.steps):
+            layer = []
+            for step_id, step in workflow.steps.items():
+                if step_id in completed:
+                    continue
+                if all(dep in completed for dep in step.dependencies):
+                    layer.append(step_id)
+            if not layer:
+                break  # Circular dependency or error
+            layers.append(layer)
+            completed.update(layer)
+        return layers
+
+    def get_stats(self) -> dict[str, Any]:
         return {
-            "workflow_id": wf.workflow_id,
-            "progress": wf.progress,
-            "phases": [
-                {
-                    "id": p.phase_id,
-                    "status": p.status.value,
-                    "findings": len(p.result.findings) if p.result else 0,
-                }
-                for p in wf.phases
-            ],
+            "workflows": len(self._workflows),
+            "templates": list(WORKFLOW_TEMPLATES.keys()),
         }
 
     def build_workflow_prompt(self, workflow_id: str = "") -> str:
-        """Build workflow context for LLM."""
+        """Build LLM prompt with workflow state."""
         if workflow_id and workflow_id in self._workflows:
             wf = self._workflows[workflow_id]
-            return self._format_workflow(wf)
-
-        lines = ["## Workflows\n"]
-        lines.append(f"Total: {len(self._workflows)}")
-        for wf in self._workflows.values():
-            lines.append(f"  {wf.name[:15]} → {wf.progress:.0%}")
+            lines = [f"## Workflow: {wf.name}"]
+            for step in wf.steps.values():
+                dep_str = f" (after {','.join(step.dependencies)})" if step.dependencies else ""
+                lines.append(f"  [{step.status.value}] {step.name}{dep_str}")
+            lines.append(f"Findings so far: {len(wf.findings)}")
+            return "\n".join(lines)
+        lines = ["## Workflow Engine"]
+        lines.append(f"Templates: {', '.join(WORKFLOW_TEMPLATES.keys())}")
+        lines.append(f"Active workflows: {len(self._workflows)}")
         return "\n".join(lines)
-
-    def _format_workflow(self, wf: Workflow) -> str:
-        """Format workflow for LLM."""
-        lines = [f"## Workflow: {wf.name}\n"]
-        lines.append(f"Target: {wf.target}")
-        lines.append(f"Progress: {wf.progress:.0%} | Findings: {wf.total_findings}")
-
-        for phase in wf.phases:
-            icon = {
-                PhaseStatus.COMPLETED: "[done]",
-                PhaseStatus.RUNNING: "[>>>]",
-                PhaseStatus.PENDING: "[   ]",
-                PhaseStatus.FAILED: "[ERR]",
-                PhaseStatus.SKIPPED: "[skip]",
-            }.get(phase.status, "[?]")
-
-            findings = ""
-            if phase.result:
-                findings = f" (f={len(phase.result.findings)})"
-
-            lines.append(f"  {icon} {phase.name}{findings}")
-
-        ready = self.get_ready_phases(wf.workflow_id)
-        if ready:
-            lines.append(f"\nReady: {', '.join(p.name for p in ready)}")
-
-        return "\n".join(lines)
-
-    def get_stats(self) -> dict[str, Any]:
-        total_findings = 0
-        for wf in self._workflows.values():
-            total_findings += wf.total_findings
-
-        return {
-            "workflows": len(self._workflows),
-            "total_findings": total_findings,
-            "templates": list(WORKFLOW_TEMPLATES.keys()),
-        }
