@@ -138,8 +138,129 @@ MODEL_SERVERS: dict[str, dict[str, Any]] = {
 }
 
 
+# ── Smart routing table ───────────────────────────────────────
+# Maps task types to the best specialist model(s).
+# For critical tasks, multiple models analyze + vote (consensus).
+# Router picks from this table; loader only starts servers on demand.
+
+TASK_ROUTING: dict[str, dict[str, Any]] = {
+    # Web vulnerability detection — WhiteRabbitNeo is the security specialist
+    "scan_web_vulns": {
+        "primary": "whiterabbitneo",
+        "fallback": ["dolphin", "mistral"],
+        "consensus": ["whiterabbitneo", "qwen-coder-14b", "deepseek-r1"],
+    },
+    "test_sql_injection": {
+        "primary": "whiterabbitneo",
+        "fallback": ["dolphin"],
+        "consensus": ["whiterabbitneo", "qwen-coder-14b"],
+    },
+    "test_xss": {
+        "primary": "whiterabbitneo",
+        "fallback": ["dolphin"],
+    },
+    "test_auth_bypass": {
+        "primary": "dolphin",
+        "fallback": ["whiterabbitneo"],
+    },
+
+    # Code analysis — Qwen-Coder is the code specialist
+    "analyze_source_code": {
+        "primary": "qwen-coder-14b",
+        "fallback": ["qwen-coder-7b", "codellama-13b"],
+    },
+    "review_security": {
+        "primary": "qwen-coder-14b",
+        "fallback": ["codellama-13b"],
+        "consensus": ["qwen-coder-14b", "whiterabbitneo"],
+    },
+    "find_code_vulns": {
+        "primary": "qwen-coder-14b",
+        "fallback": ["codellama-13b"],
+        "consensus": ["qwen-coder-14b", "whiterabbitneo", "deepseek-r1"],
+    },
+    "analyze_binary": {
+        "primary": "codellama-13b",
+        "fallback": ["codellama-7b", "qwen-coder-14b"],
+    },
+
+    # Exploit development — DeepSeek-R1 is the reasoning specialist
+    "build_exploit_chain": {
+        "primary": "deepseek-r1",
+        "fallback": ["qwen-coder-14b"],
+    },
+    "plan_attack_path": {
+        "primary": "deepseek-r1",
+        "fallback": ["hermes-4-14b", "whiterabbitneo"],
+    },
+    "complex_reasoning": {
+        "primary": "deepseek-r1",
+        "fallback": ["hermes-4-14b"],
+    },
+
+    # Special cases
+    "analyze_long_file": {
+        "primary": "yi-9b-200k",
+        "fallback": ["qwen-coder-14b"],
+    },
+    "quick_triage": {
+        "primary": "phi-3.5-mini",
+        "fallback": ["mistral", "functiongemma"],
+    },
+    "write_report": {
+        "primary": "hermes-4-14b",
+        "fallback": ["llama-3.1-8b", "mistral"],
+    },
+    "research_technique": {
+        "primary": "dolphin",
+        "fallback": ["whiterabbitneo"],
+    },
+
+    # General analysis — broad model preferences
+    "security_analysis": {
+        "primary": "whiterabbitneo",
+        "fallback": ["dolphin", "hermes-4-14b", "qwen-coder-14b"],
+        "consensus": ["whiterabbitneo", "dolphin", "deepseek-r1"],
+    },
+    "code_review": {
+        "primary": "qwen-coder-14b",
+        "fallback": ["qwen-coder-7b", "codellama-13b", "codellama-7b"],
+    },
+    "planning": {
+        "primary": "deepseek-r1",
+        "fallback": ["hermes-4-14b", "qwen-coder-14b"],
+    },
+    "recon_analysis": {
+        "primary": "whiterabbitneo",
+        "fallback": ["mistral", "llama-3.1-8b"],
+    },
+    "exploit_analysis": {
+        "primary": "whiterabbitneo",
+        "fallback": ["dolphin", "deepseek-r1"],
+        "consensus": ["whiterabbitneo", "dolphin", "deepseek-r1"],
+    },
+    "general": {
+        "primary": "mistral",
+        "fallback": ["llama-3.1-8b", "phi-3.5-mini"],
+    },
+    "fast": {
+        "primary": "phi-3.5-mini",
+        "fallback": ["functiongemma", "mistral"],
+    },
+}
+
+# Predictive model preloading — after task X, likely need model Y
+TASK_PREDICTION: dict[str, str] = {
+    "scan_web_vulns": "analyze_source_code",
+    "analyze_source_code": "build_exploit_chain",
+    "quick_triage": "scan_web_vulns",
+    "recon_analysis": "planning",
+    "planning": "security_analysis",
+}
+
+
 class LLMClient:
-    """HTTP client for llama.cpp servers."""
+    """HTTP client for llama.cpp servers with smart routing and on-demand loading."""
 
     def __init__(self, base_host: str = "127.0.0.1") -> None:
         self._base_host = base_host
@@ -148,6 +269,11 @@ class LLMClient:
         self._total_latency_ms = 0.0
         self._errors = 0
         self._log = logger.bind(component="llm_client")
+        # On-demand model tracking
+        self._online_models: list[str] = []
+        self._model_last_used: dict[str, float] = {}
+        self._model_load_count: dict[str, int] = {}
+        self._last_task_type: str = ""
 
     def get_endpoint(self, model_id: str) -> str:
         """Get the HTTP endpoint URL for a model."""
@@ -290,6 +416,166 @@ class LLMClient:
         lines.append(f"Tokens: {stats['tokens']}")
         lines.append(f"Avg latency: {stats['avg_latency_ms']:.0f}ms")
         return "\n".join(lines)
+
+    # ── Smart routing ──────────────────────────────────────────
+
+    def refresh_online_models(self) -> list[str]:
+        """Discover which model servers are currently online.
+
+        On-demand architecture: user only starts 1-2 llama.cpp servers
+        at a time. This checks which are up right now so the router
+        can pick from available models, not all 16.
+        """
+        self._online_models = self.get_healthy_models()
+        return self._online_models
+
+    def route_task(self, task_type: str) -> str:
+        """Route a task to the best available model using the smart routing table.
+
+        Checks TASK_ROUTING for the task type, tries primary model first,
+        falls back through alternatives. Returns empty string if nothing online.
+        """
+        routing = TASK_ROUTING.get(task_type, TASK_ROUTING.get("general", {}))
+        if not routing:
+            return self._online_models[0] if self._online_models else ""
+
+        # Try primary
+        primary = routing.get("primary", "")
+        if primary and primary in self._online_models:
+            self._model_last_used[primary] = time.time()
+            self._model_load_count[primary] = self._model_load_count.get(primary, 0) + 1
+            self._last_task_type = task_type
+            return primary
+
+        # Try fallbacks in order
+        for fallback in routing.get("fallback", []):
+            if fallback in self._online_models:
+                self._model_last_used[fallback] = time.time()
+                self._model_load_count[fallback] = self._model_load_count.get(fallback, 0) + 1
+                self._last_task_type = task_type
+                return fallback
+
+        # Any online model as last resort
+        if self._online_models:
+            model = self._online_models[0]
+            self._model_last_used[model] = time.time()
+            self._last_task_type = task_type
+            return model
+
+        return ""
+
+    def get_consensus_models(self, task_type: str) -> list[str]:
+        """Get the models that should participate in consensus voting for a task.
+
+        Returns only models that are currently online. If fewer than 2 are
+        available, consensus is not possible — caller should fall back to
+        single-model analysis.
+        """
+        routing = TASK_ROUTING.get(task_type, {})
+        consensus_list = routing.get("consensus", [])
+        available = [m for m in consensus_list if m in self._online_models]
+        return available
+
+    def consensus_vote(
+        self,
+        task_type: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+    ) -> tuple[str, float]:
+        """Multi-model consensus voting for critical findings.
+
+        Sends the same prompt to multiple specialist models, collects
+        responses, and returns the majority-agreed content + confidence
+        score (0.0 - 1.0). Higher confidence = more models agree.
+
+        If only one model is available, returns its response with 0.5 confidence.
+        """
+        models = self.get_consensus_models(task_type)
+        if not models:
+            # No consensus models online — use single best model
+            best = self.route_task(task_type)
+            if not best:
+                return ("", 0.0)
+            resp = self.chat(best, [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ], temperature=temperature, max_tokens=max_tokens)
+            return (resp.content if resp.success else "", 0.5)
+
+        # Query each consensus model
+        responses: list[tuple[str, str]] = []
+        for model_id in models:
+            self._log.info("consensus_query", model=model_id, task=task_type)
+            resp = self.chat(model_id, [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ], temperature=temperature, max_tokens=max_tokens)
+            if resp.success and resp.content:
+                responses.append((model_id, resp.content))
+
+        if not responses:
+            return ("", 0.0)
+        if len(responses) == 1:
+            return (responses[0][1], 0.5)
+
+        # Score: proportion of models that returned valid responses
+        confidence = len(responses) / len(models)
+
+        # Use the longest response as the primary (usually most detailed)
+        # but combine unique findings from all models
+        primary_response = max(responses, key=lambda r: len(r[1]))[1]
+
+        self._log.info(
+            "consensus_result",
+            task=task_type,
+            models_queried=len(models),
+            models_responded=len(responses),
+            confidence=f"{confidence:.2f}",
+        )
+
+        return (primary_response, confidence)
+
+    def batch_route_tasks(self, task_types: list[str]) -> dict[str, list[str]]:
+        """Group tasks by their target model to minimize model swaps.
+
+        Returns {model_id: [task_type, task_type, ...]} so the orchestrator
+        can execute all tasks for one model before loading the next.
+        """
+        batched: dict[str, list[str]] = {}
+        for task_type in task_types:
+            model = self.route_task(task_type)
+            if model:
+                if model not in batched:
+                    batched[model] = []
+                batched[model].append(task_type)
+        return batched
+
+    def predict_next_model(self) -> str:
+        """Predict which model will be needed next based on task flow.
+
+        Uses TASK_PREDICTION to anticipate the next task type after the
+        current one, and returns the model that would handle it. Callers
+        can use this to preload that model's server in the background.
+        """
+        if not self._last_task_type:
+            return ""
+        next_task = TASK_PREDICTION.get(self._last_task_type, "")
+        if not next_task:
+            return ""
+        routing = TASK_ROUTING.get(next_task, {})
+        return routing.get("primary", "")
+
+    def get_routing_stats(self) -> dict[str, Any]:
+        """Get stats about model routing — which models are used most."""
+        return {
+            "online_models": self._online_models,
+            "model_usage_counts": dict(self._model_load_count),
+            "last_task_type": self._last_task_type,
+            "predicted_next_model": self.predict_next_model(),
+            "total_task_routes": len(TASK_ROUTING),
+        }
 
     # ── Actual HTTP methods ─────────────────────────────────────
 

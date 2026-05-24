@@ -17,7 +17,7 @@ import time
 
 import structlog
 
-from recursec.agents.llm_client import LLMClient, MODEL_SERVERS
+from recursec.agents.llm_client import LLMClient, MODEL_SERVERS, TASK_ROUTING
 from recursec.agents.runner import Runner, ScanConfig
 from recursec.agents.tool_executor import ToolExecutor
 
@@ -42,6 +42,7 @@ def create_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--tool-timeout", type=int, default=300, help="Per-tool timeout")
     scan_parser.add_argument("--iterations", type=int, default=100, help="Max autonomous iterations")
     scan_parser.add_argument("--no-autonomous", action="store_true", help="Disable autonomous LLM loop")
+    scan_parser.add_argument("--no-consensus", action="store_true", help="Disable multi-model consensus voting")
 
     # models
     subparsers.add_parser("models", help="List configured LLM models")
@@ -68,6 +69,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
         stealth=args.stealth,
         deep_scan=args.deep,
         autonomous=not args.no_autonomous,
+        consensus=not args.no_consensus,
         tool_timeout_s=args.tool_timeout,
         output_dir=args.output,
     )
@@ -90,7 +92,7 @@ def cmd_models(_args: argparse.Namespace) -> None:
 def cmd_health(_args: argparse.Namespace) -> None:
     """Check which LLM servers are running."""
     client = LLMClient()
-    print("\n  LLM Server Health Check")
+    print("\n  LLM Server Health Check (On-Demand Architecture)")
     print(f"  {'─'*60}")
 
     healthy = 0
@@ -107,7 +109,13 @@ def cmd_health(_args: argparse.Namespace) -> None:
 
     print(f"\n  {healthy}/{total} models online")
     if healthy == 0:
-        print("  Start models with: ./scripts/launch_models.sh")
+        print("  Start 1-2 models for on-demand scanning:")
+        print("    ./scripts/launch_models.sh whiterabbitneo")
+        print("    ./scripts/launch_models.sh qwen-coder-14b")
+    elif healthy < 3:
+        print(f"  On-demand mode: {healthy} model(s) loaded, others available on disk")
+    print(f"\n  Smart Routing: {len(TASK_ROUTING)} task types configured")
+    print("  Consensus voting: available when 2+ models online")
     print()
 
 
