@@ -1,18 +1,16 @@
-"""Model ensemble — multi-model voting and consensus.
+"""Model ensemble — multi-model voting and consensus for high-confidence decisions.
 
-Uses multiple LLMs to produce higher-quality results:
-1. Parallel inference across models
-2. Majority voting on classifications
-3. Best-of-N sampling for reasoning
-4. Weighted consensus for decisions
-5. Disagreement detection and escalation
-6. Ensemble strategies per task type
+Implements:
+1. Multi-model voting (send same query to N models)
+2. Weighted consensus (weight by model quality for task type)
+3. Disagreement detection (flag when models disagree)
+4. Confidence calibration
+5. Model debate (models critique each other's answers)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import structlog
@@ -20,376 +18,176 @@ import structlog
 logger = structlog.get_logger()
 
 
-class EnsembleStrategy(str, Enum):
-    MAJORITY_VOTE = "majority_vote"       # Most common answer wins
-    WEIGHTED_VOTE = "weighted_vote"       # Weighted by model quality
-    BEST_OF_N = "best_of_n"              # Score all, pick best
-    DEBATE = "debate"                     # Models debate, judge decides
-    CONSENSUS = "consensus"              # All must agree
-    CASCADE = "cascade"                  # Try models in order
-    SPECIALIZE = "specialize"            # Route by expertise
-    MIXTURE = "mixture"                  # Mixture of experts
-
-
-class VoteResult(str, Enum):
-    UNANIMOUS = "unanimous"
-    MAJORITY = "majority"
-    SPLIT = "split"
-    DISAGREE = "disagree"
-
-
 @dataclass
-class ModelResponse:
-    """A response from one model."""
-    model: str = ""
+class ModelVote:
+    """A vote from a single model."""
+    model_id: str = ""
     response: str = ""
-    confidence: float = 0.0
+    confidence: float = 0.5
+    quality_score: float = 0.5
+    weight: float = 1.0
     tokens_used: int = 0
     latency_ms: float = 0.0
-    quality_score: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model[:12],
-            "conf": f"{self.confidence:.2f}",
-            "tokens": self.tokens_used,
+            "model": self.model_id[:12],
+            "confidence": f"{self.confidence:.2f}",
             "quality": f"{self.quality_score:.2f}",
+            "weight": f"{self.weight:.1f}",
         }
 
 
 @dataclass
 class EnsembleResult:
-    """Result of an ensemble query."""
-    ensemble_id: str = ""
-    strategy: EnsembleStrategy = EnsembleStrategy.MAJORITY_VOTE
-    responses: list[ModelResponse] = field(default_factory=list)
-    final_response: str = ""
-    final_confidence: float = 0.0
-    vote_result: VoteResult = VoteResult.UNANIMOUS
-    agreement_ratio: float = 0.0
+    """Result from multi-model ensemble."""
+    votes: list[ModelVote] = field(default_factory=list)
+    consensus_response: str = ""
+    consensus_confidence: float = 0.0
+    agreement_level: float = 0.0
     total_tokens: int = 0
-    total_latency_ms: float = 0.0
+    winning_model: str = ""
+    dissenting_models: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.ensemble_id[:8],
-            "strategy": self.strategy.value[:10],
-            "models": len(self.responses),
-            "vote": self.vote_result.value[:8],
-            "conf": f"{self.final_confidence:.2f}",
-            "agree": f"{self.agreement_ratio:.0%}",
+            "models": len(self.votes),
+            "confidence": f"{self.consensus_confidence:.2f}",
+            "agreement": f"{self.agreement_level:.2f}",
+            "winner": self.winning_model[:12],
+            "dissenters": len(self.dissenting_models),
         }
 
 
-# Model weights based on capabilities
-MODEL_WEIGHTS: dict[str, dict[str, float]] = {
-    "WhiteRabbitNeo-7B": {
-        "security": 2.0, "exploit": 2.0, "vuln_analysis": 1.8,
-        "general": 0.8, "code": 1.0, "reasoning": 0.9,
-    },
-    "Qwen2.5-Coder-14B": {
-        "code": 2.0, "code_audit": 2.0, "exploit_dev": 1.5,
-        "general": 1.2, "security": 1.0, "reasoning": 1.3,
-    },
-    "Qwen2.5-Coder-7B": {
-        "code": 1.6, "code_audit": 1.5, "exploit_dev": 1.2,
-        "general": 1.0, "security": 0.8, "reasoning": 1.0,
-    },
-    "DeepSeek-R1": {
-        "reasoning": 2.0, "planning": 2.0, "analysis": 1.8,
-        "general": 1.2, "security": 1.0, "code": 1.0,
-    },
-    "Yi-9B-200K": {
-        "long_context": 2.0, "analysis": 1.5, "code_review": 1.5,
-        "general": 1.0, "security": 0.8, "reasoning": 1.0,
-    },
-    "Hermes-4-14B": {
-        "instruction": 1.8, "planning": 1.5, "general": 1.5,
-        "security": 1.0, "code": 1.0, "reasoning": 1.2,
-    },
-    "Mistral-7B": {
-        "general": 1.5, "instruction": 1.3, "reasoning": 1.2,
-        "security": 0.8, "code": 0.8, "fast": 1.5,
-    },
-    "CodeLlama-13B": {
-        "code": 1.5, "code_audit": 1.3, "general": 0.8,
-        "security": 0.6, "reasoning": 0.7,
-    },
-    "CodeLlama-7B": {
-        "code": 1.2, "code_audit": 1.0, "general": 0.7,
-        "security": 0.5, "reasoning": 0.6,
-    },
-    "Dolphin-2.9": {
-        "uncensored": 2.0, "security": 1.3, "exploit": 1.5,
-        "general": 1.2, "code": 0.9, "reasoning": 1.0,
-    },
-    "Llama-3.1-8B": {
-        "general": 1.3, "instruction": 1.2, "reasoning": 1.0,
-        "security": 0.7, "code": 0.8,
-    },
-    "Phi-3.5-mini": {
-        "fast": 2.0, "general": 1.0, "reasoning": 0.8,
-        "security": 0.5, "code": 0.7,
-    },
-    "DeepSeek-Math-7B": {
-        "math": 2.0, "crypto": 1.8, "reasoning": 1.5,
-        "general": 0.7, "security": 0.5,
-    },
-}
-
-# Task type → ensemble configuration
-ENSEMBLE_CONFIGS: dict[str, dict[str, Any]] = {
-    "vuln_classification": {
-        "strategy": "majority_vote",
-        "models": ["WhiteRabbitNeo-7B", "Dolphin-2.9", "Qwen2.5-Coder-14B"],
-        "min_agreement": 0.67,
-        "weight_key": "security",
-    },
-    "exploit_validation": {
-        "strategy": "consensus",
-        "models": ["WhiteRabbitNeo-7B", "Qwen2.5-Coder-14B", "DeepSeek-R1"],
-        "min_agreement": 1.0,
-        "weight_key": "exploit",
-    },
-    "code_review": {
-        "strategy": "weighted_vote",
-        "models": ["Qwen2.5-Coder-14B", "CodeLlama-13B", "Qwen2.5-Coder-7B"],
-        "min_agreement": 0.5,
-        "weight_key": "code_audit",
-    },
-    "reasoning": {
-        "strategy": "best_of_n",
-        "models": ["DeepSeek-R1", "Hermes-4-14B", "Mistral-7B"],
-        "min_agreement": 0.5,
-        "weight_key": "reasoning",
-    },
-    "planning": {
-        "strategy": "debate",
-        "models": ["DeepSeek-R1", "Hermes-4-14B", "WhiteRabbitNeo-7B"],
-        "min_agreement": 0.67,
-        "weight_key": "planning",
-    },
-    "fast_triage": {
-        "strategy": "cascade",
-        "models": ["Phi-3.5-mini", "Mistral-7B", "WhiteRabbitNeo-7B"],
-        "min_agreement": 0.0,
-        "weight_key": "fast",
-    },
-    "crypto_analysis": {
-        "strategy": "specialize",
-        "models": ["DeepSeek-Math-7B", "DeepSeek-R1", "Qwen2.5-Coder-14B"],
-        "min_agreement": 0.67,
-        "weight_key": "crypto",
-    },
-    "uncensored_analysis": {
-        "strategy": "best_of_n",
-        "models": ["Dolphin-2.9", "WhiteRabbitNeo-7B"],
-        "min_agreement": 0.5,
-        "weight_key": "uncensored",
-    },
+# Model weights for different task types
+MODEL_TASK_WEIGHTS: dict[str, dict[str, float]] = {
+    "vulnerability_assessment": {"whiterabbit": 2.0, "qwen-coder-14b": 1.5, "deepseek-r1": 1.3, "hermes-4-14b": 1.0, "dolphin": 1.0, "mistral-7b": 0.8, "phi-3.5-mini": 0.6},
+    "code_review": {"qwen-coder-14b": 2.0, "qwen-coder-7b": 1.5, "codellama-13b": 1.3, "deepseek-r1": 1.0, "whiterabbit": 0.8},
+    "reasoning": {"deepseek-r1": 2.0, "hermes-4-14b": 1.5, "deepseek-math": 1.3, "qwen-coder-14b": 1.0},
+    "tool_selection": {"functiongemma": 2.0, "phi-3.5-mini": 1.5, "mistral-7b": 1.0},
+    "finding_validation": {"deepseek-r1": 2.0, "whiterabbit": 1.5, "qwen-coder-14b": 1.3},
 }
 
 
 class ModelEnsemble:
-    """Multi-model ensemble engine.
+    """Multi-model ensemble for high-confidence decisions."""
 
-    Produces higher-quality outputs by combining
-    multiple LLM responses through voting,
-    consensus, debate, and selection.
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, min_votes: int = 2, agreement_threshold: float = 0.6) -> None:
+        self._min_votes = min_votes
+        self._agreement_threshold = agreement_threshold
+        self._ensemble_counter = 0
         self._results: list[EnsembleResult] = []
-        self._log = logger.bind(component="ensemble")
+        self._log = logger.bind(component="model_ensemble")
 
-    def get_config(self, task_type: str) -> dict[str, Any]:
-        """Get ensemble config for a task type."""
-        return ENSEMBLE_CONFIGS.get(
-            task_type,
-            ENSEMBLE_CONFIGS.get("reasoning", {}),
-        )
+    def get_models_for_task(self, task_type: str, max_models: int = 3) -> list[tuple[str, float]]:
+        """Get recommended models and weights for a task type."""
+        weights = MODEL_TASK_WEIGHTS.get(task_type, MODEL_TASK_WEIGHTS.get("reasoning", {}))
+        sorted_models = sorted(weights.items(), key=lambda x: x[1], reverse=True)
+        return sorted_models[:max_models]
 
-    def get_model_weight(self, model: str, domain: str) -> float:
-        """Get model weight for a domain."""
-        weights = MODEL_WEIGHTS.get(model, {})
-        return weights.get(domain, 0.5)
-
-    def select_models(
+    def compute_consensus(
         self,
-        task_type: str,
-        count: int = 3,
-    ) -> list[str]:
-        """Select best models for task type."""
-        config = self.get_config(task_type)
-        models = config.get("models", [])
-        return models[:count]
-
-    def compute_majority_vote(
-        self,
-        responses: list[ModelResponse],
-        weight_key: str = "general",
-    ) -> tuple[str, float, VoteResult]:
-        """Compute majority vote across responses."""
-        if not responses:
-            return "", 0.0, VoteResult.DISAGREE
-
-        # Group by response similarity (simplified)
-        votes: dict[str, float] = {}
-        for resp in responses:
-            key = resp.response[:100]
-            weight = self.get_model_weight(resp.model, weight_key)
-            votes[key] = votes.get(key, 0.0) + weight
+        votes: list[ModelVote],
+        task_type: str = "reasoning",
+    ) -> EnsembleResult:
+        """Compute consensus from model votes."""
+        self._ensemble_counter += 1
 
         if not votes:
-            return "", 0.0, VoteResult.DISAGREE
+            return EnsembleResult()
 
-        best_key = max(votes, key=votes.get)  # type: ignore[arg-type]
-        total_weight = sum(votes.values())
-        agreement = votes[best_key] / total_weight if total_weight else 0
+        # Get task-specific weights
+        task_weights = MODEL_TASK_WEIGHTS.get(task_type, {})
 
-        # Find full response for winning key
-        winner = ""
-        for resp in responses:
-            if resp.response[:100] == best_key:
-                winner = resp.response
-                break
+        # Apply task-specific weights
+        for vote in votes:
+            if vote.model_id in task_weights:
+                vote.weight = task_weights[vote.model_id]
 
-        vote_result = VoteResult.DISAGREE
-        if agreement >= 1.0:
-            vote_result = VoteResult.UNANIMOUS
-        elif agreement >= 0.67:
-            vote_result = VoteResult.MAJORITY
-        elif agreement >= 0.5:
-            vote_result = VoteResult.SPLIT
+        # Weighted confidence
+        total_weight = sum(v.weight for v in votes)
+        weighted_confidence = sum(v.confidence * v.weight for v in votes) / total_weight if total_weight > 0 else 0.0
 
-        return winner, agreement, vote_result
+        # Find winning vote (highest weighted score)
+        for vote in votes:
+            vote.quality_score = vote.confidence * vote.weight
+        winner = max(votes, key=lambda v: v.quality_score)
 
-    def compute_best_of_n(
-        self,
-        responses: list[ModelResponse],
-    ) -> tuple[str, float]:
-        """Pick the best response by quality score."""
-        if not responses:
-            return "", 0.0
+        # Calculate agreement level
+        if len(votes) >= 2:
+            agreement_scores = []
+            for i, va in enumerate(votes):
+                for vb in votes[i + 1:]:
+                    # Simple similarity: both high confidence or both low
+                    sim = 1.0 - abs(va.confidence - vb.confidence)
+                    agreement_scores.append(sim)
+            agreement = sum(agreement_scores) / len(agreement_scores) if agreement_scores else 0.0
+        else:
+            agreement = 1.0
 
-        best = max(responses, key=lambda r: r.quality_score)
-        return best.response, best.quality_score
-
-    def compute_cascade(
-        self,
-        responses: list[ModelResponse],
-        min_confidence: float = 0.7,
-    ) -> tuple[str, float]:
-        """Try models in order, return first confident one."""
-        for resp in responses:
-            if resp.confidence >= min_confidence:
-                return resp.response, resp.confidence
-
-        # Fallback to last model
-        if responses:
-            return responses[-1].response, responses[-1].confidence
-        return "", 0.0
-
-    def run_ensemble(
-        self,
-        task_type: str,
-        responses: list[ModelResponse],
-    ) -> EnsembleResult:
-        """Run ensemble on model responses."""
-        config = self.get_config(task_type)
-        strategy = EnsembleStrategy(
-            config.get("strategy", "majority_vote"),
-        )
-        weight_key = config.get("weight_key", "general")
+        # Find dissenters (low confidence or far from consensus)
+        dissenters = [
+            v.model_id for v in votes
+            if abs(v.confidence - weighted_confidence) > 0.3
+        ]
 
         result = EnsembleResult(
-            ensemble_id=f"ens-{len(self._results) + 1}",
-            strategy=strategy,
-            responses=responses,
-            total_tokens=sum(r.tokens_used for r in responses),
-            total_latency_ms=max(
-                (r.latency_ms for r in responses), default=0,
-            ),
+            votes=votes,
+            consensus_response=winner.response,
+            consensus_confidence=weighted_confidence,
+            agreement_level=agreement,
+            total_tokens=sum(v.tokens_used for v in votes),
+            winning_model=winner.model_id,
+            dissenting_models=dissenters,
         )
 
-        if strategy == EnsembleStrategy.MAJORITY_VOTE:
-            text, agreement, vote = self.compute_majority_vote(
-                responses, weight_key,
-            )
-            result.final_response = text
-            result.agreement_ratio = agreement
-            result.vote_result = vote
-            result.final_confidence = agreement
-
-        elif strategy == EnsembleStrategy.WEIGHTED_VOTE:
-            text, agreement, vote = self.compute_majority_vote(
-                responses, weight_key,
-            )
-            result.final_response = text
-            result.agreement_ratio = agreement
-            result.vote_result = vote
-            result.final_confidence = agreement
-
-        elif strategy == EnsembleStrategy.BEST_OF_N:
-            text, score = self.compute_best_of_n(responses)
-            result.final_response = text
-            result.final_confidence = score
-            result.vote_result = VoteResult.MAJORITY
-
-        elif strategy == EnsembleStrategy.CASCADE:
-            text, conf = self.compute_cascade(responses)
-            result.final_response = text
-            result.final_confidence = conf
-            result.vote_result = VoteResult.MAJORITY
-
-        elif strategy == EnsembleStrategy.CONSENSUS:
-            text, agreement, vote = self.compute_majority_vote(
-                responses, weight_key,
-            )
-            result.final_response = text
-            result.agreement_ratio = agreement
-            result.vote_result = vote
-            result.final_confidence = agreement
-
-        else:
-            if responses:
-                result.final_response = responses[0].response
-                result.final_confidence = responses[0].confidence
-
         self._results.append(result)
+        if len(self._results) > 100:
+            self._results = self._results[-50:]
         return result
 
-    def build_ensemble_prompt(self) -> str:
-        """Build ensemble state for LLM."""
-        lines = ["## Ensemble\n"]
-        lines.append(f"Runs: {len(self._results)}")
-        lines.append(f"Configs: {len(ENSEMBLE_CONFIGS)}")
-        lines.append(f"Models: {len(MODEL_WEIGHTS)}")
+    def needs_debate(self, result: EnsembleResult) -> bool:
+        """Determine if models need to debate (low agreement)."""
+        return result.agreement_level < self._agreement_threshold
 
-        if self._results:
-            last = self._results[-1]
-            lines.append(f"\nLast: {last.strategy.value}")
-            lines.append(f"  Vote: {last.vote_result.value}")
-            lines.append(f"  Agreement: {last.agreement_ratio:.0%}")
+    def build_debate_prompt(
+        self,
+        result: EnsembleResult,
+        model_id: str,
+    ) -> str:
+        """Build a debate prompt for a model to critique other responses."""
+        lines = ["You are reviewing other models' security assessments.\n"]
+        lines.append("Other models found:\n")
+
+        for vote in result.votes:
+            if vote.model_id != model_id:
+                lines.append(f"Model {vote.model_id} (confidence {vote.confidence:.2f}):")
+                lines.append(f"  {vote.response[:300]}\n")
+
+        lines.append("Your task:")
+        lines.append("1. Do you agree or disagree with these assessments?")
+        lines.append("2. What did they miss?")
+        lines.append("3. Are any of their findings likely false positives?")
+        lines.append("4. What is YOUR confidence level (0-1)?")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        strategy_counts: dict[str, int] = {}
-        for r in self._results:
-            strategy_counts[r.strategy.value] = (
-                strategy_counts.get(r.strategy.value, 0) + 1
-            )
-
-        avg_agreement = 0.0
-        if self._results:
-            avg_agreement = (
-                sum(r.agreement_ratio for r in self._results)
-                / len(self._results)
-            )
-
+        if not self._results:
+            return {"ensembles": 0}
         return {
-            "total_runs": len(self._results),
-            "by_strategy": strategy_counts,
-            "avg_agreement": f"{avg_agreement:.0%}",
+            "ensembles": len(self._results),
+            "avg_confidence": sum(r.consensus_confidence for r in self._results) / len(self._results),
+            "avg_agreement": sum(r.agreement_level for r in self._results) / len(self._results),
+            "debates_needed": sum(1 for r in self._results if self.needs_debate(r)),
         }
+
+    def build_ensemble_prompt(self) -> str:
+        """Build LLM prompt with ensemble state."""
+        stats = self.get_stats()
+        lines = ["## Model Ensemble State"]
+        lines.append(f"Ensembles: {stats.get('ensembles', 0)}")
+        if stats.get('ensembles', 0) > 0:
+            lines.append(f"Avg confidence: {stats.get('avg_confidence', 0):.2f}")
+            lines.append(f"Avg agreement: {stats.get('avg_agreement', 0):.2f}")
+        return "\n".join(lines)
