@@ -1,19 +1,19 @@
-"""Convergence monitor — detects when assessment has explored enough.
+"""Convergence monitor — detects when agent should stop.
 
 Implements:
-1. Diminishing returns detection (new findings rate)
-2. Coverage tracking (attack surface explored %)
-3. Token efficiency monitoring (findings per token)
-4. Time-based convergence thresholds
-5. Agent productivity tracking
-6. Early stopping recommendations
-7. Convergence prompt for LLM decisions
+1. Diminishing returns detection
+2. Finding rate tracking (findings per time unit)
+3. Novelty scoring (are we finding new things?)
+4. Exploration vs exploitation balance
+5. Convergence criteria (configurable thresholds)
+6. Stop recommendations
+7. Convergence prompt for LLM
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -23,277 +23,225 @@ logger = structlog.get_logger()
 
 
 class ConvergenceState(str, Enum):
-    EXPLORING = "exploring"           # Still finding new things
-    DIMINISHING = "diminishing"       # Rate of findings dropping
-    CONVERGING = "converging"         # Near-convergence
-    CONVERGED = "converged"           # Stop — diminishing returns
-    FORCED_STOP = "forced_stop"       # Budget/time exhausted
+    EXPLORING = "exploring"         # Still finding new things
+    CONVERGING = "converging"       # Rate is declining
+    DIMINISHING = "diminishing"     # Very few new findings
+    CONVERGED = "converged"         # Should stop
+    STUCK = "stuck"                 # No progress at all
 
 
 @dataclass
-class ConvergenceWindow:
-    """A time window for measuring convergence."""
-    window_start: float = 0.0
-    window_end: float = 0.0
-    findings_count: int = 0
-    tokens_used: int = 0
-    agents_active: int = 0
-    tools_run: int = 0
+class FindingWindow:
+    """A time window of findings."""
+    start_time: float = 0.0
+    end_time: float = 0.0
+    total_findings: int = 0
+    unique_findings: int = 0
+    duplicate_findings: int = 0
+    novel_findings: int = 0      # Never-seen-before type
+    severity_sum: float = 0.0
 
     @property
     def duration_s(self) -> float:
-        return self.window_end - self.window_start
+        return max(0.001, self.end_time - self.start_time)
 
     @property
     def finding_rate(self) -> float:
-        """Findings per minute."""
-        d = self.duration_s
-        if d <= 0:
-            return 0.0
-        return (self.findings_count / d) * 60.0
+        return self.total_findings / self.duration_s
 
     @property
-    def token_efficiency(self) -> float:
-        """Findings per 1000 tokens."""
-        if self.tokens_used == 0:
+    def novelty_ratio(self) -> float:
+        if self.total_findings == 0:
             return 0.0
-        return (self.findings_count / self.tokens_used) * 1000.0
+        return self.novel_findings / self.total_findings
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "findings": self.findings_count,
-            "rate": round(self.finding_rate, 2),
-            "tokens": self.tokens_used,
-            "efficiency": round(self.token_efficiency, 2),
+            "total": self.total_findings,
+            "unique": self.unique_findings,
+            "rate": round(self.finding_rate, 3),
+            "novelty": round(self.novelty_ratio, 2),
         }
 
 
 @dataclass
-class ConvergenceMetrics:
-    """Overall convergence metrics."""
-    state: ConvergenceState = ConvergenceState.EXPLORING
-    total_findings: int = 0
-    total_tokens: int = 0
-    total_duration_s: float = 0.0
-    unique_targets_tested: int = 0
-    total_targets: int = 0
-    coverage_pct: float = 0.0
-    current_finding_rate: float = 0.0
-    peak_finding_rate: float = 0.0
-    rate_of_change: float = 0.0       # Negative = declining
-    windows: list[ConvergenceWindow] = field(default_factory=list)
-    recommendation: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "state": self.state.value,
-            "findings": self.total_findings,
-            "coverage": f"{self.coverage_pct:.0f}%",
-            "rate": round(self.current_finding_rate, 2),
-            "peak_rate": round(self.peak_finding_rate, 2),
-            "recommendation": self.recommendation[:30],
-        }
+class ConvergenceConfig:
+    """Configuration for convergence detection."""
+    window_size_s: float = 300.0     # 5 minute windows
+    min_windows: int = 3             # Minimum windows before deciding
+    rate_decline_threshold: float = 0.3   # Rate dropped by 70%
+    novelty_threshold: float = 0.1        # Less than 10% novel
+    stuck_threshold_s: float = 600.0      # No findings for 10 minutes
+    max_duration_s: float = 7200.0        # Hard stop at 2 hours
+    max_findings: int = 500               # Hard stop at 500 findings
 
 
 class ConvergenceMonitor:
-    """Monitors assessment convergence.
+    """Monitors assessment progress for convergence.
 
-    Tracks finding rates, coverage, and token
-    efficiency to recommend when an assessment
-    has explored enough of the attack surface.
+    Tracks finding rates, novelty, and progress
+    to determine when the agent should stop or
+    change strategy.
     """
 
-    def __init__(
+    def __init__(self, config: ConvergenceConfig | None = None) -> None:
+        self._config = config or ConvergenceConfig()
+        self._windows: list[FindingWindow] = []
+        self._current_window: FindingWindow | None = None
+        self._seen_types: set[str] = set()
+        self._seen_hashes: set[str] = set()
+        self._total_findings = 0
+        self._start_time = time.time()
+        self._last_finding_time = time.time()
+        self._state = ConvergenceState.EXPLORING
+        self._log = logger.bind(component="convergence")
+
+    def record_finding(
         self,
-        window_size_s: float = 300.0,    # 5-minute windows
-        min_rate_threshold: float = 0.1,  # Minimum findings/min
-        convergence_windows: int = 3,     # Consecutive low-rate windows
-        max_tokens: int = 1000000,
-        max_duration_s: float = 14400.0,  # 4 hours
+        finding_type: str,
+        severity: float = 0.5,
+        finding_hash: str = "",
     ) -> None:
-        self._window_size = window_size_s
-        self._min_rate = min_rate_threshold
-        self._convergence_count = convergence_windows
-        self._max_tokens = max_tokens
-        self._max_duration = max_duration_s
-
-        self._metrics = ConvergenceMetrics()
-        self._windows: list[ConvergenceWindow] = []
-        self._current_window: ConvergenceWindow | None = None
-        self._started_at: float = 0.0
-        self._targets_tested: set[str] = set()
-        self._low_rate_streak: int = 0
-        self._log = logger.bind(component="convergence_monitor")
-
-    def start(self, total_targets: int = 0) -> None:
-        """Start convergence monitoring."""
-        self._started_at = time.time()
-        self._metrics.total_targets = total_targets
-        self._start_new_window()
-
-    def record_finding(self, target: str = "") -> None:
         """Record a new finding."""
-        self._metrics.total_findings += 1
-        if target:
-            self._targets_tested.add(target)
+        now = time.time()
 
-        if self._current_window:
-            self._current_window.findings_count += 1
+        # Create window if needed
+        if self._current_window is None:
+            self._current_window = FindingWindow(start_time=now)
 
-        self._check_window()
+        window = self._current_window
+        window.end_time = now
+        window.total_findings += 1
 
-    def record_tokens(self, tokens: int) -> None:
-        """Record token usage."""
-        self._metrics.total_tokens += tokens
-        if self._current_window:
-            self._current_window.tokens_used += tokens
-        self._check_window()
+        # Check uniqueness
+        is_duplicate = False
+        if finding_hash:
+            if finding_hash in self._seen_hashes:
+                is_duplicate = True
+            self._seen_hashes.add(finding_hash)
 
-    def record_tool_run(self) -> None:
-        """Record a tool execution."""
-        if self._current_window:
-            self._current_window.tools_run += 1
+        if is_duplicate:
+            window.duplicate_findings += 1
+        else:
+            window.unique_findings += 1
 
-    def check_convergence(self) -> ConvergenceMetrics:
-        """Check current convergence state."""
-        self._check_window()
-        self._update_metrics()
-        return self._metrics
+        # Check novelty
+        if finding_type not in self._seen_types:
+            window.novel_findings += 1
+            self._seen_types.add(finding_type)
 
-    def should_stop(self) -> bool:
-        """Whether the assessment should stop."""
-        self._check_window()
-        self._update_metrics()
-        return self._metrics.state in (
-            ConvergenceState.CONVERGED,
-            ConvergenceState.FORCED_STOP,
+        window.severity_sum += severity
+        self._total_findings += 1
+        self._last_finding_time = now
+
+        # Rotate window if needed
+        if now - window.start_time >= self._config.window_size_s:
+            self._windows.append(window)
+            self._current_window = FindingWindow(start_time=now)
+            self._update_state()
+
+    def _update_state(self) -> None:
+        """Update convergence state based on windows."""
+        if len(self._windows) < self._config.min_windows:
+            self._state = ConvergenceState.EXPLORING
+            return
+
+        # Check rate decline
+        recent = self._windows[-1]
+        oldest = self._windows[0]
+
+        if oldest.finding_rate > 0:
+            rate_ratio = recent.finding_rate / oldest.finding_rate
+            if rate_ratio < self._config.rate_decline_threshold:
+                if recent.novelty_ratio < self._config.novelty_threshold:
+                    self._state = ConvergenceState.CONVERGED
+                    return
+                self._state = ConvergenceState.DIMINISHING
+                return
+
+        # Check novelty across recent windows
+        recent_novelty = sum(
+            w.novelty_ratio for w in self._windows[-3:]
+        ) / min(3, len(self._windows))
+
+        if recent_novelty < self._config.novelty_threshold:
+            self._state = ConvergenceState.CONVERGING
+            return
+
+        self._state = ConvergenceState.EXPLORING
+
+    def should_stop(self) -> tuple[bool, str]:
+        """Check if the assessment should stop."""
+        now = time.time()
+        elapsed = now - self._start_time
+
+        # Hard time limit
+        if elapsed > self._config.max_duration_s:
+            return True, "max_duration_exceeded"
+
+        # Hard finding limit
+        if self._total_findings >= self._config.max_findings:
+            return True, "max_findings_reached"
+
+        # Stuck (no findings for a long time)
+        since_last = now - self._last_finding_time
+        if since_last > self._config.stuck_threshold_s:
+            self._state = ConvergenceState.STUCK
+            return True, "stuck_no_progress"
+
+        # Converged
+        if self._state == ConvergenceState.CONVERGED:
+            return True, "converged"
+
+        return False, ""
+
+    def should_change_strategy(self) -> bool:
+        """Check if agent should change approach."""
+        return self._state in (
+            ConvergenceState.DIMINISHING,
+            ConvergenceState.CONVERGING,
         )
 
     def build_convergence_prompt(self) -> str:
         """Build convergence context for LLM."""
-        m = self.check_convergence()
-        lines = ["## Convergence Status\n"]
+        now = time.time()
+        elapsed = now - self._start_time
+        lines = ["## Convergence\n"]
 
         lines.append(
-            f"State: {m.state.value} | "
-            f"Findings: {m.total_findings} | "
-            f"Coverage: {m.coverage_pct:.0f}%"
-        )
-        lines.append(
-            f"Finding rate: {m.current_finding_rate:.1f}/min "
-            f"(peak: {m.peak_finding_rate:.1f}/min)"
-        )
-        lines.append(
-            f"Tokens: {m.total_tokens:,} / {self._max_tokens:,} "
-            f"({m.total_tokens / self._max_tokens:.0%})"
+            f"State: {self._state.value} | "
+            f"Findings: {self._total_findings} | "
+            f"Elapsed: {elapsed:.0f}s"
         )
 
-        elapsed = time.time() - self._started_at if self._started_at else 0
-        lines.append(
-            f"Time: {elapsed:.0f}s / {self._max_duration:.0f}s "
-            f"({elapsed / self._max_duration:.0%})"
-        )
+        lines.append(f"Unique types: {len(self._seen_types)}")
 
-        if m.recommendation:
-            lines.append(f"\nRecommendation: {m.recommendation}")
+        since_last = now - self._last_finding_time
+        lines.append(f"Since last finding: {since_last:.0f}s")
 
-        # Recent window trend
-        if len(self._windows) >= 2:
-            lines.append("\nRecent windows:")
-            for w in self._windows[-3:]:
-                lines.append(
-                    f"  rate={w.finding_rate:.1f}/min "
-                    f"eff={w.token_efficiency:.2f}f/1Kt "
-                    f"tools={w.tools_run}"
-                )
+        # Window trend
+        if self._windows:
+            rates = [w.finding_rate for w in self._windows[-5:]]
+            lines.append(f"Recent rates: {', '.join(f'{r:.3f}' for r in rates)}/s")
+
+            novelties = [w.novelty_ratio for w in self._windows[-5:]]
+            lines.append(f"Novelty trend: {', '.join(f'{n:.0%}' for n in novelties)}")
+
+        should_stop, reason = self.should_stop()
+        if should_stop:
+            lines.append(f"\nRECOMMENDATION: STOP ({reason})")
+        elif self.should_change_strategy():
+            lines.append("\nRECOMMENDATION: Change strategy (diminishing returns)")
 
         return "\n".join(lines)
 
-    def _start_new_window(self) -> None:
-        """Start a new measurement window."""
-        if self._current_window:
-            self._current_window.window_end = time.time()
-            self._windows.append(self._current_window)
-
-        self._current_window = ConvergenceWindow(
-            window_start=time.time(),
-        )
-
-    def _check_window(self) -> None:
-        """Check if current window should be closed."""
-        if not self._current_window:
-            return
-
-        elapsed = time.time() - self._current_window.window_start
-        if elapsed >= self._window_size:
-            self._start_new_window()
-
-    def _update_metrics(self) -> None:
-        """Update convergence metrics."""
-        m = self._metrics
-
-        # Coverage
-        m.unique_targets_tested = len(self._targets_tested)
-        if m.total_targets > 0:
-            m.coverage_pct = (m.unique_targets_tested / m.total_targets) * 100.0
-
-        # Duration
-        if self._started_at:
-            m.total_duration_s = time.time() - self._started_at
-
-        # Current and peak finding rate
-        if self._windows:
-            latest = self._windows[-1]
-            m.current_finding_rate = latest.finding_rate
-            m.peak_finding_rate = max(w.finding_rate for w in self._windows)
-
-            # Rate of change
-            if len(self._windows) >= 2:
-                prev = self._windows[-2]
-                m.rate_of_change = latest.finding_rate - prev.finding_rate
-
-        # Convergence detection
-        self._detect_convergence()
-
-    def _detect_convergence(self) -> None:
-        """Detect convergence state."""
-        m = self._metrics
-
-        # Hard limits
-        if m.total_tokens >= self._max_tokens:
-            m.state = ConvergenceState.FORCED_STOP
-            m.recommendation = "Token budget exhausted. Stop assessment."
-            return
-
-        if m.total_duration_s >= self._max_duration:
-            m.state = ConvergenceState.FORCED_STOP
-            m.recommendation = "Time limit reached. Stop assessment."
-            return
-
-        # Rate-based convergence
-        if self._windows:
-            recent_low = sum(
-                1 for w in self._windows[-self._convergence_count:]
-                if w.finding_rate < self._min_rate
-            )
-
-            if recent_low >= self._convergence_count:
-                m.state = ConvergenceState.CONVERGED
-                m.recommendation = (
-                    f"Finding rate below {self._min_rate}/min for "
-                    f"{self._convergence_count} consecutive windows. "
-                    "Consider stopping or pivoting strategy."
-                )
-            elif recent_low >= 1:
-                m.state = ConvergenceState.DIMINISHING
-                m.recommendation = "Finding rate declining. Consider new strategies."
-            elif m.rate_of_change < -0.5:
-                m.state = ConvergenceState.CONVERGING
-                m.recommendation = "Finding rate decreasing rapidly."
-            else:
-                m.state = ConvergenceState.EXPLORING
-                m.recommendation = "Still discovering. Continue current approach."
-
     def get_stats(self) -> dict[str, Any]:
-        m = self.check_convergence()
-        return m.to_dict()
+        now = time.time()
+        return {
+            "state": self._state.value,
+            "total_findings": self._total_findings,
+            "unique_types": len(self._seen_types),
+            "windows": len(self._windows),
+            "elapsed_s": round(now - self._start_time, 1),
+            "since_last_finding_s": round(now - self._last_finding_time, 1),
+        }

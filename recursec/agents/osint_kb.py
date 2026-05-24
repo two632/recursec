@@ -1,10 +1,10 @@
-"""OSINT knowledge base.
+"""OSINT (Open Source Intelligence) knowledge base.
 
 Deep knowledge about OSINT techniques:
-1. Domain and infrastructure reconnaissance
-2. People and organization research
+1. Subdomain enumeration
+2. Email and personnel OSINT
 3. Social media intelligence
-4. Code and leak analysis
+4. Infrastructure mapping
 5. Dark web intelligence
 """
 
@@ -39,190 +39,199 @@ class OSINTPattern:
 
 OSINT_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "osint-001", "name": "Domain Reconnaissance",
-        "category": "domain", "severity": "medium",
-        "desc": "Domain and infrastructure enumeration.",
+        "id": "osint-001", "name": "Subdomain Enumeration",
+        "category": "subdomain", "severity": "medium",
+        "desc": "Subdomain discovery techniques.",
         "detection": (
-            "DOMAIN RECONNAISSANCE:\n"
-            "DNS ENUMERATION:\n"
-            "  # Subdomain enumeration\n"
-            "  subfinder -d target.com -all -o subs.txt\n"
-            "  amass enum -d target.com -o amass.txt\n"
-            "  assetfinder target.com\n"
-            "  # DNS records\n"
-            "  dig target.com ANY +noall +answer\n"
-            "  dig target.com MX +short\n"
-            "  dig target.com TXT +short\n"
-            "  dig target.com NS +short\n"
-            "  # Zone transfer attempt\n"
-            "  dig axfr target.com @ns1.target.com\n"
-            "WHOIS:\n"
-            "  whois target.com\n"
-            "  # Registrant info, dates, nameservers\n"
-            "  # Reverse WHOIS by email/org\n"
-            "CERTIFICATE TRANSPARENCY:\n"
-            "  # crt.sh query\n"
-            "  curl 'https://crt.sh/?q=%.target.com&output=json' | jq '.[].name_value'\n"
-            "  # Censys certificate search\n"
-            "INFRASTRUCTURE:\n"
-            "  # Shodan\n"
-            "  shodan search hostname:target.com\n"
-            "  # Censys\n"
-            "  censys search target.com\n"
-            "  # IP history\n"
-            "  # SecurityTrails, ViewDNS, PassiveTotal\n"
+            "SUBDOMAIN ENUMERATION:\n"
+            "PASSIVE:\n"
+            "  # Certificate Transparency\n"
+            "  curl https://crt.sh/?q=%.target.com&output=json\n"
+            "  # DNS aggregators\n"
+            "  subfinder -d target.com -all\n"
+            "  amass enum -passive -d target.com\n"
+            "  # SecurityTrails, Censys, Shodan\n"
+            "  # Archive.org (Wayback Machine)\n"
+            "  # Google dorking: site:*.target.com\n"
+            "  # VirusTotal passive DNS\n"
+            "  # DNSDumpster, RapidDNS\n"
+            "ACTIVE:\n"
+            "  # Brute force\n"
+            "  puredns bruteforce wordlist.txt target.com\n"
+            "  # DNS zone transfer\n"
+            "  dig axfr @ns1.target.com target.com\n"
+            "  # Virtual host discovery\n"
+            "  ffuf -w vhosts.txt -u http://TARGET -H 'Host: FUZZ.target.com'\n"
+            "  # DNS recursion\n"
+            "  dnsrecon -d target.com -t brt\n"
+            "VALIDATION:\n"
+            "  # Resolve all found subdomains\n"
+            "  puredns resolve subdomains.txt\n"
+            "  # HTTP probe\n"
+            "  httpx -l subdomains.txt -status-code -title -tech\n"
+            "  # Screenshot\n"
+            "  gowitness file -f live-hosts.txt\n"
             "TOOLS:\n"
-            "  subfinder, amass, assetfinder  # Subdomain enum\n"
-            "  httpx  # HTTP probing\n"
-            "  dnsx  # DNS resolution"
+            "  subfinder, amass, puredns, httpx, gowitness"
         ),
-        "tools": ["subfinder", "amass", "httpx", "dnsx"],
+        "tools": ["subfinder", "amass", "puredns", "httpx"],
     },
     {
-        "id": "osint-002", "name": "People and Organization",
-        "category": "people", "severity": "medium",
-        "desc": "People and organization research techniques.",
+        "id": "osint-002", "name": "Email & Personnel OSINT",
+        "category": "email", "severity": "medium",
+        "desc": "Email and personnel intelligence gathering.",
         "detection": (
-            "PEOPLE AND ORGANIZATION OSINT:\n"
-            "EMAIL ENUMERATION:\n"
-            "  # theHarvester\n"
+            "EMAIL & PERSONNEL OSINT:\n"
+            "EMAIL DISCOVERY:\n"
+            "  # Pattern: first.last@target.com\n"
             "  theHarvester -d target.com -b all\n"
-            "  # Email format discovery\n"
-            "  # Common: first.last@, f.last@, first@\n"
-            "  # Verify with SMTP VRFY or RCPT TO\n"
-            "LINKEDIN:\n"
-            "  - Employee enumeration\n"
-            "  - Technology stack from job postings\n"
-            "  - Organizational structure\n"
-            "  - Key personnel identification\n"
-            "CREDENTIAL LEAKS:\n"
-            "  # Check breach databases\n"
-            "  # Have I Been Pwned API\n"
-            "  # DeHashed, IntelX, LeakCheck\n"
+            "  # Hunter.io (email patterns)\n"
+            "  # LinkedIn employee enumeration\n"
+            "  # Google: @target.com email\n"
+            "  # GitHub commits (author emails)\n"
+            "  # Phonebook.cz\n"
+            "  # Dehashed (breached credentials)\n"
+            "VALIDATION:\n"
+            "  # SMTP verification\n"
+            "  # VRFY command\n"
+            "  # RCPT TO validation\n"
+            "  # MX record check\n"
+            "BREACH DATA:\n"
+            "  # HaveIBeenPwned (HIBP)\n"
+            "  # Dehashed\n"
+            "  # IntelX\n"
+            "  # Snusbase\n"
             "  # Credential stuffing lists\n"
-            "GOOGLE DORKS:\n"
-            "  site:target.com filetype:pdf\n"
-            "  site:target.com inurl:admin\n"
-            "  site:target.com intitle:\"index of\"\n"
-            "  site:target.com ext:sql | ext:db | ext:bak\n"
-            "  site:target.com intext:password\n"
-            "  \"target.com\" filetype:env\n"
-            "GITHUB:\n"
-            "  # Search for secrets in repos\n"
-            "  trufflehog github --org=target-org\n"
-            "  gitleaks detect --source .\n"
-            "  # Search: org:target password OR secret OR api_key"
-        ),
-        "tools": ["theHarvester", "trufflehog", "gitleaks"],
-    },
-    {
-        "id": "osint-003", "name": "Web Application Recon",
-        "category": "webapp", "severity": "medium",
-        "desc": "Web application reconnaissance techniques.",
-        "detection": (
-            "WEB APPLICATION RECON:\n"
-            "TECHNOLOGY FINGERPRINTING:\n"
-            "  # Wappalyzer / WhatWeb\n"
-            "  whatweb target.com\n"
-            "  # Response headers\n"
-            "  curl -sI https://target.com | grep -i 'server\\|x-powered\\|x-aspnet'\n"
-            "  # HTML source analysis\n"
-            "  # JavaScript library detection\n"
-            "DIRECTORY/FILE DISCOVERY:\n"
-            "  ffuf -u https://target.com/FUZZ -w wordlist.txt -mc 200,301,302\n"
-            "  gobuster dir -u https://target.com -w wordlist.txt\n"
-            "  # Interesting files\n"
-            "  /robots.txt, /sitemap.xml, /.git/HEAD\n"
-            "  /.env, /wp-config.php.bak, /web.config\n"
-            "  /api, /swagger.json, /graphql\n"
-            "WAYBACK MACHINE:\n"
-            "  # Historical snapshots\n"
-            "  waybackurls target.com | sort -u\n"
-            "  gau target.com  # GetAllUrls\n"
-            "  # Find old endpoints, removed pages\n"
-            "  # JavaScript file analysis for endpoints\n"
-            "JAVASCRIPT ANALYSIS:\n"
-            "  # Extract URLs from JS files\n"
-            "  # Find API endpoints, secrets\n"
-            "  # LinkFinder, JSParser\n"
-            "  katana -u https://target.com -jc  # JS crawling"
-        ),
-        "tools": ["ffuf", "gobuster", "katana", "whatweb"],
-    },
-    {
-        "id": "osint-004", "name": "Network Infrastructure",
-        "category": "network", "severity": "medium",
-        "desc": "Network infrastructure intelligence.",
-        "detection": (
-            "NETWORK INFRASTRUCTURE OSINT:\n"
-            "ASN/BGP:\n"
-            "  # Find ASN\n"
-            "  whois -h whois.cymru.com \" -v <ip>\"\n"
-            "  # Find IP ranges for ASN\n"
-            "  whois -h whois.radb.net -- '-i origin AS12345'\n"
-            "  # BGP Looking Glass\n"
-            "PORT SCANNING:\n"
-            "  # Fast discovery\n"
-            "  masscan -p0-65535 <target> --rate=10000\n"
-            "  # Service detection\n"
-            "  nmap -sV -sC -p<ports> <target>\n"
-            "  # UDP scan\n"
-            "  nmap -sU --top-ports 100 <target>\n"
-            "CDN/WAF DETECTION:\n"
-            "  # Detect CDN\n"
-            "  # Cloudflare: cf-ray header\n"
-            "  # AWS CloudFront: x-amz-cf-id header\n"
-            "  # Akamai: x-akamai-* headers\n"
-            "  # Bypass: Find origin IP behind CDN\n"
-            "  # Check DNS history, certificate SAN\n"
-            "  # SecurityTrails, Censys for historical IPs\n"
-            "CLOUD ENUMERATION:\n"
-            "  # AWS S3 buckets\n"
-            "  aws s3 ls s3://target-name --no-sign-request\n"
-            "  # Azure blobs\n"
-            "  # target.blob.core.windows.net\n"
-            "  # GCP storage\n"
-            "  # storage.googleapis.com/target-name"
-        ),
-        "tools": ["nmap", "masscan"],
-    },
-    {
-        "id": "osint-005", "name": "Leaked Credentials",
-        "category": "leaks", "severity": "critical",
-        "desc": "Credential and data leak intelligence.",
-        "detection": (
-            "LEAKED CREDENTIALS OSINT:\n"
-            "BREACH DATABASES:\n"
-            "  - Have I Been Pwned (HIBP)\n"
-            "  - DeHashed (paid, comprehensive)\n"
-            "  - IntelX (intelligence search)\n"
-            "  - LeakCheck\n"
-            "  - Snusbase\n"
-            "CODE REPOSITORIES:\n"
-            "  # GitHub/GitLab secret scanning\n"
-            "  trufflehog github --org=target\n"
-            "  gitleaks detect --source .\n"
-            "  # Common secrets:\n"
-            "  - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY\n"
-            "  - GITHUB_TOKEN, npm_token\n"
-            "  - Database connection strings\n"
-            "  - Private keys (RSA, SSH)\n"
-            "  - .env files committed\n"
-            "PASTE SITES:\n"
-            "  - Pastebin, GitHub Gists\n"
-            "  - Ghostbin, 0bin\n"
-            "  - Search: \"target.com\" + \"password\"\n"
-            "DOCKER IMAGES:\n"
-            "  # Secrets in Docker layers\n"
-            "  dive <image>  # Explore layers\n"
-            "  # Check for .env, config files in layers\n"
+            "PERSONNEL:\n"
+            "  # LinkedIn profiles\n"
+            "  # Conference talks/papers\n"
+            "  # Job postings (tech stack reveal)\n"
+            "  # Social media accounts\n"
+            "  # Domain registrant info (WHOIS)\n"
             "TOOLS:\n"
-            "  trufflehog  # Secret scanning\n"
-            "  gitleaks  # Git secret detection\n"
-            "  h8mail  # Email breach hunting\n"
-            "  porch-pirate  # Postman workspace leaks"
+            "  theHarvester, holehe, h8mail, emailfinder"
         ),
-        "tools": ["trufflehog", "gitleaks", "h8mail"],
+        "tools": ["theharvester", "holehe"],
+    },
+    {
+        "id": "osint-003", "name": "Social Media Intelligence",
+        "category": "socmint", "severity": "low",
+        "desc": "Social media intelligence techniques.",
+        "detection": (
+            "SOCIAL MEDIA INTELLIGENCE:\n"
+            "USERNAME:\n"
+            "  # Cross-platform username search\n"
+            "  sherlock username\n"
+            "  # Maigret (advanced)\n"
+            "  maigret username --all-sites\n"
+            "  # WhatsMyName\n"
+            "PLATFORMS:\n"
+            "  TWITTER/X:\n"
+            "    - Advanced search operators\n"
+            "    - Geolocation from tweets\n"
+            "    - Follower/following analysis\n"
+            "    - Deleted tweets (archive.org)\n"
+            "  LINKEDIN:\n"
+            "    - Employee enumeration\n"
+            "    - Technology stack from jobs\n"
+            "    - Org chart reconstruction\n"
+            "    - Group memberships\n"
+            "  GITHUB:\n"
+            "    - Repository secrets scanning\n"
+            "    - Commit author emails\n"
+            "    - History search (trufflehog)\n"
+            "    - Internal tool names\n"
+            "    - Infrastructure hints\n"
+            "  REDDIT/FORUMS:\n"
+            "    - Employee discussions\n"
+            "    - Technical details\n"
+            "    - Frustration posts (security gaps)\n"
+            "METADATA:\n"
+            "  - EXIF data from images\n"
+            "  - Document metadata (author, software)\n"
+            "  - PDF properties\n"
+            "  exiftool image.jpg\n"
+            "TOOLS:\n"
+            "  sherlock, maigret, trufflehog, exiftool"
+        ),
+        "tools": ["sherlock", "maigret", "trufflehog"],
+    },
+    {
+        "id": "osint-004", "name": "Infrastructure Mapping",
+        "category": "infra", "severity": "medium",
+        "desc": "Infrastructure and network OSINT.",
+        "detection": (
+            "INFRASTRUCTURE MAPPING:\n"
+            "IP/ASN:\n"
+            "  # ASN lookup\n"
+            "  whois -h whois.radb.net -- '-i origin AS12345'\n"
+            "  # BGP prefixes\n"
+            "  # IP range discovery\n"
+            "  # Hurricane Electric BGP toolkit\n"
+            "  # ARIN, RIPE, APNIC databases\n"
+            "NETWORK:\n"
+            "  # Shodan\n"
+            "  shodan search 'org:\"Target Inc\"'\n"
+            "  # Censys\n"
+            "  censys search 'services.tls.certificates.leaf.subject.organization:\"Target\"'\n"
+            "  # ZoomEye (Chinese Shodan)\n"
+            "  # FOFA (Chinese)\n"
+            "  # BinaryEdge\n"
+            "TECH STACK:\n"
+            "  # Wappalyzer/Whatweb\n"
+            "  whatweb https://target.com\n"
+            "  # BuiltWith\n"
+            "  # HTTP headers analysis\n"
+            "  # JavaScript framework detection\n"
+            "  # Cloud provider detection\n"
+            "DNS:\n"
+            "  # MX records → email provider\n"
+            "  # SPF/DMARC → email infrastructure\n"
+            "  # NS records → DNS hosting\n"
+            "  # TXT records (verification tokens)\n"
+            "  # Historical DNS (SecurityTrails)\n"
+            "TOOLS:\n"
+            "  shodan, censys, whois, whatweb, dnsrecon"
+        ),
+        "tools": ["shodan", "whois", "whatweb"],
+    },
+    {
+        "id": "osint-005", "name": "Dark Web Intelligence",
+        "category": "darkweb", "severity": "high",
+        "desc": "Dark web intelligence gathering.",
+        "detection": (
+            "DARK WEB INTELLIGENCE:\n"
+            "SOURCES:\n"
+            "  - Tor hidden services (.onion)\n"
+            "  - I2P eepsites\n"
+            "  - Paste sites (Pastebin, Ghostbin)\n"
+            "  - Dark web forums\n"
+            "  - Ransomware leak sites\n"
+            "  - Criminal marketplaces\n"
+            "MONITORING:\n"
+            "  # Credential leaks\n"
+            "  # Data breach dumps\n"
+            "  # Ransomware victim announcements\n"
+            "  # Zero-day sales\n"
+            "  # Exploit marketplace\n"
+            "  # Initial access broker listings\n"
+            "ACCESS:\n"
+            "  # Tor Browser\n"
+            "  # OnionScan (discover hidden services)\n"
+            "  # Dark web search engines:\n"
+            "    Ahmia, Torch, DarkSearch\n"
+            "  # Automated monitoring:\n"
+            "    SpiderFoot, IntelX, DarkOwl\n"
+            "OPSEC:\n"
+            "  - Use dedicated browser (Tor)\n"
+            "  - VPN + Tor (debate on ordering)\n"
+            "  - Separate identity\n"
+            "  - Clean VM\n"
+            "  - No personal accounts\n"
+            "TOOLS:\n"
+            "  Tor, OnionScan, SpiderFoot, IntelX"
+        ),
+        "tools": ["tor", "spiderfoot"],
     },
 ]
 
@@ -230,8 +239,7 @@ OSINT_PATTERNS: list[dict[str, Any]] = [
 class OSINTKB:
     """OSINT knowledge base.
 
-    Provides OSINT techniques and patterns
-    injected into agent prompts.
+    Provides OSINT patterns injected into agent prompts.
     """
 
     def __init__(self) -> None:
@@ -266,7 +274,7 @@ class OSINTKB:
         max_patterns: int = 4,
     ) -> str:
         """Build OSINT prompt."""
-        lines = ["## OSINT Techniques\n"]
+        lines = ["## OSINT Intelligence\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
