@@ -1,11 +1,11 @@
-"""Business logic vulnerability knowledge base.
+"""Business logic attacks knowledge base.
 
 Deep knowledge about business logic flaws:
-1. Payment and financial logic flaws
-2. Access control bypass patterns
-3. Rate limiting and abuse prevention
-4. Workflow manipulation attacks
-5. Data validation bypass techniques
+1. Authentication and authorization logic
+2. Payment and transaction logic
+3. Rate limiting and abuse
+4. Workflow manipulation
+5. Race conditions and TOCTOU
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ logger = structlog.get_logger()
 
 
 @dataclass
-class BusinessLogicPattern:
-    """A business logic vulnerability pattern."""
+class BizLogicPattern:
+    """A business logic attack pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
@@ -37,196 +37,228 @@ class BusinessLogicPattern:
         }
 
 
-BUSINESS_LOGIC_PATTERNS: list[dict[str, Any]] = [
+BIZLOGIC_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "biz-001", "name": "Payment Logic Flaws",
-        "category": "payment", "severity": "critical",
-        "desc": "Payment and financial logic manipulation.",
+        "id": "bl-001", "name": "Auth/Authz Logic Flaws",
+        "category": "auth_logic", "severity": "critical",
+        "desc": "Authentication and authorization logic flaws.",
         "detection": (
-            "PAYMENT LOGIC FLAWS:\n"
-            "PRICE MANIPULATION:\n"
-            "  - Modify price in request body\n"
-            "  - Change currency code (USD → INR conversion abuse)\n"
-            "  - Negative quantity (refund without return)\n"
-            "  - Zero-price items through coupon stacking\n"
-            "  - Integer overflow on price calculation\n"
-            "COUPON/DISCOUNT ABUSE:\n"
-            "  - Apply same coupon multiple times\n"
-            "  - Race condition: apply coupon concurrently\n"
-            "  - Transfer coupon between accounts\n"
-            "  - Expired coupon replay\n"
-            "  - Coupon code brute force (predictable format)\n"
-            "PAYMENT FLOW:\n"
-            "  - Skip payment step (jump to confirmation)\n"
-            "  - Modify payment callback response\n"
-            "  - Double charge prevention bypass\n"
-            "  - Partial payment acceptance\n"
-            "  - Gift card balance transfer exploit\n"
-            "TESTING:\n"
-            "  1. Intercept checkout request\n"
-            "  2. Modify price, quantity, discount fields\n"
-            "  3. Test negative values\n"
-            "  4. Test boundary values (0, MAX_INT)\n"
-            "  5. Test currency conversion edge cases\n"
-            "  6. Test concurrent coupon application"
+            "AUTH/AUTHZ LOGIC:\n"
+            "IDOR (Insecure Direct Object Reference):\n"
+            "  - Change user_id in requests\n"
+            "  - Sequential/predictable IDs\n"
+            "  - UUID not always safe (leaked in URLs)\n"
+            "  - Bulk IDOR (iterate all objects)\n"
+            "  TEST:\n"
+            "    # Create 2 accounts\n"
+            "    # Access account A's resources as B\n"
+            "    # Try: /api/users/123/data as user 456\n"
+            "PRIVILEGE ESCALATION:\n"
+            "  - Horizontal: access other users' data\n"
+            "  - Vertical: user → admin\n"
+            "  - Role parameter manipulation\n"
+            "  - Hidden admin endpoints\n"
+            "  - isAdmin=true in request\n"
+            "  - Role in JWT claims modification\n"
+            "FORCED BROWSING:\n"
+            "  - /admin, /debug, /internal\n"
+            "  - Backup files (.bak, .old)\n"
+            "  - API version endpoints\n"
+            "  - Swagger/OpenAPI exposure\n"
+            "REGISTRATION ABUSE:\n"
+            "  - Register with admin email\n"
+            "  - Unicode normalization bypass\n"
+            "  - Case sensitivity issues\n"
+            "  - Duplicate registration\n"
+            "  - Email verification bypass\n"
+            "TOOLS:\n"
+            "  Burp Suite, Autorize extension, ffuf"
         ),
         "tools": ["burpsuite"],
     },
     {
-        "id": "biz-002", "name": "Access Control Bypass",
-        "category": "access", "severity": "critical",
-        "desc": "Business logic access control bypass patterns.",
+        "id": "bl-002", "name": "Payment and Transaction Logic",
+        "category": "payment", "severity": "critical",
+        "desc": "Payment and transaction logic flaws.",
         "detection": (
-            "ACCESS CONTROL BYPASS:\n"
-            "IDOR (Insecure Direct Object Reference):\n"
-            "  - Increment/decrement resource IDs\n"
-            "  - Replace UUID with another user's UUID\n"
-            "  - Access /api/users/123 → /api/users/124\n"
-            "  - Check all API endpoints for IDOR\n"
-            "  - Test with low-privilege vs high-privilege tokens\n"
-            "HORIZONTAL ESCALATION:\n"
-            "  - Access other users' data with same role\n"
-            "  - Modify other users' settings\n"
-            "  - View other users' orders/transactions\n"
-            "  - Change delivery address after payment\n"
-            "VERTICAL ESCALATION:\n"
-            "  - Add admin role in registration request\n"
-            "  - Modify role field in profile update\n"
-            "  - Access admin endpoints with user token\n"
-            "  - Change isAdmin flag in JWT claims\n"
-            "  - Parameter pollution: role=user&role=admin\n"
-            "FORCED BROWSING:\n"
-            "  - /admin, /administrator, /console\n"
-            "  - /api/admin/users\n"
-            "  - /debug, /status, /health\n"
-            "  - Directory traversal: /../../admin\n"
+            "PAYMENT/TRANSACTION LOGIC:\n"
+            "PRICE MANIPULATION:\n"
+            "  - Modify price in request\n"
+            "  - Negative quantity → refund\n"
+            "  - Negative price → credit\n"
+            "  - Currency conversion abuse\n"
+            "  - Discount code stacking\n"
+            "  - Coupon reuse\n"
+            "  - Integer overflow → free items\n"
+            "CHECKOUT FLOW:\n"
+            "  - Skip payment step\n"
+            "  - Modify cart after payment calc\n"
+            "  - Race condition on checkout\n"
+            "  - Partial payment + order complete\n"
+            "  - Gift card generation\n"
+            "  - Promo code brute force\n"
+            "REFUND ABUSE:\n"
+            "  - Duplicate refund requests\n"
+            "  - Refund without return\n"
+            "  - Partial refund manipulation\n"
+            "  - Refund to different payment method\n"
+            "SUBSCRIPTION:\n"
+            "  - Trial abuse (multiple accounts)\n"
+            "  - Plan downgrade keeps features\n"
+            "  - Cancel timing exploit\n"
+            "  - Grace period abuse\n"
             "TESTING:\n"
-            "  1. Map all endpoints and roles\n"
-            "  2. Test each endpoint with each role\n"
-            "  3. Test object-level access with different users\n"
-            "  4. Test function-level access across roles"
+            "  - Intercept all payment requests\n"
+            "  - Modify amounts, quantities, IDs\n"
+            "  - Test boundary values (0, -1, MAX)\n"
+            "  - Race condition testing\n"
+            "TOOLS:\n"
+            "  Burp Suite, custom scripts"
         ),
-        "tools": ["burpsuite", "autorize"],
+        "tools": [],
     },
     {
-        "id": "biz-003", "name": "Rate Limiting Bypass",
-        "category": "ratelimit", "severity": "medium",
-        "desc": "Rate limiting and abuse prevention bypass.",
+        "id": "bl-003", "name": "Rate Limiting and Abuse",
+        "category": "rate_limit", "severity": "high",
+        "desc": "Rate limiting bypass and abuse.",
         "detection": (
             "RATE LIMITING BYPASS:\n"
-            "IP-BASED BYPASS:\n"
-            "  - X-Forwarded-For: 127.0.0.1\n"
-            "  - X-Real-IP: <spoofed>\n"
-            "  - X-Originating-IP: 127.0.0.1\n"
-            "  - X-Client-IP: <spoofed>\n"
-            "  - True-Client-IP: <spoofed>\n"
-            "  - Via: 1.1 <spoofed>\n"
-            "REQUEST MANIPULATION:\n"
-            "  - Add null bytes: user%00name\n"
-            "  - URL encoding variations\n"
-            "  - Case change: /Login vs /login\n"
-            "  - Add parameters: /login?x=1 vs /login?x=2\n"
-            "  - HTTP method change: POST → PUT\n"
-            "  - Change Content-Type header\n"
-            "CAPTCHA BYPASS:\n"
-            "  - OCR-based solving (tesseract)\n"
-            "  - Audio CAPTCHA + speech-to-text\n"
-            "  - Cookie replay after solving once\n"
-            "  - Check if CAPTCHA is validated server-side\n"
-            "  - Remove CAPTCHA parameter from request\n"
-            "TIMING:\n"
-            "  - Distribute requests over time\n"
-            "  - Use multiple sessions\n"
-            "  - Reset rate limit via password reset flow\n"
-            "  - Account lockout bypass via concurrent requests"
+            "TECHNIQUES:\n"
+            "  - IP rotation (proxy lists)\n"
+            "  - X-Forwarded-For manipulation\n"
+            "  - X-Real-IP header injection\n"
+            "  - Case variation in endpoints\n"
+            "  - Path parameter variation\n"
+            "    /api/v1/login vs /API/V1/LOGIN\n"
+            "    /api/v1/login/ vs /api/v1/login\n"
+            "  - HTTP method change (GET↔POST)\n"
+            "  - API version switching\n"
+            "  - Blank/null byte insertion\n"
+            "  - Unicode normalization tricks\n"
+            "RESOURCE ABUSE:\n"
+            "  - Email bombing (password reset spam)\n"
+            "  - SMS OTP cost attack\n"
+            "  - API resource exhaustion\n"
+            "  - File upload storage abuse\n"
+            "  - Database query abuse (search DoS)\n"
+            "AUTOMATION ABUSE:\n"
+            "  - Scraping\n"
+            "  - Account creation bots\n"
+            "  - Ticket/inventory hoarding\n"
+            "  - Review/rating manipulation\n"
+            "  - Referral program abuse\n"
+            "TESTING:\n"
+            "  - Send rapid requests\n"
+            "  - Check response codes (429?)\n"
+            "  - Check Retry-After header\n"
+            "  - Test bypass techniques\n"
+            "TOOLS:\n"
+            "  Burp Intruder, custom scripts, Turbo Intruder"
         ),
-        "tools": ["burpsuite"],
+        "tools": [],
     },
     {
-        "id": "biz-004", "name": "Workflow Manipulation",
+        "id": "bl-004", "name": "Workflow Manipulation",
         "category": "workflow", "severity": "high",
-        "desc": "Workflow and state machine manipulation attacks.",
+        "desc": "Workflow and state manipulation.",
         "detection": (
             "WORKFLOW MANIPULATION:\n"
-            "STEP SKIPPING:\n"
-            "  - Skip email verification (access directly)\n"
-            "  - Skip payment (go to order confirmation)\n"
-            "  - Skip 2FA step\n"
-            "  - Skip terms acceptance\n"
-            "  - Access step 3 without completing step 1/2\n"
-            "STATE MANIPULATION:\n"
-            "  - Change order status (pending → shipped)\n"
-            "  - Reverse transaction state\n"
-            "  - Replay completed workflow\n"
-            "  - Modify state in client-side storage\n"
-            "  - Tamper with workflow tokens\n"
-            "MULTI-STEP PROCESS:\n"
-            "  - Password reset: Use reset token for different user\n"
-            "  - Email change: Verify with old email, change to new\n"
-            "  - Account merge: Force merge with admin account\n"
-            "  - Invitation: Modify invite to change role\n"
+            "STATE BYPASS:\n"
+            "  - Skip steps in multi-step process\n"
+            "  - Access step 3 directly (skip 1,2)\n"
+            "  - Modify state in requests\n"
+            "  - Replay completed steps\n"
+            "  - Go back to modify approved data\n"
+            "APPROVAL BYPASS:\n"
+            "  - Self-approval\n"
+            "  - Approve then modify\n"
+            "  - Bypass review chain\n"
+            "  - Manipulate approval thresholds\n"
+            "ORDER OF OPERATIONS:\n"
+            "  - Delete then access (use-after-free)\n"
+            "  - Create then delete → orphaned refs\n"
+            "  - Modify during processing\n"
+            "  - Double-submit forms\n"
+            "FILE UPLOAD:\n"
+            "  - Upload malicious content\n"
+            "  - Bypass extension validation\n"
+            "  - Null byte in filename\n"
+            "  - MIME type mismatch\n"
+            "  - Polyglot files\n"
+            "  - SVG with JavaScript\n"
+            "  - Image metadata injection\n"
+            "  - ZIP slip (path traversal)\n"
+            "  - Unrestricted file size\n"
             "TESTING:\n"
-            "  1. Map all multi-step workflows\n"
-            "  2. Try accessing each step directly\n"
-            "  3. Modify state parameters between steps\n"
-            "  4. Test with expired/replayed tokens\n"
-            "  5. Test concurrent workflow instances"
+            "  - Map full workflow state machine\n"
+            "  - Try every state transition\n"
+            "  - Skip, repeat, reorder steps\n"
+            "TOOLS:\n"
+            "  Burp Suite, state diagrams"
         ),
-        "tools": ["burpsuite"],
+        "tools": [],
     },
     {
-        "id": "biz-005", "name": "Data Validation Bypass",
-        "category": "validation", "severity": "high",
-        "desc": "Input validation bypass and data integrity attacks.",
+        "id": "bl-005", "name": "Race Conditions and TOCTOU",
+        "category": "race", "severity": "critical",
+        "desc": "Race conditions and TOCTOU bugs.",
         "detection": (
-            "DATA VALIDATION BYPASS:\n"
-            "TYPE JUGGLING:\n"
-            "  - PHP: '0' == false, '' == 0, '0e1' == 0\n"
-            "  - JavaScript: '0' == false, null == undefined\n"
-            "  - Python: 0 == False, '' == False\n"
-            "  - Send integer where string expected\n"
-            "  - Send array where scalar expected: param[]=value\n"
-            "ENCODING BYPASS:\n"
-            "  - URL encoding: %3Cscript%3E\n"
-            "  - Double encoding: %253Cscript%253E\n"
-            "  - Unicode normalization: \\u0041 → A\n"
-            "  - HTML entities: &lt;script&gt;\n"
-            "  - UTF-7: +ADw-script+AD4-\n"
-            "  - Null byte: %00\n"
-            "LENGTH BYPASS:\n"
-            "  - Exceed max length (buffer overflow)\n"
-            "  - Exact boundary values\n"
-            "  - Empty string vs null vs missing\n"
-            "  - Unicode characters (multi-byte)\n"
-            "LOGIC BYPASS:\n"
-            "  - Negative numbers where positive expected\n"
-            "  - Decimal values where integer expected\n"
-            "  - Date manipulation (future/past)\n"
-            "  - Email format: user@domain(comment)@evil.com\n"
-            "  - JSON injection in string fields\n"
-            "  - Prototype pollution: __proto__"
+            "RACE CONDITIONS:\n"
+            "TIME-OF-CHECK-TIME-OF-USE (TOCTOU):\n"
+            "  - Check balance → deduct → race window\n"
+            "  - Verify permission → execute → race\n"
+            "  - Read file → check → open → race\n"
+            "DOUBLE SPEND:\n"
+            "  - Send 2 withdrawal requests simultaneously\n"
+            "  - Balance checked before either deducted\n"
+            "  - Both succeed → double withdrawal\n"
+            "  - Same for coupon redemption\n"
+            "TECHNIQUES:\n"
+            "  # Turbo Intruder (Burp)\n"
+            "  # Send parallel requests\n"
+            "  # Python threading\n"
+            "  import threading\n"
+            "  threads = [threading.Thread(target=send_request)]\n"
+            "  for t in threads: t.start()\n"
+            "  # HTTP/2 single-packet attack\n"
+            "  # Send multiple requests in one TCP packet\n"
+            "  # Ensures near-simultaneous arrival\n"
+            "COMMON TARGETS:\n"
+            "  - Financial transactions\n"
+            "  - Coupon/promo codes\n"
+            "  - Vote/like/follow counts\n"
+            "  - File operations\n"
+            "  - Invitation acceptance\n"
+            "  - Limited quantity items\n"
+            "DETECTION:\n"
+            "  - Look for check-then-act patterns\n"
+            "  - Non-atomic operations on shared data\n"
+            "  - Missing database locking\n"
+            "  - Absence of idempotency keys\n"
+            "TOOLS:\n"
+            "  Turbo Intruder, Race-the-Web, custom scripts"
         ),
-        "tools": ["burpsuite"],
+        "tools": [],
     },
 ]
 
 
 class BusinessLogicKB:
-    """Business logic vulnerability knowledge base.
+    """Business logic attacks knowledge base.
 
     Provides business logic attack patterns
     injected into agent prompts.
     """
 
     def __init__(self) -> None:
-        self._patterns: dict[str, BusinessLogicPattern] = {}
-        self._log = logger.bind(component="business_logic_kb")
+        self._patterns: dict[str, BizLogicPattern] = {}
+        self._log = logger.bind(component="bizlogic_kb")
         self._load_patterns()
 
     def _load_patterns(self) -> None:
         """Load business logic patterns."""
-        for data in BUSINESS_LOGIC_PATTERNS:
-            pattern = BusinessLogicPattern(
+        for data in BIZLOGIC_PATTERNS:
+            pattern = BizLogicPattern(
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
@@ -237,20 +269,20 @@ class BusinessLogicKB:
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_category(self, category: str) -> list[BusinessLogicPattern]:
+    def get_by_category(self, category: str) -> list[BizLogicPattern]:
         """Get patterns by category."""
         return [
             p for p in self._patterns.values()
             if p.category.lower() == category.lower()
         ]
 
-    def build_business_logic_prompt(
+    def build_bizlogic_prompt(
         self,
         categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
         """Build business logic prompt."""
-        lines = ["## Business Logic Vulnerability Patterns\n"]
+        lines = ["## Business Logic Attacks\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
