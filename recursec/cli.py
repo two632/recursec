@@ -23,10 +23,10 @@ import time
 
 import structlog
 
-from recursec.agents.agent_brain import AgentBrain, BrainConfig
 from recursec.agents.config_manager import ConfigManager
 from recursec.agents.daemon_engine import DaemonEngine, TaskPriority
 from recursec.agents.persistence import PersistenceManager
+from recursec.agents.runner import Runner, ScanConfig
 from recursec.agents.tool_executor import ToolExecutor
 
 logger = structlog.get_logger()
@@ -98,51 +98,29 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Run a full security assessment."""
-    ConfigManager(args.config)
-    persistence = PersistenceManager()
-
-    brain_config = BrainConfig(
-        max_cycles=args.max_cycles,
+    """Run a full security assessment using the real Runner pipeline."""
+    scan_config = ScanConfig(
+        target=args.target,
+        goal=args.goal,
         max_time_s=args.max_time,
+        deep_scan=True,
+        output_dir=args.output if args.output else "",
     )
 
-    brain = AgentBrain(config=brain_config)
+    runner = Runner(config=scan_config)
+    report = runner.run(args.target, goal=args.goal)
 
-    print(f"[*] Starting assessment of {args.target}")
-    print(f"[*] Max cycles: {args.max_cycles}, Max time: {args.max_time}s")
-
-    # Create session
-    session = persistence.create_session(args.target, args.goal)
-    print(f"[*] Session: {session.session_id}")
-
-    # Initialize brain
-    state = brain.initialize(args.target, args.goal)
-    print(f"[*] Phase: {state.phase.value}")
-
-    # Run cycles
-    start = time.time()
-    brain.run(max_cycles=args.max_cycles)
-
-    elapsed = time.time() - start
-    final_state = brain.get_state()
-
-    print(f"\n[+] Assessment complete in {elapsed:.1f}s")
-    print(f"[+] Cycles: {final_state.cycle}")
-    print(f"[+] Findings: {final_state.total_findings}")
-    print(f"[+] Tools run: {final_state.total_tools_run}")
-    print(f"[+] Total reward: {final_state.total_reward:.2f}")
-
-    # Save results
-    stats = brain.get_stats()
-    persistence.checkpoint(
-        session.session_id,
-        brain_state=stats,
-    )
+    # Also save via persistence layer
+    try:
+        persistence = PersistenceManager()
+        session = persistence.create_session(args.target, args.goal)
+        persistence.checkpoint(session.session_id, brain_state=report)
+    except Exception:
+        pass
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2, default=str)
+            json.dump(report, f, indent=2, default=str)
         print(f"[+] Results saved to {args.output}")
 
     return 0

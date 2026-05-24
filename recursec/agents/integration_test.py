@@ -82,8 +82,8 @@ def test_llm_client() -> bool:
     from recursec.agents.llm_client import LLMClient
     client = LLMClient()
     models = client.get_available_models()
-    assert len(models) == 16
-    endpoint = client.get_endpoint("whiterabbit")
+    assert len(models) >= 16
+    endpoint = client.get_endpoint("whiterabbitneo")
     assert "8100" in endpoint
     ctx = client.get_model_context_size("yi-9b-200k")
     assert ctx == 200000

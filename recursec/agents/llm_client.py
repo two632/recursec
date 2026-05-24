@@ -17,6 +17,10 @@ Supports:
 
 from __future__ import annotations
 
+import json as json_mod
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -114,6 +118,7 @@ class EmbeddingResponse:
 
 # Model server configurations
 MODEL_SERVERS: dict[str, dict[str, Any]] = {
+    "whiterabbitneo": {"port": 8100, "name": "WhiteRabbitNeo-7B", "ctx": 4096},
     "whiterabbit": {"port": 8100, "name": "WhiteRabbitNeo-7B", "ctx": 4096},
     "mistral": {"port": 8101, "name": "Mistral-7B-Instruct", "ctx": 8192},
     "qwen-coder-14b": {"port": 8102, "name": "Qwen2.5-Coder-14B", "ctx": 8192},
@@ -285,3 +290,115 @@ class LLMClient:
         lines.append(f"Tokens: {stats['tokens']}")
         lines.append(f"Avg latency: {stats['avg_latency_ms']:.0f}ms")
         return "\n".join(lines)
+
+    # ── Actual HTTP methods ─────────────────────────────────────
+
+    def _http_post(self, url: str, payload: dict[str, Any], timeout_s: int = 120) -> dict[str, Any]:
+        """Send a POST request and return parsed JSON."""
+        data = json_mod.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                return json_mod.loads(body)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            self._log.error("llm_http_error", url=url, status=exc.code, body=body[:200])
+            return {"error": f"HTTP {exc.code}: {body[:200]}"}
+        except urllib.error.URLError as exc:
+            self._log.error("llm_url_error", url=url, reason=str(exc.reason))
+            return {"error": f"Connection failed: {exc.reason}"}
+        except Exception as exc:
+            self._log.error("llm_request_error", url=url, error=str(exc))
+            return {"error": str(exc)}
+
+    def _http_get(self, url: str, timeout_s: int = 10) -> dict[str, Any]:
+        """Send a GET request and return parsed JSON."""
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                return json_mod.loads(body)
+        except Exception:
+            return {"error": "unreachable"}
+
+    def check_health(self, model_id: str) -> bool:
+        """Check if a model server is healthy."""
+        endpoint = self.get_endpoint(model_id)
+        if not endpoint:
+            return False
+        result = self._http_get(f"{endpoint}/health", timeout_s=5)
+        return "error" not in result
+
+    def get_healthy_models(self) -> list[str]:
+        """Return list of model IDs that are currently healthy."""
+        healthy = []
+        for model_id in MODEL_SERVERS:
+            if self.check_health(model_id):
+                healthy.append(model_id)
+        return healthy
+
+    def chat(
+        self,
+        model_id: str,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> LLMResponse:
+        """Send a chat completion request and return the response."""
+        request = self.build_chat_request(model_id, messages, temperature, max_tokens)
+        if not request.endpoint_url:
+            return LLMResponse(model_id=model_id, success=False, error="Unknown model")
+
+        start = time.time()
+        raw = self._http_post(request.endpoint_url, request.to_chat_completion())
+        latency_ms = (time.time() - start) * 1000
+
+        if "error" in raw and not raw.get("choices"):
+            resp = LLMResponse(model_id=model_id, success=False, error=raw["error"], latency_ms=latency_ms)
+        else:
+            resp = self.parse_chat_response(raw, model_id=model_id, latency_ms=latency_ms)
+
+        self.record_request(resp)
+        return resp
+
+    def complete(
+        self,
+        model_id: str,
+        prompt: str,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> LLMResponse:
+        """Send a native /completion request and return the response."""
+        request = self.build_completion_request(model_id, prompt, temperature, max_tokens)
+        if not request.endpoint_url:
+            return LLMResponse(model_id=model_id, success=False, error="Unknown model")
+
+        start = time.time()
+        raw = self._http_post(request.endpoint_url, request.to_completion())
+        latency_ms = (time.time() - start) * 1000
+
+        if "error" in raw and not raw.get("content"):
+            resp = LLMResponse(model_id=model_id, success=False, error=raw["error"], latency_ms=latency_ms)
+        else:
+            resp = self.parse_completion_response(raw, model_id=model_id, latency_ms=latency_ms)
+
+        self.record_request(resp)
+        return resp
+
+    def embed(self, text: str, model_id: str = "nomic-embed") -> EmbeddingResponse:
+        """Send an embedding request and return the response."""
+        request = self.build_embedding_request(text, model_id)
+        if not request.endpoint_url:
+            return EmbeddingResponse(model_id=model_id, success=False, error="Unknown model")
+
+        raw = self._http_post(request.endpoint_url, request.to_embedding())
+        if "error" in raw and not raw.get("embedding"):
+            return EmbeddingResponse(model_id=model_id, success=False, error=raw["error"])
+
+        return self.parse_embedding_response(raw, model_id=model_id)
