@@ -1,13 +1,12 @@
-"""Consensus engine — multi-model voting on findings.
+"""Consensus engine — multi-model voting for high-stakes decisions.
 
 Implements:
-1. Finding validation via multiple model opinions
-2. Weighted voting (model expertise matters)
-3. Confidence aggregation across models
-4. Disagreement resolution protocols
-5. False positive filtering
-6. Severity consensus
-7. Consensus prompt for LLM
+1. Multi-model parallel query
+2. Weighted voting based on model expertise
+3. Confidence-threshold consensus
+4. Disagreement resolution
+5. Evidence aggregation
+6. Consensus prompt for LLM
 """
 
 from __future__ import annotations
@@ -23,277 +22,235 @@ logger = structlog.get_logger()
 
 
 class VoteType(str, Enum):
-    CONFIRM = "confirm"        # Finding is valid
-    REJECT = "reject"          # Finding is false positive
-    UNCERTAIN = "uncertain"    # Not enough info
-    ESCALATE = "escalate"      # Needs human review
+    AGREE = "agree"
+    DISAGREE = "disagree"
+    ABSTAIN = "abstain"
+    PARTIAL = "partial"
 
 
 class ConsensusStatus(str, Enum):
-    PENDING = "pending"        # Not enough votes
-    CONFIRMED = "confirmed"    # Consensus: valid
-    REJECTED = "rejected"      # Consensus: false positive
-    DISPUTED = "disputed"      # No consensus
-    ESCALATED = "escalated"    # Sent for review
+    UNANIMOUS = "unanimous"       # All agree
+    MAJORITY = "majority"         # >50% agree
+    SUPERMAJORITY = "supermajority"  # >66% agree
+    SPLIT = "split"               # No clear majority
+    INSUFFICIENT = "insufficient"  # Not enough votes
 
 
 @dataclass
 class Vote:
-    """A single model's vote on a finding."""
+    """A single model's vote."""
     model_id: str = ""
-    vote_type: VoteType = VoteType.UNCERTAIN
+    model_name: str = ""
+    vote: VoteType = VoteType.ABSTAIN
     confidence: float = 0.5
     reasoning: str = ""
-    severity_opinion: str = ""    # Model's severity assessment
-    weight: float = 1.0           # Model expertise weight
-    timestamp: float = field(default_factory=time.time)
+    evidence: list[str] = field(default_factory=list)
+    weight: float = 1.0
+    response_time_ms: float = 0.0
 
     @property
     def weighted_score(self) -> float:
-        base = {
-            VoteType.CONFIRM: 1.0,
-            VoteType.REJECT: -1.0,
-            VoteType.UNCERTAIN: 0.0,
-            VoteType.ESCALATE: 0.5,
-        }[self.vote_type]
-        return base * self.confidence * self.weight
+        scores = {
+            VoteType.AGREE: 1.0,
+            VoteType.PARTIAL: 0.5,
+            VoteType.ABSTAIN: 0.0,
+            VoteType.DISAGREE: -1.0,
+        }
+        return scores.get(self.vote, 0.0) * self.confidence * self.weight
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model_id[:10],
-            "vote": self.vote_type.value[:6],
-            "conf": round(self.confidence, 2),
-            "sev": self.severity_opinion[:8],
+            "model": self.model_name[:12],
+            "vote": self.vote.value[:6],
+            "conf": f"{self.confidence:.0%}",
+            "weight": f"{self.weight:.1f}",
         }
 
 
 @dataclass
-class FindingConsensus:
-    """Consensus result for a finding."""
-    finding_id: str = ""
-    finding_type: str = ""
-    finding_detail: str = ""
+class ConsensusResult:
+    """Result of a consensus vote."""
+    question: str = ""
     votes: list[Vote] = field(default_factory=list)
-    status: ConsensusStatus = ConsensusStatus.PENDING
-    final_severity: str = ""
-    final_confidence: float = 0.0
-    resolved_at: float = 0.0
-
-    @property
-    def vote_count(self) -> int:
-        return len(self.votes)
-
-    @property
-    def confirm_ratio(self) -> float:
-        if not self.votes:
-            return 0.0
-        confirms = sum(1 for v in self.votes if v.vote_type == VoteType.CONFIRM)
-        return confirms / len(self.votes)
+    status: ConsensusStatus = ConsensusStatus.INSUFFICIENT
+    agreement_ratio: float = 0.0
+    weighted_score: float = 0.0
+    final_answer: str = ""
+    confidence: float = 0.0
+    dissenting_reasons: list[str] = field(default_factory=list)
+    timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.finding_id[:10],
-            "type": self.finding_type[:12],
             "status": self.status.value[:8],
-            "votes": self.vote_count,
-            "confirm%": f"{self.confirm_ratio:.0%}",
+            "agree": f"{self.agreement_ratio:.0%}",
+            "score": f"{self.weighted_score:.2f}",
+            "conf": f"{self.confidence:.0%}",
+            "votes": len(self.votes),
         }
 
 
-# ── Model expertise weights ──────────────────────────────────
+@dataclass
+class ConsensusRequest:
+    """A request for multi-model consensus."""
+    request_id: str = ""
+    question: str = ""
+    context: str = ""
+    min_votes: int = 3
+    threshold: float = 0.66       # Required agreement ratio
+    domain: str = ""              # Task domain for model selection
+    created_at: float = field(default_factory=time.time)
 
-MODEL_EXPERTISE: dict[str, dict[str, float]] = {
-    "WhiteRabbitNeo": {"security": 2.0, "exploit": 2.0, "web": 1.8, "network": 1.8},
-    "Qwen2.5-Coder-14B": {"code": 2.0, "web": 1.5, "api": 1.5},
-    "Qwen2.5-Coder-7B": {"code": 1.8, "web": 1.3},
-    "DeepSeek-R1": {"reasoning": 2.0, "analysis": 1.8, "general": 1.5},
-    "CodeLlama-13B": {"code": 1.8, "binary": 1.3},
-    "CodeLlama-7B": {"code": 1.5},
-    "Yi-9B-200K": {"analysis": 1.5, "general": 1.3},
-    "Hermes-4": {"general": 1.5, "reasoning": 1.3},
-    "Llama-3.1-8B": {"general": 1.3},
-    "Dolphin-2.9": {"general": 1.3, "security": 1.2},
-    "Mistral-7B": {"general": 1.3, "fast": 1.5},
-    "Phi-3.5-mini": {"fast": 1.5, "general": 1.0},
-    "DeepSeek-Math": {"analysis": 1.5, "crypto": 1.5},
-}
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.request_id[:10],
+            "question": self.question[:25],
+            "min": self.min_votes,
+            "threshold": f"{self.threshold:.0%}",
+        }
 
 
 class ConsensusEngine:
-    """Multi-model consensus on security findings.
+    """Multi-model voting for high-stakes decisions.
 
-    Collects votes from multiple models, weights them
-    by expertise, and determines finding validity.
+    Queries multiple models in parallel and aggregates
+    their responses using weighted voting to reach
+    consensus on critical security decisions.
     """
 
-    def __init__(
-        self,
-        min_votes: int = 3,
-        confirm_threshold: float = 0.6,
-        reject_threshold: float = 0.6,
-    ) -> None:
-        self._findings: dict[str, FindingConsensus] = {}
-        self._min_votes = min_votes
-        self._confirm_threshold = confirm_threshold
-        self._reject_threshold = reject_threshold
-        self._counter = 0
+    def __init__(self) -> None:
+        self._history: list[ConsensusResult] = []
+        self._request_counter = 0
         self._log = logger.bind(component="consensus")
 
-    def submit_finding(
+    def create_request(
         self,
-        finding_type: str,
-        finding_detail: str,
-    ) -> FindingConsensus:
-        """Submit a finding for consensus."""
-        self._counter += 1
-        finding = FindingConsensus(
-            finding_id=f"finding-{self._counter}",
-            finding_type=finding_type,
-            finding_detail=finding_detail,
+        question: str,
+        context: str = "",
+        min_votes: int = 3,
+        threshold: float = 0.66,
+        domain: str = "",
+    ) -> ConsensusRequest:
+        """Create a consensus request."""
+        self._request_counter += 1
+        return ConsensusRequest(
+            request_id=f"cons-{self._request_counter}",
+            question=question,
+            context=context,
+            min_votes=min_votes,
+            threshold=threshold,
+            domain=domain,
         )
-        self._findings[finding.finding_id] = finding
-        return finding
 
-    def cast_vote(
+    def tally(
         self,
-        finding_id: str,
-        model_id: str,
-        vote_type: VoteType,
-        confidence: float = 0.5,
-        reasoning: str = "",
-        severity_opinion: str = "",
-    ) -> Vote | None:
-        """Cast a vote on a finding."""
-        finding = self._findings.get(finding_id)
-        if not finding:
-            return None
-
-        # Determine weight from model expertise
-        weight = 1.0
-        for model_name, expertise in MODEL_EXPERTISE.items():
-            if model_name.lower() in model_id.lower():
-                domain = finding.finding_type.split("_")[0] if "_" in finding.finding_type else finding.finding_type
-                weight = expertise.get(domain, expertise.get("general", 1.0))
-                break
-
-        vote = Vote(
-            model_id=model_id,
-            vote_type=vote_type,
-            confidence=confidence,
-            reasoning=reasoning,
-            severity_opinion=severity_opinion,
-            weight=weight,
-        )
-        finding.votes.append(vote)
-
-        # Try to resolve
-        if finding.vote_count >= self._min_votes:
-            self._resolve(finding)
-
-        return vote
-
-    def _resolve(self, finding: FindingConsensus) -> None:
-        """Try to resolve consensus."""
-        if finding.status != ConsensusStatus.PENDING:
-            return
-
-        # Weighted voting
-        total_weight = sum(v.weight for v in finding.votes)
-        confirm_weight = sum(
-            v.weight for v in finding.votes
-            if v.vote_type == VoteType.CONFIRM
-        )
-        reject_weight = sum(
-            v.weight for v in finding.votes
-            if v.vote_type == VoteType.REJECT
+        request: ConsensusRequest,
+        votes: list[Vote],
+    ) -> ConsensusResult:
+        """Tally votes and determine consensus."""
+        result = ConsensusResult(
+            question=request.question,
+            votes=votes,
         )
 
-        confirm_ratio = confirm_weight / total_weight if total_weight > 0 else 0
-        reject_ratio = reject_weight / total_weight if total_weight > 0 else 0
+        if len(votes) < request.min_votes:
+            result.status = ConsensusStatus.INSUFFICIENT
+            self._history.append(result)
+            return result
 
-        if confirm_ratio >= self._confirm_threshold:
-            finding.status = ConsensusStatus.CONFIRMED
-            # Average confidence of confirming votes
-            conf_votes = [v for v in finding.votes if v.vote_type == VoteType.CONFIRM]
-            finding.final_confidence = sum(v.confidence for v in conf_votes) / len(conf_votes)
-            # Severity: most common opinion
-            self._resolve_severity(finding)
-        elif reject_ratio >= self._reject_threshold:
-            finding.status = ConsensusStatus.REJECTED
-            finding.final_confidence = 0.0
+        # Count votes
+        agree_count = sum(1 for v in votes if v.vote == VoteType.AGREE)
+        total_voting = sum(1 for v in votes if v.vote != VoteType.ABSTAIN)
+
+        if total_voting == 0:
+            result.status = ConsensusStatus.INSUFFICIENT
+            self._history.append(result)
+            return result
+
+        # Agreement ratio
+        result.agreement_ratio = agree_count / total_voting
+
+        # Weighted score
+        result.weighted_score = sum(v.weighted_score for v in votes)
+
+        # Determine status
+        if result.agreement_ratio == 1.0:
+            result.status = ConsensusStatus.UNANIMOUS
+        elif result.agreement_ratio >= 0.66:
+            result.status = ConsensusStatus.SUPERMAJORITY
+        elif result.agreement_ratio > 0.5:
+            result.status = ConsensusStatus.MAJORITY
         else:
-            # Check for escalation
-            escalate_count = sum(1 for v in finding.votes if v.vote_type == VoteType.ESCALATE)
-            if escalate_count >= 2:
-                finding.status = ConsensusStatus.ESCALATED
-            else:
-                finding.status = ConsensusStatus.DISPUTED
+            result.status = ConsensusStatus.SPLIT
 
-        finding.resolved_at = time.time()
+        # Final answer from highest-confidence agreeing vote
+        agree_votes = [v for v in votes if v.vote in (VoteType.AGREE, VoteType.PARTIAL)]
+        if agree_votes:
+            best = max(agree_votes, key=lambda v: v.confidence * v.weight)
+            result.final_answer = best.reasoning
 
-    def _resolve_severity(self, finding: FindingConsensus) -> None:
-        """Resolve severity from votes."""
-        severities: dict[str, float] = {}
-        for vote in finding.votes:
-            if vote.severity_opinion and vote.vote_type == VoteType.CONFIRM:
-                sev = vote.severity_opinion.lower()
-                severities[sev] = severities.get(sev, 0) + vote.weight
-
-        if severities:
-            finding.final_severity = max(severities, key=severities.get)  # type: ignore[arg-type]
-
-    def get_confirmed(self) -> list[FindingConsensus]:
-        """Get all confirmed findings."""
-        return [
-            f for f in self._findings.values()
-            if f.status == ConsensusStatus.CONFIRMED
+        # Dissenting reasons
+        result.dissenting_reasons = [
+            v.reasoning for v in votes
+            if v.vote == VoteType.DISAGREE and v.reasoning
         ]
 
-    def get_disputed(self) -> list[FindingConsensus]:
-        """Get disputed findings needing resolution."""
-        return [
-            f for f in self._findings.values()
-            if f.status == ConsensusStatus.DISPUTED
-        ]
+        # Overall confidence
+        if votes:
+            result.confidence = sum(
+                v.confidence * v.weight for v in votes
+            ) / sum(v.weight for v in votes)
+
+        self._history.append(result)
+        return result
+
+    def meets_threshold(
+        self,
+        result: ConsensusResult,
+        threshold: float = 0.66,
+    ) -> bool:
+        """Check if consensus meets a threshold."""
+        return (
+            result.agreement_ratio >= threshold
+            and result.status != ConsensusStatus.INSUFFICIENT
+        )
 
     def build_consensus_prompt(self) -> str:
         """Build consensus context for LLM."""
-        lines = ["## Finding Consensus\n"]
+        lines = ["## Consensus Engine\n"]
 
-        status_counts: dict[str, int] = {}
-        for f in self._findings.values():
-            s = f.status.value
-            status_counts[s] = status_counts.get(s, 0) + 1
+        lines.append(f"Total decisions: {len(self._history)}")
 
-        lines.append(
-            f"Findings: {len(self._findings)} | "
-            f"Confirmed: {status_counts.get('confirmed', 0)} | "
-            f"Rejected: {status_counts.get('rejected', 0)} | "
-            f"Disputed: {status_counts.get('disputed', 0)}"
-        )
-
-        # Recent confirmed findings
-        confirmed = self.get_confirmed()
-        if confirmed:
-            lines.append("\nConfirmed findings:")
-            for f in confirmed[-3:]:
+        if self._history:
+            # Recent decisions
+            recent = self._history[-3:]
+            lines.append("\nRecent decisions:")
+            for r in recent:
                 lines.append(
-                    f"  {f.finding_type[:15]} — "
-                    f"sev={f.final_severity[:8]} "
-                    f"conf={f.final_confidence:.0%} "
-                    f"({f.vote_count} votes)"
+                    f"  [{r.status.value[:8]}] {r.question[:30]} "
+                    f"agree={r.agreement_ratio:.0%} "
+                    f"conf={r.confidence:.0%}"
                 )
+
+            # Stats
+            unanimous = sum(1 for r in self._history if r.status == ConsensusStatus.UNANIMOUS)
+            split = sum(1 for r in self._history if r.status == ConsensusStatus.SPLIT)
+            lines.append(f"\nUnanimous: {unanimous} | Split: {split}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         status_counts: dict[str, int] = {}
-        for f in self._findings.values():
-            s = f.status.value
+        for r in self._history:
+            s = r.status.value
             status_counts[s] = status_counts.get(s, 0) + 1
 
+        avg_agreement = 0.0
+        if self._history:
+            avg_agreement = sum(r.agreement_ratio for r in self._history) / len(self._history)
+
         return {
-            "total_findings": len(self._findings),
+            "total_decisions": len(self._history),
             "by_status": status_counts,
-            "total_votes": sum(f.vote_count for f in self._findings.values()),
+            "avg_agreement": avg_agreement,
         }
