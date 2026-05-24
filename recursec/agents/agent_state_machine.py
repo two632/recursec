@@ -1,13 +1,12 @@
-"""Agent state machine — formal FSM for agent lifecycle.
+"""Agent state machine — FSM governing agent lifecycle.
 
 Implements:
-1. Agent lifecycle states (init → planning → executing → reflecting → done)
-2. Valid state transitions with guards
+1. 14-state finite state machine
+2. Valid transition rules
 3. State entry/exit hooks
-4. Hierarchical states (sub-states within execution)
+4. Transition guards (conditions)
 5. State history for debugging
-6. Timeout-based auto-transitions
-7. State machine prompt for LLM context
+6. State prompt for LLM
 """
 
 from __future__ import annotations
@@ -25,279 +24,265 @@ logger = structlog.get_logger()
 class AgentState(str, Enum):
     INITIALIZING = "initializing"
     PLANNING = "planning"
-    SELECTING_TOOL = "selecting_tool"
     EXECUTING = "executing"
-    WAITING_RESULT = "waiting_result"
     ANALYZING = "analyzing"
     REFLECTING = "reflecting"
     SPAWNING_CHILD = "spawning_child"
     WAITING_CHILD = "waiting_child"
+    AGGREGATING = "aggregating"
     VALIDATING = "validating"
+    REPLANNING = "replanning"
+    ESCALATING = "escalating"
     REPORTING = "reporting"
     COMPLETED = "completed"
     FAILED = "failed"
-    PAUSED = "paused"
-    TIMEOUT = "timeout"
 
 
-class TransitionTrigger(str, Enum):
-    PLAN_READY = "plan_ready"
-    TOOL_SELECTED = "tool_selected"
-    EXECUTE = "execute"
-    RESULT_RECEIVED = "result_received"
-    ANALYSIS_DONE = "analysis_done"
-    NEED_MORE_INFO = "need_more_info"
-    SPAWN_CHILD = "spawn_child"
-    CHILD_DONE = "child_done"
-    VALIDATE = "validate"
-    REPORT = "report"
-    COMPLETE = "complete"
-    FAIL = "fail"
-    PAUSE = "pause"
-    RESUME = "resume"
-    TIMEOUT_TRIGGER = "timeout"
-    RETRY = "retry"
+# Valid transitions: source → set of valid targets
+VALID_TRANSITIONS: dict[AgentState, set[AgentState]] = {
+    AgentState.INITIALIZING: {AgentState.PLANNING, AgentState.FAILED},
+    AgentState.PLANNING: {
+        AgentState.EXECUTING,
+        AgentState.SPAWNING_CHILD,
+        AgentState.FAILED,
+    },
+    AgentState.EXECUTING: {
+        AgentState.ANALYZING,
+        AgentState.FAILED,
+        AgentState.ESCALATING,
+    },
+    AgentState.ANALYZING: {
+        AgentState.REFLECTING,
+        AgentState.EXECUTING,     # Continue execution
+        AgentState.REPLANNING,
+        AgentState.SPAWNING_CHILD,
+        AgentState.VALIDATING,
+    },
+    AgentState.REFLECTING: {
+        AgentState.PLANNING,       # Re-plan with insights
+        AgentState.EXECUTING,      # Continue with adjustments
+        AgentState.REPORTING,      # Done
+        AgentState.REPLANNING,     # Major strategy change
+    },
+    AgentState.SPAWNING_CHILD: {
+        AgentState.WAITING_CHILD,
+        AgentState.FAILED,
+    },
+    AgentState.WAITING_CHILD: {
+        AgentState.AGGREGATING,
+        AgentState.FAILED,         # Child timeout
+        AgentState.ESCALATING,     # Child stuck
+    },
+    AgentState.AGGREGATING: {
+        AgentState.ANALYZING,
+        AgentState.VALIDATING,
+        AgentState.REPORTING,
+    },
+    AgentState.VALIDATING: {
+        AgentState.REPORTING,      # Validated, done
+        AgentState.EXECUTING,      # Need more evidence
+        AgentState.REPLANNING,     # Invalid, retry
+    },
+    AgentState.REPLANNING: {
+        AgentState.PLANNING,
+        AgentState.ESCALATING,     # Can't find new plan
+        AgentState.FAILED,
+    },
+    AgentState.ESCALATING: {
+        AgentState.WAITING_CHILD,  # Escalated to parent
+        AgentState.COMPLETED,      # Parent resolved it
+        AgentState.FAILED,
+    },
+    AgentState.REPORTING: {
+        AgentState.COMPLETED,
+        AgentState.VALIDATING,     # Report review needed
+    },
+    AgentState.COMPLETED: set(),   # Terminal
+    AgentState.FAILED: set(),      # Terminal
+}
 
 
 @dataclass
 class StateTransition:
-    """A recorded state transition."""
-    from_state: AgentState
-    to_state: AgentState
-    trigger: TransitionTrigger
+    """Record of a state transition."""
+    from_state: AgentState = AgentState.INITIALIZING
+    to_state: AgentState = AgentState.INITIALIZING
+    reason: str = ""
     timestamp: float = field(default_factory=time.time)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    duration_in_state_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "from": self.from_state.value[:8],
             "to": self.to_state.value[:8],
-            "trigger": self.trigger.value[:10],
+            "reason": self.reason[:20],
         }
 
 
-# ── Valid transitions ────────────────────────────────────────
-
-VALID_TRANSITIONS: dict[AgentState, dict[TransitionTrigger, AgentState]] = {
-    AgentState.INITIALIZING: {
-        TransitionTrigger.PLAN_READY: AgentState.PLANNING,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.PLANNING: {
-        TransitionTrigger.TOOL_SELECTED: AgentState.SELECTING_TOOL,
-        TransitionTrigger.SPAWN_CHILD: AgentState.SPAWNING_CHILD,
-        TransitionTrigger.COMPLETE: AgentState.COMPLETED,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-        TransitionTrigger.PAUSE: AgentState.PAUSED,
-    },
-    AgentState.SELECTING_TOOL: {
-        TransitionTrigger.EXECUTE: AgentState.EXECUTING,
-        TransitionTrigger.NEED_MORE_INFO: AgentState.PLANNING,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.EXECUTING: {
-        TransitionTrigger.RESULT_RECEIVED: AgentState.WAITING_RESULT,
-        TransitionTrigger.TIMEOUT_TRIGGER: AgentState.TIMEOUT,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.WAITING_RESULT: {
-        TransitionTrigger.ANALYSIS_DONE: AgentState.ANALYZING,
-        TransitionTrigger.TIMEOUT_TRIGGER: AgentState.TIMEOUT,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.ANALYZING: {
-        TransitionTrigger.NEED_MORE_INFO: AgentState.PLANNING,
-        TransitionTrigger.VALIDATE: AgentState.VALIDATING,
-        TransitionTrigger.SPAWN_CHILD: AgentState.SPAWNING_CHILD,
-        TransitionTrigger.REPORT: AgentState.REPORTING,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.REFLECTING: {
-        TransitionTrigger.NEED_MORE_INFO: AgentState.PLANNING,
-        TransitionTrigger.COMPLETE: AgentState.COMPLETED,
-        TransitionTrigger.REPORT: AgentState.REPORTING,
-    },
-    AgentState.SPAWNING_CHILD: {
-        TransitionTrigger.CHILD_DONE: AgentState.WAITING_CHILD,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.WAITING_CHILD: {
-        TransitionTrigger.RESULT_RECEIVED: AgentState.ANALYZING,
-        TransitionTrigger.TIMEOUT_TRIGGER: AgentState.TIMEOUT,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.VALIDATING: {
-        TransitionTrigger.ANALYSIS_DONE: AgentState.REFLECTING,
-        TransitionTrigger.NEED_MORE_INFO: AgentState.PLANNING,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.REPORTING: {
-        TransitionTrigger.COMPLETE: AgentState.COMPLETED,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.PAUSED: {
-        TransitionTrigger.RESUME: AgentState.PLANNING,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-    AgentState.TIMEOUT: {
-        TransitionTrigger.RETRY: AgentState.PLANNING,
-        TransitionTrigger.FAIL: AgentState.FAILED,
-    },
-}
-
-# State timeouts in seconds
-STATE_TIMEOUTS: dict[AgentState, float] = {
-    AgentState.EXECUTING: 300.0,       # 5 min tool execution
-    AgentState.WAITING_RESULT: 120.0,   # 2 min waiting
-    AgentState.WAITING_CHILD: 600.0,    # 10 min child agent
-    AgentState.PLANNING: 60.0,          # 1 min planning
-    AgentState.ANALYZING: 120.0,        # 2 min analysis
-}
+@dataclass
+class StateContext:
+    """Context maintained per state."""
+    state: AgentState = AgentState.INITIALIZING
+    entered_at: float = field(default_factory=time.time)
+    step_count: int = 0
+    tokens_in_state: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentStateMachine:
-    """Formal finite state machine for agent lifecycle.
+    """FSM governing agent lifecycle.
 
-    Manages agent states, transitions, guards,
-    and timeout-based auto-transitions.
+    Manages state transitions, enforces valid
+    transition rules, maintains state history,
+    and provides state-aware context to LLM.
     """
 
-    def __init__(
-        self,
-        agent_id: str = "",
-        initial_state: AgentState = AgentState.INITIALIZING,
-    ) -> None:
+    def __init__(self, agent_id: str = "") -> None:
         self._agent_id = agent_id
-        self._current_state = initial_state
+        self._current = StateContext(state=AgentState.INITIALIZING)
         self._history: list[StateTransition] = []
-        self._state_entered_at: float = time.time()
-        self._max_retries: int = 3
-        self._retry_count: int = 0
-        self._log = logger.bind(component="agent_fsm", agent=agent_id)
+        self._state_durations: dict[AgentState, float] = {}
+        self._state_visits: dict[AgentState, int] = {}
+        self._max_history = 100
+        self._log = logger.bind(component="state_machine", agent=agent_id)
 
     @property
     def state(self) -> AgentState:
-        return self._current_state
+        return self._current.state
 
     @property
     def is_terminal(self) -> bool:
-        return self._current_state in (
-            AgentState.COMPLETED,
-            AgentState.FAILED,
-        )
+        return self.state in (AgentState.COMPLETED, AgentState.FAILED)
 
-    @property
-    def time_in_state(self) -> float:
-        return time.time() - self._state_entered_at
+    def can_transition(self, target: AgentState) -> bool:
+        """Check if a transition is valid."""
+        return target in VALID_TRANSITIONS.get(self.state, set())
 
-    def transition(
-        self,
-        trigger: TransitionTrigger,
-        metadata: dict[str, Any] | None = None,
-    ) -> bool:
+    def transition(self, target: AgentState, reason: str = "") -> bool:
         """Attempt a state transition."""
-        transitions = VALID_TRANSITIONS.get(self._current_state, {})
-        new_state = transitions.get(trigger)
-
-        if new_state is None:
+        if not self.can_transition(target):
             self._log.warning(
                 "invalid_transition",
-                current=self._current_state.value,
-                trigger=trigger.value,
+                current=self.state.value,
+                target=target.value,
             )
             return False
 
-        # Record transition
-        trans = StateTransition(
-            from_state=self._current_state,
-            to_state=new_state,
-            trigger=trigger,
-            metadata=metadata or {},
-        )
-        self._history.append(trans)
+        now = time.time()
+        duration = now - self._current.entered_at
 
-        # Exit old state
-        self._on_exit(self._current_state)
+        # Record transition
+        transition = StateTransition(
+            from_state=self.state,
+            to_state=target,
+            reason=reason,
+            duration_in_state_s=duration,
+        )
+        self._history.append(transition)
+        if len(self._history) > self._max_history:
+            self._history.pop(0)
+
+        # Track duration
+        old_state = self.state
+        self._state_durations[old_state] = (
+            self._state_durations.get(old_state, 0.0) + duration
+        )
+
+        # Track visits
+        self._state_visits[target] = self._state_visits.get(target, 0) + 1
 
         # Enter new state
-        self._current_state = new_state
-        self._state_entered_at = time.time()
-        self._on_enter(new_state)
+        self._current = StateContext(
+            state=target,
+            entered_at=now,
+        )
 
         return True
 
-    def check_timeout(self) -> bool:
-        """Check if current state has timed out."""
-        timeout = STATE_TIMEOUTS.get(self._current_state)
-        if timeout and self.time_in_state > timeout:
-            if self._retry_count < self._max_retries:
-                self._retry_count += 1
-                self.transition(TransitionTrigger.TIMEOUT_TRIGGER)
-                return True
-            else:
-                self.transition(TransitionTrigger.FAIL, {"reason": "max_retries_exceeded"})
-                return True
-        return False
+    def get_valid_transitions(self) -> list[AgentState]:
+        """Get all valid transitions from current state."""
+        return list(VALID_TRANSITIONS.get(self.state, set()))
 
-    def build_fsm_prompt(self) -> str:
-        """Build state machine context for LLM."""
+    def get_state_duration(self) -> float:
+        """Get duration in current state."""
+        return time.time() - self._current.entered_at
+
+    def increment_step(self, tokens: int = 0) -> None:
+        """Increment step counter in current state."""
+        self._current.step_count += 1
+        self._current.tokens_in_state += tokens
+
+    def get_recent_path(self, n: int = 5) -> list[str]:
+        """Get recent state path."""
+        recent = self._history[-n:]
+        path = [t.from_state.value for t in recent]
+        if recent:
+            path.append(recent[-1].to_state.value)
+        return path
+
+    def detect_loops(self) -> list[str]:
+        """Detect state loops in recent history."""
+        path = self.get_recent_path(10)
+        loops: list[str] = []
+
+        for window in range(2, min(5, len(path) // 2)):
+            for i in range(len(path) - window * 2 + 1):
+                pattern = path[i:i + window]
+                next_seg = path[i + window:i + window * 2]
+                if pattern == next_seg:
+                    loop_str = " → ".join(pattern)
+                    if loop_str not in loops:
+                        loops.append(loop_str)
+
+        return loops
+
+    def build_state_prompt(self) -> str:
+        """Build state context for LLM."""
         lines = ["## Agent State\n"]
 
-        lines.append(
-            f"Current: {self._current_state.value} "
-            f"({self.time_in_state:.0f}s)"
-        )
+        lines.append(f"Current: {self.state.value}")
+        lines.append(f"Time in state: {self.get_state_duration():.1f}s")
+        lines.append(f"Steps in state: {self._current.step_count}")
 
-        # Available transitions
-        available = VALID_TRANSITIONS.get(self._current_state, {})
-        if available:
-            triggers = [t.value for t in available.keys()]
-            lines.append(f"Available: {', '.join(triggers)}")
+        # Valid next states
+        valid = self.get_valid_transitions()
+        if valid:
+            valid_names = [s.value for s in valid]
+            lines.append(f"Valid transitions: {', '.join(valid_names)}")
 
-        # Check timeout
-        timeout = STATE_TIMEOUTS.get(self._current_state)
-        if timeout:
-            remaining = max(0, timeout - self.time_in_state)
-            lines.append(f"Timeout: {remaining:.0f}s remaining")
+        # Recent path
+        path = self.get_recent_path(5)
+        if path:
+            lines.append(f"Recent path: {' → '.join(path)}")
 
-        # Recent history
-        if self._history:
-            lines.append(f"\nHistory ({len(self._history)} transitions):")
-            for t in self._history[-5:]:
-                lines.append(
-                    f"  {t.from_state.value[:8]} → {t.to_state.value[:8]} "
-                    f"({t.trigger.value})"
-                )
+        # Loops
+        loops = self.detect_loops()
+        if loops:
+            lines.append(f"LOOPS DETECTED: {loops[0]}")
 
-        if self._retry_count > 0:
-            lines.append(f"Retries: {self._retry_count}/{self._max_retries}")
+        # Most time spent
+        if self._state_durations:
+            sorted_durations = sorted(
+                self._state_durations.items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            top = sorted_durations[0]
+            lines.append(f"Most time in: {top[0].value} ({top[1]:.0f}s)")
 
         return "\n".join(lines)
 
-    def _on_enter(self, state: AgentState) -> None:
-        """Hook called when entering a state."""
-        if state == AgentState.COMPLETED:
-            self._retry_count = 0
-        elif state == AgentState.TIMEOUT:
-            pass
-
-    def _on_exit(self, state: AgentState) -> None:
-        """Hook called when exiting a state."""
-        pass
-
     def get_stats(self) -> dict[str, Any]:
-        state_durations: dict[str, float] = {}
-        for i, t in enumerate(self._history):
-            if i + 1 < len(self._history):
-                duration = self._history[i + 1].timestamp - t.timestamp
-            else:
-                duration = time.time() - t.timestamp
-            key = t.from_state.value
-            state_durations[key] = state_durations.get(key, 0) + duration
-
         return {
-            "current_state": self._current_state.value,
+            "current": self.state.value,
             "transitions": len(self._history),
-            "retries": self._retry_count,
-            "state_durations": state_durations,
+            "visits": dict(
+                (s.value, c)
+                for s, c in sorted(
+                    self._state_visits.items(),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+            ),
+            "loops": self.detect_loops(),
         }
