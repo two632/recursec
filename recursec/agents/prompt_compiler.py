@@ -1,19 +1,20 @@
-"""Prompt compiler — assembles context into optimal LLM prompts.
+"""Prompt compiler — assembles final prompts from all subsystems.
 
 Implements:
-1. Role-specific system prompt generation
-2. Context section assembly (priority-ordered)
-3. Token budget allocation across sections
-4. Dynamic section inclusion/exclusion
-5. Prompt templating with variables
-6. History compression for long conversations
-7. Chain-of-thought instruction injection
+1. System prompt construction from agent role/config
+2. Knowledge injection from selected KBs
+3. Memory context injection (working + episodic)
+4. Tool availability context
+5. Budget/convergence state context
+6. Reasoning chain context
+7. Token-aware truncation
+8. Prompt template management
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -23,32 +24,19 @@ logger = structlog.get_logger()
 
 
 class PromptSection(str, Enum):
-    SYSTEM = "system"
-    ROLE = "role"
-    TASK = "task"
-    TARGET_INFO = "target_info"
-    KNOWLEDGE = "knowledge"
-    FINDINGS = "findings"
-    HYPOTHESES = "hypotheses"
-    PLAN = "plan"
-    TOOLS = "tools"
-    MEMORY = "memory"
-    GRAPH = "graph"
-    LOOP_STATUS = "loop_status"
-    HISTORY = "history"
-    COT_INSTRUCTIONS = "cot_instructions"
-    CONSTRAINTS = "constraints"
-
-
-class AgentRole(str, Enum):
-    COORDINATOR = "coordinator"
-    RECON = "recon"
-    SCANNER = "scanner"
-    EXPLOITER = "exploiter"
-    CODE_AUDITOR = "code_auditor"
-    VALIDATOR = "validator"
-    ANALYST = "analyst"
-    PLANNER = "planner"
+    SYSTEM = "system"                  # Core system prompt
+    ROLE = "role"                      # Agent role definition
+    KNOWLEDGE = "knowledge"            # Injected KB patterns
+    MEMORY = "memory"                  # Past findings/context
+    TOOLS = "tools"                    # Available tool descriptions
+    STATE = "state"                    # Current assessment state
+    BUDGET = "budget"                  # Token budget status
+    CONVERGENCE = "convergence"        # Convergence status
+    REASONING = "reasoning"            # Chain-of-thought hints
+    LEARNING = "learning"              # Learned patterns
+    TASK = "task"                      # Current task/objective
+    CONSTRAINTS = "constraints"        # Safety constraints
+    OUTPUT_FORMAT = "output_format"    # Expected output format
 
 
 @dataclass
@@ -56,159 +44,140 @@ class PromptBlock:
     """A block of prompt content."""
     section: PromptSection = PromptSection.SYSTEM
     content: str = ""
-    priority: int = 5       # 1=highest, 10=lowest
+    priority: int = 5       # 1=highest (always include)
     token_estimate: int = 0
     required: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "section": self.section.value,
-            "priority": self.priority,
+            "section": self.section.value[:10],
             "tokens": self.token_estimate,
+            "priority": self.priority,
             "required": self.required,
         }
 
 
 @dataclass
 class CompiledPrompt:
-    """A fully compiled prompt ready for LLM."""
-    system_prompt: str = ""
-    user_prompt: str = ""
-    total_tokens: int = 0
-    sections_included: list[str] = field(default_factory=list)
-    sections_excluded: list[str] = field(default_factory=list)
-    compiled_at: float = field(default_factory=time.time)
+    """A fully compiled prompt."""
+    system_message: str = ""
+    user_message: str = ""
+    blocks_included: int = 0
+    blocks_dropped: int = 0
+    total_tokens_est: int = 0
+    compile_time_ms: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "total_tokens": self.total_tokens,
-            "included": len(self.sections_included),
-            "excluded": len(self.sections_excluded),
+            "sys_len": len(self.system_message),
+            "user_len": len(self.user_message),
+            "blocks": self.blocks_included,
+            "dropped": self.blocks_dropped,
+            "tokens_est": self.total_tokens_est,
         }
 
 
-# ── Role system prompts ──────────────────────────────────────
+# ── Prompt templates ─────────────────────────────────────────
 
-ROLE_PROMPTS: dict[str, str] = {
+ROLE_TEMPLATES: dict[str, str] = {
     "coordinator": (
-        "You are the COORDINATOR agent in an autonomous security assessment system. "
-        "Your role is to:\n"
-        "1. Decompose high-level security objectives into sub-tasks\n"
-        "2. Assign tasks to specialized agents (recon, scanner, exploiter, etc.)\n"
-        "3. Monitor progress and adjust strategy\n"
-        "4. Synthesize findings from all agents\n"
-        "5. Make go/no-go decisions on exploitation\n"
-        "Think step-by-step. Prioritize high-impact targets."
+        "You are the COORDINATOR agent in RecurSec, a recursive multi-agent security framework.\n"
+        "Your role is to decompose security tasks, delegate to specialist agents, and aggregate results.\n"
+        "You make high-level strategic decisions about assessment approach.\n"
+        "Think step-by-step. Consider multiple attack vectors. Prioritize by impact."
     ),
     "recon": (
-        "You are the RECON agent. Your role is to discover and enumerate targets:\n"
-        "1. Subdomain enumeration\n"
-        "2. Port scanning and service detection\n"
-        "3. Technology fingerprinting\n"
-        "4. OSINT gathering\n"
-        "5. Attack surface mapping\n"
-        "Be thorough but efficient. Prioritize breadth first, then depth."
+        "You are the RECONNAISSANCE agent.\n"
+        "Your role is to gather information about the target using passive and active techniques.\n"
+        "Be thorough: enumerate subdomains, ports, services, technologies, personnel.\n"
+        "Output structured data for downstream agents."
     ),
-    "scanner": (
-        "You are the SCANNER agent. Your role is vulnerability scanning:\n"
-        "1. Run automated vulnerability scanners\n"
-        "2. Interpret and validate scanner output\n"
-        "3. Identify false positives\n"
-        "4. Prioritize findings by severity and exploitability\n"
-        "5. Suggest manual testing for ambiguous results\n"
-        "Be skeptical of scanner output. Validate before reporting."
+    "vuln_scan": (
+        "You are the VULNERABILITY SCANNING agent.\n"
+        "Your role is to identify vulnerabilities in discovered services.\n"
+        "Run appropriate tools for each service type. Validate findings to reduce false positives.\n"
+        "Classify by severity (Critical/High/Medium/Low/Info)."
     ),
-    "exploiter": (
-        "You are the EXPLOITER agent. Your role is vulnerability exploitation:\n"
-        "1. Develop exploitation strategies for confirmed vulns\n"
-        "2. Choose appropriate tools and techniques\n"
-        "3. Execute exploits safely within scope\n"
-        "4. Document exploitation steps precisely\n"
-        "5. Assess impact and escalation potential\n"
-        "Always validate scope before exploitation. Document everything."
+    "web_audit": (
+        "You are the WEB APPLICATION SECURITY agent.\n"
+        "Your role is to perform deep web application testing following OWASP methodology.\n"
+        "Test injection points, authentication, authorization, session management, file upload.\n"
+        "Think like an attacker. Chain vulnerabilities."
     ),
-    "code_auditor": (
-        "You are the CODE AUDITOR agent. Your role is source code analysis:\n"
-        "1. Static analysis for security vulnerabilities\n"
-        "2. Identify dangerous coding patterns\n"
-        "3. Trace data flow from sources to sinks\n"
-        "4. Check authentication and authorization logic\n"
-        "5. Review cryptographic usage\n"
-        "Focus on security-critical code paths. Report with exact line references."
+    "exploit": (
+        "You are the EXPLOITATION agent.\n"
+        "Your role is to validate and exploit confirmed vulnerabilities.\n"
+        "Start with lowest-risk exploits. Document proof-of-concept for each.\n"
+        "Assess real-world impact. Consider chaining for deeper access."
+    ),
+    "code_audit": (
+        "You are the CODE AUDIT agent.\n"
+        "Your role is to review source code for security vulnerabilities.\n"
+        "Look for injection sinks, auth bypass, hardcoded secrets, unsafe deserialization.\n"
+        "Trace data flow from sources to sinks."
     ),
     "validator": (
-        "You are the VALIDATOR agent. Your role is finding validation:\n"
-        "1. Verify reported vulnerabilities are real\n"
-        "2. Reproduce exploits independently\n"
-        "3. Assess false positive probability\n"
-        "4. Rate severity accurately\n"
-        "5. Challenge assumptions from other agents\n"
-        "Be adversarial. Assume findings are false until proven otherwise."
+        "You are the VALIDATION agent.\n"
+        "Your role is to cross-validate findings from other agents.\n"
+        "Verify each finding independently. Flag false positives.\n"
+        "Use different tools/approaches than the original finder."
     ),
-    "analyst": (
-        "You are the ANALYST agent. Your role is synthesis and analysis:\n"
-        "1. Correlate findings across agents\n"
-        "2. Identify attack chains and lateral paths\n"
-        "3. Assess overall security posture\n"
-        "4. Prioritize remediation recommendations\n"
-        "5. Identify patterns and systemic issues\n"
-        "Think holistically. Connect findings into a coherent narrative."
-    ),
-    "planner": (
-        "You are the PLANNER agent. Your role is assessment planning:\n"
-        "1. Create assessment plans from objectives\n"
-        "2. Allocate resources and budgets\n"
-        "3. Sequence activities optimally\n"
-        "4. Identify dependencies between tasks\n"
-        "5. Adapt plans based on progress\n"
-        "Balance thoroughness with efficiency. Adapt dynamically."
+    "reporter": (
+        "You are the REPORTING agent.\n"
+        "Your role is to compile assessment findings into a structured report.\n"
+        "Include executive summary, technical details, proof of concept, remediation.\n"
+        "Classify by severity and business impact."
     ),
 }
 
-# ── Chain-of-thought instructions ────────────────────────────
+CONSTRAINT_TEMPLATE = (
+    "CONSTRAINTS:\n"
+    "- Stay within authorized scope: {scope}\n"
+    "- Exclusions: {exclusions}\n"
+    "- Do NOT perform destructive actions\n"
+    "- Do NOT exfiltrate real data\n"
+    "- Time limit: {time_limit}\n"
+    "- Token budget: {token_budget}\n"
+    "- Safety: verify commands before execution\n"
+    "- Report all findings, even partial"
+)
 
-COT_TEMPLATE = (
-    "\n## Reasoning Instructions\n"
-    "Think step-by-step before acting:\n"
-    "1. OBSERVE: What information do you have? What is the current state?\n"
-    "2. ANALYZE: What does this information mean? What patterns do you see?\n"
-    "3. HYPOTHESIZE: What vulnerabilities might exist? Rate confidence.\n"
-    "4. PLAN: What is the next best action? Why this over alternatives?\n"
-    "5. ACT: Execute the chosen action.\n"
-    "6. REFLECT: Did the action produce expected results? What to adjust?\n"
-    "\nFormat your response as:\n"
-    "<think>\n[Your step-by-step reasoning]\n</think>\n"
-    "<action>\n[Your chosen action and parameters]\n</action>"
+OUTPUT_FORMAT_TEMPLATE = (
+    "OUTPUT FORMAT:\n"
+    "Respond with structured JSON:\n"
+    "{{\n"
+    "  \"action\": \"run_tool|spawn_agent|report_finding|complete\",\n"
+    "  \"tool\": \"tool_name (if action=run_tool)\",\n"
+    "  \"args\": {{\"arg1\": \"val1\"}},\n"
+    "  \"reasoning\": \"why this action\",\n"
+    "  \"confidence\": 0.0-1.0,\n"
+    "  \"next_steps\": [\"what to do after this\"]\n"
+    "}}"
 )
 
 
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate (~4 chars per token for English)."""
-    return len(text) // 4
-
-
 class PromptCompiler:
-    """Compiles optimized prompts from multiple context sources.
+    """Compiles prompts from multiple subsystem contexts.
 
-    Assembles role prompts, task context, knowledge,
-    findings, hypotheses, and reasoning instructions
-    into a prompt that fits within the model's
-    context window.
+    Assembles system prompt, knowledge, memory, tools,
+    and state into a final prompt that fits within
+    the model's context window.
     """
 
-    def __init__(self, max_tokens: int = 8192) -> None:
+    def __init__(
+        self,
+        max_tokens: int = 8000,
+        chars_per_token: float = 3.5,
+    ) -> None:
         self._max_tokens = max_tokens
+        self._chars_per_token = chars_per_token
         self._blocks: list[PromptBlock] = []
-        self._variables: dict[str, str] = {}
+        self._compile_count = 0
         self._log = logger.bind(component="prompt_compiler")
 
-    def set_max_tokens(self, max_tokens: int) -> None:
-        """Update the token budget."""
-        self._max_tokens = max_tokens
-
-    def set_variable(self, name: str, value: str) -> None:
-        """Set a template variable."""
-        self._variables[name] = value
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimation."""
+        return int(len(text) / self._chars_per_token)
 
     def add_block(
         self,
@@ -218,92 +187,149 @@ class PromptCompiler:
         required: bool = False,
     ) -> None:
         """Add a prompt block."""
-        block = PromptBlock(
+        tokens = self._estimate_tokens(content)
+        self._blocks.append(PromptBlock(
             section=section,
             content=content,
             priority=priority,
-            token_estimate=_estimate_tokens(content),
+            token_estimate=tokens,
             required=required,
-        )
-        self._blocks.append(block)
+        ))
 
-    def add_role(self, role: AgentRole) -> None:
-        """Add role-specific system prompt."""
-        prompt = ROLE_PROMPTS.get(role.value, "")
-        if prompt:
-            self.add_block(
-                PromptSection.ROLE,
-                prompt,
-                priority=1,
-                required=True,
-            )
-
-    def add_cot(self) -> None:
-        """Add chain-of-thought instructions."""
+    def add_role(self, role: str) -> None:
+        """Add role template."""
+        template = ROLE_TEMPLATES.get(role, ROLE_TEMPLATES["coordinator"])
         self.add_block(
-            PromptSection.COT_INSTRUCTIONS,
-            COT_TEMPLATE,
+            PromptSection.ROLE,
+            template,
+            priority=1,
+            required=True,
+        )
+
+    def add_constraints(
+        self,
+        scope: str = "*",
+        exclusions: str = "none",
+        time_limit: str = "1h",
+        token_budget: str = "50000",
+    ) -> None:
+        """Add constraint block."""
+        content = CONSTRAINT_TEMPLATE.format(
+            scope=scope,
+            exclusions=exclusions,
+            time_limit=time_limit,
+            token_budget=token_budget,
+        )
+        self.add_block(PromptSection.CONSTRAINTS, content, priority=2, required=True)
+
+    def add_output_format(self) -> None:
+        """Add output format block."""
+        self.add_block(
+            PromptSection.OUTPUT_FORMAT,
+            OUTPUT_FORMAT_TEMPLATE,
             priority=2,
             required=True,
         )
 
-    def compile(self, reserve_output: float = 0.15) -> CompiledPrompt:
-        """Compile blocks into final prompt."""
-        available = int(self._max_tokens * (1 - reserve_output))
+    def add_knowledge(self, kb_prompt: str) -> None:
+        """Add knowledge base content."""
+        if kb_prompt:
+            self.add_block(PromptSection.KNOWLEDGE, kb_prompt, priority=3)
 
-        # Sort: required first, then by priority (ascending = higher priority)
-        sorted_blocks = sorted(
-            self._blocks,
-            key=lambda b: (not b.required, b.priority),
+    def add_memory(self, memory_prompt: str) -> None:
+        """Add memory context."""
+        if memory_prompt:
+            self.add_block(PromptSection.MEMORY, memory_prompt, priority=4)
+
+    def add_tools(self, tools_prompt: str) -> None:
+        """Add tool descriptions."""
+        if tools_prompt:
+            self.add_block(PromptSection.TOOLS, tools_prompt, priority=3)
+
+    def add_state(self, state_prompt: str) -> None:
+        """Add current state context."""
+        if state_prompt:
+            self.add_block(PromptSection.STATE, state_prompt, priority=4)
+
+    def add_task(self, task_description: str) -> None:
+        """Add the current task/objective."""
+        if task_description:
+            self.add_block(
+                PromptSection.TASK,
+                f"TASK:\n{task_description}",
+                priority=1,
+                required=True,
+            )
+
+    def compile(self, user_message: str = "") -> CompiledPrompt:
+        """Compile all blocks into a final prompt."""
+        start = time.time()
+        self._compile_count += 1
+
+        # Separate required and optional blocks
+        required = [b for b in self._blocks if b.required]
+        optional = sorted(
+            [b for b in self._blocks if not b.required],
+            key=lambda b: b.priority,
         )
 
-        included: list[PromptBlock] = []
-        excluded: list[PromptBlock] = []
-        tokens_used = 0
+        # Required tokens
+        required_tokens = sum(b.token_estimate for b in required)
+        remaining = self._max_tokens - required_tokens
 
-        for block in sorted_blocks:
-            if tokens_used + block.token_estimate <= available:
-                included.append(block)
-                tokens_used += block.token_estimate
-            elif block.required:
-                # Required blocks always included
-                included.append(block)
-                tokens_used += block.token_estimate
-            else:
-                excluded.append(block)
+        # Fit optional blocks
+        included_optional: list[PromptBlock] = []
+        for block in optional:
+            if block.token_estimate <= remaining:
+                included_optional.append(block)
+                remaining -= block.token_estimate
 
-        # Build prompts
+        # Build system message
+        all_blocks = required + included_optional
+        # Sort by section order
+        section_order = list(PromptSection)
+        all_blocks.sort(key=lambda b: section_order.index(b.section))
+
         system_parts: list[str] = []
-        user_parts: list[str] = []
+        for block in all_blocks:
+            system_parts.append(block.content)
 
-        for block in included:
-            content = self._apply_variables(block.content)
-            if block.section in (PromptSection.SYSTEM, PromptSection.ROLE, PromptSection.CONSTRAINTS):
-                system_parts.append(content)
-            else:
-                user_parts.append(content)
+        system_message = "\n\n".join(system_parts)
+
+        compile_time = (time.time() - start) * 1000
 
         result = CompiledPrompt(
-            system_prompt="\n\n".join(system_parts),
-            user_prompt="\n\n".join(user_parts),
-            total_tokens=tokens_used,
-            sections_included=[b.section.value for b in included],
-            sections_excluded=[b.section.value for b in excluded],
+            system_message=system_message,
+            user_message=user_message,
+            blocks_included=len(all_blocks),
+            blocks_dropped=len(self._blocks) - len(all_blocks),
+            total_tokens_est=sum(b.token_estimate for b in all_blocks),
+            compile_time_ms=compile_time,
         )
 
+        # Clear blocks for next compilation
         self._blocks.clear()
+
         return result
 
-    def _apply_variables(self, content: str) -> str:
-        """Replace template variables in content."""
-        result = content
-        for name, value in self._variables.items():
-            result = result.replace(f"{{{{{name}}}}}", value)
-        return result
+    def build_compiler_prompt(self) -> str:
+        """Build compiler stats for debugging."""
+        lines = ["## Prompt Compiler\n"]
+        lines.append(f"Max tokens: {self._max_tokens}")
+        lines.append(f"Compiles: {self._compile_count}")
+        lines.append(f"Pending blocks: {len(self._blocks)}")
+
+        if self._blocks:
+            by_section: dict[str, int] = {}
+            for b in self._blocks:
+                by_section[b.section.value] = by_section.get(b.section.value, 0) + 1
+            lines.append(f"Sections: {by_section}")
+
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         return {
-            "pending_blocks": len(self._blocks),
             "max_tokens": self._max_tokens,
-            "variables": len(self._variables),
+            "compiles": self._compile_count,
+            "pending_blocks": len(self._blocks),
         }
