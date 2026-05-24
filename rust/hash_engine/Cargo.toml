@@ -1,0 +1,13 @@
+[package]
+name = "hash_engine"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance hash computation and token counting for RecurSec"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "hash_engine"
+path = "src/main.rs"
