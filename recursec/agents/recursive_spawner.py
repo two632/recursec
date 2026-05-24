@@ -106,6 +106,18 @@ class AgentBudget:
 
 
 @dataclass
+class SpawnRequest:
+    """Request to spawn a new agent."""
+    role: str = ""
+    task: str = ""
+    target: str = ""
+    tools: list[str] = field(default_factory=list)
+    depth: int = 0
+    parent_id: str = ""
+    context: str = ""
+
+
+@dataclass
 class SpawnedAgent:
     """A spawned agent instance."""
     agent_id: str = ""

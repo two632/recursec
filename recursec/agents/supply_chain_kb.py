@@ -259,3 +259,13 @@ def build_supply_chain_prompt(
         lines.append("")
 
     return "\n".join(lines)
+
+
+class SupplyChainKB:
+    """Wrapper for supply chain security knowledge base."""
+
+    def get_prompt(self, focus: SupplyChainAttackType | None = None) -> str:
+        return build_supply_chain_prompt(focus_type=focus)
+
+    def get_patterns(self) -> list[SupplyChainPattern]:
+        return SUPPLY_CHAIN_PATTERNS

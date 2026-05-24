@@ -23,6 +23,17 @@ import structlog
 logger = structlog.get_logger()
 
 
+class AgentState(str, Enum):
+    IDLE = "idle"
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    ANALYZING = "analyzing"
+    REPORTING = "reporting"
+    WAITING = "waiting"
+    ERROR = "error"
+    DONE = "done"
+
+
 class StateType(str, Enum):
     INITIAL = "initial"
     INTERMEDIATE = "intermediate"
@@ -329,3 +340,27 @@ class AgentStateMachine:
             "history_len": len(self._history),
             "state_durations": {k: round(v, 1) for k, v in state_durations.items()},
         }
+
+
+class MultiAgentStateTracker:
+    """Tracks state across multiple agents."""
+
+    def __init__(self) -> None:
+        self._agents: dict[str, AgentState] = {}
+        self._log = logger.bind(component="state_tracker")
+
+    def register(self, agent_id: str, state: AgentState = AgentState.IDLE) -> None:
+        self._agents[agent_id] = state
+
+    def update(self, agent_id: str, state: AgentState) -> None:
+        self._agents[agent_id] = state
+        self._log.debug("agent_state_change", agent_id=agent_id[:10], state=state.value)
+
+    def get_state(self, agent_id: str) -> AgentState:
+        return self._agents.get(agent_id, AgentState.IDLE)
+
+    def get_all_states(self) -> dict[str, str]:
+        return {aid: s.value for aid, s in self._agents.items()}
+
+    def all_done(self) -> bool:
+        return all(s in (AgentState.DONE, AgentState.ERROR) for s in self._agents.values())

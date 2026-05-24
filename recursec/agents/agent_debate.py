@@ -356,3 +356,7 @@ class AgentDebateEngine:
             ),
             "by_outcome": outcome_counts,
         }
+
+
+# Alias for backward compatibility
+AgentDebate = AgentDebateEngine

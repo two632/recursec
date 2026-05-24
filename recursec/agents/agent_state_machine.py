@@ -71,6 +71,17 @@ STATE_ACTIONS: dict[AgentState, list[str]] = {
 }
 
 
+class StateEvent(str, Enum):
+    START = "start"
+    PLAN_COMPLETE = "plan_complete"
+    EXECUTE = "execute"
+    ANALYZE = "analyze"
+    REPORT = "report"
+    ERROR = "error"
+    RETRY = "retry"
+    DONE = "done"
+
+
 @dataclass
 class StateTransition:
     """A state transition record."""

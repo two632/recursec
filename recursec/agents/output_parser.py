@@ -90,6 +90,25 @@ class FindingParsed:
         }
 
 
+@dataclass
+class ParseResult:
+    """Result from parsing tool or LLM output."""
+    raw_text: str = ""
+    format_detected: str = "text"
+    items: list[ParsedItem] = field(default_factory=list)
+    findings: list[FindingParsed] = field(default_factory=list)
+    tool_calls: list[ToolCallParsed] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "format": self.format_detected,
+            "items": len(self.items),
+            "findings": len(self.findings),
+            "tool_calls": len(self.tool_calls),
+        }
+
+
 # Severity keywords for extraction
 SEVERITY_KEYWORDS: dict[str, list[str]] = {
     "critical": ["critical", "rce", "remote code execution", "unauthenticated"],

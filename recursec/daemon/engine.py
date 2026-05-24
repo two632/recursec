@@ -10,7 +10,7 @@ from typing import Any
 import structlog
 
 from recursec.agents.factory import AgentFactory
-from recursec.config.settings import RecurSecConfig
+from recursec.config.settings import Settings as RecurSecConfig
 from recursec.core.attack_chain import AttackChainBuilder
 from recursec.core.models import AgentRole, AgentTask, Target, TaskStatus
 from recursec.llm.router import ModelConfig, ModelRouter

@@ -2,7 +2,7 @@
 
 **Recursive Multi-Agent Security Framework**
 
-Autonomous security testing with unlimited local LLMs, 215+ tools, recursive agent spawning, and 24/7 daemon mode. Everything runs locally — no cloud, no Ollama.
+Autonomous security testing with unlimited local LLMs, 244+ tools, recursive agent spawning, and autonomous think-act loop. Everything runs locally — no cloud, no Ollama, no paid APIs.
 
 ```
  ____  ____  ____  _  _  ____  ____  ____  ____
@@ -20,18 +20,18 @@ RecurSec is pre-configured for your exact GGUF models, with each model assigned 
 | Port | Model | Role | Task Types |
 |------|-------|------|------------|
 | 8100 | **WhiteRabbitNeo-7B** | Security Brain | security, exploit, vuln_analysis |
-| 8101 | **Qwen2.5-Coder-14B** | Code Analysis (Large) | code, code_audit, exploit_dev |
-| 8102 | **Qwen2.5-Coder-7B** | Code Analysis (Medium) | code, code_audit |
-| 8103 | **CodeLlama-13B** | Exploit Code | code, exploit_dev |
-| 8104 | **CodeLlama-7B** | Code (Fast) | code, fast |
-| 8105 | **DeepSeek-R1-Distill** | Reasoning | reasoning, planning, analysis |
-| 8106 | **DeepSeek-Math-7B** | Math/Crypto Reasoning | reasoning, crypto, math |
-| 8107 | **Hermes-4-14B** | General (Large) | general, writing, report |
-| 8108 | **Llama-3.1-8B** | General (Medium) | general, recon, osint |
+| 8101 | **Mistral-7B-Instruct** | General (Fast) | general, fast, recon |
+| 8102 | **Qwen2.5-Coder-14B** | Code Analysis (Large) | code, code_audit, exploit_dev |
+| 8103 | **Qwen2.5-Coder-7B** | Code Analysis (Medium) | code, code_audit |
+| 8104 | **DeepSeek-R1-Distill** | Reasoning | reasoning, planning, analysis |
+| 8105 | **Hermes-4-14B** | General (Large) | general, writing, report |
+| 8106 | **Llama-3.1-8B** | General (Medium) | general, recon, osint |
+| 8107 | **CodeLlama-13B** | Exploit Code | code, exploit_dev |
+| 8108 | **CodeLlama-7B** | Code (Fast) | code, fast |
 | 8109 | **Dolphin-2.9** | Uncensored General | general, security, pentest |
-| 8110 | **Mistral-7B** | General (Fast) | general, fast, recon |
-| 8111 | **Yi-9B-200K** | Long Context (200K!) | long_context, code_audit |
-| 8112 | **Phi-3.5-mini** | Ultra-Fast Triage | fast, triage, classification |
+| 8110 | **Phi-3.5-mini** | Ultra-Fast Triage | fast, triage, classification |
+| 8111 | **DeepSeek-Math-7B** | Math/Crypto Reasoning | reasoning, crypto, math |
+| 8112 | **Yi-9B-200K** | Long Context (200K!) | long_context, code_audit |
 | 8113 | **FunctionGemma-270m** | Tool Call Router | function_call, tool_routing |
 | 8114 | **Llama-Guard-3** | Safety Guardrail | safety classification |
 | 8115 | **Nomic-Embed-Text** | RAG / Embedding | semantic memory search |
@@ -66,17 +66,26 @@ pip install -e .
 ### 3. Run RecurSec
 
 ```bash
-# Single target scan
-recursec run --config configs/recursec.yaml --target 192.168.1.100
+# Scan a target (autonomous mode — LLM decides what tools to run)
+python -m recursec scan https://target-site.com
 
-# Full auto-assessment
-recursec run --target 192.168.1.0/24 --objective "Complete security assessment"
+# Scan with more autonomous iterations
+python -m recursec scan https://target-site.com --iterations 200
 
-# Daemon mode (24/7)
-recursec run --daemon
+# Deep + stealth scan
+python -m recursec scan 192.168.1.0/24 --deep --stealth
 
-# Check available tools
-recursec tools
+# Tools-only mode (no LLM loop)
+python -m recursec scan https://target-site.com --no-autonomous
+
+# Check LLM server health
+python -m recursec health
+
+# List all 244+ registered tools
+python -m recursec tools
+
+# List configured models
+python -m recursec models
 ```
 
 ### 4. Stop Everything

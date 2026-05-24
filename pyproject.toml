@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recursec"
-version = "0.1.0"
-description = "Recursive Multi-Agent Security Framework — configurable LLM backends, 200+ security tools, autonomous vulnerability discovery"
+version = "1.0.0"
+description = "Recursive Multi-Agent Security Framework — 16 local LLMs, 244+ security tools, autonomous vulnerability discovery"
 readme = "README.md"
 license = {text = "AGPL-3.0"}
 requires-python = ">=3.11"
@@ -46,7 +46,7 @@ all = ["recursec[vllm,sglang,litellm]"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
 
 [project.scripts]
-recursec = "recursec.cli:app"
+recursec = "recursec.cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["recursec*"]

@@ -21,6 +21,23 @@ import structlog
 logger = structlog.get_logger()
 
 
+class ContentPriority(str, Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    OPTIONAL = "optional"
+
+
+class ContentType(str, Enum):
+    TARGET_PROFILE = "target_profile"
+    STRATEGY_KNOWLEDGE = "strategy_knowledge"
+    TOOL_OUTPUT = "tool_output"
+    FINDING = "finding"
+    CONVERSATION = "conversation"
+    SYSTEM = "system"
+
+
 class ContextSection(str, Enum):
     SYSTEM = "system"           # Role and instructions
     TASK = "task"               # Current task description

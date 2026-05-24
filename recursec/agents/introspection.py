@@ -19,11 +19,22 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
 
 logger = structlog.get_logger()
+
+
+class EventType(str, Enum):
+    AGENT_START = "agent_start"
+    AGENT_STOP = "agent_stop"
+    TOOL_RUN = "tool_run"
+    LLM_CALL = "llm_call"
+    FINDING = "finding"
+    ERROR = "error"
+    STATE_CHANGE = "state_change"
 
 
 @dataclass
@@ -369,3 +380,7 @@ class IntrospectionEngine:
             "insights": len(self._insights),
             "techniques_covered": len(self._technique_coverage),
         }
+
+
+# Alias for backward compatibility
+AgentIntrospection = IntrospectionEngine

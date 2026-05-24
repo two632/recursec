@@ -37,6 +37,9 @@ class GoalType(str, Enum):
     AND = "and"     # All sub-goals must be achieved
     OR = "or"       # Any sub-goal achieves this goal
     LEAF = "leaf"   # Directly actionable
+    FULL_ASSESSMENT = "full_assessment"
+    TARGETED = "targeted"
+    RECON_ONLY = "recon_only"
 
 
 @dataclass

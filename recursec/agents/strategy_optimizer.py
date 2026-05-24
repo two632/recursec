@@ -21,6 +21,15 @@ import structlog
 logger = structlog.get_logger()
 
 
+class AssessmentStrategy(str, Enum):
+    ADAPTIVE = "adaptive"
+    AGGRESSIVE = "aggressive"
+    STEALTH = "stealth"
+    QUICK = "quick"
+    COMPREHENSIVE = "comprehensive"
+    PASSIVE = "passive"
+
+
 class StrategyDomain(str, Enum):
     SCANNING = "scanning"
     ENUMERATION = "enumeration"

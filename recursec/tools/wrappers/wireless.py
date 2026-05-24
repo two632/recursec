@@ -18,7 +18,7 @@ from typing import Any
 
 import structlog
 
-from recursec.tools.tool_runner import ToolResult
+from recursec.core.models import ToolResult
 
 logger = structlog.get_logger()
 

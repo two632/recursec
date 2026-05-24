@@ -22,6 +22,22 @@ import structlog
 logger = structlog.get_logger()
 
 
+class RoutingStrategy(str, Enum):
+    BEST_FIT = "best_fit"
+    ROUND_ROBIN = "round_robin"
+    FASTEST = "fastest"
+    CHEAPEST = "cheapest"
+    ENSEMBLE = "ensemble"
+
+
+class TaskCategory(str, Enum):
+    SECURITY_ANALYSIS = "security_analysis"
+    CODE_REVIEW = "code_review"
+    PLANNING = "planning"
+    EXPLOITATION = "exploitation"
+    GENERAL = "general"
+
+
 class TaskType(str, Enum):
     SECURITY_ANALYSIS = "security_analysis"
     CODE_REVIEW = "code_review"

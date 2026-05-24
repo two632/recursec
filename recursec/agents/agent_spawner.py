@@ -21,6 +21,14 @@ import structlog
 logger = structlog.get_logger()
 
 
+class SpawnReason(str, Enum):
+    DECOMPOSITION = "decomposition"
+    SPECIALIZATION = "specialization"
+    PARALLEL = "parallel"
+    RETRY = "retry"
+    DEEP_DIVE = "deep_dive"
+
+
 class AgentRole(str, Enum):
     COORDINATOR = "coordinator"
     RECON = "recon"

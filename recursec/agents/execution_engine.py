@@ -20,9 +20,10 @@ from typing import Any
 
 import structlog
 
-from recursec.agents.budget_manager import BudgetManager, ConvergenceDetector
+from recursec.agents.budget_manager import BudgetManager
+from recursec.agents.convergence_detector import ConvergenceDetector
 from recursec.agents.communication import MessageBus
-from recursec.agents.context_manager import ContextPool
+from recursec.agents.context_manager import ContextManager as ContextPool
 from recursec.agents.coordinator import AssessmentType, MultiAgentCoordinator
 from recursec.agents.hypothesis import HypothesisEngine
 from recursec.agents.knowledge_synthesis import KnowledgeSynthesizer
