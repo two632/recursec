@@ -1,11 +1,11 @@
 """Red team operations knowledge base.
 
-Deep knowledge about red team methodology:
-1. Red team planning and scoping
-2. Initial access techniques
-3. Command and control (C2)
-4. Data exfiltration
-5. Adversary simulation frameworks
+Deep knowledge about red team operations:
+1. Initial access techniques
+2. Command and control (C2)
+3. Evasion and OPSEC
+4. Adversary emulation
+5. Purple team exercises
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class RedTeamPattern:
     pattern_id: str = ""
     name: str = ""
     category: str = ""
-    severity: str = "critical"
+    severity: str = "high"
     description: str = ""
     detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
@@ -37,183 +37,209 @@ class RedTeamPattern:
         }
 
 
-RED_TEAM_PATTERNS: list[dict[str, Any]] = [
+REDTEAM_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "rt-001", "name": "Red Team Planning",
-        "category": "planning", "severity": "high",
-        "desc": "Red team engagement planning and methodology.",
+        "id": "rt-001", "name": "Initial Access Techniques",
+        "category": "initial_access", "severity": "high",
+        "desc": "Initial access techniques for red team.",
         "detection": (
-            "RED TEAM PLANNING:\n"
-            "ENGAGEMENT TYPES:\n"
-            "  - Full scope (assume breach, external, internal)\n"
-            "  - Objective-based (specific goals)\n"
-            "  - Purple team (collaborative with defenders)\n"
-            "  - Adversary simulation (emulate specific APT)\n"
-            "PHASES:\n"
-            "  1. Reconnaissance (passive + active)\n"
-            "  2. Initial access (phishing, external exploit)\n"
-            "  3. Execution (run payload on target)\n"
-            "  4. Persistence (survive reboots)\n"
-            "  5. Privilege escalation (user → admin → system)\n"
-            "  6. Defense evasion (bypass AV/EDR)\n"
-            "  7. Discovery (enumerate internal)\n"
-            "  8. Lateral movement (pivot to other systems)\n"
-            "  9. Collection (gather target data)\n"
-            "  10. Exfiltration (extract data)\n"
-            "  11. Impact (demonstrate objective)\n"
-            "RULES OF ENGAGEMENT:\n"
-            "  - Scope (IP ranges, domains, off-limits)\n"
-            "  - Timing (business hours, maintenance windows)\n"
-            "  - Deconfliction (emergency contacts)\n"
-            "  - Evidence handling\n"
-            "  - Reporting cadence\n"
-            "FRAMEWORKS:\n"
-            "  MITRE ATT&CK, Unified Kill Chain, Diamond Model"
+            "INITIAL ACCESS:\n"
+            "PHISHING:\n"
+            "  - Macro-enabled documents\n"
+            "    # VBA macros (.docm, .xlsm)\n"
+            "    # Auto-execute (Document_Open)\n"
+            "  - ISO/IMG containers (bypass MOTW)\n"
+            "  - LNK files (shortcut abuse)\n"
+            "  - HTML smuggling (JS drops payload)\n"
+            "  - OneNote attachments (.one)\n"
+            "  - Password-protected archives\n"
+            "  # Delivery: GoPhish + Evilginx2\n"
+            "EXTERNAL SERVICES:\n"
+            "  - VPN exploitation (Pulse, Fortinet)\n"
+            "  - RDP brute force / spray\n"
+            "  - Exchange (ProxyLogon/ProxyShell)\n"
+            "  - Citrix (CVE-2019-19781)\n"
+            "  - Public-facing web apps\n"
+            "SUPPLY CHAIN:\n"
+            "  - Trusted relationship abuse\n"
+            "  - SaaS OAuth app poisoning\n"
+            "  - Partner portal compromise\n"
+            "PHYSICAL:\n"
+            "  - USB drop (Rubber Ducky)\n"
+            "  - Evil twin WiFi\n"
+            "  - Rogue network device\n"
+            "  - Badge cloning\n"
+            "CREDENTIAL:\n"
+            "  - Password spraying (low-and-slow)\n"
+            "  - Credential stuffing\n"
+            "  - MFA bypass (SIM swap, fatigue)\n"
+            "  - AitM (adversary-in-the-middle)\n"
+            "TOOLS:\n"
+            "  Cobalt Strike, Evilginx2, GoPhish, SET"
         ),
         "tools": [],
     },
     {
-        "id": "rt-002", "name": "Initial Access",
-        "category": "initial_access", "severity": "critical",
-        "desc": "Red team initial access techniques.",
-        "detection": (
-            "INITIAL ACCESS:\n"
-            "PHISHING:\n"
-            "  - Spearphishing attachment (macro-enabled docs)\n"
-            "  - Spearphishing link (credential harvest)\n"
-            "  - QR phishing (quishing)\n"
-            "  - Callback phishing (BazarCall)\n"
-            "  - Infrastructure: GoPhish, Evilginx2, Modlishka\n"
-            "  - Payload: Office macros, ISO/LNK, OneNote\n"
-            "  - Delivery: typosquatting, lookalike domains\n"
-            "EXTERNAL EXPLOITATION:\n"
-            "  - VPN appliance vulns (Pulse Secure, Fortinet, Citrix)\n"
-            "  - Exchange Server (ProxyLogon, ProxyShell)\n"
-            "  - Web application vulnerabilities\n"
-            "  - Exposed management interfaces\n"
-            "  - Default credentials on internet-facing services\n"
-            "SUPPLY CHAIN:\n"
-            "  - Compromise software update mechanism\n"
-            "  - Typosquatting packages (npm, PyPI)\n"
-            "  - Compromise CI/CD pipeline\n"
-            "  - Third-party vendor access\n"
-            "PHYSICAL:\n"
-            "  - Dropped USB devices\n"
-            "  - Rogue device placement\n"
-            "  - Badge cloning → physical access\n"
-            "  - Social engineering at front desk\n"
-            "TOOLS:\n"
-            "  GoPhish, Evilginx2, CoerceAndCatch"
-        ),
-        "tools": ["gophish", "evilginx2"],
-    },
-    {
-        "id": "rt-003", "name": "Command and Control",
+        "id": "rt-002", "name": "Command and Control (C2)",
         "category": "c2", "severity": "critical",
-        "desc": "C2 frameworks and communication channels.",
+        "desc": "C2 infrastructure and techniques.",
         "detection": (
             "COMMAND AND CONTROL:\n"
             "C2 FRAMEWORKS:\n"
-            "  - Cobalt Strike (commercial, most mature)\n"
-            "  - Sliver (open-source, Go-based)\n"
-            "  - Havoc (open-source, modern)\n"
-            "  - Mythic (open-source, multi-agent)\n"
-            "  - Covenant (C#, .NET)\n"
-            "  - Brute Ratel (commercial, EDR evasion)\n"
-            "  - Nighthawk (commercial)\n"
-            "COMMUNICATION CHANNELS:\n"
-            "  - HTTPS (most common, blends with traffic)\n"
-            "  - DNS (slow but stealthy)\n"
-            "  - SMB named pipes (internal lateral)\n"
-            "  - DoH/DoT (encrypted DNS)\n"
-            "  - WebSocket\n"
-            "  - Cloud services (Azure, AWS, GCP)\n"
+            "  - Cobalt Strike (commercial)\n"
+            "    # Beacon: HTTP/S, DNS, SMB, TCP\n"
+            "    # Malleable C2 profiles\n"
+            "    # BOF (Beacon Object Files)\n"
+            "  - Sliver (open-source, Go)\n"
+            "    # mTLS, WireGuard, HTTP/S, DNS\n"
+            "    # Implant generation\n"
+            "    # Armory (extensions)\n"
+            "  - Havoc (open-source, C)\n"
+            "    # Demon agent\n"
+            "    # Sleep obfuscation\n"
+            "    # Indirect syscalls\n"
+            "  - Mythic (open-source, modular)\n"
+            "    # Container-based agents\n"
+            "    # Custom C2 profiles\n"
             "EVASION:\n"
-            "  - Domain fronting (CDN abuse)\n"
-            "  - Redirectors (Apache mod_rewrite)\n"
-            "  - Malleable C2 profiles (Cobalt Strike)\n"
-            "  - Jitter and sleep (irregular callbacks)\n"
-            "  - Kill dates\n"
-            "  - Peer-to-peer (SMB, TCP)\n"
+            "  - Domain fronting\n"
+            "  - CDN-based C2\n"
+            "  - DNS over HTTPS (DoH)\n"
+            "  - Cloud service C2 (Azure, AWS, GCP)\n"
+            "  - Social media C2 (Twitter, Telegram)\n"
+            "  - Steganography C2\n"
             "INFRASTRUCTURE:\n"
-            "  - Short-lived VPS (Vultr, DigitalOcean)\n"
-            "  - CDN fronting\n"
-            "  - Categorized domains (reputable)\n"
-            "  - HTTPS certificates (Let's Encrypt)\n"
-            "  - Redirector chains\n"
+            "  - Redirectors (Apache, Nginx, Cloudflare)\n"
+            "  - Domain categorization\n"
+            "  - Certificate management\n"
+            "  - Aged domains\n"
+            "  - Disposable infrastructure\n"
             "TOOLS:\n"
-            "  Sliver, Mythic, Havoc, Cobalt Strike"
+            "  Cobalt Strike, Sliver, Havoc, Mythic"
         ),
-        "tools": ["sliver", "mythic", "havoc"],
+        "tools": [],
     },
     {
-        "id": "rt-004", "name": "Data Exfiltration",
-        "category": "exfiltration", "severity": "critical",
-        "desc": "Data exfiltration techniques.",
+        "id": "rt-003", "name": "Evasion and OPSEC",
+        "category": "evasion", "severity": "high",
+        "desc": "Evasion and operational security.",
         "detection": (
-            "DATA EXFILTRATION:\n"
-            "NETWORK:\n"
-            "  - HTTPS POST to external server\n"
-            "  - DNS exfiltration (encode in subdomains)\n"
-            "  - ICMP tunneling\n"
-            "  - Steganography in images\n"
-            "  - Cloud storage (S3, Azure Blob)\n"
-            "  - Email (SMTP, Exchange)\n"
-            "  - Protocol tunneling (DNS, HTTPS, WebSocket)\n"
-            "ENCODING:\n"
-            "  - Base64/Base32\n"
-            "  - Hex encoding\n"
-            "  - Custom XOR cipher\n"
-            "  - Compression + encryption (AES)\n"
-            "  - Chunked transfer\n"
-            "STAGING:\n"
-            "  - Compress and encrypt before exfil\n"
-            "  - Split into chunks\n"
-            "  - Stage in temp directories\n"
-            "  - Password-protected archives\n"
-            "  - Use legitimate backup tools\n"
-            "COVERT CHANNELS:\n"
-            "  - Timing-based (packet delays)\n"
-            "  - Storage-based (unused header fields)\n"
-            "  - TCP ISN covert channel\n"
-            "  - DNS TXT records\n"
-            "  - Social media (Twitter, Pastebin)\n"
+            "EVASION & OPSEC:\n"
+            "AV/EDR EVASION:\n"
+            "  - AMSI bypass\n"
+            "    # Patching amsi.dll in memory\n"
+            "    # String obfuscation\n"
+            "  - ETW bypass\n"
+            "    # Patch EtwEventWrite\n"
+            "  - Unhooking ntdll.dll\n"
+            "    # Read fresh copy from disk\n"
+            "    # Direct syscalls\n"
+            "    # Indirect syscalls (Halo's Gate)\n"
+            "  - Process injection techniques\n"
+            "    # Early bird APC injection\n"
+            "    # Process hollowing\n"
+            "    # Module stomping\n"
+            "    # Thread pool abuse\n"
+            "  - Sleep obfuscation\n"
+            "    # Ekko, Foliage, Cronos\n"
+            "  - Payload encryption\n"
+            "    # AES/RC4 encrypted shellcode\n"
+            "    # XOR with rolling key\n"
+            "LIVING-OFF-THE-LAND:\n"
+            "  - PowerShell (constrained language)\n"
+            "  - WMIC, CertUtil, BITSAdmin\n"
+            "  - MSBuild, InstallUtil, RegSvr32\n"
+            "  - Rundll32, MSHTA\n"
+            "  # LOLBAS project\n"
+            "  # GTFOBins (Linux)\n"
+            "LOG EVASION:\n"
+            "  - Timestomping\n"
+            "  - Log clearing/modification\n"
+            "  - Sysmon evasion\n"
+            "  - Event log patching\n"
             "TOOLS:\n"
-            "  dnscat2, iodine, rclone, DNSExfiltrator"
+            "  ScareCrow, NimPackt, Donut, SharpC2"
         ),
-        "tools": ["dnscat2", "iodine"],
+        "tools": [],
     },
     {
-        "id": "rt-005", "name": "Adversary Simulation",
-        "category": "adversary_sim", "severity": "high",
-        "desc": "Adversary simulation and emulation frameworks.",
+        "id": "rt-004", "name": "Adversary Emulation",
+        "category": "emulation", "severity": "medium",
+        "desc": "Adversary emulation frameworks.",
         "detection": (
-            "ADVERSARY SIMULATION:\n"
-            "APT EMULATION:\n"
-            "  - MITRE ATT&CK Navigator (coverage mapping)\n"
-            "  - MITRE Caldera (automated adversary emulation)\n"
-            "  - Atomic Red Team (atomic tests per technique)\n"
-            "  - APTSimulator (quick APT behavior simulation)\n"
-            "THREAT INTELLIGENCE:\n"
-            "  - Map real APT TTPs to ATT&CK\n"
-            "  - Replicate specific campaign tradecraft\n"
-            "  - Use published threat reports as playbooks\n"
-            "  - MITRE ATT&CK Groups (APT28, APT29, etc.)\n"
-            "TESTING:\n"
-            "  - Detection coverage (which techniques trigger alerts?)\n"
-            "  - Response time (MTTD, MTTR)\n"
-            "  - Analyst capability (can they investigate?)\n"
-            "  - Tool effectiveness (EDR, SIEM, NDR)\n"
+            "ADVERSARY EMULATION:\n"
+            "FRAMEWORKS:\n"
+            "  - MITRE ATT&CK (technique reference)\n"
+            "  - Atomic Red Team\n"
+            "    # Pre-built atomics per technique\n"
+            "    # Invoke-AtomicRedTeam (PowerShell)\n"
+            "    # atomic-red-team (repository)\n"
+            "  - MITRE CALDERA\n"
+            "    # Automated adversary emulation\n"
+            "    # Plugins for different APTs\n"
+            "    # Agent-based execution\n"
+            "  - Prelude Operator\n"
+            "    # TTPs from threat intelligence\n"
+            "    # Chain execution\n"
+            "THREAT GROUPS:\n"
+            "  - APT29 (Cozy Bear) — SolarWinds\n"
+            "  - APT28 (Fancy Bear) — phishing + implants\n"
+            "  - Lazarus — financial + crypto\n"
+            "  - FIN7 — POS + e-commerce\n"
+            "  - Sandworm — ICS/SCADA destructive\n"
+            "EMULATION PLANNING:\n"
+            "  1. Select threat group/scenario\n"
+            "  2. Map TTPs to ATT&CK\n"
+            "  3. Build attack flow\n"
+            "  4. Execute techniques\n"
+            "  5. Document detections/gaps\n"
+            "  6. Report findings\n"
+            "TOOLS:\n"
+            "  Atomic Red Team, CALDERA, Prelude"
+        ),
+        "tools": [],
+    },
+    {
+        "id": "rt-005", "name": "Purple Team Exercises",
+        "category": "purple", "severity": "medium",
+        "desc": "Purple team exercises.",
+        "detection": (
+            "PURPLE TEAM EXERCISES:\n"
+            "METHODOLOGY:\n"
+            "  1. Define scope and objectives\n"
+            "  2. Select TTPs to test\n"
+            "  3. Red team executes technique\n"
+            "  4. Blue team attempts detection\n"
+            "  5. Evaluate detection capability\n"
+            "  6. Tune/create detections\n"
+            "  7. Re-test to verify\n"
+            "  8. Document coverage matrix\n"
+            "DETECTION ENGINEERING:\n"
+            "  - Sigma rules (generic detection)\n"
+            "  - YARA rules (file/memory)\n"
+            "  - Suricata rules (network)\n"
+            "  - Splunk/Elastic queries\n"
+            "  - Custom analytics\n"
+            "COVERAGE MATRIX:\n"
+            "  Technique | Logged | Alerted | Blocked\n"
+            "  T1003.001 |  Yes   |   Yes   |   No\n"
+            "  T1021.002 |  Yes   |   No    |   No\n"
+            "  T1059.001 |  Yes   |   Yes   |   Yes\n"
             "METRICS:\n"
-            "  - Techniques tested vs detected\n"
-            "  - Time to detect per technique\n"
+            "  - Detection coverage percentage\n"
+            "  - Mean time to detect (MTTD)\n"
+            "  - Mean time to respond (MTTR)\n"
             "  - False positive rate\n"
-            "  - SOC analyst response quality\n"
-            "  - Remediation effectiveness\n"
-            "PLATFORMS:\n"
-            "  MITRE Caldera, AttackIQ, SafeBreach, Randori"
+            "  - Coverage gaps by ATT&CK tactic\n"
+            "REPORTING:\n"
+            "  - Coverage heatmap (ATT&CK Navigator)\n"
+            "  - Gap analysis\n"
+            "  - Detection improvement plan\n"
+            "  - Quarterly trend tracking\n"
+            "TOOLS:\n"
+            "  ATT&CK Navigator, Sigma, DeTTECT"
         ),
-        "tools": ["caldera", "atomic-red-team"],
+        "tools": [],
     },
 ]
 
@@ -221,23 +247,23 @@ RED_TEAM_PATTERNS: list[dict[str, Any]] = [
 class RedTeamOpsKB:
     """Red team operations knowledge base.
 
-    Provides red team methodology patterns
-    injected into agent prompts.
+    Provides red team patterns injected
+    into agent prompts.
     """
 
     def __init__(self) -> None:
         self._patterns: dict[str, RedTeamPattern] = {}
-        self._log = logger.bind(component="red_team_ops_kb")
+        self._log = logger.bind(component="redteam_kb")
         self._load_patterns()
 
     def _load_patterns(self) -> None:
         """Load red team patterns."""
-        for data in RED_TEAM_PATTERNS:
+        for data in REDTEAM_PATTERNS:
             pattern = RedTeamPattern(
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
-                severity=data.get("severity", "critical"),
+                severity=data.get("severity", "high"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
@@ -256,7 +282,7 @@ class RedTeamOpsKB:
         categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
-        """Build red team operations prompt."""
+        """Build red team prompt."""
         lines = ["## Red Team Operations\n"]
         count = 0
         for pattern in self._patterns.values():
