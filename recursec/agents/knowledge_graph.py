@@ -1,13 +1,12 @@
-"""Knowledge graph engine — entity-relationship graph for security findings.
+"""Knowledge graph — entity-relationship intelligence.
 
-Implements:
-1. Entity creation (hosts, services, vulns, credentials, etc.)
-2. Relationship tracking between entities
-3. Graph traversal for attack path discovery
-4. Entity enrichment from multiple sources
-5. Temporal graph evolution
-6. Subgraph extraction for context injection
-7. Graph query for LLM prompt building
+Builds and queries a graph of security entities:
+1. Nodes: hosts, services, vulns, findings, credentials
+2. Edges: relationships (runs_on, exploits, authenticates)
+3. Path finding: attack paths through the graph
+4. Centrality: identify high-value targets
+5. Pattern matching: find known attack patterns
+6. LLM prompt generation from graph context
 """
 
 from __future__ import annotations
@@ -22,323 +21,388 @@ import structlog
 logger = structlog.get_logger()
 
 
-class EntityType(str, Enum):
+class NodeType(str, Enum):
     HOST = "host"
     SERVICE = "service"
     PORT = "port"
+    VULNERABILITY = "vulnerability"
+    FINDING = "finding"
+    CREDENTIAL = "credential"
     DOMAIN = "domain"
     SUBDOMAIN = "subdomain"
     URL = "url"
-    VULNERABILITY = "vulnerability"
-    CREDENTIAL = "credential"
+    TECHNOLOGY = "technology"
     USER = "user"
     CERTIFICATE = "certificate"
-    TECHNOLOGY = "technology"
-    FINDING = "finding"
     NETWORK = "network"
-    APPLICATION = "application"
+    CLOUD_RESOURCE = "cloud_resource"
+    CONTAINER = "container"
+    DATABASE = "database"
+    API_ENDPOINT = "api_endpoint"
 
 
-class RelationType(str, Enum):
-    RUNS_ON = "runs_on"             # service → host
-    EXPOSES = "exposes"             # host → port
-    RESOLVES_TO = "resolves_to"     # domain → host
-    SUBDOMAIN_OF = "subdomain_of"   # subdomain → domain
-    HAS_VULN = "has_vuln"          # service → vulnerability
-    AUTHENTICATES = "authenticates"  # credential → service
-    BELONGS_TO = "belongs_to"       # user → host
-    USES_TECH = "uses_tech"         # service → technology
-    LINKS_TO = "links_to"          # url → url
-    DEPENDS_ON = "depends_on"       # service → service
-    CONTAINS = "contains"           # network → host
-    EXPLOITS = "exploits"           # finding → vulnerability
-    SERVES = "serves"               # host → url
-    CHAIN = "chain"                 # finding → finding (attack chain)
+class EdgeType(str, Enum):
+    RUNS_ON = "runs_on"
+    LISTENS_ON = "listens_on"
+    EXPLOITS = "exploits"
+    AUTHENTICATES = "authenticates"
+    CONNECTS_TO = "connects_to"
+    RESOLVES_TO = "resolves_to"
+    HOSTS = "hosts"
+    USES_TECH = "uses_tech"
+    HAS_VULN = "has_vuln"
+    PART_OF = "part_of"
+    TRUSTS = "trusts"
+    ACCESSES = "accesses"
+    CONTAINS = "contains"
+    DEPENDS_ON = "depends_on"
+    LEADS_TO = "leads_to"
 
 
 @dataclass
-class Entity:
+class GraphNode:
     """A node in the knowledge graph."""
-    entity_id: str = ""
-    entity_type: EntityType = EntityType.HOST
-    name: str = ""
+    node_id: str = ""
+    node_type: NodeType = NodeType.HOST
+    label: str = ""
     properties: dict[str, Any] = field(default_factory=dict)
-    tags: list[str] = field(default_factory=list)
-    source: str = ""              # Tool or agent that created this
+    created_at: float = field(default_factory=time.time)
+    severity: str = ""
     confidence: float = 1.0
-    first_seen: float = field(default_factory=time.time)
-    last_seen: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.entity_id[:12],
-            "type": self.entity_type.value,
-            "name": self.name[:20],
-            "props": len(self.properties),
-            "conf": round(self.confidence, 2),
+            "id": self.node_id[:12],
+            "type": self.node_type.value[:8],
+            "label": self.label[:20],
         }
 
 
 @dataclass
-class Relationship:
+class GraphEdge:
     """An edge in the knowledge graph."""
-    rel_id: str = ""
-    rel_type: RelationType = RelationType.RUNS_ON
+    edge_id: str = ""
+    edge_type: EdgeType = EdgeType.CONNECTS_TO
     source_id: str = ""
     target_id: str = ""
     properties: dict[str, Any] = field(default_factory=dict)
+    weight: float = 1.0
     confidence: float = 1.0
-    created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.rel_id[:10],
-            "type": self.rel_type.value,
-            "src": self.source_id[:10],
-            "tgt": self.target_id[:10],
+            "type": self.edge_type.value[:10],
+            "src": self.source_id[:8],
+            "tgt": self.target_id[:8],
+            "w": f"{self.weight:.1f}",
         }
 
 
-class KnowledgeGraph:
-    """Entity-relationship graph for security findings.
+@dataclass
+class AttackPath:
+    """An attack path through the graph."""
+    path_id: str = ""
+    nodes: list[str] = field(default_factory=list)
+    edges: list[str] = field(default_factory=list)
+    total_weight: float = 0.0
+    severity: str = "medium"
+    description: str = ""
 
-    Tracks hosts, services, vulnerabilities, credentials,
-    and their relationships. Supports attack path discovery
-    and context injection into LLM prompts.
+    @property
+    def length(self) -> int:
+        return len(self.nodes)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.path_id[:8],
+            "length": self.length,
+            "weight": f"{self.total_weight:.1f}",
+            "severity": self.severity[:6],
+        }
+
+
+# Severity weights for path scoring
+SEVERITY_WEIGHTS: dict[str, float] = {
+    "critical": 10.0,
+    "high": 7.0,
+    "medium": 4.0,
+    "low": 2.0,
+    "info": 1.0,
+}
+
+# Node type → typical properties
+NODE_SCHEMAS: dict[NodeType, list[str]] = {
+    NodeType.HOST: ["ip", "hostname", "os", "os_version"],
+    NodeType.SERVICE: ["name", "version", "banner", "state"],
+    NodeType.PORT: ["number", "protocol", "state"],
+    NodeType.VULNERABILITY: [
+        "cve", "cvss", "severity", "description", "exploitable",
+    ],
+    NodeType.CREDENTIAL: [
+        "username", "credential_type", "service", "source",
+    ],
+    NodeType.DOMAIN: ["registrar", "creation_date", "nameservers"],
+    NodeType.SUBDOMAIN: ["parent_domain", "cname", "ip"],
+    NodeType.URL: ["path", "method", "status_code", "content_type"],
+    NodeType.TECHNOLOGY: ["name", "version", "category"],
+    NodeType.CLOUD_RESOURCE: [
+        "provider", "resource_type", "region", "arn",
+    ],
+    NodeType.API_ENDPOINT: ["method", "path", "auth_required"],
+}
+
+
+class KnowledgeGraph:
+    """Security knowledge graph.
+
+    Maintains a graph of discovered entities
+    and their relationships, enabling attack
+    path analysis and context injection.
     """
 
-    def __init__(self, max_entities: int = 10000) -> None:
-        self._entities: dict[str, Entity] = {}
-        self._relationships: dict[str, Relationship] = {}
-        self._adjacency: dict[str, list[str]] = {}      # entity_id → [rel_ids]
-        self._reverse_adj: dict[str, list[str]] = {}     # entity_id → [rel_ids targeting this]
-        self._name_index: dict[str, str] = {}            # name → entity_id
-        self._max_entities = max_entities
-        self._counter = 0
-        self._log = logger.bind(component="knowledge_graph")
+    def __init__(self) -> None:
+        self._nodes: dict[str, GraphNode] = {}
+        self._edges: dict[str, GraphEdge] = {}
+        self._adjacency: dict[str, list[str]] = {}  # node_id → edge_ids
+        self._node_counter = 0
+        self._edge_counter = 0
+        self._paths: list[AttackPath] = []
+        self._log = logger.bind(component="kg")
 
-    def add_entity(
+    def add_node(
         self,
-        entity_type: EntityType,
-        name: str,
+        node_type: NodeType,
+        label: str,
         properties: dict[str, Any] | None = None,
-        source: str = "",
+        severity: str = "",
         confidence: float = 1.0,
-        tags: list[str] | None = None,
-    ) -> Entity:
-        """Add or update an entity."""
-        # Check if entity already exists
-        existing_id = self._name_index.get(f"{entity_type.value}:{name.lower()}")
-        if existing_id and existing_id in self._entities:
-            existing = self._entities[existing_id]
-            existing.last_seen = time.time()
-            if properties:
-                existing.properties.update(properties)
-            existing.confidence = max(existing.confidence, confidence)
-            return existing
+    ) -> GraphNode:
+        """Add a node to the graph."""
+        # Check for duplicate
+        for existing in self._nodes.values():
+            if existing.label == label and existing.node_type == node_type:
+                # Update properties
+                if properties:
+                    existing.properties.update(properties)
+                return existing
 
-        self._counter += 1
-        entity = Entity(
-            entity_id=f"ent-{self._counter}",
-            entity_type=entity_type,
-            name=name,
+        self._node_counter += 1
+        node = GraphNode(
+            node_id=f"n-{self._node_counter}",
+            node_type=node_type,
+            label=label,
             properties=properties or {},
-            source=source,
+            severity=severity,
             confidence=confidence,
-            tags=tags or [],
         )
+        self._nodes[node.node_id] = node
+        self._adjacency[node.node_id] = []
+        return node
 
-        self._entities[entity.entity_id] = entity
-        self._name_index[f"{entity_type.value}:{name.lower()}"] = entity.entity_id
-        self._adjacency[entity.entity_id] = []
-        self._reverse_adj[entity.entity_id] = []
-
-        # Evict old entities if over limit
-        while len(self._entities) > self._max_entities:
-            oldest = min(
-                self._entities.values(),
-                key=lambda e: e.last_seen,
-            )
-            self.remove_entity(oldest.entity_id)
-
-        return entity
-
-    def add_relationship(
+    def add_edge(
         self,
+        edge_type: EdgeType,
         source_id: str,
         target_id: str,
-        rel_type: RelationType,
         properties: dict[str, Any] | None = None,
-        confidence: float = 1.0,
-    ) -> Relationship | None:
-        """Add a relationship between entities."""
-        if source_id not in self._entities or target_id not in self._entities:
+        weight: float = 1.0,
+    ) -> GraphEdge | None:
+        """Add an edge to the graph."""
+        if source_id not in self._nodes or target_id not in self._nodes:
             return None
 
-        self._counter += 1
-        rel = Relationship(
-            rel_id=f"rel-{self._counter}",
-            rel_type=rel_type,
+        # Check for duplicate
+        for existing in self._edges.values():
+            if (
+                existing.source_id == source_id
+                and existing.target_id == target_id
+                and existing.edge_type == edge_type
+            ):
+                return existing
+
+        self._edge_counter += 1
+        edge = GraphEdge(
+            edge_id=f"e-{self._edge_counter}",
+            edge_type=edge_type,
             source_id=source_id,
             target_id=target_id,
             properties=properties or {},
-            confidence=confidence,
+            weight=weight,
         )
-
-        self._relationships[rel.rel_id] = rel
-        self._adjacency.setdefault(source_id, []).append(rel.rel_id)
-        self._reverse_adj.setdefault(target_id, []).append(rel.rel_id)
-
-        return rel
-
-    def remove_entity(self, entity_id: str) -> bool:
-        """Remove an entity and its relationships."""
-        if entity_id not in self._entities:
-            return False
-
-        # Remove relationships
-        rel_ids = list(self._adjacency.get(entity_id, []))
-        rel_ids += list(self._reverse_adj.get(entity_id, []))
-        for rid in set(rel_ids):
-            self._relationships.pop(rid, None)
-
-        entity = self._entities.pop(entity_id)
-        self._name_index.pop(f"{entity.entity_type.value}:{entity.name.lower()}", None)
-        self._adjacency.pop(entity_id, None)
-        self._reverse_adj.pop(entity_id, None)
-        return True
+        self._edges[edge.edge_id] = edge
+        self._adjacency[source_id].append(edge.edge_id)
+        return edge
 
     def get_neighbors(
         self,
-        entity_id: str,
-        rel_type: RelationType | None = None,
-    ) -> list[Entity]:
-        """Get neighboring entities."""
-        neighbors: list[Entity] = []
-        for rel_id in self._adjacency.get(entity_id, []):
-            rel = self._relationships.get(rel_id)
-            if not rel:
+        node_id: str,
+        edge_type: EdgeType | None = None,
+    ) -> list[GraphNode]:
+        """Get neighboring nodes."""
+        neighbors: list[GraphNode] = []
+        for edge_id in self._adjacency.get(node_id, []):
+            edge = self._edges.get(edge_id)
+            if not edge:
                 continue
-            if rel_type and rel.rel_type != rel_type:
+            if edge_type and edge.edge_type != edge_type:
                 continue
-            target = self._entities.get(rel.target_id)
+            target = self._nodes.get(edge.target_id)
             if target:
                 neighbors.append(target)
         return neighbors
 
-    def find_path(
+    def get_nodes_by_type(self, node_type: NodeType) -> list[GraphNode]:
+        """Get all nodes of a specific type."""
+        return [
+            n for n in self._nodes.values()
+            if n.node_type == node_type
+        ]
+
+    def get_vulnerabilities(self) -> list[GraphNode]:
+        """Get all vulnerability nodes."""
+        return self.get_nodes_by_type(NodeType.VULNERABILITY)
+
+    def get_high_severity_nodes(self) -> list[GraphNode]:
+        """Get nodes with high/critical severity."""
+        return [
+            n for n in self._nodes.values()
+            if n.severity in ("critical", "high")
+        ]
+
+    def find_attack_paths(
         self,
         start_id: str,
-        end_id: str,
+        target_id: str,
         max_depth: int = 5,
-    ) -> list[str] | None:
-        """Find shortest path between entities (BFS)."""
-        if start_id not in self._entities or end_id not in self._entities:
-            return None
+    ) -> list[AttackPath]:
+        """Find attack paths between two nodes using BFS."""
+        if start_id not in self._nodes or target_id not in self._nodes:
+            return []
 
-        visited: set[str] = set()
-        queue: list[tuple[str, list[str]]] = [(start_id, [start_id])]
+        paths: list[AttackPath] = []
+        queue: list[tuple[list[str], list[str], float]] = [
+            ([start_id], [], 0.0),
+        ]
+        visited_paths: set[str] = set()
 
-        while queue:
-            current, path = queue.pop(0)
-            if current == end_id:
-                return path
-            if len(path) > max_depth:
+        while queue and len(paths) < 10:
+            current_nodes, current_edges, current_weight = queue.pop(0)
+            current_id = current_nodes[-1]
+
+            if len(current_nodes) > max_depth:
                 continue
-            if current in visited:
+
+            if current_id == target_id and len(current_nodes) > 1:
+                path_key = "→".join(current_nodes)
+                if path_key not in visited_paths:
+                    visited_paths.add(path_key)
+                    path = AttackPath(
+                        path_id=f"path-{len(paths) + 1}",
+                        nodes=list(current_nodes),
+                        edges=list(current_edges),
+                        total_weight=current_weight,
+                    )
+                    paths.append(path)
                 continue
-            visited.add(current)
 
-            for rel_id in self._adjacency.get(current, []):
-                rel = self._relationships.get(rel_id)
-                if rel and rel.target_id not in visited:
-                    queue.append((rel.target_id, path + [rel.target_id]))
-
-        return None
-
-    def get_attack_paths(
-        self,
-        target_entity_id: str,
-        max_depth: int = 4,
-    ) -> list[list[str]]:
-        """Find all paths leading to a target (reverse BFS)."""
-        paths: list[list[str]] = []
-
-        def dfs(entity_id: str, current_path: list[str], depth: int) -> None:
-            if depth > max_depth:
-                return
-            for rel_id in self._reverse_adj.get(entity_id, []):
-                rel = self._relationships.get(rel_id)
-                if not rel or rel.source_id in current_path:
+            for edge_id in self._adjacency.get(current_id, []):
+                edge = self._edges.get(edge_id)
+                if not edge:
                     continue
-                new_path = [rel.source_id] + current_path
-                paths.append(new_path)
-                dfs(rel.source_id, new_path, depth + 1)
+                next_id = edge.target_id
+                if next_id not in current_nodes:
+                    queue.append((
+                        current_nodes + [next_id],
+                        current_edges + [edge_id],
+                        current_weight + edge.weight,
+                    ))
 
-        dfs(target_entity_id, [target_entity_id], 0)
-        return paths
+        return sorted(paths, key=lambda p: p.total_weight)
 
-    def get_by_type(self, entity_type: EntityType) -> list[Entity]:
-        """Get all entities of a type."""
-        return [e for e in self._entities.values() if e.entity_type == entity_type]
+    def compute_centrality(self) -> dict[str, float]:
+        """Compute degree centrality for each node."""
+        centrality: dict[str, float] = {}
+        total_nodes = max(1, len(self._nodes) - 1)
+
+        for node_id in self._nodes:
+            outgoing = len(self._adjacency.get(node_id, []))
+            incoming = sum(
+                1 for e in self._edges.values()
+                if e.target_id == node_id
+            )
+            centrality[node_id] = (outgoing + incoming) / total_nodes
+
+        return centrality
+
+    def get_high_value_targets(self, top_n: int = 5) -> list[GraphNode]:
+        """Get the highest-centrality nodes."""
+        centrality = self.compute_centrality()
+        sorted_ids = sorted(
+            centrality, key=centrality.get, reverse=True,  # type: ignore[arg-type]
+        )
+        return [
+            self._nodes[nid]
+            for nid in sorted_ids[:top_n]
+            if nid in self._nodes
+        ]
 
     def build_graph_prompt(
         self,
-        focus_entity: str = "",
-        max_entities: int = 15,
-        max_rels: int = 20,
+        focus_node_id: str = "",
+        max_nodes: int = 20,
     ) -> str:
-        """Build knowledge graph context for LLM."""
+        """Build graph context for LLM prompt."""
         lines = ["## Knowledge Graph\n"]
+        lines.append(f"Nodes: {len(self._nodes)}")
+        lines.append(f"Edges: {len(self._edges)}")
 
-        # Summary
+        # Type distribution
         type_counts: dict[str, int] = {}
-        for e in self._entities.values():
-            type_counts[e.entity_type.value] = type_counts.get(e.entity_type.value, 0) + 1
+        for n in self._nodes.values():
+            type_counts[n.node_type.value] = (
+                type_counts.get(n.node_type.value, 0) + 1
+            )
+        for ntype, count in sorted(
+            type_counts.items(), key=lambda x: x[1], reverse=True,
+        )[:5]:
+            lines.append(f"  {ntype}: {count}")
 
-        lines.append(
-            f"Entities: {len(self._entities)} | "
-            f"Relationships: {len(self._relationships)}"
-        )
-        lines.append("Types: " + " ".join(f"{k}={v}" for k, v in type_counts.items()))
+        # High-severity nodes
+        high_sev = self.get_high_severity_nodes()
+        if high_sev:
+            lines.append(f"\nHigh severity: {len(high_sev)}")
+            for node in high_sev[:3]:
+                lines.append(f"  [{node.severity[:4]}] {node.label[:25]}")
 
-        if focus_entity and focus_entity in self._entities:
-            entity = self._entities[focus_entity]
-            lines.append(f"\nFocus: {entity.name} ({entity.entity_type.value})")
-
-            neighbors = self.get_neighbors(focus_entity)
-            if neighbors:
-                lines.append(f"Connected to {len(neighbors)} entities:")
-                for n in neighbors[:max_entities]:
-                    lines.append(f"  → {n.name[:20]} ({n.entity_type.value})")
-        else:
-            # Show high-value entities
-            vulns = self.get_by_type(EntityType.VULNERABILITY)
-            if vulns:
-                lines.append(f"\nVulnerabilities ({len(vulns)}):")
-                for v in vulns[:5]:
-                    lines.append(f"  {v.name[:30]}")
-
-            hosts = self.get_by_type(EntityType.HOST)
-            if hosts:
-                lines.append(f"\nHosts ({len(hosts)}):")
-                for h in hosts[:5]:
-                    lines.append(f"  {h.name[:30]}")
+        # Focus node context
+        if focus_node_id and focus_node_id in self._nodes:
+            node = self._nodes[focus_node_id]
+            neighbors = self.get_neighbors(focus_node_id)
+            lines.append(f"\nFocus: {node.label}")
+            lines.append(f"  Type: {node.node_type.value}")
+            lines.append(f"  Neighbors: {len(neighbors)}")
+            for nb in neighbors[:3]:
+                lines.append(f"    → {nb.label[:20]} ({nb.node_type.value})")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         type_counts: dict[str, int] = {}
-        for e in self._entities.values():
-            type_counts[e.entity_type.value] = type_counts.get(e.entity_type.value, 0) + 1
+        for n in self._nodes.values():
+            type_counts[n.node_type.value] = (
+                type_counts.get(n.node_type.value, 0) + 1
+            )
 
-        rel_counts: dict[str, int] = {}
-        for r in self._relationships.values():
-            rel_counts[r.rel_type.value] = rel_counts.get(r.rel_type.value, 0) + 1
+        edge_counts: dict[str, int] = {}
+        for e in self._edges.values():
+            edge_counts[e.edge_type.value] = (
+                edge_counts.get(e.edge_type.value, 0) + 1
+            )
 
         return {
-            "entities": len(self._entities),
-            "relationships": len(self._relationships),
-            "by_type": type_counts,
-            "by_rel_type": rel_counts,
+            "nodes": len(self._nodes),
+            "edges": len(self._edges),
+            "paths": len(self._paths),
+            "by_node_type": type_counts,
+            "by_edge_type": edge_counts,
         }

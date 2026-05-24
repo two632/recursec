@@ -1,16 +1,17 @@
-"""Supply chain attack knowledge base.
+"""Supply chain security knowledge base.
 
-Deep knowledge about supply chain attacks:
-1. Dependency confusion and typosquatting
-2. CI/CD pipeline attacks
-3. Package manager exploitation
-4. Build system compromise
-5. Third-party risk assessment
+Attack patterns for software supply chain attacks:
+1. Dependency Confusion — internal vs public package takeover
+2. Malicious Package Injection — typosquatting, star-jacking
+3. CI/CD Pipeline Compromise — poisoned workflows, secrets theft
+4. Source Code Repository Attacks — commit injection, signed malware
+5. Build System Compromise — compiler backdoors, reproducibility
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -18,298 +19,243 @@ import structlog
 logger = structlog.get_logger()
 
 
+class SupplyChainAttackType(str, Enum):
+    DEPENDENCY_CONFUSION = "dependency_confusion"
+    MALICIOUS_PACKAGE = "malicious_package"
+    CICD_COMPROMISE = "cicd_compromise"
+    REPO_ATTACK = "repo_attack"
+    BUILD_COMPROMISE = "build_compromise"
+
+
 @dataclass
 class SupplyChainPattern:
-    """A supply chain pattern."""
-    pattern_id: str = ""
+    """A supply chain attack pattern."""
     name: str = ""
-    category: str = ""
-    severity: str = "critical"
+    attack_type: SupplyChainAttackType = SupplyChainAttackType.DEPENDENCY_CONFUSION
     description: str = ""
-    detection_strategy: str = ""
+    detection_strategies: list[str] = field(default_factory=list)
+    indicators: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    mitre_ids: list[str] = field(default_factory=list)
+    severity: str = "high"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.pattern_id,
-            "name": self.name[:25],
-            "category": self.category[:12],
+            "name": self.name,
+            "type": self.attack_type.value,
+            "severity": self.severity,
+            "detection_count": len(self.detection_strategies),
+            "indicator_count": len(self.indicators),
         }
 
 
-SUPPLYCHAIN_PATTERNS: list[dict[str, Any]] = [
-    {
-        "id": "sc-001", "name": "Dependency Confusion",
-        "category": "dependency", "severity": "critical",
-        "desc": "Dependency confusion and typosquatting.",
-        "detection": (
-            "DEPENDENCY CONFUSION:\n"
-            "ATTACK:\n"
-            "  - Private package name discovery\n"
-            "    # package.json, requirements.txt\n"
-            "    # Internal documentation\n"
-            "    # Error messages\n"
-            "    # JavaScript source maps\n"
-            "  - Register public package with same name\n"
-            "  - Higher version number = priority\n"
-            "  - Preinstall/postinstall scripts\n"
-            "TYPOSQUATTING:\n"
-            "  - Common misspellings\n"
-            "  - Hyphen/underscore swaps\n"
-            "  - Scope confusion (@org/pkg)\n"
-            "  - Similar-looking characters\n"
-            "  # Examples:\n"
-            "  # lodash → lodahs, loadash\n"
-            "  # requests → requets, request\n"
-            "DETECTION:\n"
-            "  - Socket.dev (supply chain firewall)\n"
-            "  - npm audit, pip audit\n"
-            "  - Lockfile review\n"
-            "  - Private registry configuration\n"
-            "  - .npmrc scoped registries\n"
-            "  - pip --index-url (pin registry)\n"
-            "PREVENTION:\n"
-            "  - Private registry (Nexus, Artifactory)\n"
-            "  - Scoped packages (@company/)\n"
-            "  - Lockfile pinning\n"
-            "  - Integrity checks (SRI)\n"
-            "TOOLS:\n"
-            "  confused (tool), Socket.dev, Snyk"
+SUPPLY_CHAIN_PATTERNS: list[SupplyChainPattern] = [
+    SupplyChainPattern(
+        name="Dependency Confusion",
+        attack_type=SupplyChainAttackType.DEPENDENCY_CONFUSION,
+        description=(
+            "Attack where internal package names are registered on public "
+            "registries, causing build systems to fetch malicious versions."
         ),
-        "tools": [],
-    },
-    {
-        "id": "sc-002", "name": "CI/CD Pipeline Attacks",
-        "category": "cicd", "severity": "critical",
-        "desc": "CI/CD pipeline exploitation.",
-        "detection": (
-            "CI/CD PIPELINE ATTACKS:\n"
-            "SECRETS:\n"
-            "  - Exposed CI/CD secrets\n"
-            "  - Environment variable leaks\n"
-            "  - Build log secrets\n"
-            "  - Secret in artifact\n"
-            "  - GitHub Actions secrets\n"
-            "  - Jenkins credential store\n"
-            "CODE INJECTION:\n"
-            "  - PR-triggered pipelines\n"
-            "  - Workflow injection via branch name\n"
-            "  - Commit message injection\n"
-            "  - PR title/body injection\n"
-            "  - GitHub Actions expression injection\n"
-            "    ${{ github.event.pull_request.title }}\n"
-            "  - Poisoned pipeline execution (PPE)\n"
-            "CONFIGURATION:\n"
-            "  - Self-hosted runner compromise\n"
-            "  - Shared runner data leakage\n"
-            "  - Insufficient branch protection\n"
-            "  - Missing approval requirements\n"
-            "  - Over-privileged service accounts\n"
-            "ARTIFACTS:\n"
-            "  - Build artifact tampering\n"
-            "  - Docker image tag mutability\n"
-            "  - Unsigned releases\n"
-            "  - Missing SBOM\n"
-            "  - Reproducible builds failure\n"
-            "TOOLS:\n"
-            "  CICD-Goat, Gitleaks, TruffleHog"
+        detection_strategies=[
+            "Audit package.json/requirements.txt for private scoped names",
+            "Check if internal package names exist on public registries",
+            "Verify .npmrc/.pip.conf registry configuration scoping",
+            "Monitor build logs for unexpected package source URLs",
+            "Implement namespace reservation on public registries",
+            "Compare package checksums between internal and external versions",
+            "Check for packages with install scripts (preinstall hooks)",
+            "Monitor DNS resolution during builds for external registry calls",
+        ],
+        indicators=[
+            "Package fetched from public registry instead of internal",
+            "Version mismatch between internal and public package",
+            "Unexpected network calls during package installation",
+            "Install hook scripts executing on build servers",
+            "Registry URL in lockfile differs from expected",
+        ],
+        tools=["pip-audit", "npm-audit", "socket.dev", "snyk", "ort"],
+        commands=[
+            "pip install pip-audit && pip-audit",
+            "npm audit --json",
+            "pip index versions <package_name>",
+            "npm view <pkg> --registry https://registry.npmjs.org",
+            "grep -r 'registry' .npmrc .yarnrc* pip.conf",
+        ],
+        mitre_ids=["T1195.001"],
+        severity="critical",
+    ),
+    SupplyChainPattern(
+        name="Malicious Package Injection",
+        attack_type=SupplyChainAttackType.MALICIOUS_PACKAGE,
+        description=(
+            "Typosquatting, star-jacking, and maintainer account compromise "
+            "to inject malicious code into legitimate-looking packages."
         ),
-        "tools": ["gitleaks"],
-    },
-    {
-        "id": "sc-003", "name": "Package Manager Exploitation",
-        "category": "packages", "severity": "high",
-        "desc": "Package manager exploitation.",
-        "detection": (
-            "PACKAGE MANAGER EXPLOITATION:\n"
-            "NPM:\n"
-            "  - Install scripts (preinstall/postinstall)\n"
-            "  - Scope confusion\n"
-            "  - npm cache poisoning\n"
-            "  - package-lock.json manipulation\n"
-            "  - Lifecycle script execution\n"
-            "  # npm audit\n"
-            "  # npm pack --dry-run (inspect contents)\n"
-            "PYPI:\n"
-            "  - setup.py code execution\n"
-            "  - Wheel vs sdist security\n"
-            "  - requirements.txt pinning\n"
-            "  - Namespace confusion\n"
-            "  # pip audit\n"
-            "  # safety check\n"
-            "MAVEN/GRADLE:\n"
-            "  - Repository confusion\n"
-            "  - Plugin injection\n"
-            "  - Build file manipulation\n"
-            "  - Dependency mediation abuse\n"
-            "RUBYGEMS:\n"
-            "  - Gem install scripts\n"
-            "  - Extension compilation\n"
-            "  - Gemfile.lock manipulation\n"
-            "CARGO:\n"
-            "  - build.rs execution\n"
-            "  - Proc macro code execution\n"
-            "  - Feature flag abuse\n"
-            "GO:\n"
-            "  - Module proxy cache\n"
-            "  - Replace directives\n"
-            "  - Vanity import paths\n"
-            "GENERAL:\n"
-            "  - Maintainer account takeover\n"
-            "  - Star/download manipulation\n"
-            "  - Malicious updates (supply chain)\n"
-            "TOOLS:\n"
-            "  npm audit, pip audit, Snyk, Dependabot"
+        detection_strategies=[
+            "Fuzzy-match package names against known popular packages",
+            "Check package creation date vs popularity (new+popular=suspect)",
+            "Analyze install scripts for obfuscated code, eval(), exec()",
+            "Compare package metadata against known legitimate packages",
+            "Monitor for packages with encoded payloads in setup.py",
+            "Check GitHub stars vs npm downloads discrepancy (star-jacking)",
+            "Analyze dependency tree for unusual transitive dependencies",
+            "Review package source for network calls, fs access, env reads",
+        ],
+        indicators=[
+            "Package name similar to popular package (reqeusts vs requests)",
+            "setup.py or postinstall script with obfuscated code",
+            "Package reads environment variables or SSH keys",
+            "Outbound HTTP calls in install hooks",
+            "Base64-encoded strings in package source",
+            "Few maintainers, recent creation, high download count",
+        ],
+        tools=["socket.dev", "snyk", "ort", "bandit", "semgrep"],
+        commands=[
+            "pip download --no-deps <package> && unzip *.whl",
+            "npm pack <package> && tar xzf *.tgz",
+            "bandit -r . -f json",
+            "semgrep --config p/supply-chain .",
+            "grep -rn 'eval\\|exec\\|subprocess' *.py",
+        ],
+        mitre_ids=["T1195.001", "T1195.002"],
+        severity="critical",
+    ),
+    SupplyChainPattern(
+        name="CI/CD Pipeline Compromise",
+        attack_type=SupplyChainAttackType.CICD_COMPROMISE,
+        description=(
+            "Attacking CI/CD pipelines to inject malicious code during build, "
+            "test, or deployment phases. Includes secrets exfiltration."
         ),
-        "tools": [],
-    },
-    {
-        "id": "sc-004", "name": "Build System Compromise",
-        "category": "build", "severity": "critical",
-        "desc": "Build system compromise.",
-        "detection": (
-            "BUILD SYSTEM COMPROMISE:\n"
-            "COMPILER:\n"
-            "  - Compiler backdoor (Ken Thompson)\n"
-            "  - Compiler flag manipulation\n"
-            "  - Optimization-based vulnerabilities\n"
-            "  - Undefined behavior exploitation\n"
-            "BUILD TOOLS:\n"
-            "  - Makefile injection\n"
-            "  - CMake script execution\n"
-            "  - Gradle plugin backdoor\n"
-            "  - webpack/rollup plugin compromise\n"
-            "  - Babel transform injection\n"
-            "CONTAINER:\n"
-            "  - Base image compromise\n"
-            "  - Multi-stage build leakage\n"
-            "  - BuildKit cache poisoning\n"
-            "  - Registry confusion\n"
-            "INFRASTRUCTURE:\n"
-            "  - Build server compromise\n"
-            "  - Shared build caches\n"
-            "  - Build farm lateral movement\n"
-            "  - Artifact repository tampering\n"
-            "SIGNING:\n"
-            "  - Code signing key theft\n"
-            "  - Sigstore/cosign bypass\n"
-            "  - Certificate authority compromise\n"
-            "  - Timestamp manipulation\n"
-            "SLSA FRAMEWORK:\n"
-            "  Level 1: Documentation\n"
-            "  Level 2: Hosted build + signed provenance\n"
-            "  Level 3: Hardened build platform\n"
-            "  Level 4: Two-person review + hermetic\n"
-            "TOOLS:\n"
-            "  SLSA verifier, cosign, in-toto"
+        detection_strategies=[
+            "Audit GitHub Actions for pull_request_target with PR checkout",
+            "Check for workflow_dispatch with unvalidated inputs in run:",
+            "Scan for hardcoded secrets in CI config (even base64-encoded)",
+            "Verify third-party actions pinned to commit SHAs not tags",
+            "Monitor for self-hosted runner registration from unknown IPs",
+            "Analyze Jenkinsfile/Gitlab CI for script injection via vars",
+            "Check for OIDC token misuse in cloud provider auth",
+            "Review artifact upload/download for data exfiltration",
+        ],
+        indicators=[
+            "Workflow triggered by pull_request_target with head checkout",
+            "Third-party actions referenced by mutable tag not SHA",
+            "Secrets exposed in workflow logs or artifacts",
+            "Unexpected outbound network calls from CI runners",
+            "Modified CI config in PR without review",
+            "Self-hosted runner with broad permissions",
+        ],
+        tools=["gitleaks", "trufflehog", "semgrep", "checkov", "ggshield"],
+        commands=[
+            "gitleaks detect --source . --report-format json",
+            "trufflehog git file://. --json",
+            "grep -rn 'pull_request_target' .github/workflows/",
+            "grep -rn 'uses:.*@v[0-9]' .github/workflows/",
+            "checkov -d . --framework github_actions",
+        ],
+        mitre_ids=["T1195.002", "T1199"],
+        severity="critical",
+    ),
+    SupplyChainPattern(
+        name="Source Code Repository Attacks",
+        attack_type=SupplyChainAttackType.REPO_ATTACK,
+        description=(
+            "Attacks targeting source code repos: commit signing bypass, "
+            "force-push to protected branches, GPG key compromise."
         ),
-        "tools": [],
-    },
-    {
-        "id": "sc-005", "name": "Third-Party Risk Assessment",
-        "category": "third_party", "severity": "high",
-        "desc": "Third-party risk assessment.",
-        "detection": (
-            "THIRD-PARTY RISK:\n"
-            "SCA (Software Composition Analysis):\n"
-            "  - Dependency vulnerability scanning\n"
-            "  # Snyk, Dependabot, Renovate\n"
-            "  # OWASP Dependency-Check\n"
-            "  # Trivy (container + code)\n"
-            "  - License compliance\n"
-            "  - End-of-life component detection\n"
-            "  - Transitive dependency analysis\n"
-            "SBOM:\n"
-            "  - Software Bill of Materials\n"
-            "  # SPDX format\n"
-            "  # CycloneDX format\n"
-            "  # syft (generate SBOM)\n"
-            "  syft packages dir:./\n"
-            "  # grype (scan SBOM for vulns)\n"
-            "  grype sbom:./sbom.json\n"
-            "VENDOR:\n"
-            "  - Security questionnaires\n"
-            "  - SOC 2 report review\n"
-            "  - Pentest report review\n"
-            "  - SLA and incident response\n"
-            "  - Data handling practices\n"
-            "  - Subprocessor review\n"
-            "API DEPENDENCIES:\n"
-            "  - API key exposure\n"
-            "  - Rate limit assessment\n"
-            "  - Data handling in transit\n"
-            "  - API deprecation monitoring\n"
-            "  - Fallback for API failure\n"
-            "MONITORING:\n"
-            "  - CVE monitoring for dependencies\n"
-            "  - Automated dependency updates\n"
-            "  - Breaking change detection\n"
-            "  - Runtime dependency monitoring\n"
-            "TOOLS:\n"
-            "  Snyk, Trivy, syft, grype, Dependabot"
+        detection_strategies=[
+            "Verify commit signatures (GPG/SSH) on protected branches",
+            "Check for force-push events in audit logs",
+            "Monitor for branch protection rule changes",
+            "Analyze commit author vs committer discrepancies",
+            "Check for commits from unknown or expired GPG keys",
+            "Monitor for large binary blobs in commits (malware)",
+            "Verify PR approvals are from authorized CODEOWNERS",
+            "Check for .gitattributes manipulation to hide diffs",
+        ],
+        indicators=[
+            "Unsigned commits on protected branches",
+            "Force-push events in repository audit log",
+            "Commit author email differs from committer email",
+            "Branch protection rules weakened or disabled",
+            "Large binary files in source tree",
+            "Commits referencing unknown GPG key IDs",
+        ],
+        tools=["git", "gitleaks", "gitrob", "trufflehog", "git-secrets"],
+        commands=[
+            "git log --show-signature -10",
+            "git log --format='%H %an <%ae> %cn <%ce>' | head -50",
+            "git log --diff-filter=A --name-only | head -50",
+            "git fsck --full",
+            "find . -name '.gitattributes' -exec cat {} +",
+        ],
+        mitre_ids=["T1195.002"],
+        severity="high",
+    ),
+    SupplyChainPattern(
+        name="Build System Compromise",
+        attack_type=SupplyChainAttackType.BUILD_COMPROMISE,
+        description=(
+            "Attacks targeting the build process: compiler backdoors, "
+            "non-reproducible builds, build cache poisoning, Dockerfiles."
         ),
-        "tools": ["trivy", "snyk"],
-    },
+        detection_strategies=[
+            "Verify reproducible builds produce identical artifacts",
+            "Compare build output checksums across clean environments",
+            "Audit Dockerfiles for untrusted base images, ADD from URLs",
+            "Check Makefile/build scripts for network calls during build",
+            "Verify compiler/toolchain integrity via checksums",
+            "Monitor for build cache poisoning across projects",
+            "Analyze multi-stage Docker builds for data leakage",
+            "Check for post-build artifact modification before signing",
+        ],
+        indicators=[
+            "Build output differs between environments",
+            "Dockerfile pulls from non-official base images",
+            "Build scripts download binaries from external URLs",
+            "Compiler version mismatch in build environment",
+            "Build artifacts larger than expected",
+            "Network calls during compilation phase",
+        ],
+        tools=["cosign", "syft", "grype", "trivy", "docker-bench-security"],
+        commands=[
+            "trivy image --severity CRITICAL,HIGH <image>",
+            "syft <image> -o json",
+            "cosign verify <image>",
+            "docker history --no-trunc <image>",
+            "grep -rn 'ADD\\|COPY.*http' Dockerfile*",
+        ],
+        mitre_ids=["T1195.002", "T1195.003"],
+        severity="high",
+    ),
 ]
 
 
-class SupplyChainKB:
-    """Supply chain attack knowledge base.
+def build_supply_chain_prompt(
+    focus_type: SupplyChainAttackType | None = None,
+    max_patterns: int = 5,
+) -> str:
+    """Build LLM prompt with supply chain attack knowledge."""
+    lines = ["## Supply Chain Security Knowledge\n"]
 
-    Provides supply chain patterns
-    injected into agent prompts.
-    """
+    patterns = SUPPLY_CHAIN_PATTERNS
+    if focus_type:
+        patterns = [p for p in patterns if p.attack_type == focus_type]
 
-    def __init__(self) -> None:
-        self._patterns: dict[str, SupplyChainPattern] = {}
-        self._log = logger.bind(component="supplychain_kb")
-        self._load_patterns()
+    for pattern in patterns[:max_patterns]:
+        lines.append(f"### {pattern.name} [{pattern.severity}]")
+        lines.append(pattern.description)
+        lines.append("\nDetection:")
+        for strategy in pattern.detection_strategies[:4]:
+            lines.append(f"  - {strategy}")
+        lines.append("\nIndicators:")
+        for indicator in pattern.indicators[:3]:
+            lines.append(f"  - {indicator}")
+        lines.append("\nCommands:")
+        for cmd in pattern.commands[:3]:
+            lines.append(f"  $ {cmd}")
+        lines.append("")
 
-    def _load_patterns(self) -> None:
-        """Load supply chain patterns."""
-        for data in SUPPLYCHAIN_PATTERNS:
-            pattern = SupplyChainPattern(
-                pattern_id=data["id"],
-                name=data["name"],
-                category=data.get("category", ""),
-                severity=data.get("severity", "critical"),
-                description=data.get("desc", ""),
-                detection_strategy=data.get("detection", ""),
-                tools=data.get("tools", []),
-            )
-            self._patterns[pattern.pattern_id] = pattern
-
-    def get_by_category(self, category: str) -> list[SupplyChainPattern]:
-        """Get patterns by category."""
-        return [
-            p for p in self._patterns.values()
-            if p.category.lower() == category.lower()
-        ]
-
-    def build_supplychain_prompt(
-        self,
-        categories: list[str] | None = None,
-        max_patterns: int = 4,
-    ) -> str:
-        """Build supply chain prompt."""
-        lines = ["## Supply Chain Security\n"]
-        count = 0
-        for pattern in self._patterns.values():
-            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
-                continue
-            if count >= max_patterns:
-                break
-            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
-            lines.append(pattern.detection_strategy)
-            lines.append("")
-            count += 1
-        return "\n".join(lines)
-
-    def get_stats(self) -> dict[str, Any]:
-        cat_counts: dict[str, int] = {}
-        for p in self._patterns.values():
-            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
-        return {
-            "patterns": len(self._patterns),
-            "by_category": cat_counts,
-        }
+    return "\n".join(lines)
