@@ -1,11 +1,11 @@
 """Incident response knowledge base.
 
 Deep knowledge about incident response:
-1. IR methodology (NIST/SANS)
+1. IR lifecycle and process
 2. Containment strategies
-3. Eradication procedures
-4. Evidence collection and preservation
-5. Post-incident analysis
+3. Evidence collection
+4. Root cause analysis
+5. Recovery and lessons learned
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class IRPattern:
     pattern_id: str = ""
     name: str = ""
     category: str = ""
-    severity: str = "high"
+    severity: str = "medium"
     description: str = ""
     detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
@@ -39,227 +39,223 @@ class IRPattern:
 
 IR_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "ir-001", "name": "IR Methodology",
-        "category": "methodology", "severity": "high",
-        "desc": "Incident response methodology.",
+        "id": "ir-001", "name": "IR Lifecycle",
+        "category": "lifecycle", "severity": "medium",
+        "desc": "Incident response lifecycle.",
         "detection": (
-            "IR METHODOLOGY:\n"
+            "INCIDENT RESPONSE LIFECYCLE:\n"
             "NIST SP 800-61:\n"
             "  1. PREPARATION:\n"
-            "    - IR plan and team\n"
-            "    - Communication plans\n"
-            "    - Tool deployment\n"
-            "    - Training and exercises\n"
+            "    - IR plan and playbooks\n"
+            "    - Communication plan\n"
+            "    - Tool readiness\n"
+            "    - Jump bag / forensic kit\n"
+            "    - Contact lists (legal, PR, mgmt)\n"
+            "    - Practice (tabletop exercises)\n"
             "  2. DETECTION & ANALYSIS:\n"
-            "    - Alert triage and validation\n"
-            "    - Initial scoping\n"
-            "    - Indicator analysis\n"
-            "    - Impact assessment\n"
-            "    - Classification (severity, type)\n"
-            "  3. CONTAINMENT, ERADICATION, RECOVERY:\n"
-            "    - Short-term containment\n"
+            "    - Alert triage and classification\n"
+            "    - Severity assessment\n"
+            "    - Scope determination\n"
+            "    - Timeline construction\n"
+            "    - IOC identification\n"
+            "    - Affected systems inventory\n"
+            "  3. CONTAINMENT:\n"
+            "    - Short-term (isolate)\n"
+            "    - Long-term (remediate)\n"
             "    - Evidence preservation\n"
-            "    - Long-term containment\n"
-            "    - Threat eradication\n"
-            "    - System recovery\n"
-            "  4. POST-INCIDENT:\n"
-            "    - Lessons learned\n"
-            "    - Report writing\n"
+            "  4. ERADICATION:\n"
+            "    - Malware removal\n"
+            "    - Vulnerability patching\n"
+            "    - Account reset\n"
+            "    - System rebuild\n"
+            "  5. RECOVERY:\n"
+            "    - System restoration\n"
+            "    - Service validation\n"
+            "    - Monitoring enhancement\n"
+            "  6. LESSONS LEARNED:\n"
+            "    - Post-incident review\n"
             "    - Process improvement\n"
-            "SANS 6-STEP:\n"
-            "  1. Preparation\n"
-            "  2. Identification\n"
-            "  3. Containment\n"
-            "  4. Eradication\n"
-            "  5. Recovery\n"
-            "  6. Lessons Learned\n"
-            "CLASSIFICATION:\n"
-            "  - Malware infection\n"
-            "  - Data breach/exfiltration\n"
-            "  - Unauthorized access\n"
-            "  - Denial of service\n"
-            "  - Insider threat\n"
-            "  - Ransomware\n"
-            "  - Supply chain compromise"
+            "    - Detection enhancement\n"
+            "TOOLS:\n"
+            "  TheHive, RTIR, Cortex, SOAR platforms"
         ),
         "tools": [],
     },
     {
         "id": "ir-002", "name": "Containment Strategies",
-        "category": "containment", "severity": "critical",
-        "desc": "Incident containment approaches.",
+        "category": "containment", "severity": "high",
+        "desc": "Incident containment techniques.",
         "detection": (
             "CONTAINMENT STRATEGIES:\n"
             "NETWORK:\n"
-            "  - Isolate affected hosts\n"
-            "  - Block malicious IPs/domains\n"
-            "  - Sinkhole DNS\n"
-            "  - Null-route traffic\n"
-            "  - Segment network (VLANs)\n"
-            "  - Enable firewall rules\n"
-            "  - Disable compromised VPN accounts\n"
+            "  - VLAN isolation\n"
+            "  - Firewall rule insertion\n"
+            "    # Block malicious IPs/domains\n"
+            "    # Isolate compromised segments\n"
+            "  - DNS sinkhole (C2 domains)\n"
+            "  - Proxy block rules\n"
+            "  - BGP blackhole\n"
             "ENDPOINT:\n"
-            "  - Quarantine host (EDR)\n"
-            "  - Disable user accounts\n"
-            "  - Revoke tokens/sessions\n"
-            "  - Reset credentials\n"
-            "  - Disable remote access\n"
-            "  - Block process execution\n"
+            "  - Network quarantine (EDR)\n"
+            "  - Process termination\n"
+            "  - Service disabling\n"
+            "  - Account lockout\n"
+            "  - USB blocking\n"
+            "  - Full disk encryption lock\n"
+            "IDENTITY:\n"
+            "  - Password reset (compromised accounts)\n"
+            "  - MFA enforcement\n"
+            "  - Token revocation\n"
+            "  - Session invalidation\n"
+            "  - Conditional access policies\n"
+            "  - Service account rotation\n"
             "CLOUD:\n"
-            "  - Revoke IAM keys/roles\n"
-            "  - Disable API endpoints\n"
-            "  - Isolate compromised instances\n"
-            "  - Restrict security groups\n"
-            "  - Rotate secrets\n"
-            "  - Enable MFA enforcement\n"
+            "  - Security group lockdown\n"
+            "  - IAM policy restriction\n"
+            "  - Instance isolation\n"
+            "  - API key rotation\n"
+            "  - S3 bucket policy\n"
             "EMAIL:\n"
-            "  - Block sender/domain\n"
-            "  - Purge malicious emails\n"
-            "  - Disable mail rules\n"
-            "  - Reset compromised mailboxes\n"
-            "DECISION FACTORS:\n"
-            "  - Business impact of containment\n"
-            "  - Evidence preservation needs\n"
-            "  - Attacker awareness risk\n"
-            "  - Scope of compromise"
+            "  - Phishing URL blocking\n"
+            "  - Sender blocking\n"
+            "  - Attachment quarantine\n"
+            "TOOLS:\n"
+            "  CrowdStrike, SentinelOne, Carbon Black"
         ),
         "tools": [],
     },
     {
-        "id": "ir-003", "name": "Eradication Procedures",
-        "category": "eradication", "severity": "critical",
-        "desc": "Threat eradication techniques.",
-        "detection": (
-            "ERADICATION PROCEDURES:\n"
-            "MALWARE:\n"
-            "  - Identify all infected systems\n"
-            "  - Remove malware binaries\n"
-            "  - Clean registry/startup entries\n"
-            "  - Remove scheduled tasks\n"
-            "  - Clean WMI subscriptions\n"
-            "  - Rebuild from clean image if needed\n"
-            "PERSISTENCE:\n"
-            "  - Registry run keys\n"
-            "  - Services and drivers\n"
-            "  - Scheduled tasks/cron jobs\n"
-            "  - DLL side-loading\n"
-            "  - Bootkit/rootkit removal\n"
-            "  - Web shells\n"
-            "  - Backdoor accounts\n"
-            "  - SSH authorized_keys\n"
-            "  - GPO modifications\n"
-            "CREDENTIAL RESET:\n"
-            "  - All compromised accounts\n"
-            "  - Service accounts\n"
-            "  - Kerberos tickets (krbtgt reset)\n"
-            "  - Machine account passwords\n"
-            "  - API keys and tokens\n"
-            "  - Certificate revocation\n"
-            "AD SPECIFIC:\n"
-            "  - krbtgt password reset (2x)\n"
-            "  - Trust relationship review\n"
-            "  - AdminSDHolder cleanup\n"
-            "  - Group policy review\n"
-            "  - ACL audit\n"
-            "VERIFICATION:\n"
-            "  - Scan all systems\n"
-            "  - Monitor for re-infection\n"
-            "  - Network traffic analysis\n"
-            "  - Hash-based IOC sweep"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "ir-004", "name": "Evidence Collection",
-        "category": "evidence", "severity": "high",
-        "desc": "Digital evidence collection and preservation.",
+        "id": "ir-003", "name": "Evidence Collection",
+        "category": "evidence", "severity": "medium",
+        "desc": "Digital evidence collection.",
         "detection": (
             "EVIDENCE COLLECTION:\n"
             "ORDER OF VOLATILITY:\n"
             "  1. CPU registers, cache\n"
-            "  2. Memory (RAM)\n"
-            "  3. Network connections\n"
-            "  4. Running processes\n"
-            "  5. Disk (filesystem)\n"
-            "  6. Remote logs\n"
-            "  7. Physical evidence\n"
+            "  2. Routing table, ARP cache, processes\n"
+            "  3. Memory (RAM)\n"
+            "  4. Temporary file systems\n"
+            "  5. Disk\n"
+            "  6. Remote logging, monitoring\n"
+            "  7. Physical config, topology\n"
+            "  8. Archival media\n"
             "MEMORY:\n"
-            "  # Windows\n"
-            "  winpmem_mini.exe memdump.raw\n"
-            "  # Linux\n"
-            "  dd if=/proc/kcore of=memdump.raw\n"
-            "  # LiME module\n"
+            "  # LiME (Linux)\n"
             "  insmod lime.ko path=/tmp/mem.lime format=lime\n"
+            "  # WinPmem (Windows)\n"
+            "  winpmem_mini.exe mem.raw\n"
+            "  # DumpIt\n"
             "DISK:\n"
-            "  # Full disk image\n"
-            "  dd if=/dev/sda of=disk.img bs=4M conv=sync,noerror\n"
-            "  # With hashing\n"
-            "  dc3dd if=/dev/sda of=disk.img hash=md5 log=hash.log\n"
-            "  # Selective collection\n"
-            "  # Triage: logs, prefetch, registry, browser\n"
+            "  # Write-blocker (hardware preferred)\n"
+            "  # dd with hash verification\n"
+            "  dc3dd if=/dev/sda of=image.raw hash=sha256\n"
+            "NETWORK:\n"
+            "  # Full packet capture\n"
+            "  tcpdump -i eth0 -w evidence.pcap\n"
+            "  # NetFlow records\n"
+            "  # Proxy/firewall logs\n"
             "LOGS:\n"
-            "  # Windows Event Logs\n"
-            "  wevtutil epl Security sec.evtx\n"
-            "  wevtutil epl System sys.evtx\n"
-            "  # Linux\n"
-            "  /var/log/auth.log\n"
-            "  /var/log/syslog\n"
-            "  journalctl --since '24 hours ago'\n"
+            "  - Windows: evtx files\n"
+            "  - Linux: /var/log/*\n"
+            "  - Application: web server, DB\n"
+            "  - Cloud: CloudTrail, Activity Log\n"
             "CHAIN OF CUSTODY:\n"
-            "  - Document who, what, when, where\n"
-            "  - Hash all evidence (SHA-256)\n"
+            "  - Document every transfer\n"
+            "  - Hash all evidence\n"
+            "  - Timestamp everything\n"
             "  - Secure storage\n"
-            "  - Access log\n"
             "TOOLS:\n"
-            "  FTK Imager, dc3dd, LiME, Velociraptor"
+            "  LiME, WinPmem, dc3dd, FTK Imager"
         ),
-        "tools": ["velociraptor"],
+        "tools": [],
     },
     {
-        "id": "ir-005", "name": "Post-Incident Analysis",
-        "category": "post_incident", "severity": "medium",
-        "desc": "Post-incident analysis and improvement.",
+        "id": "ir-004", "name": "Root Cause Analysis",
+        "category": "rca", "severity": "medium",
+        "desc": "Root cause analysis techniques.",
         "detection": (
-            "POST-INCIDENT ANALYSIS:\n"
-            "TIMELINE RECONSTRUCTION:\n"
-            "  - Build complete attack timeline\n"
-            "  - Initial compromise vector\n"
-            "  - Lateral movement path\n"
-            "  - Data access/exfiltration\n"
-            "  - Persistence mechanisms\n"
-            "  - Tools: Plaso (log2timeline), Timesketch\n"
             "ROOT CAUSE ANALYSIS:\n"
-            "  - What vulnerability was exploited?\n"
-            "  - Why wasn't it detected earlier?\n"
-            "  - What controls failed?\n"
-            "  - 5 Whys technique\n"
-            "  - Fishbone diagram\n"
-            "METRICS:\n"
-            "  - MTTD: Mean Time To Detect\n"
-            "  - MTTC: Mean Time To Contain\n"
-            "  - MTTR: Mean Time To Recover\n"
-            "  - Scope: Systems/accounts affected\n"
-            "  - Data exposure volume\n"
-            "  - Business impact ($)\n"
-            "LESSONS LEARNED:\n"
-            "  - What went well?\n"
-            "  - What could improve?\n"
-            "  - Specific action items\n"
-            "  - Detection gap remediation\n"
-            "  - Process improvements\n"
-            "  - Training needs\n"
-            "REPORTING:\n"
-            "  - Executive summary\n"
-            "  - Technical details\n"
-            "  - Timeline\n"
-            "  - Impact assessment\n"
-            "  - Remediation recommendations\n"
-            "  - Regulatory notifications\n"
-            "    (GDPR: 72 hours, PCI: immediately)\n"
+            "TIMELINE:\n"
+            "  - Plaso/log2timeline\n"
+            "    # Create super-timeline from all sources\n"
+            "  - Correlate:\n"
+            "    # Network events\n"
+            "    # Endpoint events\n"
+            "    # Authentication events\n"
+            "    # Application events\n"
+            "    # Cloud events\n"
+            "INITIAL ACCESS:\n"
+            "  - Phishing email analysis\n"
+            "  - Exploit identification\n"
+            "  - Credential source\n"
+            "  - Supply chain compromise\n"
+            "  - Insider threat\n"
+            "LATERAL MOVEMENT:\n"
+            "  - RDP/SSH session tracking\n"
+            "  - PsExec/WMI/WinRM\n"
+            "  - Pass-the-hash/ticket\n"
+            "  - Service account abuse\n"
+            "  - SMB/admin shares\n"
+            "PERSISTENCE:\n"
+            "  - Scheduled tasks/cron\n"
+            "  - Registry run keys\n"
+            "  - Service creation\n"
+            "  - Web shells\n"
+            "  - Bootkit/rootkit\n"
+            "  - Account creation\n"
+            "IMPACT:\n"
+            "  - Data access/exfiltration\n"
+            "  - System modification\n"
+            "  - Privilege escalation path\n"
+            "  - Ransomware deployment\n"
             "TOOLS:\n"
-            "  Plaso, Timesketch, TheHive, MISP"
+            "  Plaso, Autopsy, Volatility, KAPE"
         ),
-        "tools": ["plaso", "thehive"],
+        "tools": [],
+    },
+    {
+        "id": "ir-005", "name": "Recovery and Lessons Learned",
+        "category": "recovery", "severity": "medium",
+        "desc": "Recovery procedures and improvement.",
+        "detection": (
+            "RECOVERY & LESSONS LEARNED:\n"
+            "SYSTEM RECOVERY:\n"
+            "  - Rebuild from clean images\n"
+            "  - Restore from verified backups\n"
+            "  - Patch all vulnerabilities\n"
+            "  - Reset all credentials\n"
+            "  - Verify system integrity\n"
+            "  - Staged reconnection\n"
+            "VALIDATION:\n"
+            "  - Vulnerability scan (post-fix)\n"
+            "  - IOC sweep (re-scan)\n"
+            "  - Behavioral monitoring\n"
+            "  - User verification\n"
+            "  - Service health checks\n"
+            "MONITORING:\n"
+            "  - Enhanced logging\n"
+            "  - New detection rules\n"
+            "  - Threat hunting queries\n"
+            "  - Increased alert sensitivity\n"
+            "LESSONS LEARNED:\n"
+            "  - Conduct post-incident review\n"
+            "  - Document:\n"
+            "    # What happened\n"
+            "    # When detected\n"
+            "    # How contained\n"
+            "    # What worked / didn't work\n"
+            "    # Recommendations\n"
+            "  - Update:\n"
+            "    # IR playbooks\n"
+            "    # Detection rules\n"
+            "    # Security policies\n"
+            "    # Training materials\n"
+            "  - Track improvements\n"
+            "  - Metrics: MTTD, MTTR, MTTC\n"
+            "TOOLS:\n"
+            "  TheHive, RTIR, Jira, Wiki"
+        ),
+        "tools": [],
     },
 ]
 
@@ -267,7 +263,8 @@ IR_PATTERNS: list[dict[str, Any]] = [
 class IncidentResponseKB:
     """Incident response knowledge base.
 
-    Provides IR patterns injected into agent prompts.
+    Provides IR patterns injected
+    into agent prompts.
     """
 
     def __init__(self) -> None:
@@ -282,7 +279,7 @@ class IncidentResponseKB:
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
-                severity=data.get("severity", "high"),
+                severity=data.get("severity", "medium"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
@@ -301,7 +298,7 @@ class IncidentResponseKB:
         categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
-        """Build incident response prompt."""
+        """Build IR prompt."""
         lines = ["## Incident Response\n"]
         count = 0
         for pattern in self._patterns.values():
