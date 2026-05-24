@@ -1,21 +1,16 @@
-"""Agent communication protocol — structured messaging between agents.
+"""Agent communication protocol — structured message passing between agents.
 
-Defines the protocol for inter-agent communication:
-1. Message types and formats
-2. Request/response patterns
-3. Task delegation messages
-4. Finding sharing
-5. Status reporting
-6. Help requests and responses
-7. Escalation protocol
-8. Message validation and routing
+Defines:
+1. Message types and formats for inter-agent communication
+2. Request/response patterns (task delegation, result aggregation)
+3. Event broadcasting (findings, status updates, errors)
+4. Agent discovery and capability advertisement
+5. Conversation threading for multi-turn agent interactions
 """
 
 from __future__ import annotations
 
-import json
 import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -26,316 +21,345 @@ logger = structlog.get_logger()
 
 
 class MessageType(str, Enum):
-    # Task management
-    TASK_ASSIGN = "task_assign"
-    TASK_ACCEPT = "task_accept"
-    TASK_REJECT = "task_reject"
-    TASK_COMPLETE = "task_complete"
-    TASK_FAILED = "task_failed"
-    TASK_PROGRESS = "task_progress"
-
-    # Findings
-    FINDING_NEW = "finding_new"
-    FINDING_VALIDATED = "finding_validated"
-    FINDING_INVALIDATED = "finding_invalidated"
-
-    # Requests
-    HELP_REQUEST = "help_request"
-    HELP_RESPONSE = "help_response"
-    INFO_REQUEST = "info_request"
-    INFO_RESPONSE = "info_response"
-
-    # Control
-    STATUS_REQUEST = "status_request"
-    STATUS_RESPONSE = "status_response"
-    PAUSE = "pause"
-    RESUME = "resume"
-    TERMINATE = "terminate"
-    HEARTBEAT = "heartbeat"
-
-    # Escalation
-    ESCALATE = "escalate"
-    ESCALATE_ACK = "escalate_ack"
-
-    # Knowledge sharing
+    TASK_REQUEST = "task_request"
+    TASK_RESPONSE = "task_response"
+    FINDING_REPORT = "finding_report"
+    STATUS_UPDATE = "status_update"
+    ERROR_REPORT = "error_report"
+    CAPABILITY_QUERY = "capability_query"
+    CAPABILITY_RESPONSE = "capability_response"
     KNOWLEDGE_SHARE = "knowledge_share"
-    CONTEXT_UPDATE = "context_update"
+    STRATEGY_CHANGE = "strategy_change"
+    ESCALATION = "escalation"
+    HEARTBEAT = "heartbeat"
+    TERMINATION = "termination"
 
 
 class MessagePriority(str, Enum):
-    URGENT = "urgent"
+    CRITICAL = "critical"
     HIGH = "high"
     NORMAL = "normal"
     LOW = "low"
 
 
+class DeliveryMode(str, Enum):
+    DIRECT = "direct"
+    BROADCAST = "broadcast"
+    MULTICAST = "multicast"
+    REPLY = "reply"
+
+
 @dataclass
 class AgentMessage:
-    """A structured message between agents."""
-    message_id: str = field(default_factory=lambda: str(uuid.uuid4())[:10])
-    message_type: MessageType = MessageType.STATUS_REQUEST
+    """A message in the agent communication protocol."""
+    message_id: str = ""
+    message_type: MessageType = MessageType.STATUS_UPDATE
+    sender_id: str = ""
+    recipient_id: str = ""
+    delivery_mode: DeliveryMode = DeliveryMode.DIRECT
     priority: MessagePriority = MessagePriority.NORMAL
-    sender: str = ""
-    recipient: str = ""           # Empty = broadcast
-    reply_to: str = ""            # Original message ID for replies
-    correlation_id: str = ""      # Group related messages
+    thread_id: str = ""
+    reply_to: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
     ttl_s: float = 300.0
-    requires_ack: bool = False
 
     @property
-    def expired(self) -> bool:
-        return time.time() - self.timestamp > self.ttl_s
+    def is_expired(self) -> bool:
+        return (time.time() - self.timestamp) > self.ttl_s
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.message_id,
-            "type": self.message_type.value,
-            "priority": self.priority.value,
-            "from": self.sender,
-            "to": self.recipient,
-            "reply_to": self.reply_to,
-            "payload_keys": list(self.payload.keys())[:5],
+            "id": self.message_id[:8],
+            "type": self.message_type.value[:12],
+            "from": self.sender_id[:8],
+            "to": self.recipient_id[:8],
+            "priority": self.priority.value[:4],
         }
 
-    def to_json(self) -> str:
-        return json.dumps({
-            "id": self.message_id,
-            "type": self.message_type.value,
-            "priority": self.priority.value,
-            "sender": self.sender,
-            "recipient": self.recipient,
-            "reply_to": self.reply_to,
-            "correlation_id": self.correlation_id,
-            "payload": self.payload,
-            "timestamp": self.timestamp,
-        })
 
-    @classmethod
-    def from_json(cls, data: str) -> AgentMessage:
-        d = json.loads(data)
-        try:
-            msg_type = MessageType(d.get("type", "status_request"))
-        except ValueError:
-            msg_type = MessageType.STATUS_REQUEST
-        try:
-            priority = MessagePriority(d.get("priority", "normal"))
-        except ValueError:
-            priority = MessagePriority.NORMAL
-        return cls(
-            message_id=d.get("id", ""),
-            message_type=msg_type,
-            priority=priority,
-            sender=d.get("sender", ""),
-            recipient=d.get("recipient", ""),
-            reply_to=d.get("reply_to", ""),
-            correlation_id=d.get("correlation_id", ""),
-            payload=d.get("payload", {}),
-            timestamp=d.get("timestamp", time.time()),
-        )
+@dataclass
+class TaskRequest:
+    """A task delegation request."""
+    task_id: str = ""
+    description: str = ""
+    intent: str = ""
+    target: str = ""
+    required_role: str = ""
+    required_tools: list[str] = field(default_factory=list)
+    required_kbs: list[str] = field(default_factory=list)
+    token_budget: int = 4096
+    timeout_s: float = 120.0
+    parent_task_id: str = ""
+    depth: int = 0
+    max_depth: int = 3
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.task_id[:8],
+            "intent": self.intent[:12],
+            "role": self.required_role[:10],
+            "depth": f"{self.depth}/{self.max_depth}",
+        }
 
 
-class MessageFactory:
-    """Factory for creating common message types."""
+@dataclass
+class TaskResponse:
+    """A task completion response."""
+    task_id: str = ""
+    status: str = "completed"
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    next_steps: list[str] = field(default_factory=list)
+    tokens_used: int = 0
+    duration_s: float = 0.0
+    confidence: float = 0.0
+    error_message: str = ""
 
-    @staticmethod
-    def task_assign(
-        sender: str,
-        recipient: str,
-        task_name: str,
-        task_description: str,
-        target: str = "",
-        tools: list[str] | None = None,
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.task_id[:8],
+            "status": self.status[:8],
+            "findings": len(self.findings),
+            "confidence": f"{self.confidence:.2f}",
+        }
+
+
+@dataclass
+class FindingReport:
+    """A security finding broadcast."""
+    finding_id: str = ""
+    title: str = ""
+    severity: str = "medium"
+    confidence: float = 0.0
+    description: str = ""
+    evidence: str = ""
+    remediation: str = ""
+    cve: str = ""
+    target: str = ""
+    tool_used: str = ""
+    discovered_by: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.finding_id[:8],
+            "severity": self.severity[:4],
+            "confidence": f"{self.confidence:.2f}",
+            "title": self.title[:25],
+        }
+
+
+@dataclass
+class AgentCapability:
+    """An agent's advertised capabilities."""
+    agent_id: str = ""
+    role: str = ""
+    tools: list[str] = field(default_factory=list)
+    kbs: list[str] = field(default_factory=list)
+    model: str = ""
+    max_context: int = 4096
+    current_load: float = 0.0
+    specialties: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.agent_id[:8],
+            "role": self.role[:10],
+            "tools": len(self.tools),
+            "load": f"{self.current_load:.1f}",
+        }
+
+
+@dataclass
+class ConversationThread:
+    """A multi-turn conversation between agents."""
+    thread_id: str = ""
+    participants: list[str] = field(default_factory=list)
+    messages: list[AgentMessage] = field(default_factory=list)
+    topic: str = ""
+    started_at: float = field(default_factory=time.time)
+    status: str = "active"
+
+    @property
+    def message_count(self) -> int:
+        return len(self.messages)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.thread_id[:8],
+            "participants": len(self.participants),
+            "messages": self.message_count,
+            "status": self.status[:6],
+        }
+
+
+class AgentProtocol:
+    """Agent communication protocol implementation."""
+
+    def __init__(self) -> None:
+        self._messages: list[AgentMessage] = []
+        self._threads: dict[str, ConversationThread] = {}
+        self._capabilities: dict[str, AgentCapability] = {}
+        self._message_counter = 0
+        self._thread_counter = 0
+        self._log = logger.bind(component="agent_protocol")
+
+    def create_message(
+        self,
+        msg_type: MessageType,
+        sender_id: str,
+        recipient_id: str,
+        payload: dict[str, Any],
         priority: MessagePriority = MessagePriority.NORMAL,
+        delivery_mode: DeliveryMode = DeliveryMode.DIRECT,
+        thread_id: str = "",
+        reply_to: str = "",
     ) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.TASK_ASSIGN,
+        """Create and store a new message."""
+        self._message_counter += 1
+        msg = AgentMessage(
+            message_id=f"msg-{self._message_counter}",
+            message_type=msg_type,
+            sender_id=sender_id,
+            recipient_id=recipient_id,
+            delivery_mode=delivery_mode,
             priority=priority,
-            sender=sender,
-            recipient=recipient,
-            requires_ack=True,
-            payload={
-                "task_name": task_name,
-                "description": task_description,
-                "target": target,
-                "tools": tools or [],
-            },
-        )
-
-    @staticmethod
-    def task_complete(
-        sender: str,
-        recipient: str,
-        task_id: str,
-        findings: list[dict[str, Any]] | None = None,
-        result: dict[str, Any] | None = None,
-    ) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.TASK_COMPLETE,
-            sender=sender,
-            recipient=recipient,
-            payload={
-                "task_id": task_id,
-                "findings": findings or [],
-                "result": result or {},
-                "findings_count": len(findings) if findings else 0,
-            },
-        )
-
-    @staticmethod
-    def task_failed(
-        sender: str,
-        recipient: str,
-        task_id: str,
-        error: str = "",
-    ) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.TASK_FAILED,
-            priority=MessagePriority.HIGH,
-            sender=sender,
-            recipient=recipient,
-            payload={"task_id": task_id, "error": error},
-        )
-
-    @staticmethod
-    def finding(
-        sender: str,
-        finding: dict[str, Any],
-    ) -> AgentMessage:
-        severity = finding.get("severity", "medium").lower()
-        priority = (
-            MessagePriority.URGENT if severity == "critical"
-            else MessagePriority.HIGH if severity == "high"
-            else MessagePriority.NORMAL
-        )
-        return AgentMessage(
-            message_type=MessageType.FINDING_NEW,
-            priority=priority,
-            sender=sender,
-            payload=finding,
-        )
-
-    @staticmethod
-    def help_request(
-        sender: str,
-        question: str,
-        context: dict[str, Any] | None = None,
-        target: str = "",
-    ) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.HELP_REQUEST,
-            priority=MessagePriority.HIGH,
-            sender=sender,
-            target=target,
-            requires_ack=True,
-            payload={"question": question, "context": context or {}},
-        )
-
-    @staticmethod
-    def help_response(
-        sender: str,
-        recipient: str,
-        reply_to: str,
-        answer: str,
-        suggestions: list[str] | None = None,
-    ) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.HELP_RESPONSE,
-            sender=sender,
-            recipient=recipient,
+            thread_id=thread_id,
             reply_to=reply_to,
-            payload={"answer": answer, "suggestions": suggestions or []},
+            payload=payload,
         )
+        self._messages.append(msg)
 
-    @staticmethod
-    def status_report(
-        sender: str,
-        status: str,
-        progress: float = 0.0,
-        findings_count: int = 0,
-        details: dict[str, Any] | None = None,
+        # Add to thread
+        if thread_id and thread_id in self._threads:
+            self._threads[thread_id].messages.append(msg)
+
+        # Trim old messages
+        if len(self._messages) > 5000:
+            self._messages = self._messages[-2500:]
+
+        return msg
+
+    def create_thread(
+        self,
+        participants: list[str],
+        topic: str,
+    ) -> ConversationThread:
+        """Create a new conversation thread."""
+        self._thread_counter += 1
+        thread = ConversationThread(
+            thread_id=f"thread-{self._thread_counter}",
+            participants=participants,
+            topic=topic,
+        )
+        self._threads[thread.thread_id] = thread
+        return thread
+
+    def register_capability(
+        self, capability: AgentCapability,
+    ) -> None:
+        """Register an agent's capabilities."""
+        self._capabilities[capability.agent_id] = capability
+
+    def find_capable_agent(
+        self,
+        required_role: str = "",
+        required_tools: list[str] | None = None,
+        required_kbs: list[str] | None = None,
+    ) -> AgentCapability | None:
+        """Find an agent matching requirements."""
+        best: AgentCapability | None = None
+        best_score = -1.0
+
+        for cap in self._capabilities.values():
+            score = 0.0
+            if required_role and cap.role == required_role:
+                score += 1.0
+            if required_tools:
+                overlap = len(set(required_tools) & set(cap.tools))
+                score += overlap / len(required_tools)
+            if required_kbs:
+                overlap = len(set(required_kbs) & set(cap.kbs))
+                score += overlap / len(required_kbs)
+            # Prefer less loaded agents
+            score -= cap.current_load * 0.5
+
+            if score > best_score:
+                best_score = score
+                best = cap
+
+        return best
+
+    def get_thread_messages(
+        self, thread_id: str,
+    ) -> list[AgentMessage]:
+        """Get all messages in a thread."""
+        thread = self._threads.get(thread_id)
+        if not thread:
+            return []
+        return thread.messages
+
+    def get_agent_messages(
+        self,
+        agent_id: str,
+        msg_type: MessageType | None = None,
+    ) -> list[AgentMessage]:
+        """Get messages for/from an agent."""
+        result = []
+        for msg in self._messages:
+            if msg.recipient_id == agent_id or msg.sender_id == agent_id:
+                if msg_type is None or msg.message_type == msg_type:
+                    result.append(msg)
+        return result
+
+    def broadcast_finding(
+        self,
+        sender_id: str,
+        finding: FindingReport,
     ) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.STATUS_RESPONSE,
-            sender=sender,
-            payload={
-                "status": status, "progress": progress,
-                "findings": findings_count,
-                **(details or {}),
-            },
+        """Broadcast a finding to all agents."""
+        return self.create_message(
+            msg_type=MessageType.FINDING_REPORT,
+            sender_id=sender_id,
+            recipient_id="*",
+            payload=finding.to_dict(),
+            priority=MessagePriority.HIGH if finding.severity in ("critical", "high") else MessagePriority.NORMAL,
+            delivery_mode=DeliveryMode.BROADCAST,
         )
 
-    @staticmethod
-    def escalate(
-        sender: str,
-        reason: str,
-        finding: dict[str, Any] | None = None,
-        context: dict[str, Any] | None = None,
+    def delegate_task(
+        self,
+        sender_id: str,
+        task: TaskRequest,
+        thread_id: str = "",
     ) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.ESCALATE,
-            priority=MessagePriority.URGENT,
-            sender=sender,
-            requires_ack=True,
-            payload={
-                "reason": reason,
-                "finding": finding or {},
-                "context": context or {},
-            },
+        """Delegate a task to a capable agent."""
+        # Find capable agent
+        agent = self.find_capable_agent(
+            required_role=task.required_role,
+            required_tools=task.required_tools,
+            required_kbs=task.required_kbs,
+        )
+        recipient = agent.agent_id if agent else "coordinator"
+
+        return self.create_message(
+            msg_type=MessageType.TASK_REQUEST,
+            sender_id=sender_id,
+            recipient_id=recipient,
+            payload=task.to_dict(),
+            priority=MessagePriority.HIGH,
+            thread_id=thread_id,
         )
 
-    @staticmethod
-    def knowledge_share(
-        sender: str,
-        knowledge_type: str,
-        content: dict[str, Any],
-    ) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.KNOWLEDGE_SHARE,
-            sender=sender,
-            payload={
-                "knowledge_type": knowledge_type,
-                "content": content,
-            },
-        )
+    def get_stats(self) -> dict[str, Any]:
+        """Get protocol statistics."""
+        type_counts: dict[str, int] = {}
+        for msg in self._messages:
+            key = msg.message_type.value
+            type_counts[key] = type_counts.get(key, 0) + 1
 
-    @staticmethod
-    def heartbeat(sender: str) -> AgentMessage:
-        return AgentMessage(
-            message_type=MessageType.HEARTBEAT,
-            priority=MessagePriority.LOW,
-            sender=sender,
-            ttl_s=60.0,
-            payload={"timestamp": time.time()},
-        )
-
-
-class ProtocolValidator:
-    """Validates messages conform to protocol."""
-
-    REQUIRED_FIELDS: dict[str, list[str]] = {
-        MessageType.TASK_ASSIGN.value: ["task_name", "description"],
-        MessageType.TASK_COMPLETE.value: ["task_id"],
-        MessageType.TASK_FAILED.value: ["task_id"],
-        MessageType.FINDING_NEW.value: ["title", "severity"],
-        MessageType.HELP_REQUEST.value: ["question"],
-        MessageType.HELP_RESPONSE.value: ["answer"],
-        MessageType.ESCALATE.value: ["reason"],
-    }
-
-    @classmethod
-    def validate(cls, message: AgentMessage) -> tuple[bool, str]:
-        """Validate a message. Returns (valid, error_message)."""
-        if not message.sender:
-            return False, "Message must have a sender"
-
-        if message.expired:
-            return False, "Message has expired"
-
-        required = cls.REQUIRED_FIELDS.get(message.message_type.value, [])
-        for field_name in required:
-            if field_name not in message.payload:
-                return False, f"Missing required field: {field_name}"
-
-        return True, ""
+        return {
+            "total_messages": len(self._messages),
+            "threads": len(self._threads),
+            "registered_agents": len(self._capabilities),
+            "by_type": type_counts,
+        }
