@@ -1,14 +1,12 @@
-"""Agent orchestrator — top-level coordinator.
+"""Agent orchestrator — top-level coordinator wiring all components.
 
-Wires together all agent subsystems:
-1. Task reception and decomposition
-2. Agent spawning with role assignment
-3. Knowledge injection via dynamic selector
-4. Model routing per task type
-5. Communication bus coordination
-6. Result aggregation and reporting
-7. Budget tracking and convergence
-8. Orchestrator prompt for LLM
+Implements:
+1. Assessment lifecycle (init → plan → execute → report)
+2. Component wiring (router, spawner, context, budget, etc.)
+3. Phase-based execution (recon → scan → exploit → validate)
+4. Knowledge injection into agent prompts
+5. Finding aggregation across agents
+6. Assessment state machine
 """
 
 from __future__ import annotations
@@ -23,387 +21,305 @@ import structlog
 logger = structlog.get_logger()
 
 
-class OrchestratorState(str, Enum):
-    IDLE = "idle"
+class AssessmentPhase(str, Enum):
+    INIT = "init"
     PLANNING = "planning"
-    EXECUTING = "executing"
-    AGGREGATING = "aggregating"
+    RECON = "recon"
+    SCANNING = "scanning"
+    EXPLOITATION = "exploitation"
+    POST_EXPLOIT = "post_exploit"
+    VALIDATION = "validation"
     REPORTING = "reporting"
-    PAUSED = "paused"
-    COMPLETED = "completed"
+    COMPLETE = "complete"
     FAILED = "failed"
 
 
 class AssessmentType(str, Enum):
-    FULL = "full"                  # Full security assessment
-    WEB = "web"                    # Web application
-    NETWORK = "network"            # Network infrastructure
-    CLOUD = "cloud"                # Cloud environment
-    MOBILE = "mobile"              # Mobile application
-    CODE = "code"                  # Source code review
-    RED_TEAM = "red_team"          # Red team engagement
-    COMPLIANCE = "compliance"      # Compliance check
-    INCIDENT = "incident"          # Incident response
-    RECON = "recon"                # Reconnaissance only
+    FULL = "full"                # Full assessment
+    RECON_ONLY = "recon_only"
+    WEB = "web"
+    NETWORK = "network"
+    CLOUD = "cloud"
+    CODE_AUDIT = "code_audit"
+    RED_TEAM = "red_team"
+    CUSTOM = "custom"
 
 
 @dataclass
-class AssessmentTask:
-    """A top-level assessment task."""
-    task_id: str = ""
-    target: str = ""
-    assessment_type: AssessmentType = AssessmentType.FULL
+class AssessmentTarget:
+    """Target specification."""
+    primary: str = ""          # IP, domain, URL
     scope: list[str] = field(default_factory=list)
-    exclusions: list[str] = field(default_factory=list)
-    max_depth: int = 4
-    token_budget: int = 500000
-    time_limit_s: float = 3600.0
-    system_prompt: str = ""
-    custom_config: dict[str, Any] = field(default_factory=dict)
-    created_at: float = field(default_factory=time.time)
+    exclude: list[str] = field(default_factory=list)
+    target_type: str = ""      # web, network, cloud, code
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.task_id[:10],
-            "target": self.target[:20],
+            "primary": self.primary[:20],
+            "scope_size": len(self.scope),
+            "type": self.target_type[:10],
+        }
+
+
+@dataclass
+class AssessmentConfig:
+    """Assessment configuration."""
+    assessment_type: AssessmentType = AssessmentType.FULL
+    max_depth: int = 5
+    max_agents: int = 30
+    token_budget: int = 200000
+    time_budget_s: float = 7200.0
+    tool_budget: int = 500
+    knowledge_domains: list[str] = field(default_factory=list)
+    skip_phases: list[str] = field(default_factory=list)
+    aggressive: bool = False
+    validate_findings: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
             "type": self.assessment_type.value[:8],
             "depth": self.max_depth,
-            "budget": self.token_budget,
+            "agents": self.max_agents,
+            "tokens": self.token_budget,
         }
 
 
 @dataclass
-class AssessmentPhase:
-    """A phase in the assessment."""
-    phase_id: str = ""
-    name: str = ""
-    description: str = ""
-    agent_roles: list[str] = field(default_factory=list)
-    knowledge_domains: list[str] = field(default_factory=list)
-    tools_needed: list[str] = field(default_factory=list)
-    depends_on: list[str] = field(default_factory=list)
-    status: str = "pending"
-    findings_count: int = 0
-    started_at: float = 0.0
-    completed_at: float = 0.0
+class PhaseResult:
+    """Result from a completed phase."""
+    phase: AssessmentPhase = AssessmentPhase.INIT
+    duration_s: float = 0.0
+    agents_used: int = 0
+    tokens_used: int = 0
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    next_phase: AssessmentPhase = AssessmentPhase.INIT
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.phase_id[:8],
-            "name": self.name[:15],
-            "status": self.status[:6],
-            "findings": self.findings_count,
+            "phase": self.phase.value[:8],
+            "dur_s": round(self.duration_s, 1),
+            "agents": self.agents_used,
+            "findings": len(self.findings),
         }
 
 
-# ── Assessment phase templates ───────────────────────────────
+@dataclass
+class Assessment:
+    """Full assessment state."""
+    assessment_id: str = ""
+    target: AssessmentTarget = field(default_factory=AssessmentTarget)
+    config: AssessmentConfig = field(default_factory=AssessmentConfig)
+    phase: AssessmentPhase = AssessmentPhase.INIT
+    phase_results: list[PhaseResult] = field(default_factory=list)
+    all_findings: list[dict[str, Any]] = field(default_factory=list)
+    total_tokens: int = 0
+    total_agents: int = 0
+    started_at: float = field(default_factory=time.time)
+    completed_at: float = 0.0
+    error: str = ""
 
-PHASE_TEMPLATES: dict[str, list[dict[str, Any]]] = {
-    "full": [
-        {
-            "name": "Passive Recon",
-            "desc": "OSINT, DNS, certificate transparency, WHOIS",
-            "roles": ["recon"],
-            "knowledge": ["network", "threat_intel"],
-            "tools": ["amass", "subfinder", "theHarvester", "whois", "dig"],
-            "depends": [],
-        },
-        {
-            "name": "Active Recon",
-            "desc": "Port scanning, service enumeration, web crawling",
-            "roles": ["recon"],
-            "knowledge": ["network", "web_security"],
-            "tools": ["nmap", "masscan", "httpx", "whatweb"],
-            "depends": ["Passive Recon"],
-        },
-        {
-            "name": "Vulnerability Scanning",
-            "desc": "Automated vulnerability scanning across discovered services",
-            "roles": ["vuln_scan"],
-            "knowledge": ["web_security", "exploitation", "detection"],
-            "tools": ["nuclei", "nikto", "wpscan", "testssl"],
-            "depends": ["Active Recon"],
-        },
-        {
-            "name": "Web Application Testing",
-            "desc": "Deep web application security testing",
-            "roles": ["web_audit"],
-            "knowledge": ["web_security", "exploitation", "advanced_strategy"],
-            "tools": ["sqlmap", "ffuf", "burp", "zap"],
-            "depends": ["Active Recon"],
-        },
-        {
-            "name": "Exploitation",
-            "desc": "Validate and exploit confirmed vulnerabilities",
-            "roles": ["exploit", "validator"],
-            "knowledge": ["exploitation", "red_team", "zeroday"],
-            "tools": ["metasploit", "sqlmap", "hydra"],
-            "depends": ["Vulnerability Scanning", "Web Application Testing"],
-        },
-        {
-            "name": "Post-Exploitation",
-            "desc": "Lateral movement, privilege escalation, persistence",
-            "roles": ["exploit"],
-            "knowledge": ["lateral_movement", "persistence", "active_directory"],
-            "tools": ["bloodhound", "mimikatz", "linpeas"],
-            "depends": ["Exploitation"],
-        },
-        {
-            "name": "Reporting",
-            "desc": "Aggregate findings and generate report",
-            "roles": ["reporter"],
-            "knowledge": ["compliance"],
-            "tools": [],
-            "depends": ["Post-Exploitation"],
-        },
-    ],
-    "web": [
-        {
-            "name": "Web Recon",
-            "desc": "Crawling, tech stack, endpoints, JS analysis",
-            "roles": ["recon"],
-            "knowledge": ["web_security"],
-            "tools": ["httpx", "whatweb", "katana", "gau"],
-            "depends": [],
-        },
-        {
-            "name": "Web Scanning",
-            "desc": "Automated DAST scanning",
-            "roles": ["vuln_scan"],
-            "knowledge": ["web_security", "detection"],
-            "tools": ["nuclei", "nikto", "zap"],
-            "depends": ["Web Recon"],
-        },
-        {
-            "name": "Manual Testing",
-            "desc": "OWASP methodology manual testing",
-            "roles": ["web_audit"],
-            "knowledge": ["web_security", "exploitation", "advanced_strategy"],
-            "tools": ["sqlmap", "ffuf", "burp"],
-            "depends": ["Web Recon"],
-        },
-        {
-            "name": "Validation",
-            "desc": "Cross-validate findings",
-            "roles": ["validator"],
-            "knowledge": ["web_security"],
-            "tools": [],
-            "depends": ["Web Scanning", "Manual Testing"],
-        },
-    ],
-    "network": [
-        {
-            "name": "Network Discovery",
-            "desc": "Host discovery, port scanning",
-            "roles": ["recon"],
-            "knowledge": ["network"],
-            "tools": ["nmap", "masscan", "arp-scan"],
-            "depends": [],
-        },
-        {
-            "name": "Service Enumeration",
-            "desc": "Service/version detection, banner grabbing",
-            "roles": ["recon"],
-            "knowledge": ["network"],
-            "tools": ["nmap", "amap"],
-            "depends": ["Network Discovery"],
-        },
-        {
-            "name": "Vulnerability Assessment",
-            "desc": "CVE scanning, misconfiguration checks",
-            "roles": ["vuln_scan"],
-            "knowledge": ["network", "exploitation"],
-            "tools": ["nmap", "nuclei", "nessus"],
-            "depends": ["Service Enumeration"],
-        },
-        {
-            "name": "Exploitation",
-            "desc": "Exploit confirmed vulnerabilities",
-            "roles": ["exploit"],
-            "knowledge": ["exploitation", "lateral_movement"],
-            "tools": ["metasploit", "hydra"],
-            "depends": ["Vulnerability Assessment"],
-        },
-    ],
-    "recon": [
-        {
-            "name": "OSINT",
-            "desc": "Open source intelligence gathering",
-            "roles": ["recon"],
-            "knowledge": ["threat_intel"],
-            "tools": ["theHarvester", "shodan", "censys"],
-            "depends": [],
-        },
-        {
-            "name": "DNS Enumeration",
-            "desc": "Subdomain discovery, DNS records",
-            "roles": ["recon"],
-            "knowledge": ["network"],
-            "tools": ["amass", "subfinder", "dig", "dnsrecon"],
-            "depends": [],
-        },
-        {
-            "name": "Port Scanning",
-            "desc": "Comprehensive port scanning",
-            "roles": ["recon"],
-            "knowledge": ["network"],
-            "tools": ["nmap", "masscan"],
-            "depends": ["DNS Enumeration"],
-        },
-    ],
+    @property
+    def duration_s(self) -> float:
+        end = self.completed_at or time.time()
+        return end - self.started_at
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.assessment_id[:10],
+            "target": self.target.primary[:15],
+            "phase": self.phase.value[:8],
+            "findings": len(self.all_findings),
+            "agents": self.total_agents,
+            "dur_s": round(self.duration_s, 1),
+        }
+
+
+# ── Phase execution order ────────────────────────────────────
+
+PHASE_ORDER: list[AssessmentPhase] = [
+    AssessmentPhase.INIT,
+    AssessmentPhase.PLANNING,
+    AssessmentPhase.RECON,
+    AssessmentPhase.SCANNING,
+    AssessmentPhase.EXPLOITATION,
+    AssessmentPhase.POST_EXPLOIT,
+    AssessmentPhase.VALIDATION,
+    AssessmentPhase.REPORTING,
+    AssessmentPhase.COMPLETE,
+]
+
+# ── Phase → knowledge domain mapping ────────────────────────
+
+PHASE_KNOWLEDGE: dict[AssessmentPhase, list[str]] = {
+    AssessmentPhase.RECON: ["osint", "threat_intel", "active_directory"],
+    AssessmentPhase.SCANNING: ["web_security", "network", "cloud_security"],
+    AssessmentPhase.EXPLOITATION: ["privilege_escalation", "zero_day", "advanced_strategy"],
+    AssessmentPhase.POST_EXPLOIT: ["red_team", "forensics"],
+    AssessmentPhase.VALIDATION: ["compliance"],
+    AssessmentPhase.REPORTING: [],
+}
+
+# ── Phase → agent roles ─────────────────────────────────────
+
+PHASE_ROLES: dict[AssessmentPhase, list[str]] = {
+    AssessmentPhase.RECON: ["recon", "osint"],
+    AssessmentPhase.SCANNING: ["vuln_scan", "web_audit", "network"],
+    AssessmentPhase.EXPLOITATION: ["exploit", "code_audit"],
+    AssessmentPhase.POST_EXPLOIT: ["exploit", "forensics"],
+    AssessmentPhase.VALIDATION: ["validator"],
+    AssessmentPhase.REPORTING: ["reporter"],
 }
 
 
 class AgentOrchestrator:
-    """Top-level orchestrator that coordinates all subsystems.
+    """Top-level coordinator that manages assessments.
 
-    Receives assessment tasks, decomposes into phases,
-    spawns agents, injects knowledge, routes to models,
-    and aggregates results.
+    Wires together all agent components:
+    - Model router (which LLM to use)
+    - Agent spawner (create specialized agents)
+    - Context manager (multi-turn state)
+    - Budget tracker (resource limits)
+    - Knowledge aggregator (KB injection)
+    - Attack chain builder (link findings)
+    - Finding deduplicator (merge findings)
+    - Reasoning engine (chain-of-thought)
+    - Self-reflection (learn from tasks)
     """
 
     def __init__(self) -> None:
-        self._state = OrchestratorState.IDLE
-        self._tasks: dict[str, AssessmentTask] = {}
-        self._phases: dict[str, list[AssessmentPhase]] = {}
-        self._findings: list[dict[str, Any]] = []
+        self._assessments: dict[str, Assessment] = {}
         self._counter = 0
-        self._token_used = 0
-        self._start_time = 0.0
         self._log = logger.bind(component="orchestrator")
 
-    def submit_task(
+    def create_assessment(
         self,
         target: str,
-        assessment_type: AssessmentType = AssessmentType.FULL,
         scope: list[str] | None = None,
-        exclusions: list[str] | None = None,
-        max_depth: int = 4,
-        token_budget: int = 500000,
-        time_limit_s: float = 3600.0,
-        system_prompt: str = "",
-        custom_config: dict[str, Any] | None = None,
-    ) -> AssessmentTask:
-        """Submit a new assessment task."""
+        assessment_type: AssessmentType = AssessmentType.FULL,
+        config: AssessmentConfig | None = None,
+    ) -> Assessment:
+        """Create a new assessment."""
         self._counter += 1
-        task = AssessmentTask(
-            task_id=f"task-{self._counter}",
-            target=target,
-            assessment_type=assessment_type,
-            scope=scope or [],
-            exclusions=exclusions or [],
-            max_depth=max_depth,
-            token_budget=token_budget,
-            time_limit_s=time_limit_s,
-            system_prompt=system_prompt,
-            custom_config=custom_config or {},
+
+        tgt = AssessmentTarget(
+            primary=target,
+            scope=scope or [target],
+            target_type=self._infer_target_type(target),
         )
-        self._tasks[task.task_id] = task
-        self._state = OrchestratorState.PLANNING
 
-        # Decompose into phases
-        phases = self._decompose(task)
-        self._phases[task.task_id] = phases
+        cfg = config or AssessmentConfig(assessment_type=assessment_type)
 
-        return task
+        assessment = Assessment(
+            assessment_id=f"assess-{self._counter}",
+            target=tgt,
+            config=cfg,
+        )
 
-    def _decompose(self, task: AssessmentTask) -> list[AssessmentPhase]:
-        """Decompose task into phases."""
-        template_key = task.assessment_type.value
-        template = PHASE_TEMPLATES.get(template_key, PHASE_TEMPLATES["full"])
+        self._assessments[assessment.assessment_id] = assessment
+        return assessment
 
-        phases: list[AssessmentPhase] = []
-        for i, spec in enumerate(template):
-            self._counter += 1
-            phase = AssessmentPhase(
-                phase_id=f"phase-{self._counter}",
-                name=spec["name"],
-                description=spec["desc"],
-                agent_roles=spec.get("roles", []),
-                knowledge_domains=spec.get("knowledge", []),
-                tools_needed=spec.get("tools", []),
-                depends_on=spec.get("depends", []),
-            )
-            phases.append(phase)
+    def _infer_target_type(self, target: str) -> str:
+        """Infer target type from target string."""
+        if target.startswith(("http://", "https://")):
+            return "web"
+        if "/" in target and "." in target:
+            return "network"
+        if target.endswith((".com", ".org", ".net", ".io")):
+            return "web"
+        if target.count(".") == 3 and all(
+            p.isdigit() for p in target.split(".")
+        ):
+            return "network"
+        return "general"
 
-        return phases
+    def advance_phase(self, assessment_id: str) -> AssessmentPhase | None:
+        """Advance to the next phase."""
+        assessment = self._assessments.get(assessment_id)
+        if not assessment:
+            return None
 
-    def get_next_phase(self, task_id: str) -> AssessmentPhase | None:
-        """Get the next executable phase."""
-        phases = self._phases.get(task_id, [])
-        completed = {p.name for p in phases if p.status == "completed"}
+        current_idx = PHASE_ORDER.index(assessment.phase)
+        if current_idx >= len(PHASE_ORDER) - 1:
+            return assessment.phase
 
-        for phase in phases:
-            if phase.status != "pending":
-                continue
-            # Check dependencies
-            if all(dep in completed for dep in phase.depends_on):
-                return phase
-        return None
+        # Find next non-skipped phase
+        for next_phase in PHASE_ORDER[current_idx + 1:]:
+            if next_phase.value not in assessment.config.skip_phases:
+                assessment.phase = next_phase
+                return next_phase
 
-    def start_phase(self, task_id: str, phase_id: str) -> bool:
-        """Mark a phase as started."""
-        phases = self._phases.get(task_id, [])
-        for phase in phases:
-            if phase.phase_id == phase_id:
-                phase.status = "running"
-                phase.started_at = time.time()
-                self._state = OrchestratorState.EXECUTING
-                return True
-        return False
+        assessment.phase = AssessmentPhase.COMPLETE
+        return AssessmentPhase.COMPLETE
 
-    def complete_phase(
+    def record_phase_result(
         self,
-        task_id: str,
-        phase_id: str,
-        findings: list[dict[str, Any]] | None = None,
-    ) -> bool:
-        """Mark a phase as completed with findings."""
-        phases = self._phases.get(task_id, [])
-        for phase in phases:
-            if phase.phase_id == phase_id:
-                phase.status = "completed"
-                phase.completed_at = time.time()
-                phase.findings_count = len(findings) if findings else 0
-                if findings:
-                    self._findings.extend(findings)
-                return True
-        return False
+        assessment_id: str,
+        result: PhaseResult,
+    ) -> None:
+        """Record results from a completed phase."""
+        assessment = self._assessments.get(assessment_id)
+        if not assessment:
+            return
 
-    def is_complete(self, task_id: str) -> bool:
-        """Check if all phases are complete."""
-        phases = self._phases.get(task_id, [])
-        return all(p.status == "completed" for p in phases)
+        assessment.phase_results.append(result)
+        assessment.all_findings.extend(result.findings)
+        assessment.total_tokens += result.tokens_used
+        assessment.total_agents += result.agents_used
 
-    def build_orchestrator_prompt(self, task_id: str = "") -> str:
+    def get_phase_knowledge(self, phase: AssessmentPhase) -> list[str]:
+        """Get relevant knowledge domains for a phase."""
+        return PHASE_KNOWLEDGE.get(phase, [])
+
+    def get_phase_roles(self, phase: AssessmentPhase) -> list[str]:
+        """Get agent roles for a phase."""
+        return PHASE_ROLES.get(phase, [])
+
+    def build_orchestrator_prompt(self, assessment_id: str = "") -> str:
         """Build orchestrator context for LLM."""
-        lines = ["## Orchestrator\n"]
+        lines = ["## Assessment Orchestrator\n"]
 
-        lines.append(f"State: {self._state.value} | Tasks: {len(self._tasks)} | Findings: {len(self._findings)}")
+        if assessment_id and assessment_id in self._assessments:
+            a = self._assessments[assessment_id]
+            lines.append(f"Target: {a.target.primary[:25]}")
+            lines.append(f"Phase: {a.phase.value} | Type: {a.config.assessment_type.value}")
+            lines.append(f"Findings: {len(a.all_findings)} | Agents: {a.total_agents}")
+            lines.append(f"Duration: {a.duration_s:.0f}s | Tokens: {a.total_tokens}")
 
-        if task_id and task_id in self._tasks:
-            task = self._tasks[task_id]
-            lines.append(f"\nTask: {task.target[:20]} ({task.assessment_type.value})")
-            lines.append(f"Budget: {self._token_used}/{task.token_budget} tokens")
+            # Phase results
+            if a.phase_results:
+                lines.append("\nPhase results:")
+                for pr in a.phase_results:
+                    lines.append(
+                        f"  {pr.phase.value[:8]}: "
+                        f"{len(pr.findings)} findings, "
+                        f"{pr.agents_used} agents, "
+                        f"{pr.duration_s:.0f}s"
+                    )
 
-            phases = self._phases.get(task_id, [])
-            completed = sum(1 for p in phases if p.status == "completed")
-            running = sum(1 for p in phases if p.status == "running")
-            pending = sum(1 for p in phases if p.status == "pending")
-            lines.append(f"Phases: {completed} done, {running} running, {pending} pending")
+            # Next steps
+            knowledge = self.get_phase_knowledge(a.phase)
+            roles = self.get_phase_roles(a.phase)
+            if knowledge:
+                lines.append(f"\nKnowledge for {a.phase.value}: {', '.join(knowledge[:3])}")
+            if roles:
+                lines.append(f"Roles needed: {', '.join(roles[:3])}")
 
-            for phase in phases:
-                status_icon = {"completed": "[+]", "running": "[>]", "pending": "[ ]"}.get(phase.status, "[?]")
-                lines.append(f"  {status_icon} {phase.name[:20]} ({phase.findings_count} findings)")
+        else:
+            lines.append(f"Active assessments: {len(self._assessments)}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        all_phases = [p for ps in self._phases.values() for p in ps]
+        phase_counts: dict[str, int] = {}
+        for a in self._assessments.values():
+            p = a.phase.value
+            phase_counts[p] = phase_counts.get(p, 0) + 1
+
         return {
-            "state": self._state.value,
-            "tasks": len(self._tasks),
-            "phases": len(all_phases),
-            "findings": len(self._findings),
-            "tokens_used": self._token_used,
+            "total_assessments": len(self._assessments),
+            "by_phase": phase_counts,
+            "total_findings": sum(len(a.all_findings) for a in self._assessments.values()),
+            "total_agents": sum(a.total_agents for a in self._assessments.values()),
         }
