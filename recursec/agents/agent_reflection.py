@@ -1,23 +1,21 @@
-"""Agent reflection — self-assessment and improvement through introspection.
+"""Agent reflection engine — self-analysis and improvement.
 
-Implements:
-1. Performance self-assessment after each task
-2. Mistake pattern detection
-3. Capability gap identification
-4. Strategy effectiveness review
-5. Confidence calibration (predicted vs actual outcomes)
-6. Improvement plan generation
-7. Reflection journal persistence
-8. Cross-session learning transfer
+After each task, the agent reflects on its performance:
+1. What went well? What failed?
+2. Were the right tools/models/KBs used?
+3. Was the reasoning strategy optimal?
+4. What should be done differently next time?
+5. Update strategy weights based on outcomes
+6. Generate improvement recommendations
+
+This is the "learn from mistakes" capability that makes
+the agent continuously better over time.
 """
 
 from __future__ import annotations
 
-import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -26,366 +24,282 @@ logger = structlog.get_logger()
 
 
 @dataclass
-class ReflectionEntry:
-    """A single reflection entry."""
-    entry_id: str = ""
-    agent_id: str = ""
+class TaskReflection:
+    """Reflection on a completed task."""
+    reflection_id: str = ""
     task_description: str = ""
-    outcome: str = ""              # success, partial, failure
-    predicted_confidence: float = 0.5
-    actual_confidence: float = 0.5
-    mistakes: list[str] = field(default_factory=list)
-    lessons: list[str] = field(default_factory=list)
-    improvements: list[str] = field(default_factory=list)
-    tools_used: list[str] = field(default_factory=list)
-    model_used: str = ""
+    target: str = ""
+    success: bool = False
+    findings_count: int = 0
     duration_s: float = 0.0
-    tokens_used: int = 0
+    tools_used: list[str] = field(default_factory=list)
+    models_used: list[str] = field(default_factory=list)
+    kbs_used: list[str] = field(default_factory=list)
+    strategy_used: str = ""
+    what_worked: list[str] = field(default_factory=list)
+    what_failed: list[str] = field(default_factory=list)
+    improvements: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task": self.task_description[:25],
+            "success": self.success,
+            "findings": self.findings_count,
+            "worked": len(self.what_worked),
+            "failed": len(self.what_failed),
+            "improvements": len(self.improvements),
+        }
+
+
+@dataclass
+class ToolEffectiveness:
+    """Track how effective each tool is."""
+    tool_name: str = ""
+    uses: int = 0
+    findings_produced: int = 0
+    false_positives: int = 0
+    avg_duration_s: float = 0.0
+    last_used: float = 0.0
+
     @property
-    def calibration_error(self) -> float:
-        """How far off was the confidence prediction?"""
-        return abs(self.predicted_confidence - self.actual_confidence)
+    def precision(self) -> float:
+        total = self.findings_produced + self.false_positives
+        return self.findings_produced / max(total, 1)
+
+    @property
+    def productivity(self) -> float:
+        return self.findings_produced / max(self.uses, 1)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.entry_id,
-            "agent": self.agent_id[:15],
-            "outcome": self.outcome,
-            "predicted": round(self.predicted_confidence, 2),
-            "actual": round(self.actual_confidence, 2),
-            "cal_error": round(self.calibration_error, 2),
-            "mistakes": len(self.mistakes),
-            "lessons": len(self.lessons),
+            "tool": self.tool_name[:12],
+            "uses": self.uses,
+            "findings": self.findings_produced,
+            "precision": f"{self.precision:.2f}",
+            "productivity": f"{self.productivity:.1f}",
         }
 
 
 @dataclass
-class MistakePattern:
-    """A recurring mistake pattern."""
-    pattern_id: str = ""
-    description: str = ""
-    occurrences: int = 0
-    severity: float = 0.5
-    contexts: list[str] = field(default_factory=list)
-    mitigation: str = ""
-    last_seen: float = field(default_factory=time.time)
+class ModelEffectiveness:
+    """Track how effective each model is per task type."""
+    model_id: str = ""
+    task_type: str = ""
+    uses: int = 0
+    quality_scores: list[float] = field(default_factory=list)
+    avg_latency_ms: float = 0.0
+    hallucination_count: int = 0
+
+    @property
+    def avg_quality(self) -> float:
+        return sum(self.quality_scores) / max(len(self.quality_scores), 1)
+
+    @property
+    def hallucination_rate(self) -> float:
+        return self.hallucination_count / max(self.uses, 1)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.pattern_id,
-            "desc": self.description[:60],
-            "occurrences": self.occurrences,
-            "severity": round(self.severity, 2),
-            "mitigation": self.mitigation[:40],
+            "model": self.model_id[:12],
+            "task": self.task_type[:10],
+            "uses": self.uses,
+            "quality": f"{self.avg_quality:.2f}",
+            "hallucination_rate": f"{self.hallucination_rate:.2f}",
         }
 
 
-@dataclass
-class CapabilityGap:
-    """An identified capability gap."""
-    gap_id: str = ""
-    area: str = ""
-    description: str = ""
-    frequency: int = 0
-    impact: float = 0.5
-    suggested_fix: str = ""
+# Reflection prompt templates
+REFLECTION_PROMPTS: dict[str, str] = {
+    "success": """Task completed successfully with {findings_count} findings.
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.gap_id,
-            "area": self.area[:20],
-            "desc": self.description[:40],
-            "frequency": self.frequency,
-            "impact": round(self.impact, 2),
-        }
+Tools used: {tools}
+Models used: {models}
+Strategy: {strategy}
+Duration: {duration:.1f}s
 
+Analyze what went well:
+1. Were the right tools chosen for this target type?
+2. Was the model routing optimal?
+3. Was the strategy effective?
+4. Were there false positives that could be reduced?
+5. Could this have been done faster?""",
 
-@dataclass
-class ImprovementPlan:
-    """A plan for improvement based on reflection."""
-    plan_id: str = ""
-    focus_areas: list[str] = field(default_factory=list)
-    actions: list[str] = field(default_factory=list)
-    expected_improvement: float = 0.0
-    priority: float = 0.5
-    created_at: float = field(default_factory=time.time)
+    "failure": """Task FAILED.
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.plan_id,
-            "areas": self.focus_areas[:3],
-            "actions": len(self.actions),
-            "expected_improvement": round(self.expected_improvement, 2),
-        }
+Tools used: {tools}
+Models used: {models}
+Strategy: {strategy}
+Duration: {duration:.1f}s
+Error patterns: {errors}
 
+Analyze the failure:
+1. Was the target correctly profiled?
+2. Were the right tools available?
+3. Did the LLM provide useful analysis?
+4. Was the strategy appropriate?
+5. What should be tried differently?""",
 
-# ── Known Mistake Patterns ────────────────────────────────────
+    "improvement": """Based on {task_count} completed tasks:
 
-KNOWN_MISTAKE_PATTERNS: list[dict[str, Any]] = [
-    {
-        "desc": "False positive: reported vuln that doesn't exist",
-        "severity": 0.8,
-        "mitigation": "Cross-validate with second tool and manual verification",
-    },
-    {
-        "desc": "Missed finding: vuln exists but wasn't detected",
-        "severity": 0.9,
-        "mitigation": "Use multiple scanning tools and techniques",
-    },
-    {
-        "desc": "Wrong severity: misclassified vulnerability severity",
-        "severity": 0.6,
-        "mitigation": "Apply CVSS scoring consistently and verify with context",
-    },
-    {
-        "desc": "Scope violation: scanned out-of-scope target",
-        "severity": 0.9,
-        "mitigation": "Always check scope before executing tools",
-    },
-    {
-        "desc": "Tool timeout: tool execution exceeded time limit",
-        "severity": 0.4,
-        "mitigation": "Set appropriate timeouts and use faster alternatives",
-    },
-    {
-        "desc": "Hallucinated evidence: LLM generated fake evidence",
-        "severity": 0.95,
-        "mitigation": "Always verify LLM claims against actual tool output",
-    },
-    {
-        "desc": "Infinite loop: agent stuck in reasoning loop",
-        "severity": 0.7,
-        "mitigation": "Implement convergence detection and max iteration limits",
-    },
-    {
-        "desc": "Resource waste: excessive tokens on low-value task",
-        "severity": 0.5,
-        "mitigation": "Budget allocation based on expected value of information",
-    },
-]
+Best performing tools: {best_tools}
+Worst performing tools: {worst_tools}
+Best model-task combos: {best_models}
+Common failure patterns: {failure_patterns}
+
+Generate improvement recommendations:
+1. Tool substitutions
+2. Strategy adjustments
+3. KB gaps to fill
+4. Model routing changes""",
+}
 
 
 class AgentReflection:
-    """Self-assessment and improvement through introspection.
+    """Manages agent self-reflection and continuous improvement."""
 
-    After each task, the agent reflects on performance,
-    identifies mistakes, and generates improvement plans.
-    """
-
-    def __init__(self, data_dir: str = "data/reflections") -> None:
-        self._data_dir = Path(data_dir)
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._entries: list[ReflectionEntry] = []
-        self._mistake_patterns: dict[str, MistakePattern] = {}
-        self._capability_gaps: dict[str, CapabilityGap] = {}
-        self._improvement_plans: list[ImprovementPlan] = []
-        self._entry_counter = 0
-        self._pattern_counter = 0
-        self._gap_counter = 0
-        self._plan_counter = 0
+    def __init__(self) -> None:
+        self._reflections: list[TaskReflection] = []
+        self._tool_effectiveness: dict[str, ToolEffectiveness] = {}
+        self._model_effectiveness: dict[str, ModelEffectiveness] = {}
+        self._reflection_counter = 0
         self._log = logger.bind(component="agent_reflection")
 
-        self._initialize_patterns()
-
-    def _initialize_patterns(self) -> None:
-        """Initialize known mistake patterns."""
-        for data in KNOWN_MISTAKE_PATTERNS:
-            self._pattern_counter += 1
-            pattern = MistakePattern(
-                pattern_id=f"mp-{self._pattern_counter}",
-                description=data["desc"],
-                severity=data["severity"],
-                mitigation=data["mitigation"],
-            )
-            self._mistake_patterns[pattern.pattern_id] = pattern
-
-    def reflect(
+    def reflect_on_task(
         self,
-        agent_id: str,
         task_description: str,
-        outcome: str,
-        predicted_confidence: float,
-        actual_confidence: float,
-        mistakes: list[str] | None = None,
-        lessons: list[str] | None = None,
-        tools_used: list[str] | None = None,
-        model_used: str = "",
+        target: str = "",
+        success: bool = True,
+        findings_count: int = 0,
         duration_s: float = 0.0,
-        tokens_used: int = 0,
-    ) -> ReflectionEntry:
-        """Record a reflection after task completion."""
-        self._entry_counter += 1
-        entry = ReflectionEntry(
-            entry_id=f"ref-{self._entry_counter}",
-            agent_id=agent_id,
+        tools_used: list[str] | None = None,
+        models_used: list[str] | None = None,
+        kbs_used: list[str] | None = None,
+        strategy_used: str = "",
+    ) -> TaskReflection:
+        """Create a reflection on a completed task."""
+        self._reflection_counter += 1
+        reflection = TaskReflection(
+            reflection_id=f"reflect-{self._reflection_counter}",
             task_description=task_description,
-            outcome=outcome,
-            predicted_confidence=predicted_confidence,
-            actual_confidence=actual_confidence,
-            mistakes=mistakes or [],
-            lessons=lessons or [],
-            tools_used=tools_used or [],
-            model_used=model_used,
+            target=target,
+            success=success,
+            findings_count=findings_count,
             duration_s=duration_s,
-            tokens_used=tokens_used,
+            tools_used=tools_used or [],
+            models_used=models_used or [],
+            kbs_used=kbs_used or [],
+            strategy_used=strategy_used,
         )
 
-        self._entries.append(entry)
-
-        # Analyze for patterns
-        self._detect_patterns(entry)
+        # Auto-analyze what worked/failed
+        if success and findings_count > 0:
+            reflection.what_worked.append(f"Found {findings_count} findings using {strategy_used}")
+            if tools_used:
+                reflection.what_worked.append(f"Tool chain: {' → '.join(tools_used[:5])}")
+        elif not success:
+            reflection.what_failed.append(f"Strategy {strategy_used} did not produce results")
 
         # Generate improvements
-        entry.improvements = self._suggest_improvements(entry)
+        if findings_count == 0:
+            reflection.improvements.append("Consider broadening scan scope or using different tools")
+        if duration_s > 300:
+            reflection.improvements.append("Task took too long. Consider parallel execution or timeout tuning")
 
-        # Persist
-        self._save_entry(entry)
+        # Update tool effectiveness
+        for tool in (tools_used or []):
+            self._update_tool(tool, findings_count, duration_s)
 
-        if len(self._entries) > 1000:
-            self._entries = self._entries[-1000:]
+        # Update model effectiveness
+        for model in (models_used or []):
+            self._update_model(model, "general", 0.7 if success else 0.3)
 
-        return entry
+        self._reflections.append(reflection)
+        return reflection
 
-    def _detect_patterns(self, entry: ReflectionEntry) -> None:
-        """Detect mistake patterns in reflection."""
-        for mistake in entry.mistakes:
-            mistake_lower = mistake.lower()
-            for pattern in self._mistake_patterns.values():
-                # Match keywords from pattern description
-                keywords = pattern.description.lower().split()
-                matches = sum(1 for kw in keywords if kw in mistake_lower)
-                if matches >= 2:
-                    pattern.occurrences += 1
-                    pattern.last_seen = time.time()
-                    if entry.task_description[:60] not in pattern.contexts:
-                        pattern.contexts.append(entry.task_description[:60])
-                        if len(pattern.contexts) > 10:
-                            pattern.contexts = pattern.contexts[-10:]
-                    break
+    def _update_tool(self, tool: str, findings: int, duration: float) -> None:
+        if tool not in self._tool_effectiveness:
+            self._tool_effectiveness[tool] = ToolEffectiveness(tool_name=tool)
+        eff = self._tool_effectiveness[tool]
+        eff.uses += 1
+        eff.findings_produced += findings
+        eff.last_used = time.time()
+        n = eff.uses
+        eff.avg_duration_s = eff.avg_duration_s * (n - 1) / n + duration / n
 
-    def _suggest_improvements(self, entry: ReflectionEntry) -> list[str]:
-        """Generate improvement suggestions."""
-        suggestions = []
+    def _update_model(self, model: str, task_type: str, quality: float) -> None:
+        key = f"{model}:{task_type}"
+        if key not in self._model_effectiveness:
+            self._model_effectiveness[key] = ModelEffectiveness(model_id=model, task_type=task_type)
+        eff = self._model_effectiveness[key]
+        eff.uses += 1
+        eff.quality_scores.append(quality)
+        if len(eff.quality_scores) > 50:
+            eff.quality_scores = eff.quality_scores[-25:]
 
-        # Calibration-based
-        if entry.calibration_error > 0.3:
-            if entry.predicted_confidence > entry.actual_confidence:
-                suggestions.append("Overconfident: lower confidence estimates for similar tasks")
-            else:
-                suggestions.append("Underconfident: increase confidence for similar tasks")
+    def get_best_tools(self, top_n: int = 5) -> list[ToolEffectiveness]:
+        """Get the most effective tools."""
+        tools = list(self._tool_effectiveness.values())
+        return sorted(tools, key=lambda t: t.productivity, reverse=True)[:top_n]
 
-        # Outcome-based
-        if entry.outcome == "failure":
-            suggestions.append("Review tool selection and execution approach")
-            if entry.mistakes:
-                suggestions.append(f"Address mistakes: {entry.mistakes[0][:60]}")
+    def get_best_models(self, task_type: str = "") -> list[ModelEffectiveness]:
+        """Get the best performing models for a task type."""
+        models = list(self._model_effectiveness.values())
+        if task_type:
+            models = [m for m in models if m.task_type == task_type]
+        return sorted(models, key=lambda m: m.avg_quality, reverse=True)
 
-        # Efficiency-based
-        if entry.tokens_used > 10000 and entry.outcome != "success":
-            suggestions.append("Reduce token usage on failed tasks — fail faster")
+    def get_common_failures(self) -> list[str]:
+        """Get common failure patterns."""
+        failures: dict[str, int] = {}
+        for ref in self._reflections:
+            if not ref.success:
+                for fail in ref.what_failed:
+                    failures[fail] = failures.get(fail, 0) + 1
+        return [f for f, _ in sorted(failures.items(), key=lambda x: x[1], reverse=True)[:5]]
 
-        return suggestions
+    def build_reflection_prompt(self) -> str:
+        """Build LLM prompt with reflection context."""
+        lines = ["## Agent Self-Reflection"]
 
-    def identify_capability_gaps(self) -> list[CapabilityGap]:
-        """Identify capability gaps from reflection history."""
-        failure_areas: dict[str, int] = defaultdict(int)
+        total = len(self._reflections)
+        successes = sum(1 for r in self._reflections if r.success)
+        total_findings = sum(r.findings_count for r in self._reflections)
 
-        for entry in self._entries:
-            if entry.outcome == "failure":
-                for tool in entry.tools_used:
-                    failure_areas[f"tool:{tool}"] += 1
-                for mistake in entry.mistakes:
-                    area = mistake.split(":")[0] if ":" in mistake else mistake[:30]
-                    failure_areas[area] += 1
+        lines.append(f"Tasks completed: {total}")
+        lines.append(f"Success rate: {successes}/{total} ({successes/max(total,1):.0%})")
+        lines.append(f"Total findings: {total_findings}")
 
-        gaps = []
-        for area, count in sorted(failure_areas.items(), key=lambda x: x[1], reverse=True)[:10]:
-            self._gap_counter += 1
-            gap = CapabilityGap(
-                gap_id=f"gap-{self._gap_counter}",
-                area=area,
-                description=f"Recurring failures in area: {area}",
-                frequency=count,
-                impact=min(1.0, count * 0.1),
-                suggested_fix=self._suggest_gap_fix(area),
-            )
-            gaps.append(gap)
-            self._capability_gaps[gap.gap_id] = gap
+        # Best tools
+        best = self.get_best_tools(3)
+        if best:
+            lines.append("\nMost effective tools:")
+            for tool in best:
+                lines.append(f"  - {tool.tool_name}: {tool.productivity:.1f} findings/use, {tool.precision:.0%} precision")
 
-        return gaps
+        # Common failures
+        failures = self.get_common_failures()
+        if failures:
+            lines.append("\nCommon failure patterns:")
+            for fail in failures[:3]:
+                lines.append(f"  - {fail}")
 
-    def _suggest_gap_fix(self, area: str) -> str:
-        """Suggest a fix for a capability gap."""
-        if area.startswith("tool:"):
-            return f"Review usage of {area[5:]} and explore alternatives"
-        return f"Increase focus on {area} with more thorough analysis"
+        # Recent reflections
+        if self._reflections:
+            lines.append("\nRecent task reflections:")
+            for ref in self._reflections[-3:]:
+                status = "✓" if ref.success else "✗"
+                lines.append(f"  {status} {ref.task_description[:40]} ({ref.findings_count} findings)")
 
-    def generate_improvement_plan(self) -> ImprovementPlan:
-        """Generate an improvement plan from reflections."""
-        self._plan_counter += 1
-
-        # Find top issues
-        top_patterns = sorted(
-            self._mistake_patterns.values(),
-            key=lambda p: p.occurrences * p.severity,
-            reverse=True,
-        )[:3]
-
-        focus_areas = [p.description[:40] for p in top_patterns]
-        actions = [p.mitigation for p in top_patterns if p.mitigation]
-
-        # Calculate calibration stats
-        if self._entries:
-            avg_cal_error = sum(e.calibration_error for e in self._entries) / len(self._entries)
-            if avg_cal_error > 0.2:
-                focus_areas.append("Improve confidence calibration")
-                actions.append("Track prediction accuracy and adjust confidence scaling")
-
-        plan = ImprovementPlan(
-            plan_id=f"plan-{self._plan_counter}",
-            focus_areas=focus_areas,
-            actions=actions,
-            expected_improvement=0.1 * len(actions),
-        )
-
-        self._improvement_plans.append(plan)
-        return plan
-
-    def get_calibration_stats(self) -> dict[str, Any]:
-        """Get confidence calibration statistics."""
-        if not self._entries:
-            return {"entries": 0}
-
-        errors = [e.calibration_error for e in self._entries]
-        outcomes: dict[str, int] = defaultdict(int)
-        for entry in self._entries:
-            outcomes[entry.outcome] += 1
-
-        return {
-            "entries": len(self._entries),
-            "avg_cal_error": round(sum(errors) / len(errors), 3),
-            "max_cal_error": round(max(errors), 3),
-            "min_cal_error": round(min(errors), 3),
-            "outcomes": dict(outcomes),
-        }
-
-    def _save_entry(self, entry: ReflectionEntry) -> None:
-        """Save a reflection entry to disk."""
-        path = self._data_dir / f"{entry.entry_id}.json"
-        try:
-            path.write_text(json.dumps(entry.to_dict(), indent=2, default=str))
-        except OSError:
-            pass
-
-    def get_recent(self, limit: int = 10) -> list[dict[str, Any]]:
-        return [e.to_dict() for e in self._entries[-limit:]]
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
+        total = len(self._reflections)
+        successes = sum(1 for r in self._reflections if r.success)
         return {
-            "reflections": len(self._entries),
-            "patterns": len(self._mistake_patterns),
-            "gaps": len(self._capability_gaps),
-            "plans": len(self._improvement_plans),
+            "total_reflections": total,
+            "success_rate": f"{successes/max(total,1):.2f}",
+            "total_findings": sum(r.findings_count for r in self._reflections),
+            "tools_tracked": len(self._tool_effectiveness),
+            "models_tracked": len(self._model_effectiveness),
         }

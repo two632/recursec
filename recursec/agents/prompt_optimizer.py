@@ -1,21 +1,20 @@
-"""Prompt optimizer — learns and optimizes prompt structures for better LLM responses.
+"""Prompt optimizer — maximizes LLM output quality per model.
 
-Implements:
-1. Prompt variant generation
-2. A/B testing of prompts
-3. Prompt performance tracking
-4. Automatic prompt selection
-5. Few-shot example curation
-6. System prompt tuning
-7. Temperature/parameter optimization
-8. Prompt chain optimization
+Each of the 16 models responds differently to different prompt formats.
+This module:
+1. Maintains model-specific prompt templates (chat vs instruct vs raw)
+2. Optimizes token allocation across prompt sections
+3. Compresses context to fit within model's context window
+4. Selects the optimal system prompt per model per task
+5. Formats tool calls in the format each model understands best
+6. Tracks prompt quality scores and adapts over time
+7. Handles model-specific quirks (chat template format, stop tokens)
 """
 
 from __future__ import annotations
 
-import random
-import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -23,250 +22,359 @@ import structlog
 logger = structlog.get_logger()
 
 
-@dataclass
-class PromptVariant:
-    """A variant of a prompt for testing."""
-    variant_id: str = ""
-    template: str = ""
-    system_prompt: str = ""
-    temperature: float = 0.7
-    max_tokens: int = 2048
-    few_shot_examples: list[dict[str, str]] = field(default_factory=list)
-    uses: int = 0
-    total_reward: float = 0.0
-    avg_reward: float = 0.0
-    avg_latency_s: float = 0.0
-    avg_output_quality: float = 0.5
-    created_at: float = field(default_factory=time.time)
-
-    @property
-    def score(self) -> float:
-        if self.uses == 0:
-            return 0.5  # Prior
-        return self.avg_reward * 0.6 + self.avg_output_quality * 0.4
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.variant_id,
-            "template": self.template[:40],
-            "temp": self.temperature,
-            "uses": self.uses,
-            "score": round(self.score, 3),
-            "avg_reward": round(self.avg_reward, 3),
-            "quality": round(self.avg_output_quality, 3),
-        }
+class PromptFormat(str, Enum):
+    CHATML = "chatml"
+    LLAMA3 = "llama3"
+    MISTRAL = "mistral"
+    ALPACA = "alpaca"
+    VICUNA = "vicuna"
+    COMPLETION = "completion"
 
 
-@dataclass
-class PromptExperiment:
-    """An A/B test experiment."""
-    experiment_id: str = ""
-    name: str = ""
-    task_type: str = ""
-    variants: list[str] = field(default_factory=list)  # variant IDs
-    winner_id: str = ""
-    min_samples: int = 10
-    started_at: float = field(default_factory=time.time)
-    concluded_at: float = 0.0
-
-    @property
-    def is_concluded(self) -> bool:
-        return self.concluded_at > 0
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.experiment_id,
-            "name": self.name[:40],
-            "task": self.task_type[:20],
-            "variants": len(self.variants),
-            "concluded": self.is_concluded,
-            "winner": self.winner_id[:15],
-        }
+class PromptSection(str, Enum):
+    SYSTEM = "system"
+    ROLE = "role"
+    TASK = "task"
+    KB_CONTEXT = "kb_context"
+    EXPERIENCE = "experience"
+    BELIEFS = "beliefs"
+    STRATEGY = "strategy"
+    TOOL_CATALOG = "tool_catalog"
+    CONVERSATION = "conversation"
+    USER = "user"
 
 
-# ── Prompt Templates ──────────────────────────────────────────
-
-BASE_SYSTEM_PROMPTS: dict[str, list[str]] = {
-    "security_analysis": [
-        "You are an expert security analyst. Analyze the following data and identify potential vulnerabilities, their severity, and recommended mitigations.",
-        "As a senior penetration tester, examine the provided information. Focus on critical and high-severity findings. Be precise and evidence-based.",
-        "You are a vulnerability researcher. Given the following security scan results, provide a structured analysis with risk ratings and exploitation potential.",
-    ],
-    "recon": [
-        "You are a reconnaissance specialist. Plan the next steps for information gathering on the target. Prioritize by expected value of information.",
-        "As an attack surface analyst, examine the target information and identify additional areas to investigate. Focus on high-value assets.",
-    ],
-    "planning": [
-        "You are a security assessment planner. Create a comprehensive test plan based on the current findings. Include tool selection, ordering, and expected outcomes.",
-        "As a senior security architect, design the optimal testing strategy. Consider stealth, thoroughness, and time constraints.",
-    ],
-    "validation": [
-        "You are a security finding validator. Verify whether the reported vulnerability is a true positive. Request additional evidence if needed.",
-        "As a QA security analyst, cross-reference the finding against known patterns. Assess confidence level and suggest confirmation steps.",
-    ],
+# Model-specific configurations
+MODEL_PROMPT_CONFIG: dict[str, dict[str, Any]] = {
+    "whiterabbit": {
+        "format": PromptFormat.CHATML,
+        "system_prefix": "<|im_start|>system\n",
+        "system_suffix": "<|im_end|>\n",
+        "user_prefix": "<|im_start|>user\n",
+        "user_suffix": "<|im_end|>\n",
+        "assistant_prefix": "<|im_start|>assistant\n",
+        "assistant_suffix": "<|im_end|>\n",
+        "stop_tokens": ["<|im_end|>"],
+        "max_ctx": 4096,
+        "strength": "security_analysis",
+        "optimal_temp": 0.3,
+        "system_prompt": "You are WhiteRabbitNeo, an elite security researcher. Analyze vulnerabilities with technical precision. Cite CWE/CVE IDs. Provide exploitation steps and remediation.",
+    },
+    "qwen-coder-14b": {
+        "format": PromptFormat.CHATML,
+        "system_prefix": "<|im_start|>system\n",
+        "system_suffix": "<|im_end|>\n",
+        "user_prefix": "<|im_start|>user\n",
+        "user_suffix": "<|im_end|>\n",
+        "assistant_prefix": "<|im_start|>assistant\n",
+        "assistant_suffix": "<|im_end|>\n",
+        "stop_tokens": ["<|im_end|>"],
+        "max_ctx": 8192,
+        "strength": "code_analysis",
+        "optimal_temp": 0.2,
+        "system_prompt": "You are a senior security code reviewer. Analyze code for vulnerabilities: injection, auth bypass, crypto flaws, race conditions, type confusion. Output findings in structured format.",
+    },
+    "deepseek-r1": {
+        "format": PromptFormat.CHATML,
+        "system_prefix": "<|im_start|>system\n",
+        "system_suffix": "<|im_end|>\n",
+        "user_prefix": "<|im_start|>user\n",
+        "user_suffix": "<|im_end|>\n",
+        "assistant_prefix": "<|im_start|>assistant\n",
+        "assistant_suffix": "<|im_end|>\n",
+        "stop_tokens": ["<|im_end|>"],
+        "max_ctx": 8192,
+        "strength": "reasoning",
+        "optimal_temp": 0.4,
+        "system_prompt": "You are a deep reasoning engine. Think step-by-step through complex security problems. Use chain-of-thought reasoning. Consider multiple hypotheses before concluding.",
+    },
+    "hermes-4-14b": {
+        "format": PromptFormat.CHATML,
+        "system_prefix": "<|im_start|>system\n",
+        "system_suffix": "<|im_end|>\n",
+        "user_prefix": "<|im_start|>user\n",
+        "user_suffix": "<|im_end|>\n",
+        "assistant_prefix": "<|im_start|>assistant\n",
+        "assistant_suffix": "<|im_end|>\n",
+        "stop_tokens": ["<|im_end|>"],
+        "max_ctx": 4096,
+        "strength": "general",
+        "optimal_temp": 0.5,
+        "system_prompt": "You are Hermes, a general-purpose security analyst. Synthesize findings across multiple domains. Write clear, actionable reports.",
+    },
+    "mistral": {
+        "format": PromptFormat.MISTRAL,
+        "system_prefix": "[INST] ",
+        "system_suffix": "",
+        "user_prefix": "",
+        "user_suffix": " [/INST]",
+        "assistant_prefix": "",
+        "assistant_suffix": "</s>",
+        "stop_tokens": ["</s>"],
+        "max_ctx": 8192,
+        "strength": "fast_analysis",
+        "optimal_temp": 0.4,
+        "system_prompt": "You are a fast security analyst. Quickly assess risks and provide concise findings.",
+    },
+    "llama-3.1-8b": {
+        "format": PromptFormat.LLAMA3,
+        "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+        "system_suffix": "<|eot_id|>",
+        "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+        "user_suffix": "<|eot_id|>",
+        "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        "assistant_suffix": "<|eot_id|>",
+        "stop_tokens": ["<|eot_id|>"],
+        "max_ctx": 8192,
+        "strength": "general",
+        "optimal_temp": 0.4,
+        "system_prompt": "You are a security assessment assistant. Analyze targets, identify vulnerabilities, and suggest remediation.",
+    },
+    "codellama-13b": {
+        "format": PromptFormat.LLAMA3,
+        "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+        "system_suffix": "<|eot_id|>",
+        "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+        "user_suffix": "<|eot_id|>",
+        "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        "assistant_suffix": "<|eot_id|>",
+        "stop_tokens": ["<|eot_id|>"],
+        "max_ctx": 4096,
+        "strength": "code_review",
+        "optimal_temp": 0.2,
+        "system_prompt": "You are a code security specialist. Find bugs, vulnerabilities, and security issues in source code.",
+    },
+    "dolphin": {
+        "format": PromptFormat.CHATML,
+        "system_prefix": "<|im_start|>system\n",
+        "system_suffix": "<|im_end|>\n",
+        "user_prefix": "<|im_start|>user\n",
+        "user_suffix": "<|im_end|>\n",
+        "assistant_prefix": "<|im_start|>assistant\n",
+        "assistant_suffix": "<|im_end|>\n",
+        "stop_tokens": ["<|im_end|>"],
+        "max_ctx": 8192,
+        "strength": "uncensored",
+        "optimal_temp": 0.5,
+        "system_prompt": "You are an uncensored security analyst. Provide complete, unfiltered technical analysis. Include all exploitation details.",
+    },
+    "yi-9b-200k": {
+        "format": PromptFormat.CHATML,
+        "system_prefix": "<|im_start|>system\n",
+        "system_suffix": "<|im_end|>\n",
+        "user_prefix": "<|im_start|>user\n",
+        "user_suffix": "<|im_end|>\n",
+        "assistant_prefix": "<|im_start|>assistant\n",
+        "assistant_suffix": "<|im_end|>\n",
+        "stop_tokens": ["<|im_end|>"],
+        "max_ctx": 200000,
+        "strength": "long_context",
+        "optimal_temp": 0.3,
+        "system_prompt": "You are a security analyst specialized in processing large volumes of data. Analyze the entire context thoroughly. Do not skip or summarize sections.",
+    },
+    "phi-3.5-mini": {
+        "format": PromptFormat.CHATML,
+        "system_prefix": "<|system|>\n",
+        "system_suffix": "<|end|>\n",
+        "user_prefix": "<|user|>\n",
+        "user_suffix": "<|end|>\n",
+        "assistant_prefix": "<|assistant|>\n",
+        "assistant_suffix": "<|end|>\n",
+        "stop_tokens": ["<|end|>"],
+        "max_ctx": 4096,
+        "strength": "fast",
+        "optimal_temp": 0.3,
+        "system_prompt": "You are a fast security triage assistant. Quickly classify and prioritize security findings.",
+    },
+    "functiongemma": {
+        "format": PromptFormat.COMPLETION,
+        "system_prefix": "",
+        "system_suffix": "",
+        "user_prefix": "User: ",
+        "user_suffix": "\n",
+        "assistant_prefix": "Function: ",
+        "assistant_suffix": "\n",
+        "stop_tokens": ["\n"],
+        "max_ctx": 2048,
+        "strength": "function_calling",
+        "optimal_temp": 0.1,
+        "system_prompt": "",
+    },
+    "nomic-embed": {
+        "format": PromptFormat.COMPLETION,
+        "system_prefix": "",
+        "system_suffix": "",
+        "user_prefix": "search_query: ",
+        "user_suffix": "",
+        "assistant_prefix": "",
+        "assistant_suffix": "",
+        "stop_tokens": [],
+        "max_ctx": 8192,
+        "strength": "embedding",
+        "optimal_temp": 0.0,
+        "system_prompt": "",
+    },
+    "llama-guard": {
+        "format": PromptFormat.LLAMA3,
+        "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+        "system_suffix": "<|eot_id|>",
+        "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+        "user_suffix": "<|eot_id|>",
+        "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        "assistant_suffix": "<|eot_id|>",
+        "stop_tokens": ["<|eot_id|>"],
+        "max_ctx": 2048,
+        "strength": "safety",
+        "optimal_temp": 0.0,
+        "system_prompt": "",
+    },
 }
 
 
-class PromptOptimizer:
-    """Learns and optimizes prompt structures for better LLM responses.
+# Token budget allocation per section (percentage of available context)
+SECTION_BUDGETS: dict[PromptSection, float] = {
+    PromptSection.SYSTEM: 0.05,
+    PromptSection.ROLE: 0.03,
+    PromptSection.TASK: 0.10,
+    PromptSection.KB_CONTEXT: 0.30,
+    PromptSection.EXPERIENCE: 0.10,
+    PromptSection.BELIEFS: 0.05,
+    PromptSection.STRATEGY: 0.05,
+    PromptSection.TOOL_CATALOG: 0.07,
+    PromptSection.CONVERSATION: 0.15,
+    PromptSection.USER: 0.10,
+}
 
-    Uses A/B testing and reward tracking to find
-    the most effective prompts for each task type.
-    """
+
+@dataclass
+class OptimizedPrompt:
+    """A fully optimized prompt ready for a specific model."""
+    model_id: str = ""
+    raw_text: str = ""
+    token_estimate: int = 0
+    max_tokens: int = 4096
+    sections_included: list[str] = field(default_factory=list)
+    format_used: str = ""
+    temperature: float = 0.4
+    stop_tokens: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model_id[:12],
+            "tokens": f"~{self.token_estimate}",
+            "max": self.max_tokens,
+            "sections": len(self.sections_included),
+            "format": self.format_used[:8],
+        }
+
+
+class PromptOptimizer:
+    """Optimizes prompts for each specific model."""
 
     def __init__(self) -> None:
-        self._variants: dict[str, PromptVariant] = {}
-        self._experiments: dict[str, PromptExperiment] = {}
-        self._task_best: dict[str, str] = {}  # task_type -> best variant_id
-        self._variant_counter = 0
-        self._experiment_counter = 0
+        self._quality_scores: dict[str, list[float]] = {}
         self._log = logger.bind(component="prompt_optimizer")
 
-        self._initialize_defaults()
-
-    def _initialize_defaults(self) -> None:
-        """Create default prompt variants from templates."""
-        for task_type, prompts in BASE_SYSTEM_PROMPTS.items():
-            for i, prompt in enumerate(prompts):
-                self._variant_counter += 1
-                variant = PromptVariant(
-                    variant_id=f"pv-{self._variant_counter}",
-                    template=f"{task_type}_v{i+1}",
-                    system_prompt=prompt,
-                    temperature=0.7 - i * 0.1,  # Vary temperature
-                )
-                self._variants[variant.variant_id] = variant
-
-    def select_prompt(
+    def optimize(
         self,
-        task_type: str,
-    ) -> PromptVariant | None:
-        """Select the best prompt for a task type."""
-        # If we have a known best, use it most of the time
-        best_id = self._task_best.get(task_type)
-        if best_id and random.random() > 0.1:  # 90% exploit
-            return self._variants.get(best_id)
+        model_id: str,
+        sections: dict[PromptSection, str],
+        task_type: str = "",
+    ) -> OptimizedPrompt:
+        """Build an optimized prompt for a specific model."""
+        config = MODEL_PROMPT_CONFIG.get(model_id)
+        if not config:
+            # Fallback to generic ChatML
+            config = MODEL_PROMPT_CONFIG.get("hermes-4-14b", {})
 
-        # Otherwise explore
-        candidates = [
-            v for v in self._variants.values()
-            if task_type in v.template
-        ]
+        max_ctx = config.get("max_ctx", 4096)
+        # Reserve 25% for generation
+        available_tokens = int(max_ctx * 0.75)
 
-        if not candidates:
-            return None
+        # Allocate token budgets per section
+        budgets: dict[PromptSection, int] = {}
+        for section, pct in SECTION_BUDGETS.items():
+            budgets[section] = int(available_tokens * pct)
 
-        # UCB1-like selection
-        return max(candidates, key=lambda v: v.score)
+        # Build prompt with model-specific formatting
+        parts = []
+        included = []
 
-    def create_variant(
-        self,
-        template: str,
-        system_prompt: str,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        few_shot_examples: list[dict[str, str]] | None = None,
-    ) -> PromptVariant:
-        """Create a new prompt variant."""
-        self._variant_counter += 1
-        variant = PromptVariant(
-            variant_id=f"pv-{self._variant_counter}",
-            template=template,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            few_shot_examples=few_shot_examples or [],
+        # System prompt (model-specific + optional override)
+        system_text = config.get("system_prompt", "")
+        if PromptSection.SYSTEM in sections:
+            system_text = sections[PromptSection.SYSTEM]
+        if system_text:
+            system_text = self._truncate_to_tokens(system_text, budgets[PromptSection.SYSTEM])
+            parts.append(config.get("system_prefix", "") + system_text + config.get("system_suffix", ""))
+            included.append("system")
+
+        # Build user message with all context sections
+        user_parts = []
+
+        for section in [PromptSection.ROLE, PromptSection.KB_CONTEXT, PromptSection.EXPERIENCE,
+                        PromptSection.BELIEFS, PromptSection.STRATEGY, PromptSection.TOOL_CATALOG]:
+            if section in sections and sections[section]:
+                text = self._truncate_to_tokens(sections[section], budgets.get(section, 500))
+                user_parts.append(text)
+                included.append(section.value)
+
+        # Task always included
+        if PromptSection.TASK in sections:
+            text = self._truncate_to_tokens(sections[PromptSection.TASK], budgets[PromptSection.TASK])
+            user_parts.append(text)
+            included.append("task")
+
+        # User query
+        if PromptSection.USER in sections:
+            text = self._truncate_to_tokens(sections[PromptSection.USER], budgets[PromptSection.USER])
+            user_parts.append(text)
+            included.append("user")
+
+        user_message = "\n\n".join(user_parts)
+        parts.append(config.get("user_prefix", "") + user_message + config.get("user_suffix", ""))
+        parts.append(config.get("assistant_prefix", ""))
+
+        raw_text = "".join(parts)
+        token_estimate = len(raw_text) // 4  # Rough estimate
+
+        return OptimizedPrompt(
+            model_id=model_id,
+            raw_text=raw_text,
+            token_estimate=token_estimate,
+            max_tokens=max_ctx,
+            sections_included=included,
+            format_used=config.get("format", PromptFormat.CHATML).value if isinstance(config.get("format"), PromptFormat) else str(config.get("format", "chatml")),
+            temperature=config.get("optimal_temp", 0.4),
+            stop_tokens=config.get("stop_tokens", []),
         )
-        self._variants[variant.variant_id] = variant
-        return variant
 
-    def record_outcome(
-        self,
-        variant_id: str,
-        reward: float,
-        output_quality: float = 0.5,
-        latency_s: float = 0.0,
-    ) -> None:
-        """Record the outcome of using a prompt variant."""
-        variant = self._variants.get(variant_id)
-        if not variant:
-            return
+    def _truncate_to_tokens(self, text: str, max_tokens: int) -> str:
+        """Truncate text to approximately max_tokens."""
+        max_chars = max_tokens * 4  # ~4 chars per token
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n[...truncated]"
 
-        variant.uses += 1
-        variant.total_reward += reward
+    def record_quality(self, model_id: str, score: float) -> None:
+        """Record prompt quality score for adaptation."""
+        if model_id not in self._quality_scores:
+            self._quality_scores[model_id] = []
+        self._quality_scores[model_id].append(score)
+        if len(self._quality_scores[model_id]) > 100:
+            self._quality_scores[model_id] = self._quality_scores[model_id][-50:]
 
-        # Running averages
-        n = variant.uses
-        variant.avg_reward += (reward - variant.avg_reward) / n
-        variant.avg_output_quality += (output_quality - variant.avg_output_quality) / n
-        if latency_s > 0:
-            variant.avg_latency_s += (latency_s - variant.avg_latency_s) / n
+    def get_avg_quality(self, model_id: str) -> float:
+        """Get average quality score for a model."""
+        scores = self._quality_scores.get(model_id, [])
+        return sum(scores) / max(len(scores), 1)
 
-        # Check if this variant is now the best for its task type
-        task_type = variant.template.rsplit("_", 1)[0]
-        current_best_id = self._task_best.get(task_type)
-        if current_best_id:
-            current_best = self._variants.get(current_best_id)
-            if current_best and variant.score > current_best.score and variant.uses >= 5:
-                self._task_best[task_type] = variant_id
-        elif variant.uses >= 5:
-            self._task_best[task_type] = variant_id
-
-    def create_experiment(
-        self,
-        name: str,
-        task_type: str,
-        variant_ids: list[str],
-        min_samples: int = 10,
-    ) -> PromptExperiment:
-        """Create an A/B test experiment."""
-        self._experiment_counter += 1
-        experiment = PromptExperiment(
-            experiment_id=f"exp-{self._experiment_counter}",
-            name=name,
-            task_type=task_type,
-            variants=variant_ids,
-            min_samples=min_samples,
-        )
-        self._experiments[experiment.experiment_id] = experiment
-        return experiment
-
-    def check_experiment(self, experiment_id: str) -> PromptExperiment | None:
-        """Check if an experiment can be concluded."""
-        experiment = self._experiments.get(experiment_id)
-        if not experiment or experiment.is_concluded:
-            return experiment
-
-        variants = [
-            self._variants.get(vid)
-            for vid in experiment.variants
-        ]
-        variants = [v for v in variants if v is not None]
-
-        # All variants need minimum samples
-        if all(v.uses >= experiment.min_samples for v in variants):
-            winner = max(variants, key=lambda v: v.score)
-            experiment.winner_id = winner.variant_id
-            experiment.concluded_at = time.time()
-            self._task_best[experiment.task_type] = winner.variant_id
-
-        return experiment
-
-    def get_best_prompts(self) -> dict[str, dict[str, Any]]:
-        """Get the best prompt for each task type."""
-        result = {}
-        for task_type, variant_id in self._task_best.items():
-            variant = self._variants.get(variant_id)
-            if variant:
-                result[task_type] = variant.to_dict()
-        return result
+    def get_model_config(self, model_id: str) -> dict[str, Any]:
+        """Get model-specific configuration."""
+        return MODEL_PROMPT_CONFIG.get(model_id, {})
 
     def get_stats(self) -> dict[str, Any]:
-        total_uses = sum(v.uses for v in self._variants.values())
         return {
-            "variants": len(self._variants),
-            "experiments": len(self._experiments),
-            "concluded": sum(1 for e in self._experiments.values() if e.is_concluded),
-            "total_uses": total_uses,
-            "known_best": len(self._task_best),
+            "models_configured": len(MODEL_PROMPT_CONFIG),
+            "quality_tracked": {m: f"{self.get_avg_quality(m):.2f}" for m in self._quality_scores},
         }
