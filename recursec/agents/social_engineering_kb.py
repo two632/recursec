@@ -1,296 +1,47 @@
-"""Social engineering knowledge base.
-
-Deep knowledge about social engineering:
-1. Phishing campaigns
-2. Pretexting and impersonation
-3. Physical social engineering
-4. Vishing and smishing
-5. Influence and manipulation
-"""
-
+"""Social engineering knowledge base — phishing, pretexting, manipulation."""
 from __future__ import annotations
-
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
-
 import structlog
-
 logger = structlog.get_logger()
 
+class SEAttackType(str, Enum):
+    PHISHING = "phishing"
+    PRETEXTING = "pretexting"
+    VISHING = "vishing"
+    OSINT = "osint"
+    PHYSICAL = "physical"
 
 @dataclass
-class SocialEngPattern:
-    """A social engineering pattern."""
-    pattern_id: str = ""
+class SEPattern:
     name: str = ""
-    category: str = ""
-    severity: str = "high"
+    attack_type: SEAttackType = SEAttackType.PHISHING
     description: str = ""
-    detection_strategy: str = ""
+    techniques: list[str] = field(default_factory=list)
+    indicators: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
-
+    commands: list[str] = field(default_factory=list)
+    severity: str = "high"
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.pattern_id,
-            "name": self.name[:25],
-            "category": self.category[:12],
-        }
+        return {"name": self.name, "type": self.attack_type.value, "severity": self.severity}
 
-
-SE_PATTERNS: list[dict[str, Any]] = [
-    {
-        "id": "se-001", "name": "Phishing Campaigns",
-        "category": "phishing", "severity": "high",
-        "desc": "Phishing attack techniques for security testing.",
-        "detection": (
-            "PHISHING CAMPAIGNS:\n"
-            "EMAIL PHISHING:\n"
-            "  - Credential harvesting (cloned login pages)\n"
-            "  - Payload delivery (macro documents, HTA)\n"
-            "  - URL shorteners and redirectors\n"
-            "  - Lookalike domains (homoglyph)\n"
-            "  - Typosquatted domains\n"
-            "SPEAR PHISHING:\n"
-            "  - OSINT-driven personalization\n"
-            "  - Impersonate known contacts\n"
-            "  - Reference recent events/projects\n"
-            "  - Embed in existing email threads\n"
-            "TECHNICAL:\n"
-            "  # GoPhish setup\n"
-            "  gophish  # Web UI on :3333\n"
-            "  # Create campaign → template → landing page\n"
-            "  # Track opens, clicks, submissions\n"
-            "  # Evilginx (real-time phishing proxy)\n"
-            "  evilginx2  # Captures session tokens\n"
-            "  # Bypasses 2FA (real-time relay)\n"
-            "DELIVERY:\n"
-            "  - SPF/DKIM/DMARC bypass techniques\n"
-            "  - Authenticated SMTP relay\n"
-            "  - Cloud email services (sendgrid, SES)\n"
-            "  - Attachment alternatives:\n"
-            "    .html (offline credential form)\n"
-            "    .iso/.img (mark-of-web bypass)\n"
-            "    .lnk (shortcut with payload)\n"
-            "    OneNote (.one) with embedded files\n"
-            "TOOLS:\n"
-            "  GoPhish, Evilginx2, SET, King Phisher"
-        ),
-        "tools": ["gophish", "evilginx2"],
-    },
-    {
-        "id": "se-002", "name": "Pretexting and Impersonation",
-        "category": "pretexting", "severity": "high",
-        "desc": "Pretexting techniques for engagements.",
-        "detection": (
-            "PRETEXTING AND IMPERSONATION:\n"
-            "COMMON PRETEXTS:\n"
-            "  - IT support / helpdesk\n"
-            "  - Vendor / contractor\n"
-            "  - New employee\n"
-            "  - Executive / management\n"
-            "  - Delivery person\n"
-            "  - Building maintenance\n"
-            "  - Fire marshal / inspector\n"
-            "  - Auditor / compliance\n"
-            "BEC (Business Email Compromise):\n"
-            "  - CEO fraud (wire transfer request)\n"
-            "  - Invoice manipulation\n"
-            "  - Attorney impersonation\n"
-            "  - W-2/tax form request\n"
-            "  - Account changes (bank details)\n"
-            "PREPARATION:\n"
-            "  - OSINT on target personnel\n"
-            "  - Org chart reconstruction\n"
-            "  - Communication style analysis\n"
-            "  - Industry terminology\n"
-            "  - Timing (payroll, quarter-end)\n"
-            "AI-ENHANCED:\n"
-            "  - Voice cloning (deepfake calls)\n"
-            "  - AI-generated emails (style matching)\n"
-            "  - Video deepfakes for video calls\n"
-            "  - Automated persona management\n"
-            "DEFENSE:\n"
-            "  - Callback verification\n"
-            "  - Multi-person approval for transfers\n"
-            "  - Security awareness training\n"
-            "  - Out-of-band verification"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "se-003", "name": "Physical Social Engineering",
-        "category": "physical", "severity": "high",
-        "desc": "Physical social engineering techniques.",
-        "detection": (
-            "PHYSICAL SOCIAL ENGINEERING:\n"
-            "TECHNIQUES:\n"
-            "  - Tailgating / piggybacking\n"
-            "  - Badge cloning (RFID/Prox)\n"
-            "  - Dumpster diving\n"
-            "  - Shoulder surfing\n"
-            "  - USB drop (BadUSB, Rubber Ducky)\n"
-            "  - Unauthorized photography\n"
-            "BUILDING ACCESS:\n"
-            "  - Delivery pretext (UPS, FedEx)\n"
-            "  - Smoking area access\n"
-            "  - Loading dock entry\n"
-            "  - Emergency door propping\n"
-            "  - Visitor sign-in bypass\n"
-            "  - Elevator surfing\n"
-            "DROP DEVICES:\n"
-            "  - USB Rubber Ducky (HID injection)\n"
-            "  - Bash Bunny (multi-payload)\n"
-            "  - LAN Turtle (network implant)\n"
-            "  - WiFi Pineapple (rogue AP)\n"
-            "  - Raspberry Pi (persistent access)\n"
-            "  - Keylogger (hardware)\n"
-            "ASSESSMENT:\n"
-            "  - Document all entry methods used\n"
-            "  - Photograph security gaps\n"
-            "  - Test badge readers and locks\n"
-            "  - Map camera blind spots\n"
-            "  - Test alarm response times\n"
-            "TOOLS:\n"
-            "  Proxmark3, Flipper Zero, Rubber Ducky, WiFi Pineapple"
-        ),
-        "tools": ["proxmark3", "flipper-zero"],
-    },
-    {
-        "id": "se-004", "name": "Vishing and Smishing",
-        "category": "vishing", "severity": "medium",
-        "desc": "Voice and SMS phishing techniques.",
-        "detection": (
-            "VISHING AND SMISHING:\n"
-            "VISHING (Voice):\n"
-            "  - Call employees as IT support\n"
-            "  - Request credentials for 'emergency'\n"
-            "  - Caller ID spoofing\n"
-            "  - IVR (Interactive Voice Response) phishing\n"
-            "  - Voicemail social engineering\n"
-            "PREPARATION:\n"
-            "  - OSINT target phone numbers\n"
-            "  - Record professional greetings\n"
-            "  - Prepare rebuttals for common objections\n"
-            "  - Background noise (call center sounds)\n"
-            "  - VoIP with spoofed caller ID\n"
-            "SMISHING (SMS):\n"
-            "  - Shortened URLs to credential pages\n"
-            "  - 'Your account has been locked' messages\n"
-            "  - Package delivery notifications\n"
-            "  - MFA fatigue via SMS\n"
-            "  - SMS interception (SIM swap)\n"
-            "AI VOICE:\n"
-            "  - Real-time voice cloning\n"
-            "  - Language translation\n"
-            "  - Accent modification\n"
-            "  - Emotional tone adjustment\n"
-            "DEFENSE:\n"
-            "  - Callback to known number\n"
-            "  - Never share credentials by phone\n"
-            "  - Verify through official channels\n"
-            "  - Report suspicious calls"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "se-005", "name": "Influence and Manipulation",
-        "category": "influence", "severity": "medium",
-        "desc": "Psychological influence techniques.",
-        "detection": (
-            "INFLUENCE AND MANIPULATION:\n"
-            "CIALDINI PRINCIPLES:\n"
-            "  1. Reciprocity: Give first, then ask\n"
-            "  2. Commitment: Get small yes, then big yes\n"
-            "  3. Social Proof: 'Everyone in IT already did this'\n"
-            "  4. Authority: Impersonate authority figure\n"
-            "  5. Liking: Build rapport first\n"
-            "  6. Scarcity: 'Only 10 minutes before lockout'\n"
-            "  7. Unity: 'We're in this together'\n"
-            "APPLICATION:\n"
-            "  URGENCY:\n"
-            "    - 'CEO needs this before the board meeting'\n"
-            "    - 'Security breach detected, verify now'\n"
-            "    - 'Your account will be deleted'\n"
-            "  AUTHORITY:\n"
-            "    - 'This is from the CTO's office'\n"
-            "    - 'Legal requires immediate compliance'\n"
-            "    - 'Auditor needs access today'\n"
-            "  HELPFULNESS:\n"
-            "    - 'I'm from IT, I can fix that for you'\n"
-            "    - 'Let me help you update your password'\n"
-            "    - 'I'll need your credentials to troubleshoot'\n"
-            "COGNITIVE BIASES:\n"
-            "  - Anchoring (first impression dominates)\n"
-            "  - Confirmation bias (believe what fits)\n"
-            "  - Authority bias (obey authority)\n"
-            "  - Halo effect (attractive = trustworthy)\n"
-            "  - Dunning-Kruger (overconfidence)\n"
-            "DEFENSE:\n"
-            "  - Security awareness training\n"
-            "  - Simulated attacks (regular testing)\n"
-            "  - Clear reporting procedures"
-        ),
-        "tools": [],
-    },
+SE_PATTERNS: list[SEPattern] = [
+    SEPattern(name="Email Phishing", attack_type=SEAttackType.PHISHING, description="Craft and detect phishing emails: spear-phishing, BEC, credential harvesting, malware delivery, clone phishing.", techniques=["Spear-phishing: targeted email with personal context", "Clone phishing: replicate legitimate email with malicious payload", "BEC (Business Email Compromise): impersonate executive", "Credential harvesting: fake login page mimicking target", "QR code phishing (quishing): embed malicious QR in email", "HTML smuggling: bypass email gateways with JS-assembled payload", "Thread hijacking: reply to stolen email thread", "Homograph attack: visually similar domain names"], indicators=["SPF/DKIM/DMARC failures", "Lookalike domains (typosquatting)", "Urgency/fear language patterns", "Mismatched display name and email address", "Suspicious attachment types or links"], tools=["gophish", "king-phisher", "evilginx2", "modlishka"], commands=["gophish # launch phishing campaign manager", "evilginx2 # reverse proxy phishing framework"], severity="high"),
+    SEPattern(name="OSINT Reconnaissance", attack_type=SEAttackType.OSINT, description="Open source intelligence gathering: employee enumeration, technology discovery, leaked credentials, social media intelligence.", techniques=["LinkedIn employee enumeration (names, roles, tech stack)", "Breached credential lookup (HaveIBeenPwned, DeHashed)", "Social media profiling (interests, locations, routines)", "Domain/email enumeration from public sources", "Google dorking for sensitive documents", "GitHub/GitLab commit history for secrets", "Job posting analysis for technology stack", "WHOIS and DNS history for infrastructure"], indicators=["Public employee lists on LinkedIn/website", "Breached credentials for target domain", "Exposed internal documents via search engines", "Social media posts revealing security practices"], tools=["theHarvester", "recon-ng", "maltego", "sherlock", "spiderfoot"], commands=["theHarvester -d target.com -b all", "sherlock username", "recon-ng -w workspace_name"], severity="medium"),
+    SEPattern(name="Vishing & Voice Attacks", attack_type=SEAttackType.VISHING, description="Voice-based social engineering: phone pretexting, caller ID spoofing, IVR exploitation, voice deepfakes.", techniques=["Phone pretexting: impersonate IT support, vendor, authority", "Caller ID spoofing: fake display number", "IVR system exploitation: navigate automated menus", "Voice deepfake: AI-generated voice of known person", "Callback phishing: leave voicemail requesting callback to attacker line", "SIM swapping preparation via social engineering"], indicators=["Unsolicited calls requesting credentials", "Caller ID inconsistencies", "Urgency to bypass normal procedures", "Requests for remote access or verification codes"], tools=["spoofcard", "asterisk-pbx"], commands=["# Voice social engineering requires human interaction and legal authorization"], severity="high"),
+    SEPattern(name="Pretexting & Impersonation", attack_type=SEAttackType.PRETEXTING, description="Create false pretexts to gain trust: IT support, vendor, authority figure, new employee, auditor.", techniques=["IT support pretext: request credentials for system migration", "Vendor impersonation: fake invoice/payment update", "Authority pretext: impersonate management or legal", "New employee pretext: request help accessing systems", "Auditor pretext: request documentation and access", "Delivery/maintenance pretext for physical access"], indicators=["Unverified identity claims", "Requests bypassing standard procedures", "Time pressure or authority pressure", "Requests for sensitive information over unsecure channels"], tools=["SET (Social Engineer Toolkit)"], commands=["setoolkit # Social Engineering Toolkit menu"], severity="high"),
+    SEPattern(name="Physical Social Engineering", attack_type=SEAttackType.PHYSICAL, description="Physical access attacks: tailgating, badge cloning, dumpster diving, shoulder surfing, baiting.", techniques=["Tailgating/piggybacking: follow authorized person through door", "Badge cloning: copy RFID badge with Proxmark3", "Dumpster diving: search trash for sensitive documents", "Shoulder surfing: observe credentials being entered", "USB baiting: drop infected USB drives in parking lot", "Impersonation: wear uniform/badge of authorized personnel", "Watering hole: compromise commonly visited location"], indicators=["Unauthorized individuals in restricted areas", "Unknown USB devices found", "Missing or altered badges", "Unusual after-hours access patterns"], tools=["proxmark3", "flipper-zero", "hak5-usb-rubber-ducky"], commands=["proxmark3 -c 'hf 14a reader' # read badge"], severity="high"),
 ]
 
-
-class SocialEngineeringKB:
-    """Social engineering knowledge base.
-
-    Provides SE patterns injected into agent prompts.
-    """
-
-    def __init__(self) -> None:
-        self._patterns: dict[str, SocialEngPattern] = {}
-        self._log = logger.bind(component="social_engineering_kb")
-        self._load_patterns()
-
-    def _load_patterns(self) -> None:
-        """Load SE patterns."""
-        for data in SE_PATTERNS:
-            pattern = SocialEngPattern(
-                pattern_id=data["id"],
-                name=data["name"],
-                category=data.get("category", ""),
-                severity=data.get("severity", "high"),
-                description=data.get("desc", ""),
-                detection_strategy=data.get("detection", ""),
-                tools=data.get("tools", []),
-            )
-            self._patterns[pattern.pattern_id] = pattern
-
-    def get_by_category(self, category: str) -> list[SocialEngPattern]:
-        """Get patterns by category."""
-        return [
-            p for p in self._patterns.values()
-            if p.category.lower() == category.lower()
-        ]
-
-    def build_social_prompt(
-        self,
-        categories: list[str] | None = None,
-        max_patterns: int = 4,
-    ) -> str:
-        """Build social engineering prompt."""
-        lines = ["## Social Engineering\n"]
-        count = 0
-        for pattern in self._patterns.values():
-            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
-                continue
-            if count >= max_patterns:
-                break
-            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
-            lines.append(pattern.detection_strategy)
-            lines.append("")
-            count += 1
-        return "\n".join(lines)
-
-    def get_stats(self) -> dict[str, Any]:
-        cat_counts: dict[str, int] = {}
-        for p in self._patterns.values():
-            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
-        return {
-            "patterns": len(self._patterns),
-            "by_category": cat_counts,
-        }
+def build_social_engineering_prompt(focus_type: SEAttackType | None = None, max_patterns: int = 5) -> str:
+    lines = ["## Social Engineering Knowledge\n"]
+    patterns = SE_PATTERNS if not focus_type else [p for p in SE_PATTERNS if p.attack_type == focus_type]
+    for p in patterns[:max_patterns]:
+        lines.append(f"### {p.name} [{p.severity}]")
+        lines.append(p.description)
+        lines.append("\nTechniques:")
+        for t in p.techniques[:4]:
+            lines.append(f"  - {t}")
+        lines.append("")
+    return "\n".join(lines)

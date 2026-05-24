@@ -1,293 +1,47 @@
-"""Hardware security knowledge base.
-
-Deep knowledge about hardware and firmware security:
-1. UEFI/BIOS attacks
-2. Side-channel attacks
-3. Hardware implants and tampering
-4. Embedded device security
-5. Physical security testing
-"""
-
+"""Hardware security knowledge base — side-channels, fault injection, chip-level attacks."""
 from __future__ import annotations
-
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
-
 import structlog
-
 logger = structlog.get_logger()
 
+class HWAttackType(str, Enum):
+    SIDE_CHANNEL = "side_channel"
+    FAULT_INJECTION = "fault_injection"
+    DEBUG_INTERFACE = "debug_interface"
+    CHIP_LEVEL = "chip_level"
+    SUPPLY_CHAIN = "supply_chain"
 
 @dataclass
-class HardwarePattern:
-    """A hardware security pattern."""
-    pattern_id: str = ""
+class HWPattern:
     name: str = ""
-    category: str = ""
-    severity: str = "critical"
+    attack_type: HWAttackType = HWAttackType.SIDE_CHANNEL
     description: str = ""
-    detection_strategy: str = ""
+    techniques: list[str] = field(default_factory=list)
+    indicators: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
-
+    commands: list[str] = field(default_factory=list)
+    severity: str = "high"
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.pattern_id,
-            "name": self.name[:25],
-            "category": self.category[:12],
-        }
+        return {"name": self.name, "type": self.attack_type.value, "severity": self.severity}
 
-
-HARDWARE_PATTERNS: list[dict[str, Any]] = [
-    {
-        "id": "hw-001", "name": "UEFI/BIOS Attacks",
-        "category": "firmware", "severity": "critical",
-        "desc": "UEFI/BIOS firmware attack techniques.",
-        "detection": (
-            "UEFI/BIOS ATTACKS:\n"
-            "FIRMWARE EXTRACTION:\n"
-            "  # SPI flash chip reading\n"
-            "  flashrom -p ch341a_spi -r firmware.bin  # CH341A programmer\n"
-            "  # Via Intel ME: MEAnalyzer, MECleaner\n"
-            "  # CHIPSEC framework:\n"
-            "  chipsec_main -m common.bios_wp  # BIOS write protection\n"
-            "  chipsec_main -m common.spi_lock  # SPI flash lock\n"
-            "  chipsec_main -m common.smm  # SMM protection\n"
-            "UEFI ROOTKITS:\n"
-            "  # DXE driver implants\n"
-            "  # Boot-time persistence (survives OS reinstall)\n"
-            "  # NVRAM variable manipulation\n"
-            "  # Secure Boot bypass\n"
-            "  # Known: LoJax, MosaicRegressor, CosmicStrand\n"
-            "SECURE BOOT:\n"
-            "  # Check Secure Boot status\n"
-            "  mokutil --sb-state\n"
-            "  # Key management (PK, KEK, db, dbx)\n"
-            "  # Shim bootloader vulnerabilities\n"
-            "  # BlackLotus UEFI bootkit\n"
-            "INTEL ME/AMD PSP:\n"
-            "  # Intel Management Engine\n"
-            "  # Runs separate OS on CPU\n"
-            "  # Full system access even when powered off\n"
-            "  # AMT remote management exploitation\n"
-            "  # AMD Platform Security Processor similar\n"
-            "TOOLS:\n"
-            "  CHIPSEC, UEFITool, flashrom, binwalk"
-        ),
-        "tools": ["chipsec", "flashrom"],
-    },
-    {
-        "id": "hw-002", "name": "Side-Channel Attacks",
-        "category": "side_channel", "severity": "critical",
-        "desc": "Side-channel attack techniques.",
-        "detection": (
-            "SIDE-CHANNEL ATTACKS:\n"
-            "TIMING ATTACKS:\n"
-            "  # Measure execution time differences\n"
-            "  # String comparison timing (password oracle)\n"
-            "  # Cache timing: Flush+Reload, Prime+Probe\n"
-            "  # Spectre/Meltdown variants\n"
-            "POWER ANALYSIS:\n"
-            "  # Simple Power Analysis (SPA)\n"
-            "  # Differential Power Analysis (DPA)\n"
-            "  # Measure power consumption during crypto ops\n"
-            "  # Extract AES/RSA keys from power traces\n"
-            "  # ChipWhisperer framework\n"
-            "ELECTROMAGNETIC:\n"
-            "  # EM emanation monitoring\n"
-            "  # TEMPEST attacks (display reconstruction)\n"
-            "  # EM fault injection\n"
-            "  # Van Eck phreaking\n"
-            "ACOUSTIC:\n"
-            "  # CPU acoustic emanations\n"
-            "  # RSA key extraction via sound\n"
-            "  # Keyboard acoustic analysis\n"
-            "SPECULATIVE EXECUTION:\n"
-            "  # Spectre (Branch prediction)\n"
-            "  # Meltdown (Out-of-order execution)\n"
-            "  # Foreshadow (L1 Terminal Fault)\n"
-            "  # MDS (Microarchitectural Data Sampling)\n"
-            "  # Zenbleed, Downfall, Inception\n"
-            "TOOLS:\n"
-            "  ChipWhisperer, OpenSSL timing tests"
-        ),
-        "tools": ["chipwhisperer"],
-    },
-    {
-        "id": "hw-003", "name": "Hardware Implants",
-        "category": "implant", "severity": "critical",
-        "desc": "Hardware implant and tampering detection.",
-        "detection": (
-            "HARDWARE IMPLANTS:\n"
-            "SUPPLY CHAIN:\n"
-            "  - Modified firmware in shipping\n"
-            "  - Counterfeit components\n"
-            "  - Extra chips soldered on board\n"
-            "  - Modified PCB traces\n"
-            "  - JTAG/SWD port exposure\n"
-            "DETECTION:\n"
-            "  - Visual inspection (X-ray, microscope)\n"
-            "  - Weight comparison\n"
-            "  - PCB layer analysis\n"
-            "  - Unexpected RF emissions\n"
-            "  - Firmware hash comparison\n"
-            "  - Side-channel anomalies\n"
-            "USB ATTACKS:\n"
-            "  - BadUSB (reprogrammed firmware)\n"
-            "  - USB Rubber Ducky (keystroke injection)\n"
-            "  - USB Killer (power surge)\n"
-            "  - O.MG Cable (WiFi-enabled HID)\n"
-            "  - USB data exfiltration\n"
-            "KEYLOGGERS:\n"
-            "  - Hardware keylogger (inline, WiFi)\n"
-            "  - BIOS-level keylogging\n"
-            "  - Firmware-modified keyboard\n"
-            "NETWORK IMPLANTS:\n"
-            "  - Modified network equipment\n"
-            "  - Rogue access points\n"
-            "  - LAN tap (passive monitoring)\n"
-            "  - Packet injection hardware"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "hw-004", "name": "Embedded Device Security",
-        "category": "embedded", "severity": "high",
-        "desc": "Embedded and IoT device security testing.",
-        "detection": (
-            "EMBEDDED DEVICE SECURITY:\n"
-            "FIRMWARE ANALYSIS:\n"
-            "  binwalk -e firmware.bin  # Extract filesystems\n"
-            "  binwalk -E firmware.bin  # Entropy analysis\n"
-            "  # Find crypto keys, hardcoded creds\n"
-            "  strings firmware.bin | grep -i 'pass\\|key\\|secret'\n"
-            "  # Identify compressed/encrypted sections\n"
-            "UART/SERIAL:\n"
-            "  # Find UART pins (TX, RX, GND, VCC)\n"
-            "  # Use logic analyzer / Bus Pirate\n"
-            "  # Baud rate detection: 9600, 115200 common\n"
-            "  # Often provides root shell\n"
-            "  screen /dev/ttyUSB0 115200\n"
-            "JTAG/SWD:\n"
-            "  # Identify JTAG pins\n"
-            "  # JTAGulator for auto-detection\n"
-            "  # OpenOCD for debug access\n"
-            "  # Read/write flash memory\n"
-            "  # Set hardware breakpoints\n"
-            "  # Bypass secure boot\n"
-            "SPI/I2C:\n"
-            "  # Read SPI flash (firmware extraction)\n"
-            "  # I2C EEPROM reading\n"
-            "  # Bus Pirate, Saleae, Flashrom\n"
-            "IoT PROTOCOLS:\n"
-            "  # MQTT (often no auth)\n"
-            "  # CoAP, Zigbee, Z-Wave\n"
-            "  # BLE (see mobile_security_kb)\n"
-            "  # LoRa/LoRaWAN\n"
-            "TOOLS:\n"
-            "  binwalk, firmwalker, EMBA, Bus Pirate, JTAGulator"
-        ),
-        "tools": ["binwalk", "emba"],
-    },
-    {
-        "id": "hw-005", "name": "Physical Security Testing",
-        "category": "physical", "severity": "high",
-        "desc": "Physical security testing techniques.",
-        "detection": (
-            "PHYSICAL SECURITY TESTING:\n"
-            "ACCESS CONTROL:\n"
-            "  - Badge cloning (Proxmark3, Flipper Zero)\n"
-            "  - RFID/NFC relay attacks\n"
-            "  - Tailgating / piggybacking\n"
-            "  - Lock picking (standard, electric picks)\n"
-            "  - Key impression\n"
-            "  - Bypass tools (shims, travelers hooks)\n"
-            "SURVEILLANCE:\n"
-            "  - Camera coverage gaps\n"
-            "  - Blind spots analysis\n"
-            "  - Motion sensor testing\n"
-            "  - Guard patrol timing\n"
-            "  - After-hours access testing\n"
-            "SOCIAL:\n"
-            "  - Impersonation (delivery, maintenance)\n"
-            "  - Dumpster diving\n"
-            "  - Shoulder surfing\n"
-            "  - Phone pretexting\n"
-            "NETWORK ACCESS:\n"
-            "  - Exposed Ethernet ports\n"
-            "  - Rogue AP deployment\n"
-            "  - Network tap installation\n"
-            "  - Server room access\n"
-            "  - Printer exploitation\n"
-            "DATA THEFT:\n"
-            "  - USB drop attacks\n"
-            "  - Document theft\n"
-            "  - Screen capture\n"
-            "  - Device theft testing\n"
-            "TOOLS:\n"
-            "  Proxmark3, Flipper Zero, WiFi Pineapple, LAN Turtle"
-        ),
-        "tools": ["proxmark3", "flipper-zero"],
-    },
+HW_PATTERNS: list[HWPattern] = [
+    HWPattern(name="Side-Channel Attacks", attack_type=HWAttackType.SIDE_CHANNEL, description="Extract secrets via physical side-channels: power analysis, electromagnetic emanations, timing, cache attacks, acoustic.", techniques=["SPA (Simple Power Analysis): visual inspection of power trace", "DPA (Differential Power Analysis): statistical correlation", "CPA (Correlation Power Analysis): Hamming weight model", "EM emanation analysis: near-field probe captures", "Cache timing attacks: Flush+Reload, Prime+Probe, Evict+Time", "Spectre/Meltdown: speculative execution side-channels", "PLATYPUS: power side-channel via Intel RAPL", "Hertzbleed: frequency side-channel on x86 CPUs"], indicators=["Timing-variable cryptographic operations", "Non-constant-time comparisons", "Shared cache between processes", "Power consumption correlated with secret data"], tools=["chipwhisperer", "riscure-inspector", "cachegrind"], commands=["# ChipWhisperer capture power traces during crypto operation"], severity="critical"),
+    HWPattern(name="Fault Injection", attack_type=HWAttackType.FAULT_INJECTION, description="Induce faults to bypass security: voltage glitching, clock glitching, laser fault injection, electromagnetic fault.", techniques=["Voltage glitching: brief power supply manipulation", "Clock glitching: inject extra clock edges or skip cycles", "Laser fault injection: precise bit-flip in silicon", "EM fault injection: localized electromagnetic pulse", "Rowhammer: DRAM disturbance error causing bit-flips", "Differential Fault Analysis (DFA): recover AES key from faulty ciphertext", "Bootloader bypass via voltage glitch during secure boot", "Read-out protection bypass on microcontrollers"], indicators=["Single point of failure in security checks", "No fault detection/correction mechanisms", "Exposed power/clock pins on PCB", "Lack of secure boot integrity verification"], tools=["chipwhisperer", "newae-cw1200", "riscure-fi"], commands=["# Voltage glitch during boot to bypass secure boot check"], severity="critical"),
+    HWPattern(name="Debug Interface Exploitation", attack_type=HWAttackType.DEBUG_INTERFACE, description="Exploit debug interfaces: JTAG, SWD, UART, SPI flash read, I2C, debug headers left on production boards.", techniques=["JTAG: boundary scan, memory read/write, CPU halt", "SWD (Serial Wire Debug): ARM debug access", "UART: serial console access, bootloader interaction", "SPI flash dump: read firmware from flash chip", "I2C EEPROM: read/write configuration data", "Debug header identification on PCB", "Chip-off: desolder flash and read externally", "ISP (In-System Programming): reprogram microcontroller"], indicators=["Exposed debug headers on PCB", "JTAG/SWD not disabled in production", "UART console accessible without authentication", "Flash read protection not enabled"], tools=["openocd", "jlink", "bus-pirate", "flashrom"], commands=["openocd -f interface/jlink.cfg -f target/stm32f4x.cfg", "flashrom -p buspirate_spi -r firmware.bin"], severity="high"),
+    HWPattern(name="Chip-Level Attacks", attack_type=HWAttackType.CHIP_LEVEL, description="Physical attacks on silicon: decapsulation, FIB modification, microprobing, ROM extraction.", techniques=["Decapsulation: chemical or mechanical chip opening", "Optical microscopy: image die layers", "FIB (Focused Ion Beam): modify metal layers on chip", "Microprobing: attach probes to internal signals", "ROM extraction: read mask ROM via optical imaging", "Fuse reading: determine security fuse state", "Backside analysis: thin wafer for backside imaging"], indicators=["High-value target justifying cost", "No tamper-evident packaging", "Standard commercial microcontrollers without security features"], tools=["microscope", "fib-system", "probestation"], commands=["# Physical lab equipment required for chip-level attacks"], severity="critical"),
+    HWPattern(name="Hardware Supply Chain", attack_type=HWAttackType.SUPPLY_CHAIN, description="Supply chain attacks on hardware: counterfeit components, implanted backdoors, modified firmware, interception.", techniques=["Hardware trojan insertion during manufacturing", "Counterfeit component detection (x-ray, electrical test)", "Firmware modification during shipping/storage", "Component substitution with vulnerable versions", "Bill of Materials (BOM) analysis for vulnerable parts", "PCB modification: added components for backdoor"], indicators=["Components from untrusted suppliers", "Unexpected firmware differences between batches", "PCB layout differences from reference design", "Unusual power consumption or emissions"], tools=["x-ray-inspection", "jtag-scanner", "binwalk"], commands=["binwalk -e firmware.bin # extract firmware for comparison"], severity="critical"),
 ]
 
-
-class HardwareSecurityKB:
-    """Hardware security knowledge base.
-
-    Provides hardware/firmware security patterns
-    injected into agent prompts.
-    """
-
-    def __init__(self) -> None:
-        self._patterns: dict[str, HardwarePattern] = {}
-        self._log = logger.bind(component="hardware_security_kb")
-        self._load_patterns()
-
-    def _load_patterns(self) -> None:
-        """Load hardware patterns."""
-        for data in HARDWARE_PATTERNS:
-            pattern = HardwarePattern(
-                pattern_id=data["id"],
-                name=data["name"],
-                category=data.get("category", ""),
-                severity=data.get("severity", "critical"),
-                description=data.get("desc", ""),
-                detection_strategy=data.get("detection", ""),
-                tools=data.get("tools", []),
-            )
-            self._patterns[pattern.pattern_id] = pattern
-
-    def get_by_category(self, category: str) -> list[HardwarePattern]:
-        """Get patterns by category."""
-        return [
-            p for p in self._patterns.values()
-            if p.category.lower() == category.lower()
-        ]
-
-    def build_hardware_prompt(
-        self,
-        categories: list[str] | None = None,
-        max_patterns: int = 4,
-    ) -> str:
-        """Build hardware security prompt."""
-        lines = ["## Hardware Security Patterns\n"]
-        count = 0
-        for pattern in self._patterns.values():
-            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
-                continue
-            if count >= max_patterns:
-                break
-            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
-            lines.append(pattern.detection_strategy)
-            lines.append("")
-            count += 1
-        return "\n".join(lines)
-
-    def get_stats(self) -> dict[str, Any]:
-        cat_counts: dict[str, int] = {}
-        for p in self._patterns.values():
-            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
-        return {
-            "patterns": len(self._patterns),
-            "by_category": cat_counts,
-        }
+def build_hardware_security_prompt(focus_type: HWAttackType | None = None, max_patterns: int = 5) -> str:
+    lines = ["## Hardware Security Knowledge\n"]
+    patterns = HW_PATTERNS if not focus_type else [p for p in HW_PATTERNS if p.attack_type == focus_type]
+    for p in patterns[:max_patterns]:
+        lines.append(f"### {p.name} [{p.severity}]")
+        lines.append(p.description)
+        lines.append("\nTechniques:")
+        for t in p.techniques[:4]:
+            lines.append(f"  - {t}")
+        lines.append("")
+    return "\n".join(lines)
