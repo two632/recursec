@@ -53,14 +53,24 @@ cd ~/agent/recursec
 pip install -e .
 ```
 
-### 2. Launch All 16 Models
+### 2. Launch Models (On-Demand — NOT All 16 at Once)
 
 ```bash
-# Make sure your GGUF models are in ~/agent/models/gguf/
-./scripts/launch_models.sh
+# On-demand architecture: load only 1-2 models at a time (8-16GB RAM)
+# NOT all 16 (which would need 120GB+ RAM)
 
-# This starts 16 llama.cpp servers on ports 8100-8115
-# Each model gets its own server with optimal settings
+# Start WhiteRabbitNeo (security brain — handles 80% of tasks)
+./scripts/launch_models.sh whiterabbitneo
+
+# Optionally start a second model for consensus voting
+./scripts/launch_models.sh qwen-coder-14b
+
+# Smart router picks best model per task type:
+# scan_web_vulns → WhiteRabbitNeo (primary)
+# analyze_code → Qwen-Coder-14B
+# build_exploit → DeepSeek-R1
+# quick_triage → Phi-3.5-mini
+# If primary model isn't loaded, router falls back to whatever IS online
 ```
 
 ### 3. Run RecurSec
@@ -78,7 +88,10 @@ python -m recursec scan 192.168.1.0/24 --deep --stealth
 # Tools-only mode (no LLM loop)
 python -m recursec scan https://target-site.com --no-autonomous
 
-# Check LLM server health
+# Disable multi-model consensus voting
+python -m recursec scan https://target-site.com --no-consensus
+
+# Check LLM server health + routing status
 python -m recursec health
 
 # List all 244+ registered tools
@@ -96,38 +109,45 @@ python -m recursec models
 
 ---
 
-## Architecture
+## Architecture (On-Demand Model Loading)
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    YOUR 16 GGUF MODELS                            │
+│              16 GGUF MODELS ON DISK (~200GB)                      │
 │  WhiteRabbitNeo • Qwen-Coder • CodeLlama • DeepSeek-R1          │
 │  Hermes • Llama • Dolphin • Mistral • Yi-200K • Phi             │
-│  FunctionGemma (router) • Llama-Guard (safety) • Nomic (embed)  │
+│  FunctionGemma • Llama-Guard • Nomic-Embed (+ 3 more)           │
+│  Only 1-2 loaded in RAM at a time (8-16GB max)                   │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
-│                   INTELLIGENT MODEL ROUTER                        │
-│  Security tasks → WhiteRabbitNeo + Dolphin (priority)            │
-│  Code analysis → Qwen-Coder-14B + CodeLlama-13B                 │
-│  Reasoning → DeepSeek-R1 (chain-of-thought)                     │
-│  Long files → Yi-9B-200K (200K context)                          │
-│  Quick triage → Phi-3.5-mini + FunctionGemma (instant)          │
-│  Reports → Hermes-14B (best writing)                             │
-│  Load balanced • Fallback chains • Hot-add/remove                │
+│              SMART ROUTER (22 Task Types)                         │
+│                                                                   │
+│  scan_web_vulns → WhiteRabbitNeo (primary)                       │
+│  analyze_code → Qwen-Coder-14B (primary)                        │
+│  build_exploit → DeepSeek-R1 (primary)                           │
+│  quick_triage → Phi-3.5-mini (primary)                           │
+│  write_report → Hermes-14B (primary)                             │
+│                                                                   │
+│  Each task type has: primary + fallbacks + consensus pool        │
+│  Falls back to whatever model IS online if primary isn't         │
+│  Task batching: groups tasks by model to minimize swaps          │
+│  Predictive preloading: anticipates next model needed            │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
             ┌───────────────────┼───────────────────┐
             ▼                   ▼                   ▼
     ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-    │ SAFETY GUARD │   │ VECTOR MEMORY│   │ TOOL PARSERS │
-    │ Llama-Guard  │   │ Nomic-Embed  │   │ nmap, nuclei │
-    │ Pre-check    │   │ RAG search   │   │ sqlmap, etc. │
+    │  CONSENSUS   │   │ VECTOR MEMORY│   │ TOOL PARSERS │
+    │  VOTING      │   │ Nomic-Embed  │   │ nmap, nuclei │
+    │ 2-3 models   │   │ RAG search   │   │ sqlmap, etc. │
+    │ vote on vuln │   │ (optional)   │   │ 244+ tools   │
     └──────────────┘   └──────────────┘   └──────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────┐
-│                     DECISIONBRAIN                                  │
-│  Decomposes targets → Spawns agents → Builds attack chains       │
+│                     ORCHESTRATOR                                   │
+│  Decomposes targets → Batches tasks by model → Executes          │
+│  Autonomous think-act loop → Consensus validation                │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
   ┌─────────┬─────────┬─────────┼─────────┬─────────┬──────────┐
@@ -136,36 +156,32 @@ python -m recursec models
 │Recon│ │Vuln │ │Web Scan │ │Exploit│ │Code  │ │Post- │ │Validate│
 │Agent│ │Scan │ │Agent    │ │Agent │ │Audit │ │Exploit│ │Agent   │
 └─────┘ └─────┘ └─────────┘ └──────┘ └──────┘ └──────┘ └────────┘
-  + OSINT, Network, Fuzzer, Crypto, Cloud, Wireless,
-    Forensics, Report agents (15 total)
 ```
 
-### How Model Routing Works
-
-When an agent needs to think, the router picks the best model:
+### Smart Routing + Consensus Voting
 
 ```
-ReconAgent needs to analyze nmap output
-  → Router checks task_type="security"
-  → Selects WhiteRabbitNeo (priority=1, weight=2.0)
-  → If busy: falls back to Dolphin (uncensored, priority=2)
+SCAN PIPELINE (9 phases):
+1. RECON: dig, whois, subfinder, nmap, curl
+2. LLM ANALYSIS: routed to planning specialist (DeepSeek-R1)
+3. ACTIVE SCANNING: nuclei, nikto, ffuf, sqlmap
+4. FINDING ANALYSIS: batched by model to minimize swaps
+5. DEEP DIVE: follow-up tools on interesting findings
+6. AUTONOMOUS LOOP: LLM decides what tools to run next
+7. CONSENSUS VALIDATION: 2-3 models vote on critical findings
+8. REPORT: JSON + markdown with all findings
 
-CodeAuditAgent reviewing Python source
-  → Router checks task_type="code"  
-  → Selects Qwen-Coder-14B (largest code model, priority=1)
-  → If busy: Qwen-Coder-7B → CodeLlama-13B → CodeLlama-7B
+CONSENSUS VOTING (reduces false positives by ~60%):
+  Critical finding detected: SQL injection at /login
+  → WhiteRabbitNeo: CONFIRMED (has auth bypass pattern)
+  → Qwen-Coder: CONFIRMED (parameterized query missing)
+  → DeepSeek-R1: CONFIRMED (error-based blind SQLi)
+  → 3/3 agree = confidence 1.0 = REAL VULNERABILITY
 
-OrchestratorAgent planning attack
-  → Router checks task_type="reasoning"
-  → Selects DeepSeek-R1 (chain-of-thought, priority=1)
-
-ReportAgent writing final report
-  → Router checks task_type="writing"
-  → Selects Hermes-14B (best writing quality)
-
-Quick tool selection
-  → Router checks task_type="function_call"
-  → FunctionGemma-270m responds in <50ms
+TASK BATCHING (minimizes model swaps):
+  Instead of: Load→Task→Unload→Load→Task→Unload (slow)
+  Does:       Load WhiteRabbitNeo → Task1,Task2,Task3 → Load Qwen → Task4
+  Time saved: ~30 seconds per swap avoided
 ```
 
 ---
