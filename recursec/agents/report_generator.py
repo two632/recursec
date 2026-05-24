@@ -1,23 +1,17 @@
-"""Report generator — produces assessment reports in multiple formats.
+"""Report generator — creates security assessment reports.
 
-Implements:
-1. JSON report generation
-2. Markdown report generation
-3. Executive summary generation
-4. Finding detail formatting
-5. Risk matrix generation
-6. Statistics and metrics
-7. Timeline of actions
-8. Remediation priority list
+Basic reporting focused on structured output:
+1. Finding summary by severity
+2. Attack chain documentation
+3. Remediation recommendations
+4. Executive summary
+5. Technical details per finding
 """
 
 from __future__ import annotations
 
-import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -30,54 +24,67 @@ class ReportSection:
     """A section of the report."""
     title: str = ""
     content: str = ""
-    subsections: list[ReportSection] = field(default_factory=list)
-    data: dict[str, Any] = field(default_factory=dict)
+    severity: str = ""
+    order: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "title": self.title[:40],
-            "content_len": len(self.content),
-            "subsections": len(self.subsections),
-        }
+        return {"title": self.title[:20], "severity": self.severity[:4], "length": len(self.content)}
 
 
 @dataclass
-class AssessmentReport:
-    """A complete assessment report."""
+class SecurityReport:
+    """A complete security assessment report."""
     report_id: str = ""
-    title: str = ""
     target: str = ""
-    assessor: str = "RecurSec"
-    start_time: float = 0.0
-    end_time: float = 0.0
+    generated_at: float = field(default_factory=time.time)
+    executive_summary: str = ""
     sections: list[ReportSection] = field(default_factory=list)
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    metrics: dict[str, Any] = field(default_factory=dict)
-    created_at: float = field(default_factory=time.time)
-
-    @property
-    def duration_s(self) -> float:
-        return max(0, self.end_time - self.start_time)
+    total_findings: int = 0
+    critical_count: int = 0
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
+    info_count: int = 0
+    attack_chains: list[dict[str, Any]] = field(default_factory=list)
+    tools_used: list[str] = field(default_factory=list)
+    kbs_used: list[str] = field(default_factory=list)
+    duration_s: float = 0.0
+    overall_risk: str = "medium"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.report_id, "target": self.target[:40],
-            "findings": len(self.findings),
-            "sections": len(self.sections),
-            "duration_s": round(self.duration_s, 0),
+            "id": self.report_id[:8],
+            "target": self.target[:20],
+            "findings": self.total_findings,
+            "critical": self.critical_count,
+            "high": self.high_count,
+            "risk": self.overall_risk[:6],
         }
 
 
+# Remediation templates per vulnerability type
+REMEDIATION_MAP: dict[str, str] = {
+    "sqli": "Use parameterized queries/prepared statements. Implement input validation. Use ORM frameworks. Apply least-privilege database accounts.",
+    "xss": "Implement context-aware output encoding. Use Content-Security-Policy headers. Sanitize user input. Use modern framework auto-escaping.",
+    "ssrf": "Implement URL allowlist validation. Block internal/private IP ranges. Use network-level controls. Disable unnecessary URL schemes.",
+    "rce": "Never pass user input to system commands. Use parameterized APIs. Implement strict input validation. Run with least privileges.",
+    "idor": "Implement proper authorization checks on every request. Use indirect object references. Validate user ownership of requested resources.",
+    "auth_bypass": "Implement multi-layer authentication. Use proven auth frameworks. Enforce session management. Add rate limiting.",
+    "csrf": "Implement anti-CSRF tokens. Use SameSite cookie attribute. Verify Origin/Referer headers. Require re-authentication for sensitive actions.",
+    "path_traversal": "Canonicalize file paths. Use allowlist for allowed directories. Never use user input in file paths directly.",
+    "xxe": "Disable external entity processing. Use JSON instead of XML. If XML needed, use safe parser configuration.",
+    "deserialization": "Avoid deserializing untrusted data. Use allowlists for permitted classes. Implement integrity checks. Use safe serialization formats.",
+    "open_redirect": "Validate redirect URLs against allowlist. Use relative URLs. Never redirect to user-controlled destinations.",
+    "weak_credentials": "Enforce strong password policies. Implement account lockout. Use MFA. Change all default credentials.",
+    "info_disclosure": "Remove verbose error messages. Disable directory listing. Remove server version headers. Implement proper error handling.",
+    "cors": "Configure strict CORS policies. Never use Access-Control-Allow-Origin: *. Validate Origin header on server side.",
+}
+
+
 class ReportGenerator:
-    """Produces assessment reports in multiple formats.
+    """Generates security assessment reports."""
 
-    Generates JSON and Markdown reports with
-    executive summaries, findings, and recommendations.
-    """
-
-    def __init__(self, output_dir: str = "data/reports") -> None:
-        self._output_dir = Path(output_dir)
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self) -> None:
         self._report_counter = 0
         self._log = logger.bind(component="report_generator")
 
@@ -85,245 +92,149 @@ class ReportGenerator:
         self,
         target: str,
         findings: list[dict[str, Any]],
-        metrics: dict[str, Any] | None = None,
-        start_time: float = 0.0,
-        end_time: float = 0.0,
-    ) -> AssessmentReport:
-        """Generate a complete assessment report."""
+        attack_chains: list[dict[str, Any]] | None = None,
+        tools_used: list[str] | None = None,
+        kbs_used: list[str] | None = None,
+        duration_s: float = 0.0,
+    ) -> SecurityReport:
+        """Generate a full security report."""
         self._report_counter += 1
-        report_id = f"report-{self._report_counter}"
 
-        report = AssessmentReport(
-            report_id=report_id,
-            title=f"Security Assessment: {target}",
+        # Count by severity
+        sev_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        for f in findings:
+            sev = f.get("severity", "info").lower()
+            if sev in sev_counts:
+                sev_counts[sev] += 1
+
+        # Determine overall risk
+        if sev_counts["critical"] > 0:
+            overall_risk = "critical"
+        elif sev_counts["high"] > 2:
+            overall_risk = "high"
+        elif sev_counts["high"] > 0:
+            overall_risk = "medium-high"
+        elif sev_counts["medium"] > 0:
+            overall_risk = "medium"
+        else:
+            overall_risk = "low"
+
+        # Generate executive summary
+        exec_summary = self._generate_executive_summary(target, sev_counts, overall_risk, attack_chains or [])
+
+        # Generate finding sections
+        sections = self._generate_finding_sections(findings)
+
+        report = SecurityReport(
+            report_id=f"report-{self._report_counter}",
             target=target,
-            start_time=start_time or time.time(),
-            end_time=end_time or time.time(),
-            findings=findings,
-            metrics=metrics or {},
+            executive_summary=exec_summary,
+            sections=sections,
+            total_findings=len(findings),
+            critical_count=sev_counts["critical"],
+            high_count=sev_counts["high"],
+            medium_count=sev_counts["medium"],
+            low_count=sev_counts["low"],
+            info_count=sev_counts["info"],
+            attack_chains=attack_chains or [],
+            tools_used=tools_used or [],
+            kbs_used=kbs_used or [],
+            duration_s=duration_s,
+            overall_risk=overall_risk,
         )
-
-        # Build sections
-        report.sections = [
-            self._executive_summary(report),
-            self._findings_section(report),
-            self._risk_matrix(report),
-            self._remediation_section(report),
-            self._metrics_section(report),
-        ]
 
         return report
 
-    def _executive_summary(self, report: AssessmentReport) -> ReportSection:
+    def _generate_executive_summary(
+        self,
+        target: str,
+        sev_counts: dict[str, int],
+        overall_risk: str,
+        chains: list[dict[str, Any]],
+    ) -> str:
         """Generate executive summary."""
-        severity_counts = self._count_severities(report.findings)
-        total = len(report.findings)
-
-        summary_lines = [
-            f"Target: {report.target}",
-            f"Duration: {report.duration_s:.0f} seconds",
-            f"Total Findings: {total}",
-            f"Critical: {severity_counts.get('critical', 0)}",
-            f"High: {severity_counts.get('high', 0)}",
-            f"Medium: {severity_counts.get('medium', 0)}",
-            f"Low: {severity_counts.get('low', 0)}",
-            f"Info: {severity_counts.get('info', 0)}",
+        total = sum(sev_counts.values())
+        lines = [
+            f"Security assessment of {target} identified {total} findings.",
+            f"Overall risk level: {overall_risk.upper()}.",
         ]
+        if sev_counts["critical"] > 0:
+            lines.append(f"{sev_counts['critical']} CRITICAL vulnerabilities require immediate attention.")
+        if sev_counts["high"] > 0:
+            lines.append(f"{sev_counts['high']} HIGH severity issues should be addressed within 30 days.")
+        if chains:
+            lines.append(f"{len(chains)} attack chains were identified that amplify individual finding impact.")
+        return " ".join(lines)
 
-        risk_level = "Low"
-        if severity_counts.get("critical", 0) > 0:
-            risk_level = "Critical"
-        elif severity_counts.get("high", 0) > 0:
-            risk_level = "High"
-        elif severity_counts.get("medium", 0) > 0:
-            risk_level = "Medium"
-
-        summary_lines.append(f"\nOverall Risk Level: {risk_level}")
-
-        return ReportSection(
-            title="Executive Summary",
-            content="\n".join(summary_lines),
-            data={"severity_counts": severity_counts, "risk_level": risk_level},
-        )
-
-    def _findings_section(self, report: AssessmentReport) -> ReportSection:
-        """Generate findings detail section."""
-        subsections = []
-
-        # Sort by severity
+    def _generate_finding_sections(self, findings: list[dict[str, Any]]) -> list[ReportSection]:
+        """Generate report sections from findings."""
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        sorted_findings = sorted(
-            report.findings,
-            key=lambda f: severity_order.get(f.get("severity", "info"), 4),
-        )
+        sorted_findings = sorted(findings, key=lambda f: severity_order.get(f.get("severity", "info"), 99))
 
-        for i, finding in enumerate(sorted_findings):
-            content_lines = [
-                f"Severity: {finding.get('severity', 'info').upper()}",
-                f"Target: {finding.get('target', 'N/A')}",
-                f"Description: {finding.get('description', 'N/A')}",
-            ]
+        sections: list[ReportSection] = []
+        for i, f in enumerate(sorted_findings[:50]):
+            sev = f.get("severity", "info")
+            title = f.get("title", "Untitled Finding")
+            desc = f.get("description", "")
+            evidence = f.get("evidence", "")
+            vuln_type = f.get("type", "").lower()
+            remediation = REMEDIATION_MAP.get(vuln_type, "Review and apply appropriate security controls.")
 
-            if finding.get("evidence"):
-                content_lines.append(f"Evidence: {finding['evidence'][:200]}")
-            if finding.get("remediation"):
-                content_lines.append(f"Remediation: {finding['remediation'][:200]}")
-            if finding.get("cve"):
-                content_lines.append(f"CVE: {finding['cve']}")
-            if finding.get("cwe"):
-                content_lines.append(f"CWE: {finding['cwe']}")
+            content = f"**Severity:** {sev.upper()}\n"
+            content += f"**Description:** {desc}\n"
+            if evidence:
+                content += f"**Evidence:** {evidence[:200]}\n"
+            content += f"**Remediation:** {remediation}\n"
 
-            subsections.append(ReportSection(
-                title=f"{i + 1}. {finding.get('title', 'Finding')}",
-                content="\n".join(content_lines),
+            sections.append(ReportSection(
+                title=f"[{sev.upper()}] {title}",
+                content=content,
+                severity=sev,
+                order=i,
             ))
 
-        return ReportSection(
-            title="Findings",
-            content=f"Total: {len(report.findings)} findings",
-            subsections=subsections,
-        )
+        return sections
 
-    def _risk_matrix(self, report: AssessmentReport) -> ReportSection:
-        """Generate risk matrix."""
-        matrix: dict[str, dict[str, int]] = {
-            "critical": {"network": 0, "web": 0, "config": 0, "crypto": 0, "other": 0},
-            "high": {"network": 0, "web": 0, "config": 0, "crypto": 0, "other": 0},
-            "medium": {"network": 0, "web": 0, "config": 0, "crypto": 0, "other": 0},
-            "low": {"network": 0, "web": 0, "config": 0, "crypto": 0, "other": 0},
-        }
+    def to_markdown(self, report: SecurityReport) -> str:
+        """Convert report to Markdown format."""
+        lines = [f"# Security Assessment Report: {report.target}\n"]
+        lines.append(f"**Generated:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(report.generated_at))}")
+        lines.append(f"**Duration:** {report.duration_s:.0f}s")
+        lines.append(f"**Overall Risk:** {report.overall_risk.upper()}\n")
 
-        for finding in report.findings:
-            sev = finding.get("severity", "low")
-            if sev not in matrix:
-                continue
+        lines.append("## Executive Summary\n")
+        lines.append(report.executive_summary + "\n")
 
-            title = finding.get("title", "").lower()
-            if any(w in title for w in ["port", "service", "network", "firewall"]):
-                category = "network"
-            elif any(w in title for w in ["xss", "sql", "injection", "web", "http"]):
-                category = "web"
-            elif any(w in title for w in ["config", "default", "misconfiguration"]):
-                category = "config"
-            elif any(w in title for w in ["ssl", "tls", "cipher", "crypto"]):
-                category = "crypto"
-            else:
-                category = "other"
+        lines.append("## Finding Summary\n")
+        lines.append("| Severity | Count |")
+        lines.append("|----------|-------|")
+        lines.append(f"| Critical | {report.critical_count} |")
+        lines.append(f"| High | {report.high_count} |")
+        lines.append(f"| Medium | {report.medium_count} |")
+        lines.append(f"| Low | {report.low_count} |")
+        lines.append(f"| Info | {report.info_count} |")
+        lines.append(f"| **Total** | **{report.total_findings}** |\n")
 
-            matrix[sev][category] += 1
+        if report.attack_chains:
+            lines.append("## Attack Chains\n")
+            for chain in report.attack_chains[:10]:
+                lines.append(f"### {chain.get('name', 'Unnamed Chain')}")
+                lines.append(f"**Severity:** {chain.get('severity', 'unknown')}")
+                for step in chain.get("steps", []):
+                    lines.append(f"  {step.get('order', 0)+1}. {step.get('finding', '')}")
+                lines.append("")
 
-        content_lines = ["Severity | Network | Web | Config | Crypto | Other"]
-        content_lines.append("---------|---------|-----|--------|--------|------")
-        for sev in ["critical", "high", "medium", "low"]:
-            row = matrix[sev]
-            content_lines.append(
-                f"{sev.upper():8s} | {row['network']:7d} | {row['web']:3d} | "
-                f"{row['config']:6d} | {row['crypto']:6d} | {row['other']:5d}"
-            )
-
-        return ReportSection(
-            title="Risk Matrix",
-            content="\n".join(content_lines),
-            data={"matrix": matrix},
-        )
-
-    def _remediation_section(self, report: AssessmentReport) -> ReportSection:
-        """Generate remediation priority list."""
-        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-
-        sorted_findings = sorted(
-            report.findings,
-            key=lambda f: severity_order.get(f.get("severity", "info"), 4),
-        )
-
-        lines = []
-        for i, finding in enumerate(sorted_findings):
-            remediation = finding.get("remediation", "No specific remediation provided")
-            sev = finding.get("severity", "info").upper()
-            lines.append(f"{i + 1}. [{sev}] {finding.get('title', 'Finding')}")
-            lines.append(f"   Remediation: {remediation[:150]}")
-            lines.append("")
-
-        return ReportSection(
-            title="Remediation Priority",
-            content="\n".join(lines),
-        )
-
-    def _metrics_section(self, report: AssessmentReport) -> ReportSection:
-        """Generate metrics section."""
-        lines = [
-            f"Assessment Duration: {report.duration_s:.0f}s",
-            f"Total Findings: {len(report.findings)}",
-        ]
-
-        if report.metrics:
-            for key, value in report.metrics.items():
-                lines.append(f"{key}: {value}")
-
-        return ReportSection(
-            title="Assessment Metrics",
-            content="\n".join(lines),
-            data=report.metrics,
-        )
-
-    def save_json(self, report: AssessmentReport) -> str:
-        """Save report as JSON."""
-        path = self._output_dir / f"{report.report_id}.json"
-
-        data = {
-            "id": report.report_id,
-            "title": report.title,
-            "target": report.target,
-            "assessor": report.assessor,
-            "duration_s": report.duration_s,
-            "findings": report.findings,
-            "metrics": report.metrics,
-            "severity_counts": self._count_severities(report.findings),
-            "sections": [s.to_dict() for s in report.sections],
-            "created_at": report.created_at,
-        }
-
-        path.write_text(json.dumps(data, indent=2, default=str))
-        return str(path)
-
-    def save_markdown(self, report: AssessmentReport) -> str:
-        """Save report as Markdown."""
-        path = self._output_dir / f"{report.report_id}.md"
-
-        lines = [
-            f"# {report.title}",
-            "",
-            f"**Target:** {report.target}",
-            f"**Assessor:** {report.assessor}",
-            f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(report.created_at))}",
-            "",
-        ]
-
-        for section in report.sections:
-            lines.append(f"## {section.title}")
-            lines.append("")
+        lines.append("## Detailed Findings\n")
+        for section in report.sections[:30]:
+            lines.append(f"### {section.title}\n")
             lines.append(section.content)
             lines.append("")
 
-            for sub in section.subsections:
-                lines.append(f"### {sub.title}")
-                lines.append("")
-                lines.append(sub.content)
-                lines.append("")
+        if report.tools_used:
+            lines.append("## Tools Used\n")
+            lines.append(", ".join(report.tools_used[:20]))
 
-        path.write_text("\n".join(lines))
-        return str(path)
-
-    @staticmethod
-    def _count_severities(findings: list[dict[str, Any]]) -> dict[str, int]:
-        counts: dict[str, int] = defaultdict(int)
-        for finding in findings:
-            sev = finding.get("severity", "info")
-            counts[sev] += 1
-        return dict(counts)
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        return {
-            "reports": self._report_counter,
-            "output_dir": str(self._output_dir),
-        }
+        return {"reports_generated": self._report_counter}
