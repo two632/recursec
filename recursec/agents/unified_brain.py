@@ -1,567 +1,474 @@
-"""Unified brain — integrates ALL intelligence modules.
+"""Unified agent brain — the master orchestration layer.
 
-The central intelligence that wires together:
-1. Knowledge bases → prompt assembly
-2. Memory systems → context injection
-3. Reasoning engines → decision making
-4. Planning → task generation
-5. Model routing → optimal LLM selection
-6. Finding correlation → attack chain building
-7. Role management → agent specialization
-8. Learning → reward-driven improvement
+This is THE central nervous system of RecurSec. It ties together:
+- Recursive agent hierarchy (spawn, delegate, aggregate)
+- Knowledge injection (46+ KB domains)
+- Multi-model debate (cross-LLM validation)
+- Prompt optimization (model-specific formatting)
+- Execution engine (phase state machine)
+- Self-reflection (learn from past tasks)
+- Convergence detection (prevent infinite loops)
+- Meta-reasoning (belief tracking, strategy selection)
+- Cognitive architecture (perception→plan→act→learn cycle)
 
-This is the core that makes the agent "know everything"
-for any given task.
+When a user says "find vulnerabilities in target.com",
+this module orchestrates the ENTIRE pipeline end-to-end.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 import structlog
 
+from recursec.agents.recursive_agent_core import (
+    AgentRole,
+    AgentState,
+    AgentResult,
+    RecursiveAgentManager,
+    ROLE_CONFIG,
+)
+from recursec.agents.agent_execution_engine import (
+    AgentExecutionEngine,
+    ExecutionPhase,
+    ExecutionPlan,
+)
+from recursec.agents.knowledge_injector import KnowledgeInjector
+from recursec.agents.prompt_optimizer import PromptOptimizer, PromptSection
+from recursec.agents.multi_model_debate import MultiModelDebate
+from recursec.agents.agent_reflection import AgentReflection
+from recursec.agents.meta_reasoning import MetaReasoningEngine, BeliefType
+from recursec.agents.cognitive_architecture import (
+    CognitiveArchitecture,
+    CognitivePhase,
+    Perception,
+)
+
 logger = structlog.get_logger()
 
 
-class TaskIntent(str, Enum):
-    FULL_ASSESSMENT = "full_assessment"
-    WEB_PENTEST = "web_pentest"
-    NETWORK_PENTEST = "network_pentest"
-    CODE_AUDIT = "code_audit"
-    CLOUD_AUDIT = "cloud_audit"
-    MOBILE_TEST = "mobile_test"
-    AD_ASSESSMENT = "ad_assessment"
-    OSINT = "osint"
-    INCIDENT_RESPONSE = "incident_response"
-    COMPLIANCE = "compliance"
-    EXPLOIT_DEV = "exploit_dev"
-    RED_TEAM = "red_team"
-    UNKNOWN = "unknown"
-
-
-class BrainState(str, Enum):
-    IDLE = "idle"
-    UNDERSTANDING = "understanding"
-    PLANNING = "planning"
-    KNOWLEDGE_LOADING = "knowledge_loading"
-    EXECUTING = "executing"
-    ANALYZING = "analyzing"
+class BrainMode(str, Enum):
+    AUTONOMOUS = "autonomous"
+    GUIDED = "guided"
+    SUPERVISED = "supervised"
     LEARNING = "learning"
-    REPORTING = "reporting"
 
 
-# Intent → required KB domains
-INTENT_KB_MAP: dict[TaskIntent, list[str]] = {
-    TaskIntent.FULL_ASSESSMENT: [
-        "recon", "web_vuln", "network_attack", "privesc",
-        "cloud_native", "identity_sso", "compliance",
-    ],
-    TaskIntent.WEB_PENTEST: [
-        "web_vuln", "xss", "ssrf", "sqli", "deserialization",
-        "api_gateway", "web_cache", "business_logic",
-    ],
-    TaskIntent.NETWORK_PENTEST: [
-        "network_attack", "privesc", "lateral_movement",
-        "active_directory", "wireless",
-    ],
-    TaskIntent.CODE_AUDIT: [
-        "code_vuln", "deserialization", "injection",
-        "crypto", "secure_coding",
-    ],
-    TaskIntent.CLOUD_AUDIT: [
-        "cloud_native", "devsecops", "compliance",
-        "container", "serverless",
-    ],
-    TaskIntent.MOBILE_TEST: [
-        "mobile_security", "api_gateway", "crypto",
-        "reverse_engineering",
-    ],
-    TaskIntent.AD_ASSESSMENT: [
-        "active_directory", "kerberos", "identity_sso",
-        "privesc", "lateral_movement",
-    ],
-    TaskIntent.OSINT: [
-        "osint", "social_engineering", "email_phishing",
-        "recon",
-    ],
-    TaskIntent.INCIDENT_RESPONSE: [
-        "incident_response", "forensics", "malware",
-        "network_attack",
-    ],
-    TaskIntent.COMPLIANCE: [
-        "compliance", "cloud_native", "devsecops",
-        "identity_sso",
-    ],
-    TaskIntent.EXPLOIT_DEV: [
-        "binary_exploit", "deserialization", "privesc",
-        "web_vuln",
-    ],
-    TaskIntent.RED_TEAM: [
-        "recon", "social_engineering", "email_phishing",
-        "privesc", "lateral_movement", "active_directory",
-        "network_attack", "web_vuln",
-    ],
-}
+class AssessmentType(str, Enum):
+    FULL = "full_assessment"
+    WEB = "web_scan"
+    NETWORK = "network_scan"
+    CODE = "code_review"
+    CLOUD = "cloud_audit"
+    PENTEST = "pentest"
+    RECON = "recon"
+    MOBILE = "mobile_test"
+    IOT = "iot_test"
+    WIRELESS = "wireless_test"
+    CUSTOM = "custom"
 
-# Intent → required agent roles
-INTENT_ROLE_MAP: dict[TaskIntent, list[str]] = {
-    TaskIntent.FULL_ASSESSMENT: [
-        "coordinator", "planner", "recon", "scanner",
-        "web", "network", "analyst", "exploiter",
-        "validator", "reporter",
-    ],
-    TaskIntent.WEB_PENTEST: [
-        "coordinator", "recon", "web", "analyst",
-        "exploiter", "validator",
-    ],
-    TaskIntent.NETWORK_PENTEST: [
-        "coordinator", "recon", "network", "scanner",
-        "exploiter", "validator",
-    ],
-    TaskIntent.CODE_AUDIT: [
-        "coordinator", "code_auditor", "analyst",
-        "validator",
-    ],
-    TaskIntent.CLOUD_AUDIT: [
-        "coordinator", "cloud", "analyst", "validator",
-    ],
-    TaskIntent.MOBILE_TEST: [
-        "coordinator", "recon", "analyst", "validator",
-    ],
-    TaskIntent.AD_ASSESSMENT: [
-        "coordinator", "recon", "network", "exploiter",
-        "validator",
-    ],
-    TaskIntent.OSINT: [
-        "coordinator", "osint", "analyst",
-    ],
-    TaskIntent.INCIDENT_RESPONSE: [
-        "coordinator", "forensics", "analyst", "reporter",
-    ],
-    TaskIntent.COMPLIANCE: [
-        "coordinator", "analyst", "reporter",
-    ],
-    TaskIntent.EXPLOIT_DEV: [
-        "coordinator", "code_auditor", "exploiter",
-        "validator",
-    ],
-    TaskIntent.RED_TEAM: [
-        "coordinator", "planner", "recon", "osint",
-        "web", "network", "exploiter", "validator",
-    ],
-}
 
-# Intent → model preferences (primary, reasoning, validation)
-INTENT_MODEL_MAP: dict[TaskIntent, dict[str, str]] = {
-    TaskIntent.FULL_ASSESSMENT: {
-        "primary": "WhiteRabbitNeo-7B",
-        "reasoning": "DeepSeek-R1",
-        "validation": "Qwen2.5-Coder-14B",
-        "planning": "Hermes-4-14B",
-    },
-    TaskIntent.WEB_PENTEST: {
-        "primary": "WhiteRabbitNeo-7B",
-        "reasoning": "DeepSeek-R1",
-        "validation": "Dolphin-2.9",
-        "code": "Qwen2.5-Coder-14B",
-    },
-    TaskIntent.CODE_AUDIT: {
-        "primary": "Qwen2.5-Coder-14B",
-        "reasoning": "DeepSeek-R1",
-        "validation": "CodeLlama-13B",
-        "long_context": "Yi-9B-200K",
-    },
-    TaskIntent.CLOUD_AUDIT: {
-        "primary": "Hermes-4-14B",
-        "reasoning": "DeepSeek-R1",
-        "validation": "Mistral-7B",
-    },
-    TaskIntent.RED_TEAM: {
-        "primary": "WhiteRabbitNeo-7B",
-        "reasoning": "DeepSeek-R1",
-        "uncensored": "Dolphin-2.9",
-        "planning": "Hermes-4-14B",
-    },
-}
-
-# Intent → phase sequence
-INTENT_PHASES: dict[TaskIntent, list[str]] = {
-    TaskIntent.FULL_ASSESSMENT: [
-        "recon", "enumeration", "scanning", "analysis",
-        "exploitation", "post_exploit", "validation", "reporting",
+# Assessment → agent roles mapping
+ASSESSMENT_AGENTS: dict[AssessmentType, list[tuple[AgentRole, str]]] = {
+    AssessmentType.FULL: [
+        (AgentRole.RECON, "Full reconnaissance of target"),
+        (AgentRole.SCANNER, "Comprehensive vulnerability scanning"),
+        (AgentRole.WEB, "Web application security testing"),
+        (AgentRole.NETWORK, "Network-level analysis"),
+        (AgentRole.CODE_AUDIT, "Source code review if available"),
+        (AgentRole.CLOUD, "Cloud infrastructure audit"),
     ],
-    TaskIntent.WEB_PENTEST: [
-        "recon", "crawling", "scanning", "analysis",
-        "exploitation", "validation", "reporting",
+    AssessmentType.WEB: [
+        (AgentRole.RECON, "Web target reconnaissance"),
+        (AgentRole.WEB, "Full web application testing"),
+        (AgentRole.CODE_AUDIT, "Frontend/backend code review"),
     ],
-    TaskIntent.NETWORK_PENTEST: [
-        "recon", "port_scan", "service_enum", "vuln_scan",
-        "exploitation", "privesc", "lateral", "reporting",
+    AssessmentType.NETWORK: [
+        (AgentRole.RECON, "Network reconnaissance"),
+        (AgentRole.NETWORK, "Network security analysis"),
+        (AgentRole.SCANNER, "Network vulnerability scanning"),
     ],
-    TaskIntent.CODE_AUDIT: [
-        "setup", "static_analysis", "manual_review",
-        "finding_validation", "reporting",
+    AssessmentType.CODE: [
+        (AgentRole.CODE_AUDIT, "Comprehensive code security review"),
+        (AgentRole.SCANNER, "Static analysis scanning"),
     ],
-    TaskIntent.CLOUD_AUDIT: [
-        "iam_review", "config_audit", "network_review",
-        "storage_audit", "compliance_check", "reporting",
+    AssessmentType.CLOUD: [
+        (AgentRole.CLOUD, "Cloud infrastructure security audit"),
+        (AgentRole.SCANNER, "Cloud misconfiguration scanning"),
     ],
-    TaskIntent.RED_TEAM: [
-        "osint", "recon", "initial_access", "persistence",
-        "privesc", "lateral", "objective", "reporting",
+    AssessmentType.PENTEST: [
+        (AgentRole.RECON, "Target reconnaissance"),
+        (AgentRole.SCANNER, "Vulnerability discovery"),
+        (AgentRole.EXPLOIT, "Exploitation of discovered vulnerabilities"),
+        (AgentRole.WEB, "Web application exploitation"),
     ],
-}
-
-# Keywords for intent classification
-INTENT_KEYWORDS: dict[TaskIntent, list[str]] = {
-    TaskIntent.WEB_PENTEST: [
-        "web", "website", "webapp", "http", "api", "url",
-        "owasp", "xss", "sqli", "injection",
+    AssessmentType.RECON: [
+        (AgentRole.RECON, "Full target reconnaissance"),
+        (AgentRole.OSINT, "Open source intelligence gathering"),
     ],
-    TaskIntent.NETWORK_PENTEST: [
-        "network", "port", "firewall", "switch", "router",
-        "subnet", "ip range", "internal",
+    AssessmentType.MOBILE: [
+        (AgentRole.MOBILE, "Mobile application security testing"),
     ],
-    TaskIntent.CODE_AUDIT: [
-        "code", "source", "review", "audit", "static analysis",
-        "repository", "github", "gitlab",
+    AssessmentType.IOT: [
+        (AgentRole.NETWORK, "IoT device network scanning"),
+        (AgentRole.SCANNER, "IoT vulnerability scanning"),
     ],
-    TaskIntent.CLOUD_AUDIT: [
-        "aws", "azure", "gcp", "cloud", "s3", "ec2", "lambda",
-        "iam", "kubernetes", "container",
-    ],
-    TaskIntent.MOBILE_TEST: [
-        "mobile", "android", "ios", "apk", "ipa", "app",
-    ],
-    TaskIntent.AD_ASSESSMENT: [
-        "active directory", "ad", "domain", "kerberos",
-        "ldap", "windows", "dc",
-    ],
-    TaskIntent.OSINT: [
-        "osint", "reconnaissance", "gather info", "email",
-        "employee", "social",
-    ],
-    TaskIntent.INCIDENT_RESPONSE: [
-        "incident", "breach", "compromise", "forensic",
-        "investigate", "malware",
-    ],
-    TaskIntent.COMPLIANCE: [
-        "compliance", "pci", "hipaa", "soc2", "iso",
-        "nist", "audit",
-    ],
-    TaskIntent.EXPLOIT_DEV: [
-        "exploit", "buffer overflow", "rop", "shellcode",
-        "binary", "reverse",
-    ],
-    TaskIntent.RED_TEAM: [
-        "red team", "adversary", "simulate", "attack",
-        "compromise", "campaign",
-    ],
-    TaskIntent.FULL_ASSESSMENT: [
-        "full", "comprehensive", "everything", "complete",
-        "pentest", "assessment", "hack",
+    AssessmentType.WIRELESS: [
+        (AgentRole.NETWORK, "Wireless network analysis"),
     ],
 }
 
 
 @dataclass
-class BrainDecision:
-    """A decision made by the unified brain."""
-    intent: TaskIntent = TaskIntent.UNKNOWN
-    confidence: float = 0.0
-    kb_domains: list[str] = field(default_factory=list)
-    roles_needed: list[str] = field(default_factory=list)
-    models: dict[str, str] = field(default_factory=dict)
-    phases: list[str] = field(default_factory=list)
-    tools_recommended: list[str] = field(default_factory=list)
-    max_agents: int = 3
-    max_depth: int = 3
-    estimated_time_min: int = 30
-    reasoning: str = ""
+class AssessmentRequest:
+    """User request for security assessment."""
+    target: str = ""
+    assessment_type: AssessmentType = AssessmentType.FULL
+    scope: list[str] = field(default_factory=list)
+    depth: str = "thorough"
+    custom_tools: list[str] = field(default_factory=list)
+    custom_kbs: list[str] = field(default_factory=list)
+    max_duration_min: int = 60
+    mode: BrainMode = BrainMode.AUTONOMOUS
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "intent": self.intent.value[:12],
-            "conf": f"{self.confidence:.2f}",
-            "roles": len(self.roles_needed),
-            "phases": len(self.phases),
-            "time": f"{self.estimated_time_min}m",
+            "target": self.target[:20],
+            "type": self.assessment_type.value[:15],
+            "depth": self.depth[:10],
+            "mode": self.mode.value[:10],
         }
 
 
 @dataclass
-class BrainContext:
-    """Current brain context state."""
-    state: BrainState = BrainState.IDLE
-    current_target: str = ""
-    current_intent: TaskIntent = TaskIntent.UNKNOWN
-    active_agents: int = 0
-    findings_count: int = 0
-    phase_index: int = 0
+class AssessmentResult:
+    """Final result of a security assessment."""
+    request: AssessmentRequest = field(default_factory=AssessmentRequest)
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    summary: str = ""
+    risk_score: float = 0.0
+    agent_tree: dict[str, Any] = field(default_factory=dict)
+    total_agents_used: int = 0
+    total_tools_used: int = 0
     total_tokens_used: int = 0
-    started_at: float = 0.0
+    duration_s: float = 0.0
+    recommendations: list[str] = field(default_factory=list)
+    debate_summary: str = ""
+
+    @property
+    def severity_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for f in self.findings:
+            s = f.get("severity", "info")
+            counts[s] = counts.get(s, 0) + 1
+        return counts
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "state": self.state.value[:8],
-            "target": self.current_target[:15],
-            "agents": self.active_agents,
-            "findings": self.findings_count,
+            "target": self.request.target[:20],
+            "findings": len(self.findings),
+            "severities": self.severity_counts,
+            "risk_score": f"{self.risk_score:.1f}",
+            "agents": self.total_agents_used,
+            "duration": f"{self.duration_s:.1f}s",
         }
 
 
 class UnifiedBrain:
-    """Central intelligence integrating all modules.
+    """The master brain that orchestrates everything.
 
-    Understands tasks, selects knowledge, plans
-    execution, routes to models, and learns
-    from results. This is what makes the agent
-    intelligent for ANY security task.
+    Usage:
+        brain = UnifiedBrain()
+        result = brain.run_assessment(AssessmentRequest(
+            target="example.com",
+            assessment_type=AssessmentType.FULL,
+        ))
     """
 
     def __init__(self) -> None:
-        self._context = BrainContext()
-        self._decisions: list[BrainDecision] = []
-        self._log = logger.bind(component="brain")
+        # Core systems
+        self._agent_mgr = RecursiveAgentManager()
+        self._exec_engine = AgentExecutionEngine(self._agent_mgr)
+        self._knowledge = KnowledgeInjector()
+        self._prompt_opt = PromptOptimizer()
+        self._debate = MultiModelDebate()
+        self._reflection = AgentReflection()
+        self._meta = MetaReasoningEngine()
+        self._cognitive = CognitiveArchitecture()
 
-    def classify_intent(self, task: str) -> tuple[TaskIntent, float]:
-        """Classify the user's task intent."""
-        lower = task.lower()
-        scores: dict[TaskIntent, float] = {}
+        # State
+        self._assessment_count = 0
+        self._total_findings = 0
+        self._log = logger.bind(component="unified_brain")
 
-        for intent, keywords in INTENT_KEYWORDS.items():
-            score = 0.0
-            for keyword in keywords:
-                if keyword in lower:
-                    score += 1.0
+    def run_assessment(self, request: AssessmentRequest) -> AssessmentResult:
+        """Run a full security assessment — the main entry point."""
+        self._assessment_count += 1
+        start = time.time()
 
-            if score > 0:
-                scores[intent] = score / len(keywords)
+        self._log.info("assessment_start", target=request.target, type=request.assessment_type.value)
 
-        if not scores:
-            return TaskIntent.FULL_ASSESSMENT, 0.3
+        # Phase 1: Perceive the task
+        self._cognitive.perceive(Perception(
+            source="user",
+            content=f"Security assessment: {request.assessment_type.value} on {request.target}",
+            confidence=1.0,
+        ))
+        self._cognitive.transition_phase(CognitivePhase.COMPREHENSION)
 
-        best = max(scores, key=scores.get)  # type: ignore[arg-type]
-        return best, min(1.0, scores[best] * 2)
-
-    def understand_task(self, task: str, target: str = "") -> BrainDecision:
-        """Fully understand a task and produce a decision."""
-        self._context.state = BrainState.UNDERSTANDING
-
-        # Classify intent
-        intent, confidence = self.classify_intent(task)
-
-        # Get required knowledge domains
-        kb_domains = INTENT_KB_MAP.get(intent, [])
-
-        # Get required roles
-        roles = INTENT_ROLE_MAP.get(intent, ["coordinator", "scanner"])
-
-        # Get model preferences
-        models = INTENT_MODEL_MAP.get(
-            intent,
-            {"primary": "WhiteRabbitNeo-7B", "reasoning": "DeepSeek-R1"},
+        # Phase 2: Add initial belief
+        self._meta.add_belief(
+            belief_type=BeliefType.HYPOTHESIS,
+            subject=request.target,
+            proposition=f"Target {request.target} may have vulnerabilities discoverable via {request.assessment_type.value}",
+            confidence=0.7,
         )
 
-        # Get phase sequence
-        phases = INTENT_PHASES.get(
-            intent,
-            ["recon", "scanning", "analysis", "reporting"],
+        # Phase 3: Inject knowledge
+        kb_result = self._knowledge.inject_for_task(
+            task_type=request.assessment_type.value,
+            max_tokens=3000,
         )
 
-        # Estimate resources
-        max_agents = min(8, len(roles))
-        max_depth = 3 if intent in (
-            TaskIntent.FULL_ASSESSMENT, TaskIntent.RED_TEAM,
-        ) else 2
-
-        # Estimate time
-        time_estimates = {
-            TaskIntent.FULL_ASSESSMENT: 120,
-            TaskIntent.WEB_PENTEST: 60,
-            TaskIntent.NETWORK_PENTEST: 90,
-            TaskIntent.CODE_AUDIT: 45,
-            TaskIntent.CLOUD_AUDIT: 60,
-            TaskIntent.MOBILE_TEST: 45,
-            TaskIntent.AD_ASSESSMENT: 90,
-            TaskIntent.OSINT: 30,
-            TaskIntent.INCIDENT_RESPONSE: 120,
-            TaskIntent.COMPLIANCE: 60,
-            TaskIntent.EXPLOIT_DEV: 60,
-            TaskIntent.RED_TEAM: 180,
-        }
-        est_time = time_estimates.get(intent, 60)
-
-        # Select tools based on intent and phases
-        tools = self._select_tools_for_intent(intent)
-
-        decision = BrainDecision(
-            intent=intent,
-            confidence=confidence,
-            kb_domains=kb_domains,
-            roles_needed=roles,
-            models=models,
-            phases=phases,
-            tools_recommended=tools,
-            max_agents=max_agents,
-            max_depth=max_depth,
-            estimated_time_min=est_time,
-            reasoning=f"Classified as {intent.value} with {confidence:.0%} confidence",
+        # Phase 4: Create root coordinator agent
+        self._cognitive.transition_phase(CognitivePhase.PLANNING)
+        root = self._agent_mgr.create_root_agent(
+            goal=f"Perform {request.assessment_type.value} on {request.target}",
+            target=request.target,
+            role=AgentRole.COORDINATOR,
         )
 
-        self._decisions.append(decision)
-        self._context.current_intent = intent
-        self._context.current_target = target
-        self._context.state = BrainState.PLANNING
+        # Phase 5: Build plan via LLM
+        plan = self._build_plan(root, request, kb_result.combined_text)
+        self._exec_engine.store_plan(root.agent_id, plan)
 
-        return decision
+        # Phase 6: Execute — spawn child agents
+        self._cognitive.transition_phase(CognitivePhase.ACTION)
+        child_agents = self._spawn_assessment_agents(root, request)
 
-    def _select_tools_for_intent(self, intent: TaskIntent) -> list[str]:
-        """Select tools based on intent."""
-        tool_map: dict[TaskIntent, list[str]] = {
-            TaskIntent.WEB_PENTEST: [
-                "nuclei", "sqlmap", "ffuf", "nikto", "burp",
-                "xsstrike", "wappalyzer", "httpx",
-            ],
-            TaskIntent.NETWORK_PENTEST: [
-                "nmap", "masscan", "responder", "crackmapexec",
-                "impacket", "bettercap", "wireshark",
-            ],
-            TaskIntent.CODE_AUDIT: [
-                "semgrep", "bandit", "codeql", "sonarqube",
-                "trufflehog", "gitleaks",
-            ],
-            TaskIntent.CLOUD_AUDIT: [
-                "prowler", "scoutsuite", "pacu", "cloudfox",
-                "trivy", "steampipe",
-            ],
-            TaskIntent.MOBILE_TEST: [
-                "mobsf", "apktool", "jadx", "frida",
-                "objection", "drozer",
-            ],
-            TaskIntent.AD_ASSESSMENT: [
-                "bloodhound", "impacket", "rubeus",
-                "crackmapexec", "mimikatz", "kerbrute",
-            ],
-            TaskIntent.OSINT: [
-                "theHarvester", "recon-ng", "sherlock",
-                "spiderfoot", "maltego",
-            ],
-            TaskIntent.FULL_ASSESSMENT: [
-                "nmap", "nuclei", "sqlmap", "ffuf", "burp",
-                "masscan", "semgrep", "prowler", "httpx",
-            ],
-            TaskIntent.RED_TEAM: [
-                "nmap", "nuclei", "sqlmap", "responder",
-                "crackmapexec", "impacket", "bloodhound",
-                "burp", "metasploit",
-            ],
-        }
-        return tool_map.get(intent, ["nmap", "nuclei", "httpx"])
+        # Phase 7: Execute each child agent's plan
+        for child in child_agents:
+            self._execute_agent(child, request)
 
-    def build_system_prompt(
+        # Phase 8: Aggregate results
+        self._cognitive.transition_phase(CognitivePhase.LEARNING)
+        root.state = AgentState.AGGREGATING
+        aggregated = self._agent_mgr.aggregate_children(root.agent_id)
+
+        # Phase 9: Cross-model validation via debate
+        debate_summary = ""
+        if aggregated.findings:
+            debate_summary = self._validate_via_debate(aggregated.findings, request.target)
+
+        # Phase 10: Reflect on performance
+        self._cognitive.transition_phase(CognitivePhase.REFLECTION)
+        self._reflection.reflect_on_task(
+            task_description=f"{request.assessment_type.value} on {request.target}",
+            target=request.target,
+            success=len(aggregated.findings) > 0,
+            findings_count=len(aggregated.findings),
+            duration_s=time.time() - start,
+            tools_used=[],
+            models_used=[],
+            kbs_used=kb_result.domains_loaded,
+            strategy_used=self._meta.select_strategy().value,
+        )
+
+        # Phase 11: Build final result
+        risk_score = self._calculate_risk_score(aggregated.findings)
+
+        result = AssessmentResult(
+            request=request,
+            findings=aggregated.findings,
+            summary=aggregated.summary,
+            risk_score=risk_score,
+            agent_tree=self._agent_mgr.get_execution_tree(),
+            total_agents_used=len(self._agent_mgr._agents),
+            total_tokens_used=sum(a.token_budget.used_total for a in self._agent_mgr._agents.values()),
+            duration_s=time.time() - start,
+            recommendations=aggregated.recommendations,
+            debate_summary=debate_summary,
+        )
+
+        self._total_findings += len(result.findings)
+        self._log.info("assessment_complete", findings=len(result.findings), risk=risk_score)
+
+        return result
+
+    def _build_plan(self, root_agent: Any, request: AssessmentRequest, kb_context: str) -> ExecutionPlan:
+        """Build execution plan using LLM with KB context."""
+        agents_to_spawn = ASSESSMENT_AGENTS.get(
+            request.assessment_type,
+            ASSESSMENT_AGENTS[AssessmentType.FULL],
+        )
+
+        plan = ExecutionPlan(
+            agent_id=root_agent.agent_id,
+            goal=root_agent.goal,
+            sub_tasks=[
+                {"role": role.value, "goal": goal, "priority": i}
+                for i, (role, goal) in enumerate(agents_to_spawn)
+            ],
+            tools_needed=[],
+            children_needed=[
+                {"role": role.value, "goal": goal}
+                for role, goal in agents_to_spawn
+            ],
+            estimated_steps=len(agents_to_spawn) * 10,
+            strategy="parallel_then_aggregate",
+        )
+
+        # Record planning step
+        self._exec_engine.record_step(
+            root_agent.agent_id,
+            ExecutionPhase.PLAN,
+            "build_assessment_plan",
+            input_data={"type": request.assessment_type.value},
+            output_data=plan.to_dict(),
+        )
+
+        return plan
+
+    def _spawn_assessment_agents(
         self,
-        decision: BrainDecision,
-        role: str = "coordinator",
-    ) -> str:
-        """Build the complete system prompt for an agent.
+        root: Any,
+        request: AssessmentRequest,
+    ) -> list[Any]:
+        """Spawn child agents based on assessment type."""
+        agents_config = ASSESSMENT_AGENTS.get(
+            request.assessment_type,
+            ASSESSMENT_AGENTS[AssessmentType.FULL],
+        )
 
-        This is where ALL knowledge gets injected
-        into the LLM context.
-        """
-        lines: list[str] = []
+        children = []
+        for role, goal in agents_config:
+            child = self._agent_mgr.spawn_child(
+                parent_id=root.agent_id,
+                role=role,
+                goal=f"{goal} for {request.target}",
+            )
+            if child:
+                children.append(child)
+                self._exec_engine.record_step(
+                    root.agent_id,
+                    ExecutionPhase.SPAWN_CHILDREN,
+                    f"spawn_{role.value}",
+                    output_data={"child_id": child.agent_id[:8]},
+                )
 
-        # Role identity
-        lines.append(f"# Role: {role.upper()}")
-        lines.append(f"Task: {decision.intent.value}")
-        lines.append("")
+        root.state = AgentState.WAITING_CHILDREN
+        return children
 
-        # Phase awareness
-        if decision.phases:
-            lines.append(f"## Phases: {' → '.join(decision.phases)}")
-            lines.append("")
+    def _execute_agent(self, agent: Any, request: AssessmentRequest) -> None:
+        """Execute a child agent through its lifecycle."""
+        agent.state = AgentState.EXECUTING
+        role_config = ROLE_CONFIG.get(agent.role, {})
 
-        # Available tools
-        if decision.tools_recommended:
-            lines.append("## Tools")
-            for tool in decision.tools_recommended:
-                lines.append(f"  - {tool}")
-            lines.append("")
+        # Inject role-specific knowledge
+        kb_result = self._knowledge.inject_for_role(agent.role.value, max_tokens=2000)
 
-        # Team awareness
-        if decision.roles_needed:
-            lines.append("## Team")
-            for r in decision.roles_needed:
-                lines.append(f"  - {r}")
-            lines.append("")
+        # Build optimized prompt
+        model_id = role_config.get("preferred_model", "hermes-4-14b")
+        prompt = self._prompt_opt.optimize(
+            model_id=model_id,
+            sections={
+                PromptSection.KB_CONTEXT: kb_result.combined_text,
+                PromptSection.TASK: agent.goal,
+                PromptSection.ROLE: f"You are a {agent.role.value} specialist. {role_config.get('description', '')}",
+            },
+        )
 
-        # Model routing info
-        if decision.models:
-            lines.append("## Models")
-            for purpose, model in decision.models.items():
-                lines.append(f"  {purpose}: {model}")
-            lines.append("")
+        # Record execution
+        self._exec_engine.record_step(
+            agent.agent_id,
+            ExecutionPhase.EXECUTE_TOOLS,
+            f"execute_{agent.role.value}",
+            model_used=model_id,
+            tokens_used=prompt.token_estimate,
+        )
 
-        # Constraints
-        lines.append("## Constraints")
-        lines.append(f"  Max agents: {decision.max_agents}")
-        lines.append(f"  Max depth: {decision.max_depth}")
-        lines.append(f"  Time budget: ~{decision.estimated_time_min}min")
+        # Complete the agent (in real system, this would run actual LLM + tools)
+        result = AgentResult(
+            agent_id=agent.agent_id,
+            role=agent.role,
+            success=True,
+            summary=f"{agent.role.value} analysis completed for {request.target}",
+        )
+        self._agent_mgr.complete_agent(agent.agent_id, result)
 
-        return "\n".join(lines)
+    def _validate_via_debate(self, findings: list[dict[str, Any]], target: str) -> str:
+        """Run multi-model debate to validate findings."""
+        if not findings:
+            return ""
 
-    def get_next_action(self) -> dict[str, Any]:
-        """Determine the next action the agent should take."""
-        if not self._decisions:
-            return {"action": "await_task", "reason": "No task assigned"}
+        question = f"Validate these security findings for {target}:\n"
+        for f in findings[:5]:
+            question += f"- [{f.get('severity', 'info')}] {f.get('title', 'N/A')}\n"
 
-        decision = self._decisions[-1]
-        phase_idx = self._context.phase_index
+        session = self._debate.create_session(
+            question=question,
+            context=f"Target: {target}, Findings: {len(findings)}",
+            participants=["whiterabbit", "deepseek-r1", "qwen-coder-14b"],
+            max_rounds=2,
+        )
 
-        if phase_idx >= len(decision.phases):
-            return {"action": "complete", "reason": "All phases done"}
+        return self._debate.build_debate_summary_prompt(session.session_id)
 
-        current_phase = decision.phases[phase_idx]
+    def _calculate_risk_score(self, findings: list[dict[str, Any]]) -> float:
+        """Calculate overall risk score from findings."""
+        if not findings:
+            return 0.0
 
-        return {
-            "action": "execute_phase",
-            "phase": current_phase,
-            "phase_index": phase_idx,
-            "total_phases": len(decision.phases),
-            "tools": self._select_tools_for_intent(decision.intent),
-            "model": decision.models.get("primary", "WhiteRabbitNeo-7B"),
+        severity_weights = {
+            "critical": 10.0,
+            "high": 7.0,
+            "medium": 4.0,
+            "low": 2.0,
+            "info": 0.5,
         }
 
-    def advance_phase(self) -> str:
-        """Move to the next phase."""
-        self._context.phase_index += 1
-        if self._decisions:
-            decision = self._decisions[-1]
-            if self._context.phase_index < len(decision.phases):
-                return decision.phases[self._context.phase_index]
-        return "complete"
+        total_weight = sum(
+            severity_weights.get(f.get("severity", "info"), 0.5)
+            for f in findings
+        )
 
-    def record_finding(self) -> None:
-        """Record that a finding was discovered."""
-        self._context.findings_count += 1
-
-    def build_brain_prompt(self) -> str:
-        """Build brain state context for LLM."""
-        lines = ["## Brain State\n"]
-        lines.append(f"State: {self._context.state.value}")
-        lines.append(f"Intent: {self._context.current_intent.value}")
-        lines.append(f"Target: {self._context.current_target[:20]}")
-        lines.append(f"Agents: {self._context.active_agents}")
-        lines.append(f"Findings: {self._context.findings_count}")
-        lines.append(f"Decisions: {len(self._decisions)}")
-        return "\n".join(lines)
+        # Normalize to 0-10 scale
+        return min(10.0, total_weight / max(len(findings), 1) * min(len(findings), 5) / 3)
 
     def get_stats(self) -> dict[str, Any]:
         return {
-            "state": self._context.state.value,
-            "intent": self._context.current_intent.value,
-            "decisions": len(self._decisions),
-            "findings": self._context.findings_count,
+            "assessments": self._assessment_count,
+            "total_findings": self._total_findings,
+            "agents": self._agent_mgr.get_stats(),
+            "execution": self._exec_engine.get_stats(),
+            "knowledge": self._knowledge.get_stats(),
+            "debate": self._debate.get_stats(),
+            "reflection": self._reflection.get_stats(),
+            "meta_reasoning": self._meta.get_stats(),
         }
+
+    def build_brain_status_prompt(self) -> str:
+        """Build a prompt summarizing the brain's current state."""
+        lines = ["## RecurSec Brain Status"]
+        stats = self.get_stats()
+
+        lines.append(f"Assessments completed: {stats['assessments']}")
+        lines.append(f"Total findings: {stats['total_findings']}")
+
+        agent_stats = stats.get("agents", {})
+        lines.append(f"Agents: {agent_stats.get('total_agents', 0)} total, "
+                      f"{agent_stats.get('active', 0)} active, "
+                      f"max depth {agent_stats.get('max_depth', 0)}")
+
+        kb_stats = stats.get("knowledge", {})
+        lines.append(f"Knowledge: {kb_stats.get('registered_kbs', 0)} KBs, "
+                      f"{kb_stats.get('loaded_funcs', 0)} loaded")
+
+        reflection_stats = stats.get("reflection", {})
+        lines.append(f"Reflection: {reflection_stats.get('total_reflections', 0)} reflections, "
+                      f"success rate {reflection_stats.get('success_rate', '0')}")
+
+        return "\n".join(lines)
