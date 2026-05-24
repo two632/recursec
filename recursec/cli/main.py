@@ -40,6 +40,8 @@ def create_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--timeout", type=int, default=3600, help="Max time in seconds")
     scan_parser.add_argument("--output", "-o", default="", help="Output directory")
     scan_parser.add_argument("--tool-timeout", type=int, default=300, help="Per-tool timeout")
+    scan_parser.add_argument("--iterations", type=int, default=100, help="Max autonomous iterations")
+    scan_parser.add_argument("--no-autonomous", action="store_true", help="Disable autonomous LLM loop")
 
     # models
     subparsers.add_parser("models", help="List configured LLM models")
@@ -62,8 +64,10 @@ def cmd_scan(args: argparse.Namespace) -> None:
         target=args.target,
         goal=args.goal,
         max_time_s=float(args.timeout),
+        max_iterations=args.iterations,
         stealth=args.stealth,
         deep_scan=args.deep,
+        autonomous=not args.no_autonomous,
         tool_timeout_s=args.tool_timeout,
         output_dir=args.output,
     )

@@ -115,8 +115,10 @@ class ScanConfig:
     goal: str = ""
     max_time_s: float = 3600.0
     max_findings: int = 500
+    max_iterations: int = 100
     stealth: bool = False
     deep_scan: bool = True
+    autonomous: bool = True
     llm_model: str = ""
     tool_timeout_s: int = 300
     output_dir: str = ""
@@ -163,6 +165,33 @@ Format your response as a JSON list of objects with keys: tool, args, reason.
 Only suggest tools that actually exist (nmap, nuclei, nikto, sqlmap, ffuf, gobuster, subfinder, httpx, etc.).
 Be specific with arguments — include the actual target, ports, and options."""
 
+AUTONOMOUS_SYSTEM_PROMPT = """You are RecurSec, a fully autonomous security assessment agent.
+You have access to 300+ pentesting tools. Your job is to find vulnerabilities, exploits, and security issues in the target.
+
+AVAILABLE TOOLS (only use ones that exist on the system):
+{available_tools}
+
+RULES:
+1. Output EXACTLY ONE shell command to execute next. Nothing else.
+2. The command must be a real tool invocation (nmap, nuclei, sqlmap, ffuf, curl, dig, etc.)
+3. Include the actual target/URL/IP in the command.
+4. Use appropriate flags for machine-readable output when possible (-oN, -json, --json, -silent, etc.)
+5. Do NOT use pipes, semicolons, or chain commands. One single command only.
+6. If you believe the assessment is complete, output exactly: DONE
+7. Do NOT repeat commands you've already run.
+8. Prioritize: recon first, then vuln scanning, then exploitation verification.
+9. Be creative — try different attack vectors, not just the obvious ones.
+10. For web targets: check headers, directories, parameters, injection points, misconfigs.
+11. For network targets: enumerate services, check for default creds, known CVEs.
+
+IMPORTANT: Output the raw command only. No explanation, no markdown, no backticks. Just the command."""
+
+ANALYSIS_SYSTEM_PROMPT = """You are a security analyst. Analyze the following tool output and extract security findings.
+For each finding provide: title, severity (critical/high/medium/low/info), type, evidence, cwe, remediation.
+If there are no findings, return an empty findings list.
+Be precise — only report what the evidence shows. Do NOT hallucinate.
+Respond as JSON: {{"findings": [{{"title":"...", "severity":"...", "type":"...", "evidence":"...", "cwe":"...", "remediation":"..."}}]}}"""
+
 
 class Runner:
     """The real end-to-end autonomous security scanner."""
@@ -178,6 +207,8 @@ class Runner:
         self._primary_model: str = ""
         self._log = logger.bind(component="runner")
         self._output_dir = self._config.output_dir or f"output/{int(time.time())}"
+        self._executed_commands: list[str] = []
+        self._memory: list[dict[str, str]] = []
 
     def run(self, target: str, goal: str = "") -> dict[str, Any]:
         """Run a full autonomous security assessment."""
@@ -233,6 +264,12 @@ class Runner:
             self._phase = ScanPhase.DEEP_DIVE
             self._print("\n[*] Phase 5: DEEP DIVE")
             self._run_deep_dive(target, target_type)
+
+        # Step 7.5: Autonomous think-act loop (LLM decides what to run next)
+        if self._primary_model and self._config.autonomous:
+            self._phase = ScanPhase.ACTIVE_SCAN
+            self._print("\n[*] Phase 6: AUTONOMOUS AGENT LOOP")
+            self._run_autonomous_loop(target, target_type)
 
         # Step 8: Report
         self._phase = ScanPhase.REPORT
@@ -666,6 +703,232 @@ class Runner:
                         cmd = self._build_tool_command(tool, step.get("args", ""), target, domain, target)
                         if cmd:
                             self._run_tool(f"deep-{tool}", cmd)
+
+    # ── Autonomous think-act loop ────────────────────────────────
+
+    def _get_available_tools_text(self) -> str:
+        """Build a concise list of tools available on this system."""
+        from recursec.agents.tool_executor import TOOL_REGISTRY
+        available = []
+        for tool_def in TOOL_REGISTRY:
+            binary = tool_def.get("binary", tool_def["name"])
+            if shutil.which(binary):
+                available.append(f"{tool_def['name']} ({tool_def['desc']})")
+        return ", ".join(available) if available else "curl, nmap, dig, whois (basic set)"
+
+    def _run_autonomous_loop(self, target: str, target_type: TargetType) -> None:
+        """Run the LLM-driven autonomous think-act loop.
+
+        The LLM sees what tools are available, what has been done so far,
+        and decides what command to run next. It keeps going until it
+        says DONE, hits the iteration limit, or runs out of time.
+        """
+        max_iterations = self._config.max_iterations
+        available_tools = self._get_available_tools_text()
+        system_prompt = AUTONOMOUS_SYSTEM_PROMPT.format(available_tools=available_tools)
+
+        # Build initial memory from what we've already done
+        for out in self._tool_outputs:
+            if out.success:
+                summary = out.stdout[:300] if out.stdout else "(no output)"
+                self._memory.append({"command": out.command, "output": summary})
+                self._executed_commands.append(out.command)
+
+        findings_so_far = [f.to_dict() for f in self._findings[:10]]
+
+        for iteration in range(max_iterations):
+            elapsed = time.time() - self._start_time
+            if elapsed > self._config.max_time_s:
+                self._print(f"  [!] Time limit reached ({elapsed:.0f}s)")
+                break
+
+            # Build the user prompt with full context
+            recent_memory = self._memory[-8:]
+            memory_text = ""
+            for m in recent_memory:
+                memory_text += f"\nCommand: {m['command']}\nOutput: {m['output'][:200]}\n"
+
+            user_prompt = (
+                f"Target: {target}\n"
+                f"Target type: {target_type.value}\n"
+                f"Iteration: {iteration + 1}/{max_iterations}\n"
+                f"Findings so far: {len(self._findings)}\n"
+                f"Tools run: {len(self._tool_outputs)}\n"
+                f"Time elapsed: {elapsed:.0f}s / {self._config.max_time_s:.0f}s\n"
+            )
+            if findings_so_far:
+                user_prompt += f"\nCurrent findings:\n{json.dumps(findings_so_far[:5], indent=1)}\n"
+            if memory_text:
+                user_prompt += f"\nRecent actions:\n{memory_text}\n"
+            user_prompt += "\nWhat command should I run next?"
+
+            # Ask the LLM
+            model = self._select_model("security_analysis")
+            command_text = self._llm_query(system_prompt, user_prompt, model_id=model, max_tokens=256)
+
+            if not command_text:
+                self._print("  [!] LLM returned empty response, stopping loop")
+                break
+
+            # Clean up the command
+            command_text = command_text.strip()
+            # Remove markdown code fences if present
+            if command_text.startswith("```"):
+                lines = command_text.split("\n")
+                command_text = "\n".join(ln for ln in lines if not ln.startswith("```")).strip()
+            # Take only the first line (should be one command)
+            command_text = command_text.split("\n")[0].strip()
+
+            # Check if LLM says we're done
+            if command_text.upper() in ("DONE", "DONE.", "ASSESSMENT COMPLETE", "COMPLETE"):
+                self._print(f"  [*] LLM says assessment is complete after {iteration + 1} iterations")
+                break
+
+            # Validate the command
+            if not self._is_safe_command(command_text):
+                self._print(f"  [!] Blocked unsafe command: {command_text[:60]}")
+                self._memory.append({"command": command_text, "output": "BLOCKED: unsafe command"})
+                continue
+
+            # Skip if we already ran this exact command
+            if command_text in self._executed_commands:
+                self._memory.append({"command": command_text, "output": "SKIPPED: already executed"})
+                continue
+
+            # Execute the command
+            self._print(f"  [{iteration + 1}] Agent: {command_text[:80]}")
+            output = self._run_shell_command(command_text)
+            self._executed_commands.append(command_text)
+
+            if output.success and output.stdout:
+                summary = output.stdout[:500]
+                self._memory.append({"command": command_text, "output": summary})
+
+                # Have LLM analyze the output for findings
+                if len(output.stdout) > 50:
+                    self._llm_extract_findings(output, target)
+            else:
+                err_msg = output.stderr[:200] if output.stderr else "no output"
+                self._memory.append({"command": command_text, "output": f"ERROR: {err_msg}"})
+
+            # Update findings list for next iteration context
+            findings_so_far = [f.to_dict() for f in self._findings[:10]]
+
+        self._print(f"  [*] Autonomous loop completed: {len(self._executed_commands)} commands, {len(self._findings)} findings")
+
+    def _run_shell_command(self, command: str) -> ToolOutput:
+        """Run a shell command safely and capture output."""
+        # Extract tool name from command
+        parts = command.split()
+        tool_name = parts[0] if parts else "unknown"
+
+        start = time.time()
+        try:
+            result = subprocess.run(
+                parts,
+                capture_output=True,
+                text=True,
+                timeout=self._config.tool_timeout_s,
+                env={**os.environ, "TERM": "dumb"},
+            )
+            output = ToolOutput(
+                tool=tool_name,
+                command=command,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.returncode,
+                duration_s=time.time() - start,
+            )
+        except subprocess.TimeoutExpired:
+            output = ToolOutput(
+                tool=tool_name, command=command,
+                stderr=f"Timeout after {self._config.tool_timeout_s}s",
+                exit_code=-1, duration_s=time.time() - start,
+            )
+        except FileNotFoundError:
+            output = ToolOutput(
+                tool=tool_name, command=command,
+                stderr=f"Tool not found: {tool_name}",
+                exit_code=-1, duration_s=0.0,
+            )
+        except OSError as exc:
+            output = ToolOutput(
+                tool=tool_name, command=command,
+                stderr=str(exc), exit_code=-1, duration_s=0.0,
+            )
+
+        self._tool_outputs.append(output)
+
+        if output.success:
+            self._print(f"       OK ({output.duration_s:.1f}s, {len(output.stdout)} bytes)")
+        else:
+            self._print(f"       FAIL: {output.stderr[:60]}")
+
+        # Save raw output
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", f"auto_{len(self._executed_commands)}_{tool_name}")
+        out_path = os.path.join(self._output_dir, f"{safe_name}.txt")
+        with open(out_path, "w") as f:
+            f.write(f"Command: {command}\nExit: {output.exit_code}\n\n{output.stdout}\n\nSTDERR:\n{output.stderr}")
+
+        return output
+
+    def _is_safe_command(self, command: str) -> bool:
+        """Check if a command is safe to execute."""
+        cmd_lower = command.lower()
+
+        # Block destructive patterns
+        blocked = [
+            "rm -rf", "rm -r /", "mkfs", "dd if=", "chmod -R 777 /",
+            ":(){:|:&};:", "fork", "> /dev/sd", "mv / ", "shutdown",
+            "reboot", "halt", "poweroff", "init 0", "init 6",
+            "wget -O- | sh", "curl | sh", "eval ", "exec ",
+        ]
+        for b in blocked:
+            if b in cmd_lower:
+                return False
+
+        # Block shell metacharacters (prevent injection)
+        dangerous_chars = [";", "&&", "||", "|", "`", "$(", ">>", ">"]
+        for ch in dangerous_chars:
+            if ch in command:
+                return False
+
+        # Must start with a known binary
+        parts = command.split()
+        if not parts:
+            return False
+        binary = parts[0]
+        if not shutil.which(binary):
+            return False
+
+        return True
+
+    def _llm_extract_findings(self, output: ToolOutput, target: str) -> None:
+        """Have LLM analyze tool output and extract findings."""
+        prompt = (
+            f"Target: {target}\nTool: {output.tool}\nCommand: {output.command}\n\n"
+            f"Tool output:\n{output.stdout[:4000]}\n\n"
+            "Extract ALL security findings from this output."
+        )
+
+        model = self._select_model("security_analysis")
+        response = self._llm_query(ANALYSIS_SYSTEM_PROMPT, prompt, model_id=model, max_tokens=4096)
+
+        parsed = self._extract_json(response)
+        if isinstance(parsed, dict) and "findings" in parsed:
+            for f in parsed["findings"]:
+                if isinstance(f, dict) and f.get("title"):
+                    self._add_finding(ScanFinding(
+                        title=f.get("title", ""),
+                        severity=f.get("severity", "medium"),
+                        vuln_type=f.get("type", ""),
+                        target=target,
+                        evidence=f.get("evidence", ""),
+                        tool=output.tool,
+                        cwe=f.get("cwe", ""),
+                        remediation=f.get("remediation", ""),
+                        confidence="medium",
+                    ))
 
     # ── Finding management ─────────────────────────────────────
 
