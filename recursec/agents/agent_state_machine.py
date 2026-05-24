@@ -1,12 +1,12 @@
-"""Agent state machine — FSM governing agent lifecycle.
+"""Agent state machine — FSM for assessment lifecycle.
 
 Implements:
 1. 14-state finite state machine
-2. Valid transition rules
-3. State entry/exit hooks
-4. Transition guards (conditions)
-5. State history for debugging
-6. State prompt for LLM
+2. Valid transition enforcement
+3. Loop detection
+4. Transition history tracking
+5. State-based action routing
+6. State machine prompt for LLM
 """
 
 from __future__ import annotations
@@ -22,267 +22,218 @@ logger = structlog.get_logger()
 
 
 class AgentState(str, Enum):
-    INITIALIZING = "initializing"
-    PLANNING = "planning"
-    EXECUTING = "executing"
-    ANALYZING = "analyzing"
-    REFLECTING = "reflecting"
-    SPAWNING_CHILD = "spawning_child"
-    WAITING_CHILD = "waiting_child"
-    AGGREGATING = "aggregating"
-    VALIDATING = "validating"
-    REPLANNING = "replanning"
-    ESCALATING = "escalating"
-    REPORTING = "reporting"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    IDLE = "idle"                   # Not started
+    INITIALIZING = "initializing"   # Setting up
+    PLANNING = "planning"           # Creating plan
+    RECON = "recon"                 # Reconnaissance
+    ENUMERATION = "enumeration"     # Service enumeration
+    SCANNING = "scanning"           # Vulnerability scanning
+    ANALYSIS = "analysis"           # Analyzing results
+    EXPLOITATION = "exploitation"   # Exploiting vulns
+    POST_EXPLOIT = "post_exploit"   # Post-exploitation
+    VALIDATION = "validation"       # Validating findings
+    REPORTING = "reporting"         # Generating report
+    PAUSED = "paused"               # Temporarily paused
+    ERROR = "error"                 # Error state
+    COMPLETED = "completed"         # Assessment done
 
 
-# Valid transitions: source → set of valid targets
-VALID_TRANSITIONS: dict[AgentState, set[AgentState]] = {
-    AgentState.INITIALIZING: {AgentState.PLANNING, AgentState.FAILED},
-    AgentState.PLANNING: {
-        AgentState.EXECUTING,
-        AgentState.SPAWNING_CHILD,
-        AgentState.FAILED,
-    },
-    AgentState.EXECUTING: {
-        AgentState.ANALYZING,
-        AgentState.FAILED,
-        AgentState.ESCALATING,
-    },
-    AgentState.ANALYZING: {
-        AgentState.REFLECTING,
-        AgentState.EXECUTING,     # Continue execution
-        AgentState.REPLANNING,
-        AgentState.SPAWNING_CHILD,
-        AgentState.VALIDATING,
-    },
-    AgentState.REFLECTING: {
-        AgentState.PLANNING,       # Re-plan with insights
-        AgentState.EXECUTING,      # Continue with adjustments
-        AgentState.REPORTING,      # Done
-        AgentState.REPLANNING,     # Major strategy change
-    },
-    AgentState.SPAWNING_CHILD: {
-        AgentState.WAITING_CHILD,
-        AgentState.FAILED,
-    },
-    AgentState.WAITING_CHILD: {
-        AgentState.AGGREGATING,
-        AgentState.FAILED,         # Child timeout
-        AgentState.ESCALATING,     # Child stuck
-    },
-    AgentState.AGGREGATING: {
-        AgentState.ANALYZING,
-        AgentState.VALIDATING,
-        AgentState.REPORTING,
-    },
-    AgentState.VALIDATING: {
-        AgentState.REPORTING,      # Validated, done
-        AgentState.EXECUTING,      # Need more evidence
-        AgentState.REPLANNING,     # Invalid, retry
-    },
-    AgentState.REPLANNING: {
-        AgentState.PLANNING,
-        AgentState.ESCALATING,     # Can't find new plan
-        AgentState.FAILED,
-    },
-    AgentState.ESCALATING: {
-        AgentState.WAITING_CHILD,  # Escalated to parent
-        AgentState.COMPLETED,      # Parent resolved it
-        AgentState.FAILED,
-    },
-    AgentState.REPORTING: {
-        AgentState.COMPLETED,
-        AgentState.VALIDATING,     # Report review needed
-    },
-    AgentState.COMPLETED: set(),   # Terminal
-    AgentState.FAILED: set(),      # Terminal
+# Valid state transitions (from → list of allowed to)
+TRANSITIONS: dict[AgentState, list[AgentState]] = {
+    AgentState.IDLE: [AgentState.INITIALIZING],
+    AgentState.INITIALIZING: [AgentState.PLANNING, AgentState.ERROR],
+    AgentState.PLANNING: [AgentState.RECON, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.RECON: [AgentState.ENUMERATION, AgentState.ANALYSIS, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.ENUMERATION: [AgentState.SCANNING, AgentState.ANALYSIS, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.SCANNING: [AgentState.ANALYSIS, AgentState.EXPLOITATION, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.ANALYSIS: [AgentState.EXPLOITATION, AgentState.SCANNING, AgentState.RECON, AgentState.VALIDATION, AgentState.REPORTING, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.EXPLOITATION: [AgentState.POST_EXPLOIT, AgentState.ANALYSIS, AgentState.VALIDATION, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.POST_EXPLOIT: [AgentState.ANALYSIS, AgentState.VALIDATION, AgentState.REPORTING, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.VALIDATION: [AgentState.ANALYSIS, AgentState.REPORTING, AgentState.EXPLOITATION, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.REPORTING: [AgentState.COMPLETED, AgentState.ANALYSIS, AgentState.ERROR, AgentState.PAUSED],
+    AgentState.PAUSED: [AgentState.PLANNING, AgentState.RECON, AgentState.ENUMERATION, AgentState.SCANNING, AgentState.ANALYSIS, AgentState.EXPLOITATION, AgentState.VALIDATION, AgentState.REPORTING],
+    AgentState.ERROR: [AgentState.PLANNING, AgentState.PAUSED, AgentState.COMPLETED],
+    AgentState.COMPLETED: [],
+}
+
+# Phase → recommended actions
+STATE_ACTIONS: dict[AgentState, list[str]] = {
+    AgentState.INITIALIZING: ["load_config", "verify_target", "check_scope"],
+    AgentState.PLANNING: ["decompose_task", "select_tools", "allocate_budget"],
+    AgentState.RECON: ["subdomain_enum", "dns_recon", "port_scan", "osint"],
+    AgentState.ENUMERATION: ["service_detection", "version_scan", "dir_brute", "tech_fingerprint"],
+    AgentState.SCANNING: ["vuln_scan", "web_scan", "config_audit", "ssl_check"],
+    AgentState.ANALYSIS: ["correlate_findings", "prioritize_vulns", "identify_chains"],
+    AgentState.EXPLOITATION: ["exploit_vuln", "verify_impact", "document_proof"],
+    AgentState.POST_EXPLOIT: ["pivot", "escalate_privs", "extract_data", "persistence"],
+    AgentState.VALIDATION: ["verify_finding", "reduce_fp", "cross_check"],
+    AgentState.REPORTING: ["generate_report", "summarize_findings", "risk_rating"],
 }
 
 
 @dataclass
 class StateTransition:
-    """Record of a state transition."""
-    from_state: AgentState = AgentState.INITIALIZING
-    to_state: AgentState = AgentState.INITIALIZING
+    """A state transition record."""
+    from_state: AgentState = AgentState.IDLE
+    to_state: AgentState = AgentState.IDLE
     reason: str = ""
     timestamp: float = field(default_factory=time.time)
-    duration_in_state_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "from": self.from_state.value[:8],
             "to": self.to_state.value[:8],
-            "reason": self.reason[:20],
         }
 
 
-@dataclass
-class StateContext:
-    """Context maintained per state."""
-    state: AgentState = AgentState.INITIALIZING
-    entered_at: float = field(default_factory=time.time)
-    step_count: int = 0
-    tokens_in_state: int = 0
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
 class AgentStateMachine:
-    """FSM governing agent lifecycle.
+    """Finite state machine for agent assessment lifecycle.
 
-    Manages state transitions, enforces valid
-    transition rules, maintains state history,
-    and provides state-aware context to LLM.
+    Enforces valid transitions, detects loops,
+    and provides state-based action routing.
     """
 
-    def __init__(self, agent_id: str = "") -> None:
-        self._agent_id = agent_id
-        self._current = StateContext(state=AgentState.INITIALIZING)
+    def __init__(self, max_loop_count: int = 3) -> None:
+        self._state = AgentState.IDLE
         self._history: list[StateTransition] = []
-        self._state_durations: dict[AgentState, float] = {}
-        self._state_visits: dict[AgentState, int] = {}
-        self._max_history = 100
-        self._log = logger.bind(component="state_machine", agent=agent_id)
+        self._state_counts: dict[AgentState, int] = {}
+        self._max_loop = max_loop_count
+        self._started_at = 0.0
+        self._log = logger.bind(component="fsm")
 
     @property
     def state(self) -> AgentState:
-        return self._current.state
+        return self._state
 
     @property
     def is_terminal(self) -> bool:
-        return self.state in (AgentState.COMPLETED, AgentState.FAILED)
+        return self._state in (AgentState.COMPLETED, AgentState.ERROR)
 
     def can_transition(self, target: AgentState) -> bool:
-        """Check if a transition is valid."""
-        return target in VALID_TRANSITIONS.get(self.state, set())
+        """Check if transition is valid."""
+        allowed = TRANSITIONS.get(self._state, [])
+        return target in allowed
 
-    def transition(self, target: AgentState, reason: str = "") -> bool:
+    def transition(
+        self,
+        target: AgentState,
+        reason: str = "",
+    ) -> bool:
         """Attempt a state transition."""
         if not self.can_transition(target):
             self._log.warning(
                 "invalid_transition",
-                current=self.state.value,
+                current=self._state.value,
                 target=target.value,
             )
             return False
 
-        now = time.time()
-        duration = now - self._current.entered_at
-
-        # Record transition
-        transition = StateTransition(
-            from_state=self.state,
+        record = StateTransition(
+            from_state=self._state,
             to_state=target,
             reason=reason,
-            duration_in_state_s=duration,
         )
-        self._history.append(transition)
-        if len(self._history) > self._max_history:
-            self._history.pop(0)
+        self._history.append(record)
 
-        # Track duration
-        old_state = self.state
-        self._state_durations[old_state] = (
-            self._state_durations.get(old_state, 0.0) + duration
-        )
+        # Track state visits
+        self._state_counts[target] = self._state_counts.get(target, 0) + 1
 
-        # Track visits
-        self._state_visits[target] = self._state_visits.get(target, 0) + 1
+        old = self._state
+        self._state = target
 
-        # Enter new state
-        self._current = StateContext(
-            state=target,
-            entered_at=now,
-        )
+        if old == AgentState.IDLE:
+            self._started_at = time.time()
 
         return True
 
-    def get_valid_transitions(self) -> list[AgentState]:
-        """Get all valid transitions from current state."""
-        return list(VALID_TRANSITIONS.get(self.state, set()))
+    def detect_loop(self) -> bool:
+        """Detect if the agent is in a loop."""
+        if len(self._history) < 4:
+            return False
 
-    def get_state_duration(self) -> float:
-        """Get duration in current state."""
-        return time.time() - self._current.entered_at
+        # Check for repeated state sequences
+        recent = [t.to_state for t in self._history[-6:]]
+        for state in set(recent):
+            if recent.count(state) >= self._max_loop:
+                return True
 
-    def increment_step(self, tokens: int = 0) -> None:
-        """Increment step counter in current state."""
-        self._current.step_count += 1
-        self._current.tokens_in_state += tokens
+        return False
 
-    def get_recent_path(self, n: int = 5) -> list[str]:
-        """Get recent state path."""
-        recent = self._history[-n:]
-        path = [t.from_state.value for t in recent]
-        if recent:
-            path.append(recent[-1].to_state.value)
-        return path
+    def get_loop_states(self) -> list[AgentState]:
+        """Get states involved in detected loops."""
+        if len(self._history) < 4:
+            return []
 
-    def detect_loops(self) -> list[str]:
-        """Detect state loops in recent history."""
-        path = self.get_recent_path(10)
-        loops: list[str] = []
+        recent = [t.to_state for t in self._history[-6:]]
+        return [
+            state for state in set(recent)
+            if recent.count(state) >= self._max_loop
+        ]
 
-        for window in range(2, min(5, len(path) // 2)):
-            for i in range(len(path) - window * 2 + 1):
-                pattern = path[i:i + window]
-                next_seg = path[i + window:i + window * 2]
-                if pattern == next_seg:
-                    loop_str = " → ".join(pattern)
-                    if loop_str not in loops:
-                        loops.append(loop_str)
+    def get_recommended_actions(self) -> list[str]:
+        """Get recommended actions for current state."""
+        return STATE_ACTIONS.get(self._state, [])
 
-        return loops
+    def get_allowed_transitions(self) -> list[AgentState]:
+        """Get allowed transitions from current state."""
+        return TRANSITIONS.get(self._state, [])
 
-    def build_state_prompt(self) -> str:
-        """Build state context for LLM."""
-        lines = ["## Agent State\n"]
+    def get_phase_duration(self, state: AgentState) -> float:
+        """Get total time spent in a state."""
+        total = 0.0
+        for i, record in enumerate(self._history):
+            if record.to_state == state:
+                # Time until next transition
+                if i + 1 < len(self._history):
+                    total += self._history[i + 1].timestamp - record.timestamp
+                elif self._state == state:
+                    total += time.time() - record.timestamp
 
-        lines.append(f"Current: {self.state.value}")
-        lines.append(f"Time in state: {self.get_state_duration():.1f}s")
-        lines.append(f"Steps in state: {self._current.step_count}")
+        return total
 
-        # Valid next states
-        valid = self.get_valid_transitions()
-        if valid:
-            valid_names = [s.value for s in valid]
-            lines.append(f"Valid transitions: {', '.join(valid_names)}")
+    def build_fsm_prompt(self) -> str:
+        """Build FSM context for LLM."""
+        lines = ["## Assessment State\n"]
+        lines.append(f"State: {self._state.value}")
 
-        # Recent path
-        path = self.get_recent_path(5)
-        if path:
-            lines.append(f"Recent path: {' → '.join(path)}")
+        # Duration
+        if self._started_at:
+            elapsed = time.time() - self._started_at
+            lines.append(f"Elapsed: {elapsed:.0f}s")
 
-        # Loops
-        loops = self.detect_loops()
-        if loops:
-            lines.append(f"LOOPS DETECTED: {loops[0]}")
+        # Allowed transitions
+        allowed = self.get_allowed_transitions()
+        if allowed:
+            lines.append(f"Next: {', '.join(s.value[:8] for s in allowed)}")
 
-        # Most time spent
-        if self._state_durations:
-            sorted_durations = sorted(
-                self._state_durations.items(),
-                key=lambda x: x[1],
-                reverse=True,
+        # Recommended actions
+        actions = self.get_recommended_actions()
+        if actions:
+            lines.append(f"Actions: {', '.join(actions[:4])}")
+
+        # Loop detection
+        if self.detect_loop():
+            loop_states = self.get_loop_states()
+            lines.append(
+                f"WARNING: Loop detected in {', '.join(s.value for s in loop_states)}"
             )
-            top = sorted_durations[0]
-            lines.append(f"Most time in: {top[0].value} ({top[1]:.0f}s)")
+
+        # Recent transitions
+        if self._history:
+            lines.append("\nRecent:")
+            for t in self._history[-3:]:
+                lines.append(
+                    f"  {t.from_state.value[:8]} → {t.to_state.value[:8]}"
+                )
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         return {
-            "current": self.state.value,
+            "state": self._state.value,
             "transitions": len(self._history),
-            "visits": dict(
-                (s.value, c)
-                for s, c in sorted(
-                    self._state_visits.items(),
-                    key=lambda x: x[1],
-                    reverse=True,
-                )
-            ),
-            "loops": self.detect_loops(),
+            "visits": {
+                s.value: c for s, c in self._state_counts.items()
+            },
+            "loop_detected": self.detect_loop(),
         }
