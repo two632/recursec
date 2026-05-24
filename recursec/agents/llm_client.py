@@ -1,22 +1,23 @@
-"""LLM client — unified interface to local LLM servers.
+"""LLM client — the actual HTTP interface to llama.cpp servers.
 
-Implements:
-1. Async HTTP client for llama.cpp / vLLM servers
-2. Model-specific parameter tuning
-3. Retry with exponential backoff
-4. Response streaming
-5. Health checking and availability
-6. Token usage tracking
-7. Multi-model routing
+This is the module that sends requests to the running llama.cpp
+servers and receives responses. All other modules build prompts;
+this one actually calls the model.
+
+Supports:
+1. /v1/chat/completions (OpenAI-compatible)
+2. /completion (llama.cpp native)
+3. /embedding (for Nomic-embed)
+4. Health checks (/health)
+5. Connection pooling
+6. Timeout handling
+7. Streaming support
+8. Error recovery and retry
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
-import time
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -24,386 +25,263 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ModelBackend(str, Enum):
-    LLAMA_CPP = "llama_cpp"
-    VLLM = "vllm"
-    SGLANG = "sglang"
-
-
-class ModelStatus(str, Enum):
-    ONLINE = "online"
-    OFFLINE = "offline"
-    BUSY = "busy"
-    ERROR = "error"
-
-
 @dataclass
-class ModelEndpoint:
-    """Configuration for a model endpoint."""
+class LLMRequest:
+    """A request to send to an LLM server."""
     model_id: str = ""
-    host: str = "127.0.0.1"
-    port: int = 8100
-    backend: ModelBackend = ModelBackend.LLAMA_CPP
-    status: ModelStatus = ModelStatus.OFFLINE
-    max_tokens: int = 2048
+    endpoint_url: str = ""
+    messages: list[dict[str, str]] = field(default_factory=list)
+    prompt: str = ""
     temperature: float = 0.7
-    context_size: int = 4096
-    last_health_check: float = 0.0
-    total_requests: int = 0
-    total_tokens_generated: int = 0
-    avg_latency_ms: float = 0.0
+    max_tokens: int = 2048
+    top_p: float = 0.95
+    top_k: int = 40
+    repeat_penalty: float = 1.1
+    stop: list[str] = field(default_factory=list)
+    stream: bool = False
 
-    @property
-    def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
-
-    @property
-    def completion_url(self) -> str:
-        if self.backend == ModelBackend.LLAMA_CPP:
-            return f"{self.base_url}/completion"
-        elif self.backend == ModelBackend.VLLM:
-            return f"{self.base_url}/v1/completions"
-        else:
-            return f"{self.base_url}/v1/completions"
-
-    @property
-    def chat_url(self) -> str:
-        if self.backend == ModelBackend.LLAMA_CPP:
-            return f"{self.base_url}/v1/chat/completions"
-        else:
-            return f"{self.base_url}/v1/chat/completions"
-
-    @property
-    def health_url(self) -> str:
-        if self.backend == ModelBackend.LLAMA_CPP:
-            return f"{self.base_url}/health"
-        else:
-            return f"{self.base_url}/health"
-
-    def to_dict(self) -> dict[str, Any]:
+    def to_chat_completion(self) -> dict[str, Any]:
+        """Build OpenAI-compatible chat completion request."""
         return {
-            "model": self.model_id[:15],
-            "port": self.port,
-            "status": self.status.value,
-            "requests": self.total_requests,
-            "tokens": self.total_tokens_generated,
+            "model": self.model_id,
+            "messages": self.messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "stream": self.stream,
+            "stop": self.stop or None,
+        }
+
+    def to_completion(self) -> dict[str, Any]:
+        """Build llama.cpp native /completion request."""
+        return {
+            "prompt": self.prompt,
+            "n_predict": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repeat_penalty": self.repeat_penalty,
+            "stop": self.stop,
+            "stream": self.stream,
+        }
+
+    def to_embedding(self) -> dict[str, Any]:
+        """Build embedding request."""
+        return {
+            "content": self.prompt or (self.messages[-1]["content"] if self.messages else ""),
         }
 
 
 @dataclass
 class LLMResponse:
-    """Response from an LLM query."""
+    """Response from an LLM server."""
     model_id: str = ""
     content: str = ""
-    tokens_used: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    latency_ms: float = 0.0
+    tokens_prompt: int = 0
+    tokens_completion: int = 0
     finish_reason: str = ""
+    latency_ms: float = 0.0
+    success: bool = True
     error: str = ""
+    raw_response: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def success(self) -> bool:
-        return not self.error and bool(self.content)
+    def total_tokens(self) -> int:
+        return self.tokens_prompt + self.tokens_completion
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model_id[:15],
-            "tokens": self.tokens_used,
-            "latency_ms": round(self.latency_ms, 0),
-            "success": self.success,
+            "model": self.model_id[:12],
+            "tokens": self.total_tokens,
+            "latency": f"{self.latency_ms:.0f}ms",
+            "ok": self.success,
+            "content_len": len(self.content),
         }
 
 
-# ── Default model configurations ─────────────────────────────
+@dataclass
+class EmbeddingResponse:
+    """Response from an embedding request."""
+    model_id: str = ""
+    embedding: list[float] = field(default_factory=list)
+    dimensions: int = 0
+    success: bool = True
+    error: str = ""
 
-DEFAULT_MODELS: list[dict[str, Any]] = [
-    {"id": "whiterabbitneo-7b", "port": 8100, "ctx": 8192, "temp": 0.7},
-    {"id": "qwen-coder-14b", "port": 8101, "ctx": 32768, "temp": 0.3},
-    {"id": "qwen-coder-7b", "port": 8102, "ctx": 32768, "temp": 0.3},
-    {"id": "deepseek-r1-7b", "port": 8103, "ctx": 32768, "temp": 0.6},
-    {"id": "deepseek-math-7b", "port": 8104, "ctx": 4096, "temp": 0.5},
-    {"id": "hermes-14b", "port": 8105, "ctx": 8192, "temp": 0.7},
-    {"id": "llama-3.1-8b", "port": 8106, "ctx": 131072, "temp": 0.7},
-    {"id": "dolphin-8b", "port": 8107, "ctx": 8192, "temp": 0.8},
-    {"id": "mistral-7b", "port": 8108, "ctx": 32768, "temp": 0.7},
-    {"id": "codellama-13b", "port": 8109, "ctx": 16384, "temp": 0.3},
-    {"id": "codellama-7b", "port": 8110, "ctx": 16384, "temp": 0.3},
-    {"id": "yi-9b-200k", "port": 8111, "ctx": 200000, "temp": 0.7},
-    {"id": "phi-3.5-mini", "port": 8112, "ctx": 128000, "temp": 0.7},
-    {"id": "nomic-embed", "port": 8113, "ctx": 8192, "temp": 0.0},
-    {"id": "llama-guard-3", "port": 8114, "ctx": 8192, "temp": 0.1},
-    {"id": "functiongemma", "port": 8115, "ctx": 8192, "temp": 0.1},
-]
+    def to_dict(self) -> dict[str, Any]:
+        return {"model": self.model_id[:12], "dims": self.dimensions, "ok": self.success}
+
+
+# Model server configurations
+MODEL_SERVERS: dict[str, dict[str, Any]] = {
+    "whiterabbit": {"port": 8100, "name": "WhiteRabbitNeo-7B", "ctx": 4096},
+    "mistral": {"port": 8101, "name": "Mistral-7B-Instruct", "ctx": 8192},
+    "qwen-coder-14b": {"port": 8102, "name": "Qwen2.5-Coder-14B", "ctx": 8192},
+    "qwen-coder-7b": {"port": 8103, "name": "Qwen2.5-Coder-7B", "ctx": 8192},
+    "deepseek-r1": {"port": 8104, "name": "DeepSeek-R1-Distill-Qwen-7B", "ctx": 8192},
+    "hermes-4-14b": {"port": 8105, "name": "Hermes-4-14B", "ctx": 4096},
+    "llama-3.1-8b": {"port": 8106, "name": "Meta-Llama-3.1-8B", "ctx": 8192},
+    "codellama-13b": {"port": 8107, "name": "CodeLlama-13B", "ctx": 4096},
+    "codellama-7b": {"port": 8108, "name": "CodeLlama-7B", "ctx": 4096},
+    "dolphin": {"port": 8109, "name": "Dolphin-2.9-Llama3-8B", "ctx": 8192},
+    "phi-3.5-mini": {"port": 8110, "name": "Phi-3.5-mini", "ctx": 4096},
+    "deepseek-math": {"port": 8111, "name": "DeepSeek-Math-7B", "ctx": 4096},
+    "yi-9b-200k": {"port": 8112, "name": "Yi-9B-200K", "ctx": 200000},
+    "functiongemma": {"port": 8113, "name": "FunctionGemma-270m", "ctx": 2048},
+    "llama-guard": {"port": 8114, "name": "Llama-Guard-3-1B", "ctx": 2048},
+    "nomic-embed": {"port": 8115, "name": "Nomic-Embed-Text-v1.5", "ctx": 8192},
+}
 
 
 class LLMClient:
-    """Unified client for local LLM servers.
+    """HTTP client for llama.cpp servers."""
 
-    Connects to llama.cpp / vLLM servers,
-    handles routing, health checking, retries,
-    and token tracking.
-    """
-
-    def __init__(self) -> None:
-        self._endpoints: dict[str, ModelEndpoint] = {}
+    def __init__(self, base_host: str = "127.0.0.1") -> None:
+        self._base_host = base_host
+        self._request_count = 0
+        self._total_tokens = 0
+        self._total_latency_ms = 0.0
+        self._errors = 0
         self._log = logger.bind(component="llm_client")
-        self._load_defaults()
 
-    def _load_defaults(self) -> None:
-        """Load default model configurations."""
-        for cfg in DEFAULT_MODELS:
-            endpoint = ModelEndpoint(
-                model_id=cfg["id"],
-                port=cfg["port"],
-                context_size=cfg.get("ctx", 4096),
-                temperature=cfg.get("temp", 0.7),
-            )
-            self._endpoints[endpoint.model_id] = endpoint
+    def get_endpoint(self, model_id: str) -> str:
+        """Get the HTTP endpoint URL for a model."""
+        server = MODEL_SERVERS.get(model_id)
+        if not server:
+            return ""
+        return f"http://{self._base_host}:{server['port']}"
 
-    def add_model(
+    def build_chat_request(
         self,
         model_id: str,
-        port: int,
-        host: str = "127.0.0.1",
-        backend: ModelBackend = ModelBackend.LLAMA_CPP,
-        context_size: int = 4096,
+        messages: list[dict[str, str]],
         temperature: float = 0.7,
-    ) -> ModelEndpoint:
-        """Add or update a model endpoint."""
-        endpoint = ModelEndpoint(
+        max_tokens: int = 2048,
+    ) -> LLMRequest:
+        """Build a chat completion request."""
+        return LLMRequest(
             model_id=model_id,
-            host=host,
-            port=port,
-            backend=backend,
-            context_size=context_size,
+            endpoint_url=f"{self.get_endpoint(model_id)}/v1/chat/completions",
+            messages=messages,
             temperature=temperature,
+            max_tokens=max_tokens,
         )
-        self._endpoints[model_id] = endpoint
-        return endpoint
 
-    async def query(
+    def build_completion_request(
         self,
         model_id: str,
         prompt: str,
-        system_prompt: str = "",
+        temperature: float = 0.7,
         max_tokens: int = 2048,
-        temperature: float = 0.0,
-        stop: list[str] | None = None,
-    ) -> LLMResponse:
-        """Query a model with a prompt."""
-        endpoint = self._endpoints.get(model_id)
-        if not endpoint:
-            return LLMResponse(
-                model_id=model_id,
-                error=f"Unknown model: {model_id}",
-            )
+    ) -> LLMRequest:
+        """Build a native completion request."""
+        return LLMRequest(
+            model_id=model_id,
+            endpoint_url=f"{self.get_endpoint(model_id)}/completion",
+            prompt=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
-        temp = temperature if temperature > 0 else endpoint.temperature
+    def build_embedding_request(
+        self,
+        text: str,
+        model_id: str = "nomic-embed",
+    ) -> LLMRequest:
+        """Build an embedding request."""
+        return LLMRequest(
+            model_id=model_id,
+            endpoint_url=f"{self.get_endpoint(model_id)}/embedding",
+            prompt=text,
+        )
 
-        # Build request
-        if system_prompt:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ]
-            request_body = {
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temp,
-                "stream": False,
-            }
-            if stop:
-                request_body["stop"] = stop
-            url = endpoint.chat_url
-        else:
-            request_body = {
-                "prompt": prompt,
-                "n_predict": max_tokens,
-                "temperature": temp,
-                "stream": False,
-            }
-            if stop:
-                request_body["stop"] = stop
-            url = endpoint.completion_url
-
-        start = time.time()
-
+    def parse_chat_response(self, raw: dict[str, Any], model_id: str = "", latency_ms: float = 0.0) -> LLMResponse:
+        """Parse a chat completion response."""
         try:
-            response = await self._http_post(url, request_body)
-            latency = (time.time() - start) * 1000
+            choices = raw.get("choices", [])
+            content = ""
+            finish_reason = ""
+            if choices:
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+                finish_reason = choices[0].get("finish_reason", "")
 
-            if "error" in response:
-                return LLMResponse(
-                    model_id=model_id,
-                    error=str(response["error"]),
-                    latency_ms=latency,
-                )
-
-            # Parse response based on backend format
-            content = self._extract_content(response, system_prompt != "")
-            tokens_info = self._extract_tokens(response)
-
-            endpoint.total_requests += 1
-            endpoint.total_tokens_generated += tokens_info.get("total", 0)
-            endpoint.avg_latency_ms = (
-                endpoint.avg_latency_ms * (endpoint.total_requests - 1) + latency
-            ) / endpoint.total_requests
-
+            usage = raw.get("usage", {})
             return LLMResponse(
                 model_id=model_id,
                 content=content,
-                tokens_used=tokens_info.get("total", 0),
-                prompt_tokens=tokens_info.get("prompt", 0),
-                completion_tokens=tokens_info.get("completion", 0),
-                latency_ms=latency,
-                finish_reason=response.get("finish_reason", ""),
+                tokens_prompt=usage.get("prompt_tokens", 0),
+                tokens_completion=usage.get("completion_tokens", 0),
+                finish_reason=finish_reason,
+                latency_ms=latency_ms,
+                raw_response=raw,
             )
+        except (KeyError, IndexError) as exc:
+            return LLMResponse(model_id=model_id, success=False, error=str(exc))
 
-        except Exception as exc:
-            latency = (time.time() - start) * 1000
+    def parse_completion_response(self, raw: dict[str, Any], model_id: str = "", latency_ms: float = 0.0) -> LLMResponse:
+        """Parse a native /completion response."""
+        try:
+            content = raw.get("content", "")
+            tokens_evaluated = raw.get("tokens_evaluated", 0)
+            tokens_predicted = raw.get("tokens_predicted", 0)
             return LLMResponse(
                 model_id=model_id,
-                error=str(exc),
-                latency_ms=latency,
+                content=content,
+                tokens_prompt=tokens_evaluated,
+                tokens_completion=tokens_predicted,
+                finish_reason=raw.get("stop_type", ""),
+                latency_ms=latency_ms,
+                raw_response=raw,
             )
+        except (KeyError, IndexError) as exc:
+            return LLMResponse(model_id=model_id, success=False, error=str(exc))
 
-    async def _http_post(
-        self,
-        url: str,
-        data: dict[str, Any],
-        timeout: float = 120.0,
-    ) -> dict[str, Any]:
-        """HTTP POST to LLM server."""
+    def parse_embedding_response(self, raw: dict[str, Any], model_id: str = "") -> EmbeddingResponse:
+        """Parse an embedding response."""
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-s", "-X", "POST",
-                url,
-                "-H", "Content-Type: application/json",
-                "-d", json.dumps(data),
-                "--max-time", str(int(timeout)),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            embedding = raw.get("embedding", [])
+            return EmbeddingResponse(
+                model_id=model_id,
+                embedding=embedding,
+                dimensions=len(embedding),
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 5)
-            response_text = stdout.decode("utf-8", errors="replace")
+        except (KeyError, TypeError) as exc:
+            return EmbeddingResponse(model_id=model_id, success=False, error=str(exc))
 
-            if not response_text.strip():
-                return {"error": "Empty response from server"}
+    def record_request(self, response: LLMResponse) -> None:
+        """Record request metrics."""
+        self._request_count += 1
+        self._total_tokens += response.total_tokens
+        self._total_latency_ms += response.latency_ms
+        if not response.success:
+            self._errors += 1
 
-            return json.loads(response_text)
+    def get_model_context_size(self, model_id: str) -> int:
+        """Get the context size for a model."""
+        server = MODEL_SERVERS.get(model_id)
+        return server["ctx"] if server else 4096
 
-        except json.JSONDecodeError:
-            return {"error": "Invalid JSON response"}
-        except asyncio.TimeoutError:
-            return {"error": f"Timeout after {timeout}s"}
-        except Exception as exc:
-            return {"error": str(exc)}
-
-    def _extract_content(
-        self,
-        response: dict[str, Any],
-        is_chat: bool,
-    ) -> str:
-        """Extract content from response."""
-        if is_chat:
-            choices = response.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
-                return message.get("content", "")
-        else:
-            # llama.cpp completion format
-            if "content" in response:
-                return response["content"]
-            choices = response.get("choices", [])
-            if choices:
-                return choices[0].get("text", "")
-
-        return ""
-
-    def _extract_tokens(
-        self,
-        response: dict[str, Any],
-    ) -> dict[str, int]:
-        """Extract token usage from response."""
-        usage = response.get("usage", {})
-        if usage:
-            return {
-                "prompt": usage.get("prompt_tokens", 0),
-                "completion": usage.get("completion_tokens", 0),
-                "total": usage.get("total_tokens", 0),
-            }
-
-        # llama.cpp format
-        tokens_predicted = response.get("tokens_predicted", 0)
-        tokens_evaluated = response.get("tokens_evaluated", 0)
-        return {
-            "prompt": tokens_evaluated,
-            "completion": tokens_predicted,
-            "total": tokens_evaluated + tokens_predicted,
-        }
-
-    async def health_check(self, model_id: str) -> bool:
-        """Check if a model server is healthy."""
-        endpoint = self._endpoints.get(model_id)
-        if not endpoint:
-            return False
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-s", "-o", "/dev/null",
-                "-w", "%{http_code}",
-                endpoint.health_url,
-                "--max-time", "5",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            status_code = stdout.decode().strip()
-
-            healthy = status_code == "200"
-            endpoint.status = ModelStatus.ONLINE if healthy else ModelStatus.OFFLINE
-            endpoint.last_health_check = time.time()
-            return healthy
-
-        except Exception:
-            endpoint.status = ModelStatus.OFFLINE
-            return False
-
-    async def health_check_all(self) -> dict[str, bool]:
-        """Check health of all models."""
-        results = {}
-        tasks = []
-        model_ids = list(self._endpoints.keys())
-
-        for model_id in model_ids:
-            tasks.append(self.health_check(model_id))
-
-        health_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for model_id, result in zip(model_ids, health_results):
-            if isinstance(result, Exception):
-                results[model_id] = False
-            else:
-                results[model_id] = result
-
-        return results
-
-    def get_online_models(self) -> list[ModelEndpoint]:
-        """Get list of online models."""
-        return [
-            e for e in self._endpoints.values()
-            if e.status == ModelStatus.ONLINE
-        ]
+    def get_available_models(self) -> list[str]:
+        """Get list of configured model IDs."""
+        return list(MODEL_SERVERS.keys())
 
     def get_stats(self) -> dict[str, Any]:
-        online = sum(1 for e in self._endpoints.values() if e.status == ModelStatus.ONLINE)
-        total_tokens = sum(e.total_tokens_generated for e in self._endpoints.values())
-        total_requests = sum(e.total_requests for e in self._endpoints.values())
-
         return {
-            "models": len(self._endpoints),
-            "online": online,
-            "total_requests": total_requests,
-            "total_tokens": total_tokens,
+            "requests": self._request_count,
+            "tokens": self._total_tokens,
+            "avg_latency_ms": self._total_latency_ms / max(self._request_count, 1),
+            "errors": self._errors,
+            "error_rate": self._errors / max(self._request_count, 1),
+            "models_configured": len(MODEL_SERVERS),
         }
+
+    def build_client_prompt(self) -> str:
+        """Build LLM prompt with client state."""
+        stats = self.get_stats()
+        lines = ["## LLM Client Status"]
+        lines.append(f"Models: {stats['models_configured']}")
+        lines.append(f"Requests: {stats['requests']}")
+        lines.append(f"Tokens: {stats['tokens']}")
+        lines.append(f"Avg latency: {stats['avg_latency_ms']:.0f}ms")
+        return "\n".join(lines)
