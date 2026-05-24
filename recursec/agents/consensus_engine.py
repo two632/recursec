@@ -1,13 +1,13 @@
-"""Consensus engine — multi-model voting and debate for finding validation.
+"""Consensus engine — multi-model voting on findings.
 
 Implements:
-1. Multi-model voting on findings (majority vote)
-2. Weighted voting based on model expertise
-3. Debate protocol (argue/counter/synthesize)
-4. Confidence aggregation across models
-5. Disagreement resolution strategies
-6. Validation quorum requirements
-7. Finding deduplication via consensus
+1. Finding validation via multiple model opinions
+2. Weighted voting (model expertise matters)
+3. Confidence aggregation across models
+4. Disagreement resolution protocols
+5. False positive filtering
+6. Severity consensus
+7. Consensus prompt for LLM
 """
 
 from __future__ import annotations
@@ -23,84 +23,60 @@ logger = structlog.get_logger()
 
 
 class VoteType(str, Enum):
-    VALID = "valid"
-    INVALID = "invalid"
-    UNCERTAIN = "uncertain"
-    NEEDS_MORE_INFO = "needs_more_info"
-
-
-class DebatePhase(str, Enum):
-    INITIAL_ASSESSMENT = "initial_assessment"
-    ARGUMENT = "argument"
-    COUNTER_ARGUMENT = "counter_argument"
-    REBUTTAL = "rebuttal"
-    SYNTHESIS = "synthesis"
-    VERDICT = "verdict"
+    CONFIRM = "confirm"        # Finding is valid
+    REJECT = "reject"          # Finding is false positive
+    UNCERTAIN = "uncertain"    # Not enough info
+    ESCALATE = "escalate"      # Needs human review
 
 
 class ConsensusStatus(str, Enum):
-    PENDING = "pending"
-    VOTING = "voting"
-    DEBATING = "debating"
-    CONSENSUS_REACHED = "consensus_reached"
-    NO_CONSENSUS = "no_consensus"
-    ESCALATED = "escalated"
+    PENDING = "pending"        # Not enough votes
+    CONFIRMED = "confirmed"    # Consensus: valid
+    REJECTED = "rejected"      # Consensus: false positive
+    DISPUTED = "disputed"      # No consensus
+    ESCALATED = "escalated"    # Sent for review
 
 
 @dataclass
 class Vote:
-    """A model's vote on a finding."""
-    voter_id: str = ""         # Model or agent ID
-    model_name: str = ""
-    vote: VoteType = VoteType.UNCERTAIN
+    """A single model's vote on a finding."""
+    model_id: str = ""
+    vote_type: VoteType = VoteType.UNCERTAIN
     confidence: float = 0.5
     reasoning: str = ""
-    weight: float = 1.0        # Expertise-based weight
+    severity_opinion: str = ""    # Model's severity assessment
+    weight: float = 1.0           # Model expertise weight
     timestamp: float = field(default_factory=time.time)
+
+    @property
+    def weighted_score(self) -> float:
+        base = {
+            VoteType.CONFIRM: 1.0,
+            VoteType.REJECT: -1.0,
+            VoteType.UNCERTAIN: 0.0,
+            VoteType.ESCALATE: 0.5,
+        }[self.vote_type]
+        return base * self.confidence * self.weight
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "voter": self.voter_id[:10],
-            "model": self.model_name[:12],
-            "vote": self.vote.value,
+            "model": self.model_id[:10],
+            "vote": self.vote_type.value[:6],
             "conf": round(self.confidence, 2),
-            "weight": round(self.weight, 2),
+            "sev": self.severity_opinion[:8],
         }
 
 
 @dataclass
-class DebateEntry:
-    """An entry in a debate."""
-    entry_id: str = ""
-    phase: DebatePhase = DebatePhase.INITIAL_ASSESSMENT
-    model_name: str = ""
-    position: str = ""        # valid/invalid
-    argument: str = ""
-    evidence: list[str] = field(default_factory=list)
-    timestamp: float = field(default_factory=time.time)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "phase": self.phase.value,
-            "model": self.model_name[:12],
-            "position": self.position[:10],
-        }
-
-
-@dataclass
-class ConsensusSession:
-    """A consensus session for a finding."""
-    session_id: str = ""
+class FindingConsensus:
+    """Consensus result for a finding."""
     finding_id: str = ""
-    finding_description: str = ""
-    status: ConsensusStatus = ConsensusStatus.PENDING
+    finding_type: str = ""
+    finding_detail: str = ""
     votes: list[Vote] = field(default_factory=list)
-    debate_entries: list[DebateEntry] = field(default_factory=list)
-    quorum: int = 3          # Minimum votes needed
-    threshold: float = 0.66  # Fraction needed for consensus
-    final_verdict: str = ""
+    status: ConsensusStatus = ConsensusStatus.PENDING
+    final_severity: str = ""
     final_confidence: float = 0.0
-    created_at: float = field(default_factory=time.time)
     resolved_at: float = 0.0
 
     @property
@@ -108,230 +84,216 @@ class ConsensusSession:
         return len(self.votes)
 
     @property
-    def has_quorum(self) -> bool:
-        return self.vote_count >= self.quorum
-
-    @property
-    def valid_votes(self) -> int:
-        return sum(1 for v in self.votes if v.vote == VoteType.VALID)
-
-    @property
-    def invalid_votes(self) -> int:
-        return sum(1 for v in self.votes if v.vote == VoteType.INVALID)
-
-    @property
-    def weighted_valid_score(self) -> float:
-        total_weight = sum(v.weight for v in self.votes)
-        if total_weight == 0:
-            return 0
-        valid_weight = sum(v.weight * v.confidence for v in self.votes if v.vote == VoteType.VALID)
-        return valid_weight / total_weight
+    def confirm_ratio(self) -> float:
+        if not self.votes:
+            return 0.0
+        confirms = sum(1 for v in self.votes if v.vote_type == VoteType.CONFIRM)
+        return confirms / len(self.votes)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.session_id[:10],
-            "finding": self.finding_description[:25],
-            "status": self.status.value,
-            "votes": f"{self.valid_votes}v/{self.invalid_votes}i/{self.vote_count}t",
-            "score": round(self.weighted_valid_score, 2),
-            "verdict": self.final_verdict[:15],
+            "id": self.finding_id[:10],
+            "type": self.finding_type[:12],
+            "status": self.status.value[:8],
+            "votes": self.vote_count,
+            "confirm%": f"{self.confirm_ratio:.0%}",
         }
 
 
 # ── Model expertise weights ──────────────────────────────────
 
-MODEL_WEIGHTS: dict[str, dict[str, float]] = {
-    "whiterabbitneo-7b": {"security": 2.0, "exploit": 2.0, "default": 1.0},
-    "qwen-coder-14b": {"code": 2.0, "vuln_analysis": 1.5, "default": 1.0},
-    "qwen-coder-7b": {"code": 1.8, "default": 0.9},
-    "deepseek-r1-7b": {"reasoning": 2.0, "analysis": 1.8, "default": 1.0},
-    "hermes-14b": {"general": 1.5, "reasoning": 1.3, "default": 1.0},
-    "codellama-13b": {"code": 1.8, "default": 0.8},
-    "dolphin-8b": {"security": 1.3, "default": 1.0},
-    "mistral-7b": {"general": 1.2, "default": 1.0},
-    "llama-3.1-8b": {"general": 1.2, "default": 1.0},
+MODEL_EXPERTISE: dict[str, dict[str, float]] = {
+    "WhiteRabbitNeo": {"security": 2.0, "exploit": 2.0, "web": 1.8, "network": 1.8},
+    "Qwen2.5-Coder-14B": {"code": 2.0, "web": 1.5, "api": 1.5},
+    "Qwen2.5-Coder-7B": {"code": 1.8, "web": 1.3},
+    "DeepSeek-R1": {"reasoning": 2.0, "analysis": 1.8, "general": 1.5},
+    "CodeLlama-13B": {"code": 1.8, "binary": 1.3},
+    "CodeLlama-7B": {"code": 1.5},
+    "Yi-9B-200K": {"analysis": 1.5, "general": 1.3},
+    "Hermes-4": {"general": 1.5, "reasoning": 1.3},
+    "Llama-3.1-8B": {"general": 1.3},
+    "Dolphin-2.9": {"general": 1.3, "security": 1.2},
+    "Mistral-7B": {"general": 1.3, "fast": 1.5},
+    "Phi-3.5-mini": {"fast": 1.5, "general": 1.0},
+    "DeepSeek-Math": {"analysis": 1.5, "crypto": 1.5},
 }
 
 
 class ConsensusEngine:
-    """Multi-model consensus engine for finding validation.
+    """Multi-model consensus on security findings.
 
-    Multiple models vote on whether a finding is
-    valid. Supports weighted voting, quorum, and
-    structured debate for disagreements.
+    Collects votes from multiple models, weights them
+    by expertise, and determines finding validity.
     """
 
     def __init__(
         self,
-        quorum: int = 3,
-        threshold: float = 0.66,
+        min_votes: int = 3,
+        confirm_threshold: float = 0.6,
+        reject_threshold: float = 0.6,
     ) -> None:
-        self._sessions: dict[str, ConsensusSession] = {}
-        self._quorum = quorum
-        self._threshold = threshold
+        self._findings: dict[str, FindingConsensus] = {}
+        self._min_votes = min_votes
+        self._confirm_threshold = confirm_threshold
+        self._reject_threshold = reject_threshold
         self._counter = 0
-        self._log = logger.bind(component="consensus_engine")
+        self._log = logger.bind(component="consensus")
 
-    def create_session(
+    def submit_finding(
         self,
-        finding_id: str,
-        finding_description: str,
-    ) -> ConsensusSession:
-        """Create a new consensus session."""
+        finding_type: str,
+        finding_detail: str,
+    ) -> FindingConsensus:
+        """Submit a finding for consensus."""
         self._counter += 1
-        session = ConsensusSession(
-            session_id=f"cons-{self._counter}",
-            finding_id=finding_id,
-            finding_description=finding_description,
-            status=ConsensusStatus.VOTING,
-            quorum=self._quorum,
-            threshold=self._threshold,
+        finding = FindingConsensus(
+            finding_id=f"finding-{self._counter}",
+            finding_type=finding_type,
+            finding_detail=finding_detail,
         )
-        self._sessions[session.session_id] = session
-        return session
+        self._findings[finding.finding_id] = finding
+        return finding
 
     def cast_vote(
         self,
-        session_id: str,
-        voter_id: str,
-        model_name: str,
-        vote: VoteType,
+        finding_id: str,
+        model_id: str,
+        vote_type: VoteType,
         confidence: float = 0.5,
         reasoning: str = "",
-        domain: str = "default",
+        severity_opinion: str = "",
     ) -> Vote | None:
-        """Cast a vote in a session."""
-        session = self._sessions.get(session_id)
-        if not session:
+        """Cast a vote on a finding."""
+        finding = self._findings.get(finding_id)
+        if not finding:
             return None
 
-        # Calculate weight from model expertise
-        model_weights = MODEL_WEIGHTS.get(model_name, {"default": 1.0})
-        weight = model_weights.get(domain, model_weights.get("default", 1.0))
+        # Determine weight from model expertise
+        weight = 1.0
+        for model_name, expertise in MODEL_EXPERTISE.items():
+            if model_name.lower() in model_id.lower():
+                domain = finding.finding_type.split("_")[0] if "_" in finding.finding_type else finding.finding_type
+                weight = expertise.get(domain, expertise.get("general", 1.0))
+                break
 
-        v = Vote(
-            voter_id=voter_id,
-            model_name=model_name,
-            vote=vote,
+        vote = Vote(
+            model_id=model_id,
+            vote_type=vote_type,
             confidence=confidence,
             reasoning=reasoning,
+            severity_opinion=severity_opinion,
             weight=weight,
         )
-        session.votes.append(v)
+        finding.votes.append(vote)
 
-        # Check for consensus after each vote
-        if session.has_quorum:
-            self._check_consensus(session)
+        # Try to resolve
+        if finding.vote_count >= self._min_votes:
+            self._resolve(finding)
 
-        return v
+        return vote
 
-    def add_debate_entry(
-        self,
-        session_id: str,
-        phase: DebatePhase,
-        model_name: str,
-        position: str,
-        argument: str,
-        evidence: list[str] | None = None,
-    ) -> DebateEntry | None:
-        """Add a debate entry."""
-        session = self._sessions.get(session_id)
-        if not session:
-            return None
+    def _resolve(self, finding: FindingConsensus) -> None:
+        """Try to resolve consensus."""
+        if finding.status != ConsensusStatus.PENDING:
+            return
 
-        self._counter += 1
-        entry = DebateEntry(
-            entry_id=f"debate-{self._counter}",
-            phase=phase,
-            model_name=model_name,
-            position=position,
-            argument=argument,
-            evidence=evidence or [],
+        # Weighted voting
+        total_weight = sum(v.weight for v in finding.votes)
+        confirm_weight = sum(
+            v.weight for v in finding.votes
+            if v.vote_type == VoteType.CONFIRM
         )
-        session.debate_entries.append(entry)
-        session.status = ConsensusStatus.DEBATING
-        return entry
+        reject_weight = sum(
+            v.weight for v in finding.votes
+            if v.vote_type == VoteType.REJECT
+        )
 
-    def force_verdict(
-        self,
-        session_id: str,
-        verdict: str,
-        confidence: float = 0.5,
-    ) -> bool:
-        """Force a verdict when no consensus can be reached."""
-        session = self._sessions.get(session_id)
-        if not session:
-            return False
+        confirm_ratio = confirm_weight / total_weight if total_weight > 0 else 0
+        reject_ratio = reject_weight / total_weight if total_weight > 0 else 0
 
-        session.final_verdict = verdict
-        session.final_confidence = confidence
-        session.status = ConsensusStatus.ESCALATED
-        session.resolved_at = time.time()
-        return True
+        if confirm_ratio >= self._confirm_threshold:
+            finding.status = ConsensusStatus.CONFIRMED
+            # Average confidence of confirming votes
+            conf_votes = [v for v in finding.votes if v.vote_type == VoteType.CONFIRM]
+            finding.final_confidence = sum(v.confidence for v in conf_votes) / len(conf_votes)
+            # Severity: most common opinion
+            self._resolve_severity(finding)
+        elif reject_ratio >= self._reject_threshold:
+            finding.status = ConsensusStatus.REJECTED
+            finding.final_confidence = 0.0
+        else:
+            # Check for escalation
+            escalate_count = sum(1 for v in finding.votes if v.vote_type == VoteType.ESCALATE)
+            if escalate_count >= 2:
+                finding.status = ConsensusStatus.ESCALATED
+            else:
+                finding.status = ConsensusStatus.DISPUTED
 
-    def get_active_sessions(self) -> list[ConsensusSession]:
-        """Get sessions still awaiting consensus."""
+        finding.resolved_at = time.time()
+
+    def _resolve_severity(self, finding: FindingConsensus) -> None:
+        """Resolve severity from votes."""
+        severities: dict[str, float] = {}
+        for vote in finding.votes:
+            if vote.severity_opinion and vote.vote_type == VoteType.CONFIRM:
+                sev = vote.severity_opinion.lower()
+                severities[sev] = severities.get(sev, 0) + vote.weight
+
+        if severities:
+            finding.final_severity = max(severities, key=severities.get)  # type: ignore[arg-type]
+
+    def get_confirmed(self) -> list[FindingConsensus]:
+        """Get all confirmed findings."""
         return [
-            s for s in self._sessions.values()
-            if s.status in (ConsensusStatus.PENDING, ConsensusStatus.VOTING, ConsensusStatus.DEBATING)
+            f for f in self._findings.values()
+            if f.status == ConsensusStatus.CONFIRMED
         ]
 
-    def get_validated_findings(self) -> list[ConsensusSession]:
-        """Get sessions with validated findings."""
+    def get_disputed(self) -> list[FindingConsensus]:
+        """Get disputed findings needing resolution."""
         return [
-            s for s in self._sessions.values()
-            if s.status == ConsensusStatus.CONSENSUS_REACHED
-            and s.final_verdict == "valid"
+            f for f in self._findings.values()
+            if f.status == ConsensusStatus.DISPUTED
         ]
 
-    def build_consensus_prompt(self, max_sessions: int = 5) -> str:
+    def build_consensus_prompt(self) -> str:
         """Build consensus context for LLM."""
-        lines = ["## Consensus Status\n"]
+        lines = ["## Finding Consensus\n"]
 
-        active = self.get_active_sessions()
-        if active:
-            lines.append(f"Active sessions: {len(active)}")
-            for s in active[:max_sessions]:
+        status_counts: dict[str, int] = {}
+        for f in self._findings.values():
+            s = f.status.value
+            status_counts[s] = status_counts.get(s, 0) + 1
+
+        lines.append(
+            f"Findings: {len(self._findings)} | "
+            f"Confirmed: {status_counts.get('confirmed', 0)} | "
+            f"Rejected: {status_counts.get('rejected', 0)} | "
+            f"Disputed: {status_counts.get('disputed', 0)}"
+        )
+
+        # Recent confirmed findings
+        confirmed = self.get_confirmed()
+        if confirmed:
+            lines.append("\nConfirmed findings:")
+            for f in confirmed[-3:]:
                 lines.append(
-                    f"  [{s.session_id[:8]}] {s.finding_description[:30]} "
-                    f"votes={s.valid_votes}v/{s.invalid_votes}i score={s.weighted_valid_score:.2f}"
+                    f"  {f.finding_type[:15]} — "
+                    f"sev={f.final_severity[:8]} "
+                    f"conf={f.final_confidence:.0%} "
+                    f"({f.vote_count} votes)"
                 )
-
-        validated = self.get_validated_findings()
-        if validated:
-            lines.append(f"\nValidated findings: {len(validated)}")
 
         return "\n".join(lines)
 
-    def _check_consensus(self, session: ConsensusSession) -> None:
-        """Check if consensus has been reached."""
-        score = session.weighted_valid_score
-
-        if score >= session.threshold:
-            session.status = ConsensusStatus.CONSENSUS_REACHED
-            session.final_verdict = "valid"
-            session.final_confidence = score
-            session.resolved_at = time.time()
-        elif (1 - score) >= session.threshold:
-            session.status = ConsensusStatus.CONSENSUS_REACHED
-            session.final_verdict = "invalid"
-            session.final_confidence = 1 - score
-            session.resolved_at = time.time()
-        elif session.vote_count >= session.quorum + 2:
-            # Extended voting, still no consensus
-            session.status = ConsensusStatus.NO_CONSENSUS
-
     def get_stats(self) -> dict[str, Any]:
         status_counts: dict[str, int] = {}
-        for s in self._sessions.values():
-            status_counts[s.status.value] = status_counts.get(s.status.value, 0) + 1
+        for f in self._findings.values():
+            s = f.status.value
+            status_counts[s] = status_counts.get(s, 0) + 1
 
         return {
-            "sessions": len(self._sessions),
+            "total_findings": len(self._findings),
             "by_status": status_counts,
-            "validated": len(self.get_validated_findings()),
-            "avg_votes": (
-                sum(s.vote_count for s in self._sessions.values()) / len(self._sessions)
-                if self._sessions else 0
-            ),
+            "total_votes": sum(f.vote_count for f in self._findings.values()),
         }
