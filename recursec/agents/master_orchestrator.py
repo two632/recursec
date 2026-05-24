@@ -1,30 +1,27 @@
-"""Master orchestrator — the central brain that coordinates all subsystems.
+"""Master orchestrator — ties all agent brain modules together.
 
-This is the top-level agent that:
-1. Receives a target and goal from the user
-2. Analyzes the target (target_analyzer)
-3. Creates a threat model (threat_modeler)
-4. Generates hypotheses (hypothesis_engine)
-5. Plans the assessment (task_planner, workflow_engine)
-6. Manages the state machine
-7. Spawns recursive agents (recursive_spawner)
-8. Executes tools (tool_executor)
-9. Validates findings (adversarial_validator, model_debate)
-10. Enriches findings (vuln_intelligence)
-11. Generates reports (report_formatter)
-12. Learns from the assessment (meta_learning, learning_system)
-13. Manages checkpoints (checkpoint)
-14. Publishes events (event_bus)
-15. Manages scope (scope_manager)
-16. Monitors convergence (convergence_monitor)
-
-This is the agent that the user interacts with.
+Central integration point that wires:
+1. State machine → controls assessment flow
+2. Recursive planner → task decomposition
+3. Prompt assembler → KB selection for LLM
+4. Token budget → context window management
+5. Chain-of-thought → structured reasoning
+6. Model ensemble → multi-model coordination
+7. Reward signals → learning feedback
+8. Convergence → stopping criteria
+9. Self-healing → error recovery
+10. Collaboration → inter-agent sharing
+11. Target profiler → target intelligence
+12. Experience replay → learning from past
+13. Delegation → child agent spawning
+14. Tool effectiveness → tool selection
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -32,454 +29,324 @@ import structlog
 logger = structlog.get_logger()
 
 
+class OrchestratorMode(str, Enum):
+    SINGLE_AGENT = "single_agent"
+    MULTI_AGENT = "multi_agent"
+    SWARM = "swarm"
+    COMPETITIVE = "competitive"
+    HIERARCHICAL = "hierarchical"
+
+
 @dataclass
-class OrchestratorConfig:
-    """Configuration for the master orchestrator."""
+class AssessmentConfig:
+    """Configuration for an assessment run."""
     target: str = ""
-    goal: str = ""
-    max_time_s: float = 3600.0
-    max_agents: int = 30
-    max_depth: int = 5
-    validate_findings: bool = True
-    deep_mode: bool = False
-    stealth_mode: bool = False
-    risk_threshold: float = 0.3
-    strategy: str = "adaptive"
-    scope_includes: list[str] = field(default_factory=list)
-    scope_excludes: list[str] = field(default_factory=list)
+    scope: list[str] = field(default_factory=list)
+    mode: OrchestratorMode = OrchestratorMode.MULTI_AGENT
+    max_depth: int = 4
+    max_agents: int = 10
+    total_budget_tokens: int = 100000
+    timeout_s: float = 3600.0
+    auto_exploit: bool = False
+    phases_enabled: list[str] = field(default_factory=lambda: [
+        "recon", "enumeration", "scanning",
+        "analysis", "exploitation", "validation",
+        "reporting",
+    ])
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "target": self.target, "goal": self.goal[:100],
-            "max_time_s": self.max_time_s,
+            "target": self.target[:20],
+            "mode": self.mode.value[:10],
             "max_agents": self.max_agents,
-            "strategy": self.strategy,
-            "deep": self.deep_mode,
+            "phases": len(self.phases_enabled),
         }
 
 
 @dataclass
-class OrchestratorResult:
-    """Result of a complete orchestrated assessment."""
-    target: str = ""
-    goal: str = ""
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    validated_findings: list[dict[str, Any]] = field(default_factory=list)
-    enriched_findings: list[dict[str, Any]] = field(default_factory=list)
-    threat_model: dict[str, Any] = field(default_factory=dict)
-    hypotheses: list[dict[str, Any]] = field(default_factory=list)
-    report_path: str = ""
-    agents_spawned: int = 0
-    tools_used: list[str] = field(default_factory=list)
+class AgentInstance:
+    """A running agent instance."""
+    agent_id: str = ""
+    role: str = ""
+    model: str = ""
+    parent_id: str = ""
+    depth: int = 0
+    task: str = ""
+    status: str = "active"
+    findings_count: int = 0
+    started_at: float = field(default_factory=time.time)
     tokens_used: int = 0
-    duration_s: float = 0.0
-    success: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "target": self.target,
-            "findings": len(self.findings),
-            "validated": len(self.validated_findings),
-            "enriched": len(self.enriched_findings),
-            "agents": self.agents_spawned,
-            "tools": len(self.tools_used),
-            "tokens": self.tokens_used,
-            "duration_s": round(self.duration_s, 1),
-            "success": self.success,
+            "id": self.agent_id[:10],
+            "role": self.role[:10],
+            "model": self.model[:12],
+            "depth": self.depth,
+            "status": self.status[:6],
         }
+
+
+@dataclass
+class AssessmentResult:
+    """Result of an assessment run."""
+    target: str = ""
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    agents_spawned: int = 0
+    total_tokens: int = 0
+    duration_s: float = 0.0
+    phases_completed: list[str] = field(default_factory=list)
+    risk_score: float = 0.0
+    critical_count: int = 0
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target": self.target[:20],
+            "findings": len(self.findings),
+            "risk": f"{self.risk_score:.1f}",
+            "critical": self.critical_count,
+            "high": self.high_count,
+        }
+
+
+# Role → preferred model mapping
+ROLE_MODEL_MAP: dict[str, str] = {
+    "security": "WhiteRabbitNeo",
+    "code_audit": "Qwen2.5-Coder-14B",
+    "reasoning": "DeepSeek-R1",
+    "planning": "Hermes-4-14B",
+    "fast_triage": "Phi-3.5-mini",
+    "long_analysis": "Yi-9B-200K",
+    "exploit_dev": "WhiteRabbitNeo",
+    "general": "Mistral-7B",
+    "uncensored": "Dolphin-2.9",
+    "math_crypto": "DeepSeek-Math",
+    "code": "CodeLlama-13B",
+    "validation": "Qwen2.5-Coder-7B",
+}
+
+# Phase → agent roles needed
+PHASE_ROLES: dict[str, list[str]] = {
+    "recon": ["security", "general"],
+    "enumeration": ["security", "fast_triage"],
+    "scanning": ["security", "code_audit"],
+    "analysis": ["reasoning", "security"],
+    "exploitation": ["exploit_dev", "security"],
+    "post_exploit": ["security", "uncensored"],
+    "validation": ["validation", "reasoning"],
+    "reporting": ["general", "planning"],
+    "code_audit": ["code_audit", "code", "long_analysis"],
+    "cloud_audit": ["security", "planning"],
+    "container_audit": ["security", "code"],
+}
 
 
 class MasterOrchestrator:
-    """Central brain coordinating all RecurSec subsystems.
+    """Central orchestrator tying all brain modules together.
 
-    This is the entry point for all assessments.
-    It coordinates between 15+ subsystems to produce
-    comprehensive security assessments.
+    Coordinates the full assessment lifecycle:
+    - Spawns agents based on task complexity
+    - Routes tasks to appropriate models
+    - Manages state transitions
+    - Tracks convergence and learning
+    - Handles errors and recovery
     """
 
     def __init__(self) -> None:
+        self._agents: dict[str, AgentInstance] = {}
+        self._agent_counter = 0
+        self._config: AssessmentConfig | None = None
+        self._result: AssessmentResult | None = None
+        self._started_at = 0.0
         self._log = logger.bind(component="orchestrator")
 
-        # Lazy-loaded subsystems
-        self._router = None
-        self._target_analyzer = None
-        self._threat_modeler = None
-        self._hypothesis_engine = None
-        self._task_planner = None
-        self._workflow_engine = None
-        self._state_machine = None
-        self._tool_executor = None
-        self._exploit_planner = None
-        self._vuln_intel = None
-        self._reasoning = None
-        self._debate = None
-        self._memory = None
-        self._meta_learning = None
-        self._checkpoint_mgr = None
-        self._event_bus = None
-        self._scope_manager = None
-        self._session_manager = None
-        self._report_formatter = None
-        self._prompt_engine = None
-        self._agent_pool = None
+    def configure(self, config: AssessmentConfig) -> None:
+        """Configure the orchestrator."""
+        self._config = config
+        self._result = AssessmentResult(target=config.target)
 
-    def _ensure_subsystems(self) -> None:
-        """Lazy-initialize all subsystems."""
-        if self._router is not None:
+    def spawn_agent(
+        self,
+        role: str,
+        task: str,
+        parent_id: str = "",
+        model: str = "",
+        depth: int = 0,
+    ) -> AgentInstance:
+        """Spawn a new agent instance."""
+        self._agent_counter += 1
+
+        if not model:
+            model = ROLE_MODEL_MAP.get(role, "Mistral-7B")
+
+        agent = AgentInstance(
+            agent_id=f"agent-{self._agent_counter}",
+            role=role,
+            model=model,
+            parent_id=parent_id,
+            depth=depth,
+            task=task,
+        )
+        self._agents[agent.agent_id] = agent
+        return agent
+
+    def get_phase_agents(self, phase: str) -> list[str]:
+        """Get agent roles needed for a phase."""
+        return PHASE_ROLES.get(phase, ["general"])
+
+    def retire_agent(
+        self,
+        agent_id: str,
+        findings: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Retire an agent after task completion."""
+        agent = self._agents.get(agent_id)
+        if not agent:
             return
 
-        from recursec.llm.advanced_router import AdvancedRouter
-        from recursec.agents.target_analyzer import TargetAnalyzer
-        from recursec.agents.threat_modeler import ThreatModeler
-        from recursec.agents.hypothesis_engine import HypothesisEngine
-        from recursec.agents.task_planner import TaskPlanner
-        from recursec.agents.workflow_engine import WorkflowEngine
-        from recursec.agents.state_machine import AgentStateMachine
-        from recursec.agents.tool_executor import ToolExecutor
-        from recursec.agents.exploit_planner import ExploitPlanner
-        from recursec.agents.vuln_intelligence import VulnIntelligence
-        from recursec.agents.reasoning_chain import ReasoningEngine
-        from recursec.agents.model_debate import ModelDebate
-        from recursec.agents.agent_memory import AgentMemory
-        from recursec.agents.meta_learning import MetaLearning
-        from recursec.agents.checkpoint import CheckpointManager
-        from recursec.agents.event_bus import EventBus
-        from recursec.agents.scope_manager import ScopeManager
-        from recursec.agents.session_manager import SessionManager
-        from recursec.reporting.formatter import ReportFormatter
-        from recursec.agents.prompt_engine import PromptEngine
-        from recursec.agents.agent_pool import AgentPool
+        agent.status = "retired"
+        if findings:
+            agent.findings_count = len(findings)
+            if self._result:
+                self._result.findings.extend(findings)
 
-        self._router = AdvancedRouter()
-        self._target_analyzer = TargetAnalyzer(model_router=self._router)
-        self._threat_modeler = ThreatModeler(model_router=self._router)
-        self._hypothesis_engine = HypothesisEngine(model_router=self._router)
-        self._task_planner = TaskPlanner(model_router=self._router)
-        self._workflow_engine = WorkflowEngine()
-        self._state_machine = AgentStateMachine()
-        self._tool_executor = ToolExecutor()
-        self._exploit_planner = ExploitPlanner(model_router=self._router)
-        self._vuln_intel = VulnIntelligence(model_router=self._router)
-        self._reasoning = ReasoningEngine(model_router=self._router)
-        self._debate = ModelDebate(model_router=self._router)
-        self._memory = AgentMemory()
-        self._meta_learning = MetaLearning()
-        self._checkpoint_mgr = CheckpointManager()
-        self._event_bus = EventBus()
-        self._scope_manager = ScopeManager()
-        self._session_manager = SessionManager()
-        self._report_formatter = ReportFormatter()
-        self._prompt_engine = PromptEngine()
-        self._agent_pool = AgentPool()
+    def get_active_agents(self) -> list[AgentInstance]:
+        """Get all active agents."""
+        return [
+            a for a in self._agents.values()
+            if a.status == "active"
+        ]
 
-    async def run(self, config: OrchestratorConfig) -> OrchestratorResult:
-        """Run a complete orchestrated assessment."""
-        self._ensure_subsystems()
+    def get_agent_tree(self) -> dict[str, list[str]]:
+        """Get parent-child agent tree."""
+        tree: dict[str, list[str]] = {}
+        for agent in self._agents.values():
+            parent = agent.parent_id or "root"
+            if parent not in tree:
+                tree[parent] = []
+            tree[parent].append(agent.agent_id)
+        return tree
 
-        start = time.time()
-        result = OrchestratorResult(
-            target=config.target,
-            goal=config.goal,
+    def should_spawn_child(
+        self,
+        parent_id: str,
+        task_complexity: float,
+    ) -> bool:
+        """Decide if a child agent should be spawned."""
+        if not self._config:
+            return False
+
+        parent = self._agents.get(parent_id)
+        if not parent:
+            return False
+
+        # Depth limit
+        if parent.depth >= self._config.max_depth:
+            return False
+
+        # Agent count limit
+        active = len(self.get_active_agents())
+        if active >= self._config.max_agents:
+            return False
+
+        # Complexity threshold
+        return task_complexity > 0.6
+
+    def select_model_for_task(
+        self,
+        task_type: str,
+        context_length: int = 0,
+    ) -> str:
+        """Select the best model for a task."""
+        # Long context → Yi-9B-200K
+        if context_length > 8000:
+            return "Yi-9B-200K"
+
+        return ROLE_MODEL_MAP.get(task_type, "Mistral-7B")
+
+    def record_finding(
+        self,
+        agent_id: str,
+        finding: dict[str, Any],
+    ) -> None:
+        """Record a finding from an agent."""
+        if self._result:
+            self._result.findings.append(finding)
+
+            severity = finding.get("severity", "medium").lower()
+            if severity == "critical":
+                self._result.critical_count += 1
+            elif severity == "high":
+                self._result.high_count += 1
+            elif severity == "medium":
+                self._result.medium_count += 1
+            elif severity == "low":
+                self._result.low_count += 1
+
+    def complete_phase(self, phase: str) -> None:
+        """Mark a phase as completed."""
+        if self._result and phase not in self._result.phases_completed:
+            self._result.phases_completed.append(phase)
+
+    def calculate_risk_score(self) -> float:
+        """Calculate overall risk score."""
+        if not self._result:
+            return 0.0
+
+        score = (
+            self._result.critical_count * 4.0 +
+            self._result.high_count * 3.0 +
+            self._result.medium_count * 2.0 +
+            self._result.low_count * 1.0
         )
+        return min(10.0, score)
 
-        # Create session
-        session = self._session_manager.create_session(
-            target=config.target, goal=config.goal,
-        )
-        self._session_manager.start_session(session.session_id)
+    def build_orchestrator_prompt(self) -> str:
+        """Build orchestrator context for LLM."""
+        lines = ["## Orchestrator\n"]
 
-        try:
-            # Phase 1: Setup scope
-            await self._setup_scope(config)
-            self._state_machine.transition(
-                self._get_event_type("start"),
+        if self._config:
+            lines.append(f"Target: {self._config.target[:20]}")
+            lines.append(f"Mode: {self._config.mode.value}")
+
+        active = self.get_active_agents()
+        lines.append(f"Active agents: {len(active)}")
+        lines.append(f"Total spawned: {len(self._agents)}")
+
+        if self._result:
+            lines.append(f"\nFindings: {len(self._result.findings)}")
+            lines.append(
+                f"  Critical: {self._result.critical_count}, "
+                f"High: {self._result.high_count}, "
+                f"Medium: {self._result.medium_count}"
+            )
+            lines.append(
+                f"Phases done: {', '.join(self._result.phases_completed[:5])}"
             )
 
-            # Phase 2: Target analysis
-            self._state_machine.transition(self._get_event_type("complete"))
-            profile = await self._target_analyzer.analyze(config.target)
-            self._memory.store_knowledge(
-                f"Target {config.target} is type {profile.target_type.value}",
-                tags=["target", "profile"],
-            )
-
-            # Phase 3: Threat modeling
-            threat_model = await self._threat_modeler.model_target(
-                target=config.target,
-                target_type=profile.target_type.value,
-                technologies=profile.tech_stack.technologies,
-            )
-            result.threat_model = threat_model.to_dict()
-
-            # Phase 4: Generate hypotheses
-            observations = [
-                f"Target type: {profile.target_type.value}",
-                f"Entry points: {len(profile.entry_points)}",
-                f"Risk profile: {profile.risk_profile}",
-            ]
-            hypotheses = await self._hypothesis_engine.generate_hypotheses(
-                target=config.target, observations=observations,
-            )
-            result.hypotheses = [h.to_dict() for h in hypotheses]
-
-            # Phase 5: Plan assessment
-            self._state_machine.transition(self._get_event_type("complete"))
-            await self._task_planner.create_plan(
-                target=config.target,
-                target_type=profile.target_type.value,
-            )
-
-            # Phase 6: Execute workflow
-            self._state_machine.transition(self._get_event_type("complete"))
-            wf = self._workflow_engine.create_workflow(
-                template_name=profile.target_type.value,
-                parameters={"target": config.target},
-            )
-            wf_result = await self._workflow_engine.execute(wf.workflow_id)
-
-            # Phase 7: Collect findings from tool outputs
-            all_findings = self._extract_findings(wf_result)
-
-            # Phase 8: Execute tool scans
-            self._state_machine.transition(self._get_event_type("complete"))
-            tool_findings = await self._run_tools(config, profile)
-            all_findings.extend(tool_findings)
-
-            # Phase 9: Validate findings
-            if config.validate_findings and all_findings:
-                self._state_machine.transition(self._get_event_type("complete"))
-                validated = await self._validate_findings(all_findings)
-                result.validated_findings = validated
-            else:
-                result.validated_findings = all_findings
-
-            # Phase 10: Enrich findings
-            enriched = await self._vuln_intel.enrich_batch(all_findings)
-            result.enriched_findings = [e.to_dict() for e in enriched]
-
-            # Phase 11: Exploit planning (if deep mode)
-            if config.deep_mode:
-                self._state_machine.transition(self._get_event_type("complete"))
-                exploit_plans = await self._exploit_planner.create_plans_for_findings(
-                    all_findings,
+        # Agent tree summary
+        if active:
+            lines.append("\nActive:")
+            for a in active[:5]:
+                indent = "  " * a.depth
+                lines.append(
+                    f"{indent}{a.role[:10]} ({a.model[:10]}) "
+                    f"→ {a.task[:20]}"
                 )
-                for plan_data in exploit_plans:
-                    result.findings.append(plan_data.to_dict())
 
-            # Phase 12: Generate report
-            self._state_machine.transition(self._get_event_type("complete"))
-            report = self._report_formatter.generate(
-                target=config.target,
-                findings=all_findings,
-                validated=result.validated_findings,
-            )
-            path = self._report_formatter.save_json(report)
-            self._report_formatter.save_markdown(report)
-            result.report_path = str(path)
-
-            # Phase 13: Learn
-            self._meta_learning.record_strategy_outcome(
-                strategy=config.strategy,
-                target_type=profile.target_type.value,
-                findings=len(all_findings),
-                critical=sum(1 for f in all_findings if f.get("severity") == "critical"),
-                time_s=time.time() - start,
-                success=True,
-            )
-
-            result.findings = all_findings
-            result.success = True
-
-            # Complete session
-            self._session_manager.complete_session(
-                session.session_id,
-                findings=all_findings,
-                validated=result.validated_findings,
-            )
-
-        except Exception as e:
-            self._log.error("orchestration_failed", error=str(e)[:200])
-            result.success = False
-            self._session_manager.fail_session(session.session_id, str(e)[:200])
-
-        result.duration_s = time.time() - start
-        return result
-
-    async def quick_scan(self, target: str) -> OrchestratorResult:
-        """Run a quick scan (faster, less thorough)."""
-        config = OrchestratorConfig(
-            target=target,
-            goal=f"Quick security scan of {target}",
-            max_time_s=600.0,
-            max_agents=10,
-            validate_findings=False,
-        )
-        return await self.run(config)
-
-    async def deep_assess(self, target: str, goal: str = "") -> OrchestratorResult:
-        """Run a deep assessment (slower, more thorough)."""
-        config = OrchestratorConfig(
-            target=target,
-            goal=goal or f"Deep security assessment of {target}",
-            max_time_s=7200.0,
-            max_agents=50,
-            deep_mode=True,
-            validate_findings=True,
-        )
-        return await self.run(config)
-
-    async def _setup_scope(self, config: OrchestratorConfig) -> None:
-        """Setup assessment scope."""
-        self._scope_manager.add_target(config.target)
-        for include in config.scope_includes:
-            self._scope_manager.add_target(include)
-        for exclude in config.scope_excludes:
-            self._scope_manager.add_exclusion(exclude)
-
-    async def _run_tools(
-        self,
-        config: OrchestratorConfig,
-        profile: Any,
-    ) -> list[dict[str, Any]]:
-        """Run recommended tools against the target."""
-        findings = []
-        tools = profile.recommended_tools[:5]
-
-        for tool_name in tools:
-            if not self._tool_executor.is_tool_available(tool_name):
-                continue
-
-            cmd = self._build_tool_command(tool_name, config.target)
-            if not cmd:
-                continue
-
-            result = await self._tool_executor.execute(
-                command=cmd, tool_name=tool_name,
-            )
-
-            if result.success and result.stdout:
-                extracted = self._parse_tool_output(tool_name, result.stdout, config.target)
-                findings.extend(extracted)
-
-        return findings
-
-    async def _validate_findings(
-        self,
-        findings: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Validate findings using multi-model debate."""
-        validated = []
-
-        for finding in findings[:20]:
-            title = finding.get("title", "")
-            severity = finding.get("severity", "info")
-
-            if severity in ("critical", "high"):
-                # High-severity findings get full debate
-                debate_result = await self._debate.debate(
-                    question=f"Is this finding valid? {title}",
-                    context=str(finding)[:300],
-                )
-                if debate_result.consensus_confidence > 0.5:
-                    finding["validated"] = True
-                    finding["validation_confidence"] = debate_result.consensus_confidence
-                    validated.append(finding)
-            else:
-                # Lower severity just gets reasoning
-                chain = await self._reasoning.reason_about_finding(finding)
-                if chain.overall_confidence > 0.4:
-                    finding["validated"] = True
-                    finding["validation_confidence"] = chain.overall_confidence
-                    validated.append(finding)
-
-        return validated
-
-    def _build_tool_command(self, tool: str, target: str) -> str:
-        """Build a tool command for a target."""
-        commands = {
-            "nmap": f"nmap -sV -sC -T4 {target}",
-            "nuclei": f"nuclei -u {target} -severity critical,high,medium -silent",
-            "nikto": f"nikto -h {target} -maxtime 300",
-            "httpx": f"echo {target} | httpx -silent -tech-detect",
-            "subfinder": f"subfinder -d {target} -silent",
-            "ffuf": f"ffuf -u {target}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302 -t 50",
-            "whatweb": f"whatweb {target}",
-            "curl": f"curl -sI {target}",
-        }
-        return commands.get(tool, "")
-
-    def _parse_tool_output(
-        self,
-        tool: str,
-        output: str,
-        target: str,
-    ) -> list[dict[str, Any]]:
-        """Extract findings from tool output."""
-        findings = []
-
-        if tool == "nuclei":
-            for line in output.strip().splitlines():
-                if not line.strip():
-                    continue
-                parts = line.split()
-                if len(parts) >= 2:
-                    findings.append({
-                        "title": " ".join(parts[:-1])[:100],
-                        "severity": self._detect_severity(line),
-                        "target": target,
-                        "tool": "nuclei",
-                        "evidence": line[:200],
-                    })
-
-        elif tool == "nmap":
-            for line in output.splitlines():
-                if "open" in line and "/" in line:
-                    findings.append({
-                        "title": f"Open port: {line.strip()[:60]}",
-                        "severity": "info",
-                        "target": target,
-                        "tool": "nmap",
-                        "evidence": line.strip(),
-                    })
-
-        return findings
-
-    def _detect_severity(self, text: str) -> str:
-        """Detect severity from tool output text."""
-        text_lower = text.lower()
-        if "critical" in text_lower:
-            return "critical"
-        if "high" in text_lower:
-            return "high"
-        if "medium" in text_lower:
-            return "medium"
-        if "low" in text_lower:
-            return "low"
-        return "info"
-
-    def _extract_findings(self, wf_result: dict[str, Any]) -> list[dict[str, Any]]:
-        """Extract findings from workflow results."""
-        findings = []
-        for step_id, step_result in wf_result.get("results", {}).items():
-            if isinstance(step_result, dict) and "findings" in step_result:
-                findings.extend(step_result["findings"])
-        return findings
-
-    def _get_event_type(self, name: str) -> Any:
-        from recursec.agents.state_machine import EventType
-        try:
-            return EventType(name)
-        except ValueError:
-            return EventType.COMPLETE
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        self._ensure_subsystems()
+        active = len(self.get_active_agents())
         return {
-            "subsystems": {
-                "router": self._router.get_stats(),
-                "memory": self._memory.get_stats(),
-                "meta_learning": self._meta_learning.get_stats(),
-                "sessions": self._session_manager.get_stats(),
-                "agent_pool": self._agent_pool.get_stats(),
-            }
+            "total_agents": len(self._agents),
+            "active_agents": active,
+            "findings": len(self._result.findings) if self._result else 0,
+            "risk_score": self.calculate_risk_score(),
+            "phases_completed": (
+                self._result.phases_completed if self._result else []
+            ),
         }
