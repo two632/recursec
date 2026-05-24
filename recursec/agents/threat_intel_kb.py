@@ -1,11 +1,11 @@
 """Threat intelligence knowledge base.
 
 Deep knowledge about threat intelligence:
-1. Threat intelligence platforms and feeds
-2. IOC types and enrichment
-3. APT group profiles and TTPs
-4. Threat hunting methodologies
-5. Intelligence-driven defense
+1. Threat actor profiling (APT groups)
+2. Indicator of Compromise (IoC) management
+3. Threat feeds and sources
+4. Threat modeling (STRIDE, PASTA)
+5. Threat hunting techniques
 """
 
 from __future__ import annotations
@@ -37,191 +37,201 @@ class ThreatIntelPattern:
         }
 
 
-THREAT_INTEL_PATTERNS: list[dict[str, Any]] = [
+TI_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "ti-001", "name": "Threat Intel Platforms",
-        "category": "platforms", "severity": "medium",
-        "desc": "Threat intelligence platforms and feeds.",
+        "id": "ti-001", "name": "Threat Actor Profiling",
+        "category": "actors", "severity": "high",
+        "desc": "APT group and threat actor profiling.",
         "detection": (
-            "THREAT INTELLIGENCE PLATFORMS:\n"
-            "OPEN SOURCE:\n"
-            "  MISP (Malware Information Sharing Platform)\n"
-            "  - Self-hosted threat sharing\n"
-            "  - STIX/TAXII format\n"
-            "  - Correlation engine\n"
-            "  - Galaxy clusters (threat actors, tools)\n"
-            "  OpenCTI (Open Cyber Threat Intelligence)\n"
-            "  - Knowledge graph-based\n"
-            "  - STIX 2.1 native\n"
-            "  - Connector ecosystem\n"
-            "FEEDS:\n"
-            "  - abuse.ch (URLhaus, MalwareBazaar, ThreatFox)\n"
-            "  - AlienVault OTX\n"
-            "  - VirusTotal\n"
-            "  - Shodan\n"
-            "  - Censys\n"
-            "  - GreyNoise\n"
-            "  - PhishTank\n"
-            "STANDARDS:\n"
-            "  - STIX (Structured Threat Info Expression)\n"
-            "  - TAXII (transport protocol)\n"
-            "  - CybOX (observables)\n"
-            "  - MITRE ATT&CK (TTPs)\n"
-            "  - Diamond Model (intrusion analysis)\n"
-            "  - Kill Chain (Lockheed Martin)\n"
+            "THREAT ACTOR PROFILING:\n"
+            "NOTABLE APT GROUPS:\n"
+            "  APT28 (Fancy Bear/Russia):\n"
+            "    - Targets: Gov, military, media\n"
+            "    - TTPs: Phishing, zero-days, credential theft\n"
+            "    - Tools: X-Agent, Zebrocy, LoJax\n"
+            "  APT29 (Cozy Bear/Russia):\n"
+            "    - Targets: Gov, think tanks, tech\n"
+            "    - TTPs: Supply chain, cloud abuse\n"
+            "    - Tools: SUNBURST, WellMess, EnvyScout\n"
+            "  APT41 (China):\n"
+            "    - Targets: Healthcare, tech, gaming\n"
+            "    - TTPs: Supply chain, zero-days, dual-use\n"
+            "    - Both espionage and financial\n"
+            "  Lazarus (North Korea):\n"
+            "    - Targets: Finance, crypto, defense\n"
+            "    - TTPs: Social eng, custom malware\n"
+            "    - Financial motivation + espionage\n"
+            "  FIN7/FIN11 (Financially motivated):\n"
+            "    - Targets: Retail, hospitality, finance\n"
+            "    - TTPs: Phishing, PoS malware, ransomware\n"
+            "PROFILING:\n"
+            "  - MITRE ATT&CK Navigator (group overlay)\n"
+            "  - TTP mapping\n"
+            "  - Infrastructure analysis\n"
+            "  - Malware family tracking\n"
             "TOOLS:\n"
-            "  MISP, OpenCTI, TheHive"
+            "  MITRE ATT&CK Navigator, OpenCTI, MISP"
+        ),
+        "tools": ["opencti", "misp"],
+    },
+    {
+        "id": "ti-002", "name": "IoC Management",
+        "category": "ioc", "severity": "medium",
+        "desc": "Indicator of Compromise management.",
+        "detection": (
+            "IoC MANAGEMENT:\n"
+            "IoC TYPES:\n"
+            "  - Atomic: IP, domain, hash, email, URL\n"
+            "  - Computed: YARA rules, regex patterns\n"
+            "  - Behavioral: TTPs, attack patterns\n"
+            "STANDARDS:\n"
+            "  - STIX (Structured Threat Information eXpression)\n"
+            "  - TAXII (transport protocol for STIX)\n"
+            "  - OpenIOC (Mandiant format)\n"
+            "  - CybOX (cyber observables)\n"
+            "MANAGEMENT:\n"
+            "  # MISP (open source TIP)\n"
+            "  # OpenCTI (knowledge management)\n"
+            "  # TheHive (incident response)\n"
+            "  # Cortex (analysis)\n"
+            "ENRICHMENT:\n"
+            "  - VirusTotal (hash, IP, domain)\n"
+            "  - Shodan (IP info)\n"
+            "  - PassiveTotal (DNS history)\n"
+            "  - AbuseIPDB (IP reputation)\n"
+            "  - GreyNoise (Internet noise)\n"
+            "  - URLhaus (malicious URLs)\n"
+            "LIFECYCLE:\n"
+            "  1. Collection (feeds, manual, tools)\n"
+            "  2. Processing (parsing, normalization)\n"
+            "  3. Analysis (enrichment, correlation)\n"
+            "  4. Dissemination (alerts, reports)\n"
+            "  5. Feedback (effectiveness tracking)\n"
+            "TOOLS:\n"
+            "  MISP, OpenCTI, TheHive, Cortex, YETI"
         ),
         "tools": ["misp", "opencti"],
     },
     {
-        "id": "ti-002", "name": "IOC Types and Enrichment",
-        "category": "ioc", "severity": "high",
-        "desc": "Indicator of Compromise types and enrichment.",
+        "id": "ti-003", "name": "Threat Feeds and Sources",
+        "category": "feeds", "severity": "medium",
+        "desc": "Threat intelligence feeds and data sources.",
         "detection": (
-            "IOC TYPES AND ENRICHMENT:\n"
-            "NETWORK:\n"
-            "  - IP addresses (IPv4, IPv6)\n"
-            "  - Domain names\n"
-            "  - URLs\n"
-            "  - Email addresses\n"
-            "  - SSL certificate hashes\n"
-            "  - JA3/JA3S fingerprints\n"
-            "HOST:\n"
-            "  - File hashes (MD5, SHA1, SHA256)\n"
-            "  - File names and paths\n"
-            "  - Registry keys\n"
-            "  - Mutex names\n"
-            "  - Process names\n"
-            "  - Scheduled tasks\n"
-            "BEHAVIORAL:\n"
-            "  - YARA rules\n"
-            "  - Sigma rules\n"
-            "  - Snort/Suricata rules\n"
-            "  - MITRE ATT&CK technique IDs\n"
-            "ENRICHMENT:\n"
-            "  - VirusTotal lookup\n"
-            "  - Shodan host info\n"
-            "  - WHOIS data\n"
-            "  - GeoIP location\n"
-            "  - DNS history (PassiveTotal)\n"
-            "  - Reputation scoring\n"
-            "  - Malware family classification\n"
+            "THREAT FEEDS AND SOURCES:\n"
+            "FREE FEEDS:\n"
+            "  - AlienVault OTX (community IoCs)\n"
+            "  - Abuse.ch (URLhaus, MalwareBazaar, ThreatFox)\n"
+            "  - Blocklist.de (attack IPs)\n"
+            "  - Feodo Tracker (banking trojans)\n"
+            "  - PhishTank (phishing URLs)\n"
+            "  - Spamhaus (spam/botnet IPs)\n"
+            "  - Emerging Threats (Suricata rules)\n"
+            "  - CIRCL (Luxembourg CERT)\n"
+            "COMMERCIAL:\n"
+            "  - Recorded Future\n"
+            "  - Mandiant (Google)\n"
+            "  - CrowdStrike Falcon Intel\n"
+            "  - Unit 42 (Palo Alto)\n"
+            "  - Talos Intelligence (Cisco)\n"
+            "GOVERNMENT:\n"
+            "  - CISA (US-CERT advisories)\n"
+            "  - NCSC (UK)\n"
+            "  - BSI (Germany)\n"
+            "  - ANSSI (France)\n"
+            "  - JPCERT (Japan)\n"
+            "  - CERT-In (India)\n"
+            "  - KrCERT (Korea)\n"
+            "INTEGRATION:\n"
+            "  # Aggregate feeds\n"
+            "  # Normalize to STIX format\n"
+            "  # Score confidence\n"
+            "  # Age out old IoCs\n"
             "TOOLS:\n"
-            "  IntelOwl, Cortex, MISP modules"
+            "  IntelOwl, MISP, OTX, ThreatConnect"
         ),
-        "tools": ["intelowl", "cortex"],
+        "tools": ["misp"],
     },
     {
-        "id": "ti-003", "name": "APT Group Profiles",
-        "category": "apt", "severity": "critical",
-        "desc": "Advanced Persistent Threat group profiles.",
+        "id": "ti-004", "name": "Threat Modeling",
+        "category": "modeling", "severity": "medium",
+        "desc": "Threat modeling methodologies.",
         "detection": (
-            "APT GROUP PROFILES:\n"
-            "NATION-STATE:\n"
-            "  APT28 (Fancy Bear / Russia)\n"
-            "  - Targets: NATO, governments, defense\n"
-            "  - TTPs: Spearphishing, OAuth abuse, credential harvest\n"
-            "  - Tools: X-Agent, Zebrocy, custom implants\n"
-            "  APT29 (Cozy Bear / Russia)\n"
-            "  - Targets: Government, healthcare, tech\n"
-            "  - TTPs: Supply chain, cloud abuse, WellMess\n"
-            "  APT41 (Winnti / China)\n"
-            "  - Targets: Gaming, telecom, tech\n"
-            "  - TTPs: Supply chain, rootkits, ShadowPad\n"
-            "  Lazarus Group (North Korea)\n"
-            "  - Targets: Financial, crypto, defense\n"
-            "  - TTPs: Watering hole, social engineering\n"
-            "  - Financially motivated + espionage\n"
-            "CYBERCRIME:\n"
-            "  - FIN7/Carbanak (financial fraud)\n"
-            "  - REvil/Sodinokibi (ransomware)\n"
-            "  - Conti/Royal/Black Basta (ransomware)\n"
-            "  - LockBit (RaaS)\n"
-            "TRACKING:\n"
-            "  - MITRE ATT&CK Groups page\n"
-            "  - Mandiant APT reports\n"
-            "  - CrowdStrike adversary profiles\n"
-            "  - Kaspersky APT tracker"
+            "THREAT MODELING:\n"
+            "STRIDE:\n"
+            "  S - Spoofing (authentication bypass)\n"
+            "  T - Tampering (data modification)\n"
+            "  R - Repudiation (deny actions)\n"
+            "  I - Information Disclosure (data leak)\n"
+            "  D - Denial of Service\n"
+            "  E - Elevation of Privilege\n"
+            "PASTA:\n"
+            "  1. Define objectives\n"
+            "  2. Define technical scope\n"
+            "  3. Application decomposition\n"
+            "  4. Threat analysis\n"
+            "  5. Vulnerability analysis\n"
+            "  6. Attack modeling\n"
+            "  7. Risk/impact analysis\n"
+            "ATTACK TREES:\n"
+            "  - Root: attacker goal\n"
+            "  - Branches: different paths\n"
+            "  - Leaves: specific techniques\n"
+            "  - AND/OR nodes\n"
+            "  - Cost and probability annotations\n"
+            "DATA FLOW DIAGRAMS:\n"
+            "  - External entities\n"
+            "  - Processes\n"
+            "  - Data stores\n"
+            "  - Data flows\n"
+            "  - Trust boundaries\n"
+            "TOOLS:\n"
+            "  Microsoft Threat Modeling Tool, OWASP Threat Dragon,\n"
+            "  IriusRisk, Threagile"
         ),
         "tools": [],
     },
     {
-        "id": "ti-004", "name": "Threat Hunting",
+        "id": "ti-005", "name": "Threat Hunting",
         "category": "hunting", "severity": "high",
-        "desc": "Threat hunting methodologies.",
+        "desc": "Proactive threat hunting techniques.",
         "detection": (
             "THREAT HUNTING:\n"
             "METHODOLOGY:\n"
-            "  1. Hypothesis generation\n"
-            "     - ATT&CK technique-based\n"
-            "     - Intelligence-driven\n"
-            "     - Anomaly-based\n"
-            "  2. Data collection\n"
-            "     - EDR telemetry\n"
-            "     - Network flow data\n"
-            "     - DNS logs\n"
-            "     - Authentication logs\n"
-            "  3. Investigation\n"
-            "     - Pattern analysis\n"
-            "     - Behavioral analysis\n"
-            "     - Statistical analysis\n"
-            "  4. Validation\n"
-            "     - Confirm/deny hypothesis\n"
-            "     - Document findings\n"
-            "  5. Action\n"
-            "     - Create detection rules\n"
-            "     - Update IOCs\n"
-            "     - Remediate findings\n"
-            "HUNT TECHNIQUES:\n"
-            "  - Stack counting (frequency analysis)\n"
-            "  - Long tail analysis (rare events)\n"
-            "  - Clustering (group similar events)\n"
-            "  - Beaconing detection (regular intervals)\n"
-            "  - DNS analysis (DGA, tunneling)\n"
-            "  - Process tree analysis\n"
-            "  - Lateral movement patterns\n"
+            "  1. Hypothesis generation (intel-driven)\n"
+            "  2. Data collection (logs, telemetry)\n"
+            "  3. Investigation (search, correlate)\n"
+            "  4. Findings (confirm/deny hypothesis)\n"
+            "  5. Response (contain, remediate)\n"
+            "  6. Document (new detections)\n"
+            "TECHNIQUES:\n"
+            "  STACK COUNTING:\n"
+            "    - Count occurrences of values\n"
+            "    - Outliers = suspicious\n"
+            "    - Example: rare process names\n"
+            "  CLUSTERING:\n"
+            "    - Group similar events\n"
+            "    - Identify anomalous clusters\n"
+            "  LONG TAIL:\n"
+            "    - Focus on rare events\n"
+            "    - Unusual user agents\n"
+            "    - Rare DNS queries\n"
+            "    - Uncommon executables\n"
+            "  TTP-BASED:\n"
+            "    - Hunt for specific ATT&CK techniques\n"
+            "    - T1059: Command and Scripting\n"
+            "    - T1053: Scheduled Tasks\n"
+            "    - T1003: Credential Dumping\n"
+            "    - T1021: Remote Services\n"
+            "DATA SOURCES:\n"
+            "  - EDR telemetry (CrowdStrike, Defender)\n"
+            "  - SIEM logs (Splunk, Elastic, Sentinel)\n"
+            "  - Network (Zeek, Suricata)\n"
+            "  - DNS logs\n"
+            "  - Authentication logs\n"
             "TOOLS:\n"
-            "  ELK Stack, Splunk, Velociraptor, RITA"
+            "  Splunk, Elastic SIEM, Sigma rules, YARA, osquery"
         ),
-        "tools": ["velociraptor"],
-    },
-    {
-        "id": "ti-005", "name": "Intelligence-Driven Defense",
-        "category": "defense", "severity": "medium",
-        "desc": "Intelligence-driven defense strategies.",
-        "detection": (
-            "INTELLIGENCE-DRIVEN DEFENSE:\n"
-            "F3EAD CYCLE:\n"
-            "  Find → Fix → Finish → Exploit → Analyze → Disseminate\n"
-            "  - Find: Identify threats/adversaries\n"
-            "  - Fix: Attribute to specific actors\n"
-            "  - Finish: Contain/eradicate\n"
-            "  - Exploit: Gather intelligence from incident\n"
-            "  - Analyze: Process intelligence\n"
-            "  - Disseminate: Share with stakeholders\n"
-            "DIAMOND MODEL:\n"
-            "  - Adversary ↔ Capability ↔ Infrastructure ↔ Victim\n"
-            "  - Pivot analysis (one axis to discover others)\n"
-            "  - Activity threading\n"
-            "  - Activity-attack graph\n"
-            "INTELLIGENCE LEVELS:\n"
-            "  Strategic: Executive, risk-based decisions\n"
-            "  Operational: Campaign-level, TTPs\n"
-            "  Tactical: IOCs, signatures, rules\n"
-            "  Technical: Raw data, artifacts\n"
-            "AUTOMATION:\n"
-            "  - Automated IOC ingestion\n"
-            "  - SOAR playbooks\n"
-            "  - Threat feed correlation\n"
-            "  - Automated blocking (IP, domain, hash)\n"
-            "  - Enrichment pipelines\n"
-            "METRICS:\n"
-            "  - Intel accuracy rate\n"
-            "  - Time to detect (MTTD)\n"
-            "  - Intelligence actionability score"
-        ),
-        "tools": [],
+        "tools": ["sigma"],
     },
 ]
 
@@ -229,7 +239,7 @@ THREAT_INTEL_PATTERNS: list[dict[str, Any]] = [
 class ThreatIntelKB:
     """Threat intelligence knowledge base.
 
-    Provides threat intel patterns
+    Provides threat intelligence patterns
     injected into agent prompts.
     """
 
@@ -240,7 +250,7 @@ class ThreatIntelKB:
 
     def _load_patterns(self) -> None:
         """Load threat intel patterns."""
-        for data in THREAT_INTEL_PATTERNS:
+        for data in TI_PATTERNS:
             pattern = ThreatIntelPattern(
                 pattern_id=data["id"],
                 name=data["name"],
@@ -264,7 +274,7 @@ class ThreatIntelKB:
         categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
-        """Build threat intel prompt."""
+        """Build threat intelligence prompt."""
         lines = ["## Threat Intelligence\n"]
         count = 0
         for pattern in self._patterns.values():
