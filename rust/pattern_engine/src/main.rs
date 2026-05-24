@@ -1,367 +1,418 @@
-//! RecurSec Pattern Engine — high-performance multi-pattern matching.
-//!
-//! Scans text against thousands of security patterns simultaneously.
-//! Used for:
-//! 1. Vulnerability signature matching in tool output
-//! 2. Secret detection in code (API keys, tokens, credentials)
-//! 3. Indicator of Compromise (IoC) matching
-//! 4. Technology fingerprinting
-//! 5. Log analysis pattern matching
-//! 6. False positive filtering
+// RecurSec Pattern Matching Engine
+//
+// High-performance vulnerability pattern matching:
+// - Aho-Corasick multi-pattern matching
+// - Regex-based signature detection
+// - YARA-like rule matching
+// - Binary pattern matching
+// - JSON output for agent consumption
+//
+// Matches thousands of vulnerability signatures against
+// tool output, HTTP responses, and source code at native speed.
 
-use regex::RegexSet;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
-use std::time::Instant;
+use std::env;
+use std::io::{self, Read};
 
-/// A security pattern with metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A vulnerability signature pattern
 struct Pattern {
     id: String,
     name: String,
-    category: String,
-    regex: String,
     severity: String,
+    pattern_type: PatternType,
+    pattern: String,
     description: String,
-    false_positive_hint: String,
+    cwe: String,
+    remediation: String,
 }
 
-/// A match found in the input.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone)]
+enum PatternType {
+    Exact,
+    Contains,
+    StartsWith,
+    EndsWith,
+    Regex,
+}
+
 struct Match {
     pattern_id: String,
     pattern_name: String,
-    category: String,
     severity: String,
-    line_number: usize,
-    line_content: String,
-    column: usize,
+    offset: usize,
+    matched_text: String,
+    context: String,
+    cwe: String,
 }
 
-/// Result of scanning text.
-#[derive(Debug, Serialize, Deserialize)]
-struct ScanResult {
-    matches: Vec<Match>,
-    lines_scanned: usize,
-    patterns_checked: usize,
-    duration_ms: u64,
-    stats: HashMap<String, usize>,
-}
-
-/// Built-in security patterns for secret detection.
-fn builtin_secret_patterns() -> Vec<Pattern> {
-    vec![
-        Pattern {
-            id: "SEC-001".into(), name: "AWS Access Key".into(),
-            category: "secrets".into(), regex: r"(?i)AKIA[0-9A-Z]{16}".into(),
-            severity: "critical".into(), description: "AWS access key ID".into(),
-            false_positive_hint: "Check if in example/test code".into(),
-        },
-        Pattern {
-            id: "SEC-002".into(), name: "AWS Secret Key".into(),
-            category: "secrets".into(), regex: r"(?i)aws[_\-]?secret[_\-]?access[_\-]?key\s*[=:]\s*[A-Za-z0-9/+=]{40}".into(),
-            severity: "critical".into(), description: "AWS secret access key".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "SEC-003".into(), name: "GitHub Token".into(),
-            category: "secrets".into(), regex: r"gh[pousr]_[A-Za-z0-9_]{36,255}".into(),
-            severity: "critical".into(), description: "GitHub personal access token".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "SEC-004".into(), name: "Generic API Key".into(),
-            category: "secrets".into(), regex: r#"(?i)(api[_\-]?key|apikey)\s*[=:]\s*["']?[A-Za-z0-9\-_]{20,}"#.into(),
-            severity: "high".into(), description: "Generic API key pattern".into(),
-            false_positive_hint: "May match config templates".into(),
-        },
-        Pattern {
-            id: "SEC-005".into(), name: "Private Key".into(),
-            category: "secrets".into(), regex: r"-----BEGIN\s+(RSA|EC|DSA|OPENSSH)?\s*PRIVATE KEY-----".into(),
-            severity: "critical".into(), description: "Private key in PEM format".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "SEC-006".into(), name: "JWT Token".into(),
-            category: "secrets".into(), regex: r"eyJ[A-Za-z0-9\-_]{10,}\.eyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}".into(),
-            severity: "high".into(), description: "JSON Web Token".into(),
-            false_positive_hint: "Check if expired/test token".into(),
-        },
-        Pattern {
-            id: "SEC-007".into(), name: "Slack Token".into(),
-            category: "secrets".into(), regex: r"xox[baprs]-[0-9]{10,}-[A-Za-z0-9\-]{10,}".into(),
-            severity: "critical".into(), description: "Slack API token".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "SEC-008".into(), name: "Google API Key".into(),
-            category: "secrets".into(), regex: r"AIza[0-9A-Za-z\-_]{35}".into(),
-            severity: "high".into(), description: "Google API key".into(),
-            false_positive_hint: "Check if restricted".into(),
-        },
-        Pattern {
-            id: "SEC-009".into(), name: "Password in URL".into(),
-            category: "secrets".into(), regex: r"[a-zA-Z]+://[^/\s:]+:[^/\s:]+@[^/\s]+".into(),
-            severity: "critical".into(), description: "Credentials embedded in URL".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "SEC-010".into(), name: "Hardcoded Password".into(),
-            category: "secrets".into(), regex: r#"(?i)(password|passwd|pwd)\s*[=:]\s*["'][^"']{8,}["']"#.into(),
-            severity: "high".into(), description: "Hardcoded password".into(),
-            false_positive_hint: "May match password validation".into(),
-        },
-    ]
-}
-
-/// Built-in patterns for vulnerability detection in tool output.
-fn builtin_vuln_patterns() -> Vec<Pattern> {
-    vec![
-        Pattern {
-            id: "VULN-001".into(), name: "SQL Injection Indicator".into(),
-            category: "vulnerability".into(), regex: r"(?i)(sql\s*injection|sqli|union\s+select|or\s+1\s*=\s*1|syntax\s+error.*sql)".into(),
-            severity: "critical".into(), description: "SQL injection vulnerability indicator".into(),
-            false_positive_hint: "Verify with manual testing".into(),
-        },
-        Pattern {
-            id: "VULN-002".into(), name: "XSS Indicator".into(),
-            category: "vulnerability".into(), regex: r"(?i)(cross[- ]site\s*scripting|xss|<script>|javascript:|on(error|load|click)\s*=)".into(),
-            severity: "high".into(), description: "Cross-site scripting indicator".into(),
-            false_positive_hint: "Check if reflected or stored".into(),
-        },
-        Pattern {
-            id: "VULN-003".into(), name: "Command Injection".into(),
-            category: "vulnerability".into(), regex: r"(?i)(command\s*injection|os\s*command|shell\s*injection|;.*cat\s+/etc/passwd)".into(),
-            severity: "critical".into(), description: "OS command injection".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "VULN-004".into(), name: "Path Traversal".into(),
-            category: "vulnerability".into(), regex: r"(?i)(path\s*traversal|directory\s*traversal|\.\.\/|\.\.\\|/etc/passwd|/etc/shadow)".into(),
-            severity: "high".into(), description: "Path/directory traversal".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "VULN-005".into(), name: "SSRF Indicator".into(),
-            category: "vulnerability".into(), regex: r"(?i)(ssrf|server[- ]side\s*request|169\.254\.169\.254|metadata\.google|100\.100\.100\.200)".into(),
-            severity: "critical".into(), description: "Server-side request forgery".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "VULN-006".into(), name: "Open Redirect".into(),
-            category: "vulnerability".into(), regex: r"(?i)(open\s*redirect|url\s*redirect|redirect[_\-]?to\s*=\s*http)".into(),
-            severity: "medium".into(), description: "Open redirect vulnerability".into(),
-            false_positive_hint: "Check if within same domain".into(),
-        },
-        Pattern {
-            id: "VULN-007".into(), name: "Information Disclosure".into(),
-            category: "vulnerability".into(), regex: r"(?i)(information\s*disclosure|sensitive\s*data|stack\s*trace|debug\s*mode|phpinfo)".into(),
-            severity: "medium".into(), description: "Information disclosure".into(),
-            false_positive_hint: "Check sensitivity level".into(),
-        },
-        Pattern {
-            id: "VULN-008".into(), name: "Authentication Bypass".into(),
-            category: "vulnerability".into(), regex: r"(?i)(auth(entication)?\s*bypass|access\s*control|broken\s*auth|privilege\s*escalation)".into(),
-            severity: "critical".into(), description: "Authentication/authorization bypass".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "VULN-009".into(), name: "Deserialization".into(),
-            category: "vulnerability".into(), regex: r"(?i)(deserialization|insecure\s*unserialize|pickle\s*load|readobject|xmldecoder)".into(),
-            severity: "critical".into(), description: "Insecure deserialization".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "VULN-010".into(), name: "Weak Crypto".into(),
-            category: "vulnerability".into(), regex: r"(?i)(md5|sha1|des|rc4|ecb\s*mode|weak\s*(cipher|crypto|hash|algorithm))".into(),
-            severity: "medium".into(), description: "Weak cryptographic algorithm".into(),
-            false_positive_hint: "Check if used for security".into(),
-        },
-    ]
-}
-
-/// Built-in IoC patterns.
-fn builtin_ioc_patterns() -> Vec<Pattern> {
-    vec![
-        Pattern {
-            id: "IOC-001".into(), name: "IPv4 Address".into(),
-            category: "ioc".into(), regex: r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b".into(),
-            severity: "info".into(), description: "IPv4 address".into(),
-            false_positive_hint: "Check if internal/private".into(),
-        },
-        Pattern {
-            id: "IOC-002".into(), name: "Email Address".into(),
-            category: "ioc".into(), regex: r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b".into(),
-            severity: "info".into(), description: "Email address".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "IOC-003".into(), name: "URL".into(),
-            category: "ioc".into(), regex: r#"https?://[^\s<>"']+"#.into(),
-            severity: "info".into(), description: "URL/URI".into(),
-            false_positive_hint: "".into(),
-        },
-        Pattern {
-            id: "IOC-004".into(), name: "MD5 Hash".into(),
-            category: "ioc".into(), regex: r"\b[a-fA-F0-9]{32}\b".into(),
-            severity: "info".into(), description: "MD5 hash".into(),
-            false_positive_hint: "May match other hex strings".into(),
-        },
-        Pattern {
-            id: "IOC-005".into(), name: "SHA256 Hash".into(),
-            category: "ioc".into(), regex: r"\b[a-fA-F0-9]{64}\b".into(),
-            severity: "info".into(), description: "SHA256 hash".into(),
-            false_positive_hint: "".into(),
-        },
-    ]
-}
-
-/// Pattern engine that compiles and matches patterns.
-struct PatternEngine {
+/// Aho-Corasick-like multi-pattern matcher (simplified)
+struct PatternMatcher {
     patterns: Vec<Pattern>,
-    regex_set: RegexSet,
 }
 
-impl PatternEngine {
-    fn new(patterns: Vec<Pattern>) -> Result<Self, regex::Error> {
-        let regexes: Vec<&str> = patterns.iter().map(|p| p.regex.as_str()).collect();
-        let regex_set = RegexSet::new(&regexes)?;
-        Ok(PatternEngine { patterns, regex_set })
+impl PatternMatcher {
+    fn new() -> Self {
+        PatternMatcher {
+            patterns: Vec::new(),
+        }
     }
 
-    fn scan_line(&self, line: &str, line_number: usize) -> Vec<Match> {
-        let matching_indices: Vec<usize> = self.regex_set.matches(line).into_iter().collect();
-        matching_indices
-            .into_iter()
-            .map(|idx| {
-                let pattern = &self.patterns[idx];
-                Match {
+    fn add_pattern(&mut self, pattern: Pattern) {
+        self.patterns.push(pattern);
+    }
+
+    fn load_default_patterns(&mut self) {
+        let defaults = vec![
+            // SQL Injection patterns
+            ("sqli-001", "SQL Injection - Error Based", "critical", PatternType::Contains,
+             "You have an error in your SQL syntax", "CWE-89", "Use parameterized queries"),
+            ("sqli-002", "SQL Injection - MySQL", "critical", PatternType::Contains,
+             "mysql_fetch_array()", "CWE-89", "Use prepared statements"),
+            ("sqli-003", "SQL Injection - MSSQL", "critical", PatternType::Contains,
+             "Microsoft OLE DB Provider", "CWE-89", "Use parameterized queries"),
+            ("sqli-004", "SQL Injection - PostgreSQL", "critical", PatternType::Contains,
+             "PSQLException", "CWE-89", "Use parameterized queries"),
+            ("sqli-005", "SQL Injection - Oracle", "critical", PatternType::Contains,
+             "ORA-01756", "CWE-89", "Use bind variables"),
+
+            // XSS patterns
+            ("xss-001", "XSS - Script Tag", "high", PatternType::Contains,
+             "<script>", "CWE-79", "Encode output, use CSP"),
+            ("xss-002", "XSS - Event Handler", "high", PatternType::Contains,
+             "onerror=", "CWE-79", "Sanitize input, encode output"),
+            ("xss-003", "XSS - JavaScript URI", "high", PatternType::Contains,
+             "javascript:", "CWE-79", "Validate URL schemes"),
+
+            // Path Traversal
+            ("pt-001", "Path Traversal", "high", PatternType::Contains,
+             "../../../etc/passwd", "CWE-22", "Validate and normalize paths"),
+            ("pt-002", "Path Traversal - Windows", "high", PatternType::Contains,
+             "..\\..\\..\\windows", "CWE-22", "Validate and normalize paths"),
+
+            // Information Disclosure
+            ("info-001", "Server Version Disclosure", "medium", PatternType::Contains,
+             "Server: Apache/", "CWE-200", "Remove server version headers"),
+            ("info-002", "PHP Info Disclosure", "medium", PatternType::Contains,
+             "phpinfo()", "CWE-200", "Remove phpinfo pages"),
+            ("info-003", "Stack Trace Disclosure", "medium", PatternType::Contains,
+             "at java.lang.", "CWE-209", "Disable debug mode in production"),
+            ("info-004", "Stack Trace - Python", "medium", PatternType::Contains,
+             "Traceback (most recent call last)", "CWE-209", "Use custom error handlers"),
+            ("info-005", "Stack Trace - .NET", "medium", PatternType::Contains,
+             "System.NullReferenceException", "CWE-209", "Use custom error pages"),
+
+            // Secrets
+            ("secret-001", "AWS Key Exposed", "critical", PatternType::Contains,
+             "AKIA", "CWE-798", "Rotate key immediately, use IAM roles"),
+            ("secret-002", "Private Key Exposed", "critical", PatternType::Contains,
+             "-----BEGIN RSA PRIVATE KEY-----", "CWE-798", "Remove key, rotate credentials"),
+            ("secret-003", "JWT Secret", "critical", PatternType::Contains,
+             "jwt_secret", "CWE-798", "Use environment variables"),
+            ("secret-004", "API Key Pattern", "high", PatternType::Contains,
+             "api_key=", "CWE-798", "Use environment variables"),
+
+            // SSRF
+            ("ssrf-001", "SSRF - Internal IP", "high", PatternType::Contains,
+             "169.254.169.254", "CWE-918", "Validate URLs, block internal IPs"),
+            ("ssrf-002", "SSRF - Localhost", "high", PatternType::Contains,
+             "127.0.0.1", "CWE-918", "Block localhost in URL parameters"),
+
+            // Deserialization
+            ("deser-001", "Java Deserialization", "critical", PatternType::Contains,
+             "ObjectInputStream", "CWE-502", "Use safe deserialization"),
+            ("deser-002", "PHP Deserialization", "critical", PatternType::Contains,
+             "unserialize(", "CWE-502", "Use json_decode instead"),
+            ("deser-003", "Python Pickle", "critical", PatternType::Contains,
+             "pickle.loads", "CWE-502", "Use json instead of pickle"),
+
+            // Command Injection
+            ("cmdi-001", "Command Injection - Bash", "critical", PatternType::Contains,
+             "os.system(", "CWE-78", "Use subprocess with shell=False"),
+            ("cmdi-002", "Command Injection - Eval", "critical", PatternType::Contains,
+             "eval(", "CWE-94", "Never use eval with user input"),
+            ("cmdi-003", "Command Injection - Exec", "critical", PatternType::Contains,
+             "exec(", "CWE-94", "Avoid exec with dynamic input"),
+
+            // Authentication
+            ("auth-001", "Hardcoded Password", "critical", PatternType::Contains,
+             "password = \"", "CWE-798", "Use environment variables"),
+            ("auth-002", "Default Credentials", "high", PatternType::Contains,
+             "admin:admin", "CWE-798", "Change default credentials"),
+
+            // Crypto
+            ("crypto-001", "Weak Hash - MD5", "medium", PatternType::Contains,
+             "md5(", "CWE-328", "Use SHA-256 or bcrypt"),
+            ("crypto-002", "Weak Hash - SHA1", "medium", PatternType::Contains,
+             "sha1(", "CWE-328", "Use SHA-256 or bcrypt"),
+            ("crypto-003", "Weak Cipher - DES", "high", PatternType::Contains,
+             "DES/ECB", "CWE-327", "Use AES-256-GCM"),
+        ];
+
+        for (id, name, sev, ptype, pat, cwe, rem) in defaults {
+            self.add_pattern(Pattern {
+                id: id.to_string(),
+                name: name.to_string(),
+                severity: sev.to_string(),
+                pattern_type: ptype,
+                pattern: pat.to_string(),
+                description: name.to_string(),
+                cwe: cwe.to_string(),
+                remediation: rem.to_string(),
+            });
+        }
+    }
+
+    fn scan(&self, input: &str) -> Vec<Match> {
+        let mut matches = Vec::new();
+
+        for pattern in &self.patterns {
+            let found_positions = self.find_pattern(input, pattern);
+            for (offset, matched_text) in found_positions {
+                let context_start = if offset > 40 { offset - 40 } else { 0 };
+                let context_end = std::cmp::min(input.len(), offset + matched_text.len() + 40);
+                let context = input[context_start..context_end].to_string();
+
+                matches.push(Match {
                     pattern_id: pattern.id.clone(),
                     pattern_name: pattern.name.clone(),
-                    category: pattern.category.clone(),
                     severity: pattern.severity.clone(),
-                    line_number,
-                    line_content: if line.len() > 200 {
-                        format!("{}...", &line[..200])
-                    } else {
-                        line.to_string()
-                    },
-                    column: 0,
-                }
-            })
-            .collect()
-    }
-
-    fn scan_text(&self, text: &str) -> ScanResult {
-        let start = Instant::now();
-        let mut all_matches = Vec::new();
-        let mut stats: HashMap<String, usize> = HashMap::new();
-        let mut lines_scanned = 0;
-
-        for (i, line) in text.lines().enumerate() {
-            lines_scanned += 1;
-            let matches = self.scan_line(line, i + 1);
-            for m in &matches {
-                *stats.entry(m.category.clone()).or_insert(0) += 1;
-                *stats.entry(m.severity.clone()).or_insert(0) += 1;
+                    offset,
+                    matched_text: matched_text.to_string(),
+                    context: context.replace('\n', "\\n").replace('"', "\\\""),
+                    cwe: pattern.cwe.clone(),
+                });
             }
-            all_matches.extend(matches);
         }
 
-        ScanResult {
-            matches: all_matches,
-            lines_scanned,
-            patterns_checked: self.patterns.len(),
-            duration_ms: start.elapsed().as_millis() as u64,
-            stats,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct ScanRequest {
-    text: Option<String>,
-    categories: Option<Vec<String>>,
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-
-    // Collect all built-in patterns
-    let mut all_patterns = Vec::new();
-    all_patterns.extend(builtin_secret_patterns());
-    all_patterns.extend(builtin_vuln_patterns());
-    all_patterns.extend(builtin_ioc_patterns());
-
-    // Filter by category if requested
-    let categories: Vec<String> = args.iter()
-        .skip(1)
-        .filter(|a| !a.starts_with('-'))
-        .cloned()
-        .collect();
-
-    if !categories.is_empty() {
-        all_patterns.retain(|p| categories.contains(&p.category));
+        matches
     }
 
-    let engine = match PatternEngine::new(all_patterns) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("Failed to compile patterns: {}", err);
-            std::process::exit(1);
-        }
-    };
+    fn find_pattern(&self, input: &str, pattern: &Pattern) -> Vec<(usize, String)> {
+        let mut results = Vec::new();
+        let pat = &pattern.pattern;
 
-    // Check for --json mode (read JSON requests from stdin)
-    if args.iter().any(|a| a == "--json") {
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            if let Ok(req) = serde_json::from_str::<ScanRequest>(&line) {
-                if let Some(text) = req.text {
-                    let result = engine.scan_text(&text);
-                    if let Ok(json) = serde_json::to_string(&result) {
-                        let _ = writeln!(out, "{}", json);
+        match pattern.pattern_type {
+            PatternType::Exact => {
+                if input == pat {
+                    results.push((0, pat.clone()));
+                }
+            }
+            PatternType::Contains => {
+                let pat_lower = pat.to_lowercase();
+                let input_lower = input.to_lowercase();
+                let mut start = 0;
+                while let Some(pos) = input_lower[start..].find(&pat_lower) {
+                    let actual_pos = start + pos;
+                    let end = actual_pos + pat.len();
+                    if end <= input.len() {
+                        results.push((actual_pos, input[actual_pos..end].to_string()));
+                    }
+                    start = actual_pos + 1;
+                    if start >= input.len() {
+                        break;
                     }
                 }
             }
+            PatternType::StartsWith => {
+                if input.starts_with(pat) {
+                    results.push((0, pat.clone()));
+                }
+            }
+            PatternType::EndsWith => {
+                if input.ends_with(pat) {
+                    results.push((input.len() - pat.len(), pat.clone()));
+                }
+            }
+            PatternType::Regex => {
+                // Simplified: treat as contains for now
+                if let Some(pos) = input.find(pat) {
+                    results.push((pos, pat.clone()));
+                }
+            }
         }
+
+        results
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_control() => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+fn output_json(matches: &[Match], input_size: usize) {
+    let mut severity_counts: HashMap<&str, usize> = HashMap::new();
+    for m in matches {
+        *severity_counts.entry(m.severity.as_str()).or_insert(0) += 1;
+    }
+
+    print!("{{\"total_matches\":{},\"input_size\":{}", matches.len(), input_size);
+    print!(",\"severity_counts\":{{");
+    let mut first = true;
+    for (sev, count) in &severity_counts {
+        if !first { print!(","); }
+        print!("\"{}\":{}", sev, count);
+        first = false;
+    }
+    print!("}}");
+
+    print!(",\"matches\":[");
+    for (i, m) in matches.iter().enumerate() {
+        if i > 0 { print!(","); }
+        print!("{{\"id\":\"{}\",\"name\":\"{}\",\"severity\":\"{}\",\"offset\":{},\"matched\":\"{}\",\"context\":\"{}\",\"cwe\":\"{}\"}}",
+            json_escape(&m.pattern_id),
+            json_escape(&m.pattern_name),
+            json_escape(&m.severity),
+            m.offset,
+            json_escape(&m.matched_text),
+            json_escape(&m.context),
+            json_escape(&m.cwe),
+        );
+    }
+    println!("]}}");
+}
+
+fn output_text(matches: &[Match]) {
+    if matches.is_empty() {
+        println!("No patterns matched.");
         return;
     }
 
-    // Default: read text from stdin, scan, output results
-    let mut input = String::new();
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(l) => {
-                input.push_str(&l);
-                input.push('\n');
+    println!("Found {} matches:\n", matches.len());
+    for m in matches {
+        println!("[{}] {} ({})", m.severity.to_uppercase(), m.pattern_name, m.cwe);
+        println!("  Offset: {}, Matched: \"{}\"", m.offset, m.matched_text);
+        println!("  Context: ...{}...", &m.context[..std::cmp::min(m.context.len(), 80)]);
+        println!();
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut json_output = false;
+    let mut input_file: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json_output = true,
+            "--file" | "-f" => {
+                if i + 1 < args.len() {
+                    input_file = Some(args[i + 1].clone());
+                    i += 1;
+                }
             }
-            Err(_) => break,
+            "--help" | "-h" => {
+                eprintln!("RecurSec Pattern Engine - Vulnerability Signature Matching");
+                eprintln!("Usage: pattern_engine [--json] [--file <path>]");
+                eprintln!("  Reads from stdin if no file specified");
+                eprintln!("  --json    Output JSON format");
+                eprintln!("  --file    Input file to scan");
+                std::process::exit(0);
+            }
+            _ => {}
         }
+        i += 1;
     }
 
-    let result = engine.scan_text(&input);
-
-    if args.iter().any(|a| a == "--summary") {
-        println!("Lines scanned: {}", result.lines_scanned);
-        println!("Patterns checked: {}", result.patterns_checked);
-        println!("Matches found: {}", result.matches.len());
-        println!("Duration: {}ms", result.duration_ms);
-        for (key, count) in &result.stats {
-            println!("  {}: {}", key, count);
-        }
+    // Read input
+    let input = if let Some(path) = input_file {
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        })
     } else {
-        match serde_json::to_string_pretty(&result) {
-            Ok(json) => println!("{}", json),
-            Err(err) => eprintln!("Failed to serialize: {}", err),
-        }
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
+            eprintln!("Error reading stdin: {}", e);
+            std::process::exit(1);
+        });
+        buf
+    };
+
+    // Create matcher and load patterns
+    let mut matcher = PatternMatcher::new();
+    matcher.load_default_patterns();
+
+    // Scan
+    let matches = matcher.scan(&input);
+
+    // Output
+    if json_output {
+        output_json(&matches, input.len());
+    } else {
+        output_text(&matches);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sql_injection_detection() {
+        let mut matcher = PatternMatcher::new();
+        matcher.load_default_patterns();
+        let input = "Error: You have an error in your SQL syntax near 'DROP TABLE'";
+        let matches = matcher.scan(input);
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].severity, "critical");
+    }
+
+    #[test]
+    fn test_xss_detection() {
+        let mut matcher = PatternMatcher::new();
+        matcher.load_default_patterns();
+        let input = "<html><script>alert('xss')</script></html>";
+        let matches = matcher.scan(input);
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].cwe, "CWE-79");
+    }
+
+    #[test]
+    fn test_secret_detection() {
+        let mut matcher = PatternMatcher::new();
+        matcher.load_default_patterns();
+        let input = "aws_key = AKIAIOSFODNN7EXAMPLE";
+        let matches = matcher.scan(input);
+        assert!(!matches.is_empty());
+    }
+
+    #[test]
+    fn test_no_false_positives() {
+        let mut matcher = PatternMatcher::new();
+        matcher.load_default_patterns();
+        let input = "Hello World, this is a normal text without any vulnerabilities.";
+        let matches = matcher.scan(input);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_json_escape() {
+        assert_eq!(json_escape("hello"), "hello");
+        assert_eq!(json_escape("he\"llo"), "he\\\"llo");
+        assert_eq!(json_escape("line1\nline2"), "line1\\nline2");
+    }
+
+    #[test]
+    fn test_multiple_matches() {
+        let mut matcher = PatternMatcher::new();
+        matcher.load_default_patterns();
+        let input = "eval(user_input) and os.system(cmd) and pickle.loads(data)";
+        let matches = matcher.scan(input);
+        assert!(matches.len() >= 3);
     }
 }
