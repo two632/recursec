@@ -86,8 +86,8 @@ class TargetProfile:
 
 # Target type detection patterns
 TARGET_PATTERNS: list[tuple[str, TargetType]] = [
+    (r'^https?://.*(/api/|/v\d+/|/graphql)', TargetType.API_ENDPOINT),
     (r'^https?://', TargetType.WEB_APP),
-    (r'^http.*(/api/|/v\d+/|/graphql)', TargetType.API_ENDPOINT),
     (r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', TargetType.NETWORK_HOST),
     (r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$', TargetType.NETWORK_RANGE),
     (r'^(github|gitlab|bitbucket)\.', TargetType.CODE_REPO),

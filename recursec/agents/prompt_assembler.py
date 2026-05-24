@@ -247,7 +247,7 @@ class PromptAssembler:
         try:
             from recursec.agents.experience_replay import ExperienceReplay
             replay = ExperienceReplay()
-            return replay.build_experience_prompt()
+            return replay.build_experience_prompt(intent=intent)
         except ImportError:
             return ""
 
