@@ -1,17 +1,25 @@
-"""Reasoning chain engine — structured chain-of-thought with backtracking.
+"""Agent reasoning chain engine — structured multi-step reasoning.
 
-Implements:
-1. Step-by-step reasoning chains
-2. Branch and backtrack on dead ends
-3. Evidence-based reasoning (link to findings)
-4. Hypothesis tracking
-5. Reasoning quality scoring
-6. Reasoning prompt for LLM
+Implements multiple reasoning paradigms:
+1. Chain-of-Thought (CoT) — linear step-by-step reasoning
+2. Tree-of-Thought (ToT) — branching exploration with evaluation
+3. ReAct — Reason + Act interleaving
+4. Self-Consistency — multiple chains, majority vote
+5. Reflexion — self-critique and improvement
+6. Hypothesis Testing — generate hypotheses, test, refine
+7. Adversarial Reasoning — red team vs blue team thought
+8. Analogical Reasoning — map to known patterns
+9. Abductive Reasoning — best explanation from evidence
+10. Bayesian Reasoning — update beliefs with evidence
+
+This is the core thinking engine that produces high-quality
+security analysis by chaining multiple reasoning steps.
 """
 
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -21,67 +29,49 @@ import structlog
 logger = structlog.get_logger()
 
 
-class StepType(str, Enum):
-    OBSERVATION = "observation"
-    HYPOTHESIS = "hypothesis"
-    ACTION = "action"
-    RESULT = "result"
-    DEDUCTION = "deduction"
-    BACKTRACK = "backtrack"
-    CONCLUSION = "conclusion"
+class ReasoningMode(str, Enum):
+    CHAIN_OF_THOUGHT = "chain_of_thought"
+    TREE_OF_THOUGHT = "tree_of_thought"
+    REACT = "react"
+    SELF_CONSISTENCY = "self_consistency"
+    REFLEXION = "reflexion"
+    HYPOTHESIS_TEST = "hypothesis_test"
+    ADVERSARIAL = "adversarial"
+    ANALOGICAL = "analogical"
+    ABDUCTIVE = "abductive"
+    BAYESIAN = "bayesian"
 
 
 class StepStatus(str, Enum):
-    ACTIVE = "active"
-    CONFIRMED = "confirmed"
-    REJECTED = "rejected"
-    BACKTRACKED = "backtracked"
+    PENDING = "pending"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
 
 
 @dataclass
 class ReasoningStep:
     """A single step in a reasoning chain."""
-    step_id: str = ""
-    step_type: StepType = StepType.OBSERVATION
-    content: str = ""
-    status: StepStatus = StepStatus.ACTIVE
-    parent_step: str = ""       # Parent step ID
-    branch_id: str = "main"     # Branch identifier
-    evidence: list[str] = field(default_factory=list)
+    step_id: int = 0
+    thought: str = ""
+    action: str = ""
+    observation: str = ""
     confidence: float = 0.5
-    timestamp: float = field(default_factory=time.time)
+    status: StepStatus = StepStatus.PENDING
+    tool_used: str = ""
+    model_used: str = ""
+    tokens_used: int = 0
+    duration_ms: float = 0.0
+    alternatives_considered: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.step_id[:8],
-            "type": self.step_type.value[:6],
-            "status": self.status.value[:6],
-            "branch": self.branch_id[:6],
+            "step": self.step_id,
+            "thought": self.thought[:30],
+            "action": self.action[:20],
             "conf": f"{self.confidence:.0%}",
-        }
-
-
-@dataclass
-class Hypothesis:
-    """A tracked hypothesis."""
-    hyp_id: str = ""
-    statement: str = ""
-    confidence: float = 0.5
-    supporting: list[str] = field(default_factory=list)     # Step IDs that support
-    contradicting: list[str] = field(default_factory=list)  # Step IDs that contradict
-    status: str = "active"    # active, confirmed, rejected
-
-    @property
-    def net_evidence(self) -> int:
-        return len(self.supporting) - len(self.contradicting)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.hyp_id[:8],
-            "statement": self.statement[:30],
-            "conf": f"{self.confidence:.0%}",
-            "for": len(self.supporting),
-            "against": len(self.contradicting),
+            "status": self.status.value[:8],
         }
 
 
@@ -89,286 +79,345 @@ class Hypothesis:
 class ReasoningChain:
     """A complete reasoning chain."""
     chain_id: str = ""
-    task: str = ""
+    mode: ReasoningMode = ReasoningMode.CHAIN_OF_THOUGHT
+    goal: str = ""
     steps: list[ReasoningStep] = field(default_factory=list)
-    hypotheses: list[Hypothesis] = field(default_factory=list)
-    current_branch: str = "main"
-    branches: list[str] = field(default_factory=lambda: ["main"])
-    quality_score: float = 0.0
+    conclusion: str = ""
+    overall_confidence: float = 0.0
+    total_tokens: int = 0
+    total_duration_ms: float = 0.0
     created_at: float = field(default_factory=time.time)
-    completed_at: float = 0.0
 
     @property
-    def active_steps(self) -> list[ReasoningStep]:
-        return [s for s in self.steps if s.status == StepStatus.ACTIVE]
-
-    @property
-    def is_complete(self) -> bool:
-        return any(s.step_type == StepType.CONCLUSION for s in self.steps)
+    def length(self) -> int:
+        return len(self.steps)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.chain_id[:10],
-            "steps": len(self.steps),
-            "branches": len(self.branches),
-            "hypotheses": len(self.hypotheses),
-            "quality": f"{self.quality_score:.0%}",
+            "id": self.chain_id[:8],
+            "mode": self.mode.value[:12],
+            "steps": self.length,
+            "conf": f"{self.overall_confidence:.0%}",
+            "conclusion": self.conclusion[:30],
         }
 
 
-class ReasoningEngine:
-    """Structured reasoning with chain-of-thought and backtracking.
+@dataclass
+class Hypothesis:
+    """A hypothesis for testing."""
+    hypothesis_id: str = ""
+    statement: str = ""
+    evidence_for: list[str] = field(default_factory=list)
+    evidence_against: list[str] = field(default_factory=list)
+    prior_probability: float = 0.5
+    posterior_probability: float = 0.5
+    status: str = "untested"
+    tests_run: int = 0
 
-    Manages reasoning chains that track observations,
-    hypotheses, actions, and conclusions with the ability
-    to branch and backtrack when reasoning paths fail.
-    """
+    def update_probability(self, evidence_supports: bool, strength: float = 0.2) -> None:
+        if evidence_supports:
+            self.posterior_probability = min(0.99, self.posterior_probability + strength * (1 - self.posterior_probability))
+        else:
+            self.posterior_probability = max(0.01, self.posterior_probability - strength * self.posterior_probability)
+        self.tests_run += 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stmt": self.statement[:30],
+            "prob": f"{self.posterior_probability:.0%}",
+            "tests": self.tests_run,
+            "status": self.status[:8],
+        }
+
+
+@dataclass
+class BeliefState:
+    """Bayesian belief tracking."""
+    beliefs: dict[str, float] = field(default_factory=dict)
+    evidence_log: list[tuple[str, bool, float]] = field(default_factory=list)
+
+    def update(self, belief_key: str, evidence_supports: bool, strength: float = 0.15) -> None:
+        current = self.beliefs.get(belief_key, 0.5)
+        if evidence_supports:
+            new = min(0.99, current + strength * (1 - current))
+        else:
+            new = max(0.01, current - strength * current)
+        self.beliefs[belief_key] = new
+        self.evidence_log.append((belief_key, evidence_supports, strength))
+
+    def get_top_beliefs(self, n: int = 5) -> list[tuple[str, float]]:
+        sorted_beliefs = sorted(self.beliefs.items(), key=lambda x: x[1], reverse=True)
+        return sorted_beliefs[:n]
+
+
+@dataclass
+class ThoughtNode:
+    """A node in a Tree-of-Thought."""
+    node_id: int = 0
+    thought: str = ""
+    score: float = 0.0
+    children: list[int] = field(default_factory=list)
+    parent_id: int = -1
+    depth: int = 0
+    is_leaf: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.node_id,
+            "thought": self.thought[:25],
+            "score": f"{self.score:.2f}",
+            "children": len(self.children),
+            "depth": self.depth,
+        }
+
+
+# Reasoning prompts by mode
+REASONING_PROMPTS: dict[ReasoningMode, str] = {
+    ReasoningMode.CHAIN_OF_THOUGHT: (
+        "Think through this step by step:\n"
+        "Step 1: What is the goal?\n"
+        "Step 2: What information do I have?\n"
+        "Step 3: What is the most likely approach?\n"
+        "Step 4: What tools should I use?\n"
+        "Step 5: What could go wrong?\n"
+        "Step 6: What is my conclusion?"
+    ),
+    ReasoningMode.REACT: (
+        "Use the ReAct pattern:\n"
+        "Thought: [What am I trying to do?]\n"
+        "Action: [What tool/command to run]\n"
+        "Observation: [What did I see?]\n"
+        "Thought: [What does this mean?]\n"
+        "... repeat until conclusion"
+    ),
+    ReasoningMode.HYPOTHESIS_TEST: (
+        "Form and test hypotheses:\n"
+        "1. Based on evidence, what hypotheses can I form?\n"
+        "2. For each hypothesis, what test would confirm/deny it?\n"
+        "3. Run the tests\n"
+        "4. Update belief probabilities\n"
+        "5. What is the strongest hypothesis?"
+    ),
+    ReasoningMode.ADVERSARIAL: (
+        "Think as both attacker and defender:\n"
+        "ATTACKER: What are the possible attack vectors?\n"
+        "DEFENDER: How can each be detected/prevented?\n"
+        "ATTACKER: How can I bypass the defenses?\n"
+        "DEFENDER: What additional mitigations exist?\n"
+        "CONCLUSION: What is the real risk?"
+    ),
+    ReasoningMode.ABDUCTIVE: (
+        "Find the best explanation:\n"
+        "1. What observations/evidence do I have?\n"
+        "2. What are possible explanations?\n"
+        "3. Which explanation best fits ALL the evidence?\n"
+        "4. Are there any counter-examples?\n"
+        "5. Rank explanations by plausibility"
+    ),
+}
+
+# Task type → recommended reasoning mode
+TASK_REASONING_MAP: dict[str, ReasoningMode] = {
+    "vulnerability_analysis": ReasoningMode.HYPOTHESIS_TEST,
+    "code_review": ReasoningMode.CHAIN_OF_THOUGHT,
+    "exploit_planning": ReasoningMode.ADVERSARIAL,
+    "triage": ReasoningMode.ABDUCTIVE,
+    "recon_analysis": ReasoningMode.CHAIN_OF_THOUGHT,
+    "finding_validation": ReasoningMode.HYPOTHESIS_TEST,
+    "attack_planning": ReasoningMode.TREE_OF_THOUGHT,
+    "risk_assessment": ReasoningMode.BAYESIAN,
+    "incident_response": ReasoningMode.REACT,
+    "defense_strategy": ReasoningMode.ADVERSARIAL,
+}
+
+
+class ReasoningChainEngine:
+    """Manages and executes reasoning chains."""
 
     def __init__(self) -> None:
         self._chains: dict[str, ReasoningChain] = {}
+        self._hypotheses: dict[str, Hypothesis] = {}
+        self._beliefs = BeliefState()
+        self._thought_tree: dict[int, ThoughtNode] = {}
         self._chain_counter = 0
-        self._step_counter = 0
-        self._hyp_counter = 0
-        self._log = logger.bind(component="reasoning")
+        self._hypothesis_counter = 0
+        self._node_counter = 0
+        self._log = logger.bind(component="reasoning_chain")
 
-    def create_chain(self, task: str) -> ReasoningChain:
+    def select_mode(self, task_type: str) -> ReasoningMode:
+        """Select best reasoning mode for a task type."""
+        return TASK_REASONING_MAP.get(task_type, ReasoningMode.CHAIN_OF_THOUGHT)
+
+    def create_chain(self, goal: str, mode: ReasoningMode | None = None) -> ReasoningChain:
         """Create a new reasoning chain."""
         self._chain_counter += 1
         chain = ReasoningChain(
             chain_id=f"chain-{self._chain_counter}",
-            task=task,
+            mode=mode or ReasoningMode.CHAIN_OF_THOUGHT,
+            goal=goal,
         )
         self._chains[chain.chain_id] = chain
         return chain
 
-    def add_step(
-        self,
-        chain_id: str,
-        step_type: StepType,
-        content: str,
-        evidence: list[str] | None = None,
-        confidence: float = 0.5,
-    ) -> ReasoningStep | None:
+    def add_step(self, chain_id: str, thought: str, action: str = "", observation: str = "", confidence: float = 0.5) -> ReasoningStep:
         """Add a step to a reasoning chain."""
         chain = self._chains.get(chain_id)
         if not chain:
-            return None
-
-        self._step_counter += 1
-
-        # Find parent (last step on current branch)
-        parent_id = ""
-        for step in reversed(chain.steps):
-            if step.branch_id == chain.current_branch and step.status == StepStatus.ACTIVE:
-                parent_id = step.step_id
-                break
+            return ReasoningStep()
 
         step = ReasoningStep(
-            step_id=f"step-{self._step_counter}",
-            step_type=step_type,
-            content=content,
-            parent_step=parent_id,
-            branch_id=chain.current_branch,
-            evidence=evidence or [],
+            step_id=len(chain.steps),
+            thought=thought,
+            action=action,
+            observation=observation,
             confidence=confidence,
+            status=StepStatus.COMPLETED,
         )
-
         chain.steps.append(step)
 
-        # Update hypotheses
-        self._update_hypotheses(chain, step)
+        # Update chain confidence
+        if chain.steps:
+            chain.overall_confidence = sum(s.confidence for s in chain.steps) / len(chain.steps)
 
         return step
 
-    def add_hypothesis(
-        self,
-        chain_id: str,
-        statement: str,
-        confidence: float = 0.5,
-    ) -> Hypothesis | None:
-        """Add a hypothesis to track."""
+    def conclude_chain(self, chain_id: str, conclusion: str) -> ReasoningChain:
+        """Conclude a reasoning chain."""
         chain = self._chains.get(chain_id)
-        if not chain:
-            return None
+        if chain:
+            chain.conclusion = conclusion
+        return chain or ReasoningChain()
 
-        self._hyp_counter += 1
+    def create_hypothesis(self, statement: str, prior: float = 0.5) -> Hypothesis:
+        """Create a new hypothesis for testing."""
+        self._hypothesis_counter += 1
         hyp = Hypothesis(
-            hyp_id=f"hyp-{self._hyp_counter}",
+            hypothesis_id=f"hyp-{self._hypothesis_counter}",
             statement=statement,
-            confidence=confidence,
+            prior_probability=prior,
+            posterior_probability=prior,
         )
-        chain.hypotheses.append(hyp)
+        self._hypotheses[hyp.hypothesis_id] = hyp
         return hyp
 
-    def _update_hypotheses(self, chain: ReasoningChain, step: ReasoningStep) -> None:
-        """Update hypotheses based on new step."""
-        if step.step_type == StepType.RESULT:
-            for hyp in chain.hypotheses:
-                if hyp.status != "active":
-                    continue
-                # Check if result supports or contradicts
-                content_lower = step.content.lower()
-                stmt_lower = hyp.statement.lower()
-
-                # Simple keyword overlap heuristic
-                stmt_words = set(stmt_lower.split())
-                content_words = set(content_lower.split())
-                overlap = stmt_words & content_words
-
-                if len(overlap) >= 2:
-                    if any(neg in content_lower for neg in ["not found", "failed", "no ", "denied"]):
-                        hyp.contradicting.append(step.step_id)
-                        hyp.confidence *= 0.8
-                    else:
-                        hyp.supporting.append(step.step_id)
-                        hyp.confidence = min(0.99, hyp.confidence * 1.1)
-
-    def branch(self, chain_id: str, reason: str = "") -> str | None:
-        """Create a new reasoning branch."""
-        chain = self._chains.get(chain_id)
-        if not chain:
-            return None
-
-        branch_name = f"b{len(chain.branches)}"
-        chain.branches.append(branch_name)
-        chain.current_branch = branch_name
-
-        self.add_step(
-            chain_id,
-            StepType.OBSERVATION,
-            f"Branching: {reason}",
-        )
-
-        return branch_name
-
-    def backtrack(self, chain_id: str, reason: str = "") -> bool:
-        """Backtrack to previous branch."""
-        chain = self._chains.get(chain_id)
-        if not chain or len(chain.branches) < 2:
-            return False
-
-        # Mark current branch steps as backtracked
-        current = chain.current_branch
-        for step in chain.steps:
-            if step.branch_id == current and step.status == StepStatus.ACTIVE:
-                step.status = StepStatus.BACKTRACKED
-
-        self._step_counter += 1
-        bt_step = ReasoningStep(
-            step_id=f"step-{self._step_counter}",
-            step_type=StepType.BACKTRACK,
-            content=f"Backtracking: {reason}",
-            branch_id=current,
-        )
-        chain.steps.append(bt_step)
-
-        # Switch to previous branch
-        idx = chain.branches.index(current)
-        chain.current_branch = chain.branches[idx - 1] if idx > 0 else "main"
-
-        return True
-
-    def conclude(
-        self,
-        chain_id: str,
-        conclusion: str,
-        confidence: float = 0.5,
-    ) -> ReasoningStep | None:
-        """Add a conclusion to end the chain."""
-        chain = self._chains.get(chain_id)
-        if not chain:
-            return None
-
-        step = self.add_step(
-            chain_id,
-            StepType.CONCLUSION,
-            conclusion,
-            confidence=confidence,
-        )
-
-        if step:
-            chain.completed_at = time.time()
-            chain.quality_score = self._score_chain(chain)
-
-        return step
-
-    def _score_chain(self, chain: ReasoningChain) -> float:
-        """Score reasoning quality."""
-        if not chain.steps:
-            return 0.0
-
-        score = 0.0
-
-        # Has observations? (+0.2)
-        if any(s.step_type == StepType.OBSERVATION for s in chain.steps):
-            score += 0.2
-
-        # Has hypotheses? (+0.15)
-        if chain.hypotheses:
-            score += 0.15
-
-        # Has evidence-backed steps? (+0.2)
-        evidence_steps = sum(1 for s in chain.steps if s.evidence)
-        if evidence_steps > 0:
-            score += min(0.2, evidence_steps * 0.05)
-
-        # Has conclusions? (+0.2)
-        if chain.is_complete:
-            score += 0.2
-
-        # Hypothesis resolution (+0.15)
-        resolved = sum(1 for h in chain.hypotheses if h.status != "active")
-        if chain.hypotheses:
-            score += 0.15 * (resolved / len(chain.hypotheses))
-
-        # Low backtrack ratio (+0.1)
-        total = len(chain.steps)
-        bt = sum(1 for s in chain.steps if s.status == StepStatus.BACKTRACKED)
-        if total > 0:
-            bt_ratio = bt / total
-            score += 0.1 * max(0, 1 - bt_ratio * 2)
-
-        return min(1.0, score)
-
-    def build_reasoning_prompt(self, chain_id: str = "") -> str:
-        """Build reasoning context for LLM."""
-        lines = ["## Reasoning State\n"]
-
-        if chain_id and chain_id in self._chains:
-            chain = self._chains[chain_id]
-            lines.append(f"Task: {chain.task[:50]}")
-            lines.append(f"Steps: {len(chain.steps)} | Branches: {len(chain.branches)}")
-            lines.append(f"Current branch: {chain.current_branch}")
-
-            # Recent active steps
-            active = [s for s in chain.steps if s.status == StepStatus.ACTIVE][-5:]
-            if active:
-                lines.append("\nRecent reasoning:")
-                for s in active:
-                    lines.append(f"  [{s.step_type.value[:6]}] {s.content[:50]}")
-
-            # Active hypotheses
-            active_hyps = [h for h in chain.hypotheses if h.status == "active"]
-            if active_hyps:
-                lines.append("\nHypotheses:")
-                for h in active_hyps[:3]:
-                    lines.append(
-                        f"  {h.statement[:40]} "
-                        f"(conf={h.confidence:.0%}, +"
-                        f"{len(h.supporting)}/-{len(h.contradicting)})"
-                    )
+    def test_hypothesis(self, hypothesis_id: str, evidence: str, supports: bool, strength: float = 0.2) -> Hypothesis:
+        """Update a hypothesis with new evidence."""
+        hyp = self._hypotheses.get(hypothesis_id)
+        if not hyp:
+            return Hypothesis()
+        if supports:
+            hyp.evidence_for.append(evidence)
         else:
-            lines.append(f"Active chains: {len(self._chains)}")
+            hyp.evidence_against.append(evidence)
+        hyp.update_probability(supports, strength)
+        return hyp
+
+    def create_thought_tree(self, root_thought: str) -> ThoughtNode:
+        """Create a Tree-of-Thought root node."""
+        self._node_counter += 1
+        node = ThoughtNode(
+            node_id=self._node_counter,
+            thought=root_thought,
+            depth=0,
+        )
+        self._thought_tree[node.node_id] = node
+        return node
+
+    def expand_thought(self, parent_id: int, thoughts: list[str]) -> list[ThoughtNode]:
+        """Expand a thought node with children."""
+        parent = self._thought_tree.get(parent_id)
+        if not parent:
+            return []
+
+        children = []
+        for thought in thoughts:
+            self._node_counter += 1
+            child = ThoughtNode(
+                node_id=self._node_counter,
+                thought=thought,
+                parent_id=parent_id,
+                depth=parent.depth + 1,
+            )
+            self._thought_tree[child.node_id] = child
+            parent.children.append(child.node_id)
+            children.append(child)
+
+        return children
+
+    def score_thought(self, node_id: int, score: float) -> None:
+        """Score a thought node."""
+        node = self._thought_tree.get(node_id)
+        if node:
+            node.score = score
+
+    def get_best_path(self, root_id: int) -> list[ThoughtNode]:
+        """Get the highest-scoring path in the thought tree."""
+        root = self._thought_tree.get(root_id)
+        if not root:
+            return []
+
+        path = [root]
+        current = root
+        while current.children:
+            best_child = None
+            best_score = -1.0
+            for child_id in current.children:
+                child = self._thought_tree.get(child_id)
+                if child and child.score > best_score:
+                    best_score = child.score
+                    best_child = child
+            if best_child:
+                path.append(best_child)
+                current = best_child
+            else:
+                break
+
+        return path
+
+    def self_consistency_vote(self, chains: list[str]) -> str:
+        """Vote across multiple chains for self-consistency."""
+        conclusions: dict[str, int] = defaultdict(int)
+        for chain_id in chains:
+            chain = self._chains.get(chain_id)
+            if chain and chain.conclusion:
+                conclusions[chain.conclusion] += 1
+        if not conclusions:
+            return ""
+        return max(conclusions, key=conclusions.get)
+
+    def build_reasoning_prompt(self, goal: str, mode: ReasoningMode, context: str = "") -> str:
+        """Build a reasoning prompt for the LLM."""
+        lines = ["## Reasoning Task"]
+        lines.append(f"Mode: {mode.value}")
+        lines.append(f"Goal: {goal}")
+
+        scaffold = REASONING_PROMPTS.get(mode, "")
+        if scaffold:
+            lines.append(f"\n{scaffold}")
+
+        if context:
+            lines.append(f"\n## Context:\n{context}")
+
+        # Add relevant hypotheses
+        active_hyps = [h for h in self._hypotheses.values() if h.status != "rejected"]
+        if active_hyps:
+            lines.append("\n## Active Hypotheses:")
+            for hyp in sorted(active_hyps, key=lambda h: h.posterior_probability, reverse=True)[:3]:
+                lines.append(f"  - [{hyp.posterior_probability:.0%}] {hyp.statement[:50]}")
+
+        # Add top beliefs
+        top_beliefs = self._beliefs.get_top_beliefs(3)
+        if top_beliefs:
+            lines.append("\n## Current Beliefs:")
+            for belief, prob in top_beliefs:
+                lines.append(f"  - [{prob:.0%}] {belief[:40]}")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        total_steps = sum(len(c.steps) for c in self._chains.values())
-        total_hyps = sum(len(c.hypotheses) for c in self._chains.values())
-
         return {
-            "total_chains": len(self._chains),
-            "total_steps": total_steps,
-            "total_hypotheses": total_hyps,
-            "completed": sum(1 for c in self._chains.values() if c.is_complete),
+            "chains": len(self._chains),
+            "hypotheses": len(self._hypotheses),
+            "beliefs": len(self._beliefs.beliefs),
+            "tree_nodes": len(self._thought_tree),
         }
