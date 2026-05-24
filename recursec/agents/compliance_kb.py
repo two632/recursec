@@ -1,11 +1,11 @@
-"""Compliance and regulatory knowledge base.
+"""Compliance and audit knowledge base.
 
-Deep knowledge about security compliance frameworks:
-1. PCI DSS compliance testing
-2. HIPAA security assessment
-3. SOC 2 controls
-4. GDPR technical requirements
-5. NIST CSF mapping
+Deep knowledge about compliance frameworks:
+1. PCI DSS (Payment Card Industry)
+2. HIPAA (Healthcare)
+3. SOC 2 (Service Organizations)
+4. ISO 27001 (Information Security)
+5. NIST Cybersecurity Framework
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class CompliancePattern:
     pattern_id: str = ""
     name: str = ""
     category: str = ""
-    severity: str = "high"
+    severity: str = "medium"
     description: str = ""
     detection_strategy: str = ""
     tools: list[str] = field(default_factory=list)
@@ -39,190 +39,209 @@ class CompliancePattern:
 
 COMPLIANCE_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "comp-001", "name": "PCI DSS Testing",
+        "id": "comp-001", "name": "PCI DSS",
         "category": "pci", "severity": "high",
-        "desc": "PCI DSS compliance security testing.",
+        "desc": "PCI DSS compliance assessment.",
         "detection": (
-            "PCI DSS COMPLIANCE TESTING:\n"
-            "REQUIREMENT 1: Network Security Controls\n"
-            "  - Firewall rules review\n"
-            "  - Network segmentation testing\n"
-            "  - CDE boundary verification\n"
-            "  - DMZ configuration check\n"
-            "REQUIREMENT 2: Secure Configurations\n"
-            "  - Default credential check\n"
-            "  - Unnecessary service removal\n"
-            "  - Encryption standards (TLS 1.2+)\n"
-            "  - System hardening benchmarks (CIS)\n"
-            "REQUIREMENT 3: Stored Account Data\n"
-            "  - PAN storage discovery\n"
-            "  - Encryption verification (AES-256)\n"
-            "  - Key management review\n"
-            "  - Data retention policies\n"
-            "REQUIREMENT 6: Secure Software\n"
-            "  - OWASP Top 10 testing\n"
-            "  - Secure SDLC review\n"
-            "  - Public-facing web app scanning\n"
-            "  - WAF deployment check\n"
-            "REQUIREMENT 11: Regular Testing\n"
-            "  - Quarterly ASV scans\n"
-            "  - Annual penetration testing\n"
-            "  - Internal vulnerability scans\n"
+            "PCI DSS COMPLIANCE:\n"
+            "KEY REQUIREMENTS:\n"
+            "  Req 1: Firewall/network security\n"
+            "  Req 2: No vendor defaults (passwords)\n"
+            "  Req 3: Protect stored cardholder data\n"
+            "  Req 4: Encrypt transmission\n"
+            "  Req 5: Anti-malware\n"
+            "  Req 6: Secure development\n"
+            "  Req 7: Restrict access (need-to-know)\n"
+            "  Req 8: Identify users (authentication)\n"
+            "  Req 9: Physical access controls\n"
+            "  Req 10: Log and monitor access\n"
+            "  Req 11: Regular testing\n"
+            "  Req 12: Security policy\n"
+            "TESTING:\n"
+            "  - Network segmentation verification\n"
+            "  - ASV (Approved Scanning Vendor) scans\n"
+            "  - Penetration testing (internal/external)\n"
             "  - Wireless scanning\n"
-            "  - IDS/IPS monitoring\n"
             "  - File integrity monitoring\n"
+            "  - IDS/IPS testing\n"
+            "CARDHOLDER DATA:\n"
+            "  - PAN (Primary Account Number)\n"
+            "  - Track data (magnetic stripe)\n"
+            "  - CVV2/CVC2\n"
+            "  - PIN/PIN block\n"
+            "  - Where is data stored/processed/transmitted?\n"
             "TOOLS:\n"
-            "  Nessus, Qualys, nmap, nuclei"
+            "  Nessus (PCI plugin), Qualys PCI, OpenSCAP"
         ),
-        "tools": ["nessus", "qualys"],
+        "tools": ["nessus", "openscap"],
     },
     {
         "id": "comp-002", "name": "HIPAA Security",
         "category": "hipaa", "severity": "high",
-        "desc": "HIPAA security assessment.",
+        "desc": "HIPAA compliance for healthcare.",
         "detection": (
-            "HIPAA SECURITY ASSESSMENT:\n"
-            "ADMINISTRATIVE (§164.308):\n"
-            "  - Risk analysis conducted\n"
-            "  - Risk management plan\n"
-            "  - Workforce training\n"
-            "  - Information access management\n"
-            "  - Security incident procedures\n"
-            "PHYSICAL (§164.310):\n"
-            "  - Facility access controls\n"
-            "  - Workstation security\n"
-            "  - Device and media controls\n"
-            "  - Disposal procedures\n"
-            "TECHNICAL (§164.312):\n"
-            "  - Access control (unique user ID, auto-logoff)\n"
-            "  - Audit controls (logging, monitoring)\n"
-            "  - Integrity controls (hashing, checksums)\n"
-            "  - Transmission security (encryption in transit)\n"
-            "  - Authentication mechanisms\n"
-            "PHI DATA:\n"
-            "  - PHI at rest encryption\n"
-            "  - PHI in transit encryption (TLS 1.2+)\n"
-            "  - Access logging for PHI access\n"
-            "  - Minimum necessary principle\n"
-            "  - Business associate agreements\n"
+            "HIPAA SECURITY:\n"
+            "SAFEGUARDS:\n"
+            "  ADMINISTRATIVE:\n"
+            "    - Risk analysis (164.308(a)(1))\n"
+            "    - Security management\n"
+            "    - Workforce security\n"
+            "    - Information access management\n"
+            "    - Security awareness training\n"
+            "    - Incident procedures\n"
+            "    - Contingency plan\n"
+            "    - Business associate agreements\n"
+            "  PHYSICAL:\n"
+            "    - Facility access controls\n"
+            "    - Workstation use\n"
+            "    - Device and media controls\n"
+            "  TECHNICAL:\n"
+            "    - Access control\n"
+            "    - Audit controls (logging)\n"
+            "    - Integrity (ePHI modification)\n"
+            "    - Person/entity authentication\n"
+            "    - Transmission security (encryption)\n"
+            "PHI/ePHI:\n"
+            "  - Protected Health Information\n"
+            "  - 18 HIPAA identifiers\n"
+            "  - Names, dates, SSN, medical records\n"
+            "  - Biometric data, photos, device IDs\n"
             "TESTING:\n"
-            "  - Network segmentation of PHI systems\n"
-            "  - PHI data discovery (DLP scanning)\n"
-            "  - Access control testing\n"
-            "  - Encryption verification"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "comp-003", "name": "SOC 2 Controls",
-        "category": "soc2", "severity": "medium",
-        "desc": "SOC 2 Trust Services Criteria.",
-        "detection": (
-            "SOC 2 CONTROLS:\n"
-            "SECURITY (CC):\n"
-            "  CC6.1: Access controls (RBAC, MFA)\n"
-            "  CC6.2: Authentication mechanisms\n"
-            "  CC6.3: Authorization management\n"
-            "  CC6.6: External threat protection\n"
-            "  CC6.7: Network security monitoring\n"
-            "  CC6.8: Unauthorized access prevention\n"
-            "AVAILABILITY (A):\n"
-            "  A1.1: Capacity planning\n"
-            "  A1.2: Environmental safeguards\n"
-            "  A1.3: Recovery procedures\n"
-            "CONFIDENTIALITY (C):\n"
-            "  C1.1: Data classification\n"
-            "  C1.2: Confidential data protection\n"
-            "PROCESSING INTEGRITY (PI):\n"
-            "  PI1.1: Processing accuracy\n"
-            "  PI1.2: Input/output validation\n"
-            "TESTING:\n"
-            "  - Evidence collection automation\n"
-            "  - Control effectiveness testing\n"
-            "  - Gap analysis against criteria\n"
-            "  - Continuous monitoring setup\n"
-            "  - Policy and procedure review\n"
+            "  - PHI data flow mapping\n"
+            "  - Encryption audit (at rest + in transit)\n"
+            "  - Access control review\n"
+            "  - Audit log analysis\n"
             "TOOLS:\n"
-            "  Vanta, Drata, Secureframe (compliance automation)"
+            "  HIPAA compliance scanners, Nessus"
         ),
-        "tools": [],
+        "tools": ["nessus"],
     },
     {
-        "id": "comp-004", "name": "GDPR Technical",
-        "category": "gdpr", "severity": "high",
-        "desc": "GDPR technical security requirements.",
+        "id": "comp-003", "name": "SOC 2",
+        "category": "soc2", "severity": "medium",
+        "desc": "SOC 2 compliance assessment.",
         "detection": (
-            "GDPR TECHNICAL REQUIREMENTS:\n"
-            "ARTICLE 32 (Security of Processing):\n"
-            "  - Encryption of personal data\n"
-            "  - Confidentiality, integrity, availability\n"
-            "  - Resilience of processing systems\n"
-            "  - Ability to restore data\n"
-            "  - Regular testing of security\n"
-            "DATA PROTECTION:\n"
-            "  - Data at rest encryption (AES-256)\n"
-            "  - Data in transit encryption (TLS 1.2+)\n"
-            "  - Pseudonymization/anonymization\n"
-            "  - Data minimization\n"
-            "  - Storage limitation\n"
-            "ACCESS CONTROL:\n"
-            "  - Role-based access (RBAC)\n"
-            "  - Multi-factor authentication\n"
-            "  - Privileged access management\n"
-            "  - Access reviews\n"
-            "BREACH NOTIFICATION (Art. 33/34):\n"
-            "  - 72-hour notification to authority\n"
-            "  - Breach detection capabilities\n"
-            "  - Incident response procedures\n"
-            "  - Data subject notification\n"
-            "DATA SUBJECT RIGHTS:\n"
-            "  - Right to access (Art. 15)\n"
-            "  - Right to erasure (Art. 17)\n"
-            "  - Data portability (Art. 20)\n"
-            "  - Technical implementation of rights"
-        ),
-        "tools": [],
-    },
-    {
-        "id": "comp-005", "name": "NIST CSF Mapping",
-        "category": "nist", "severity": "medium",
-        "desc": "NIST Cybersecurity Framework mapping.",
-        "detection": (
-            "NIST CSF MAPPING:\n"
-            "IDENTIFY (ID):\n"
-            "  ID.AM: Asset management\n"
-            "  ID.BE: Business environment\n"
-            "  ID.GV: Governance\n"
-            "  ID.RA: Risk assessment\n"
-            "  ID.RM: Risk management strategy\n"
-            "PROTECT (PR):\n"
-            "  PR.AC: Access control\n"
-            "  PR.AT: Awareness training\n"
-            "  PR.DS: Data security\n"
-            "  PR.IP: Information protection\n"
-            "  PR.MA: Maintenance\n"
-            "  PR.PT: Protective technology\n"
-            "DETECT (DE):\n"
-            "  DE.AE: Anomalies and events\n"
-            "  DE.CM: Continuous monitoring\n"
-            "  DE.DP: Detection processes\n"
-            "RESPOND (RS):\n"
-            "  RS.RP: Response planning\n"
-            "  RS.CO: Communications\n"
-            "  RS.AN: Analysis\n"
-            "  RS.MI: Mitigation\n"
-            "  RS.IM: Improvements\n"
-            "RECOVER (RC):\n"
-            "  RC.RP: Recovery planning\n"
-            "  RC.IM: Improvements\n"
-            "  RC.CO: Communications\n"
+            "SOC 2 COMPLIANCE:\n"
+            "TRUST SERVICE CRITERIA:\n"
+            "  SECURITY (Common Criteria):\n"
+            "    - CC1: Control environment\n"
+            "    - CC2: Communication and information\n"
+            "    - CC3: Risk assessment\n"
+            "    - CC4: Monitoring activities\n"
+            "    - CC5: Control activities\n"
+            "    - CC6: Logical/physical access\n"
+            "    - CC7: System operations\n"
+            "    - CC8: Change management\n"
+            "    - CC9: Risk mitigation\n"
+            "  AVAILABILITY:\n"
+            "    - A1: Capacity planning\n"
+            "    - Backup and recovery\n"
+            "    - Business continuity\n"
+            "  PROCESSING INTEGRITY:\n"
+            "    - PI1: Processing completeness\n"
+            "    - Data validation\n"
+            "    - Error handling\n"
+            "  CONFIDENTIALITY:\n"
+            "    - C1: Identification of confidential info\n"
+            "    - Encryption, access controls\n"
+            "  PRIVACY:\n"
+            "    - P1-P8: Notice, choice, access\n"
+            "    - Data retention, disposal\n"
             "TESTING:\n"
-            "  - Map existing controls to CSF\n"
-            "  - Identify gaps per function\n"
-            "  - Prioritize by risk/impact\n"
-            "  - Implement maturity levels (1-4)"
+            "  - Evidence collection (screenshots, logs)\n"
+            "  - Policy review\n"
+            "  - Technical control verification\n"
+            "  - Pen testing (CC7.1)\n"
+            "TOOLS:\n"
+            "  Vanta, Drata, Secureframe, manual review"
         ),
         "tools": [],
+    },
+    {
+        "id": "comp-004", "name": "ISO 27001",
+        "category": "iso27001", "severity": "medium",
+        "desc": "ISO 27001 compliance assessment.",
+        "detection": (
+            "ISO 27001 COMPLIANCE:\n"
+            "ANNEX A CONTROLS (2022):\n"
+            "  5. Organizational (37 controls)\n"
+            "    - Policies, roles, segregation of duties\n"
+            "    - Threat intelligence\n"
+            "    - Information classification\n"
+            "    - Identity management\n"
+            "  6. People (8 controls)\n"
+            "    - Screening, awareness, training\n"
+            "    - Disciplinary process\n"
+            "    - Post-employment\n"
+            "  7. Physical (14 controls)\n"
+            "    - Perimeters, entry controls\n"
+            "    - Equipment protection\n"
+            "    - Clear desk/screen\n"
+            "  8. Technological (34 controls)\n"
+            "    - User endpoint devices\n"
+            "    - Access control (8.2-8.5)\n"
+            "    - Malware protection\n"
+            "    - Backup (8.13)\n"
+            "    - Logging (8.15)\n"
+            "    - Network security (8.20-8.23)\n"
+            "    - Cryptography (8.24)\n"
+            "    - Vulnerability management (8.8)\n"
+            "    - Configuration management (8.9)\n"
+            "    - Secure development (8.25-8.29)\n"
+            "ASSESSMENT:\n"
+            "  - Gap analysis against Annex A\n"
+            "  - Risk treatment plan\n"
+            "  - Statement of Applicability\n"
+            "  - Technical control testing\n"
+            "TOOLS:\n"
+            "  OpenSCAP, Lynis, CIS Benchmark tools"
+        ),
+        "tools": ["openscap", "lynis"],
+    },
+    {
+        "id": "comp-005", "name": "NIST CSF",
+        "category": "nist", "severity": "medium",
+        "desc": "NIST Cybersecurity Framework assessment.",
+        "detection": (
+            "NIST CYBERSECURITY FRAMEWORK:\n"
+            "FUNCTIONS:\n"
+            "  IDENTIFY (ID):\n"
+            "    - Asset management (ID.AM)\n"
+            "    - Business environment (ID.BE)\n"
+            "    - Governance (ID.GV)\n"
+            "    - Risk assessment (ID.RA)\n"
+            "    - Risk management strategy (ID.RM)\n"
+            "    - Supply chain risk (ID.SC)\n"
+            "  PROTECT (PR):\n"
+            "    - Access control (PR.AC)\n"
+            "    - Awareness training (PR.AT)\n"
+            "    - Data security (PR.DS)\n"
+            "    - Information protection (PR.IP)\n"
+            "    - Maintenance (PR.MA)\n"
+            "    - Protective technology (PR.PT)\n"
+            "  DETECT (DE):\n"
+            "    - Anomalies and events (DE.AE)\n"
+            "    - Continuous monitoring (DE.CM)\n"
+            "    - Detection processes (DE.DP)\n"
+            "  RESPOND (RS):\n"
+            "    - Response planning (RS.RP)\n"
+            "    - Communications (RS.CO)\n"
+            "    - Analysis (RS.AN)\n"
+            "    - Mitigation (RS.MI)\n"
+            "    - Improvements (RS.IM)\n"
+            "  RECOVER (RC):\n"
+            "    - Recovery planning (RC.RP)\n"
+            "    - Improvements (RC.IM)\n"
+            "    - Communications (RC.CO)\n"
+            "MATURITY:\n"
+            "  Tier 1: Partial\n"
+            "  Tier 2: Risk Informed\n"
+            "  Tier 3: Repeatable\n"
+            "  Tier 4: Adaptive\n"
+            "TOOLS:\n"
+            "  NIST CSF Assessment Tools, OpenSCAP"
+        ),
+        "tools": ["openscap"],
     },
 ]
 
@@ -230,7 +249,7 @@ COMPLIANCE_PATTERNS: list[dict[str, Any]] = [
 class ComplianceKB:
     """Compliance knowledge base.
 
-    Provides compliance framework patterns
+    Provides compliance patterns
     injected into agent prompts.
     """
 
@@ -246,7 +265,7 @@ class ComplianceKB:
                 pattern_id=data["id"],
                 name=data["name"],
                 category=data.get("category", ""),
-                severity=data.get("severity", "high"),
+                severity=data.get("severity", "medium"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
                 tools=data.get("tools", []),
@@ -266,7 +285,7 @@ class ComplianceKB:
         max_patterns: int = 4,
     ) -> str:
         """Build compliance prompt."""
-        lines = ["## Compliance Frameworks\n"]
+        lines = ["## Compliance & Audit\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
