@@ -1,12 +1,13 @@
-"""Context manager — manages context windows for agents.
+"""Context manager — manages multi-turn state across recursion levels.
 
 Implements:
-1. Context window size tracking per model
-2. Context pruning strategies (sliding, importance, recency)
-3. Context compression for long conversations
-4. Multi-tier context (system, knowledge, conversation, working)
-5. Token counting and budget enforcement
-6. Context serialization for agent checkpointing
+1. Hierarchical context (parent → child inheritance)
+2. Context scoping (what each level can see)
+3. Working memory management (recent N turns)
+4. Context compression (summarize old turns)
+5. Cross-agent context sharing
+6. Context snapshot and restore
+7. Context prompt for LLM
 """
 
 from __future__ import annotations
@@ -21,327 +22,347 @@ import structlog
 logger = structlog.get_logger()
 
 
-class ContextTier(str, Enum):
-    SYSTEM = "system"           # System prompt (always retained)
-    KNOWLEDGE = "knowledge"     # Injected KB content
-    TOOL_DOCS = "tool_docs"     # Tool documentation
-    FINDINGS = "findings"       # Current findings context
-    CONVERSATION = "conversation"  # Agent conversation history
-    WORKING = "working"         # Current working memory
+class MessageRole(str, Enum):
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+    PARENT = "parent"
+    CHILD = "child"
 
 
-class PruneStrategy(str, Enum):
-    SLIDING_WINDOW = "sliding_window"   # Keep most recent
-    IMPORTANCE = "importance"           # Keep highest priority
-    SUMMARIZE = "summarize"             # Compress old context
-    HYBRID = "hybrid"                   # Sliding + importance
+class ContextScope(str, Enum):
+    LOCAL = "local"            # Only this agent
+    INHERITED = "inherited"    # From parent
+    SHARED = "shared"          # Cross-agent
+    GLOBAL = "global"          # All agents
 
 
 @dataclass
-class ContextEntry:
-    """A single context entry."""
-    entry_id: str = ""
-    tier: ContextTier = ContextTier.CONVERSATION
+class ContextMessage:
+    """A single message in the context."""
+    role: MessageRole = MessageRole.USER
     content: str = ""
-    token_estimate: int = 0
-    priority: int = 0
+    scope: ContextScope = ContextScope.LOCAL
+    agent_id: str = ""
     timestamp: float = field(default_factory=time.time)
-    pinned: bool = False
+    token_estimate: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.entry_id[:10],
-            "tier": self.tier.value,
+            "role": self.role.value[:6],
+            "agent": self.agent_id[:10],
+            "scope": self.scope.value[:6],
             "tokens": self.token_estimate,
-            "priority": self.priority,
-            "pinned": self.pinned,
         }
 
 
 @dataclass
-class ContextWindow:
-    """A complete context window for a model."""
-    window_id: str = ""
-    model_id: str = ""
-    max_tokens: int = 4096
-    entries: list[ContextEntry] = field(default_factory=list)
-    prune_strategy: PruneStrategy = PruneStrategy.HYBRID
+class AgentContext:
+    """Context for a single agent."""
+    agent_id: str = ""
+    parent_id: str = ""
+    depth: int = 0
+    role: str = ""
+    messages: list[ContextMessage] = field(default_factory=list)
+    working_memory: list[str] = field(default_factory=list)
+    inherited_context: list[ContextMessage] = field(default_factory=list)
+    shared_context: list[ContextMessage] = field(default_factory=list)
+    max_working_memory: int = 10
+    max_messages: int = 50
+    total_tokens: int = 0
+    created_at: float = field(default_factory=time.time)
 
     @property
-    def used_tokens(self) -> int:
-        return sum(e.token_estimate for e in self.entries)
-
-    @property
-    def available_tokens(self) -> int:
-        return max(0, self.max_tokens - self.used_tokens)
-
-    @property
-    def utilization(self) -> float:
-        if self.max_tokens == 0:
-            return 0.0
-        return self.used_tokens / self.max_tokens
+    def all_messages(self) -> list[ContextMessage]:
+        """All messages in chronological order."""
+        all_msgs = self.inherited_context + self.shared_context + self.messages
+        all_msgs.sort(key=lambda m: m.timestamp)
+        return all_msgs
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model_id[:15],
-            "used": self.used_tokens,
-            "max": self.max_tokens,
-            "entries": len(self.entries),
-            "util": round(self.utilization, 2),
+            "id": self.agent_id[:10],
+            "depth": self.depth,
+            "msgs": len(self.messages),
+            "inherited": len(self.inherited_context),
+            "tokens": self.total_tokens,
         }
-
-
-# ── Model context sizes ──────────────────────────────────────
-
-MODEL_CONTEXT_SIZES: dict[str, int] = {
-    "whiterabbitneo-7b": 8192,
-    "qwen-coder-14b": 32768,
-    "qwen-coder-7b": 32768,
-    "deepseek-r1-7b": 32768,
-    "deepseek-math-7b": 4096,
-    "hermes-14b": 8192,
-    "llama-3.1-8b": 131072,
-    "dolphin-8b": 8192,
-    "mistral-7b": 32768,
-    "codellama-13b": 16384,
-    "codellama-7b": 16384,
-    "yi-9b-200k": 200000,
-    "phi-3.5-mini": 128000,
-    "nomic-embed": 8192,
-    "llama-guard-3": 8192,
-    "functiongemma": 8192,
-}
-
-
-# ── Tier budget ratios ────────────────────────────────────────
-
-TIER_BUDGETS: dict[str, float] = {
-    "system": 0.10,         # 10% for system prompt
-    "knowledge": 0.25,      # 25% for knowledge base
-    "tool_docs": 0.10,      # 10% for tool documentation
-    "findings": 0.15,       # 15% for current findings
-    "conversation": 0.30,   # 30% for conversation history
-    "working": 0.10,        # 10% for working memory
-}
 
 
 class ContextManager:
-    """Manages context windows for LLM agents.
+    """Manages multi-turn conversation state across agents.
 
-    Tracks token usage, enforces budgets,
-    and prunes context using configurable
-    strategies.
+    Handles context inheritance (parent → child),
+    cross-agent sharing, working memory, and
+    context compression.
     """
 
-    def __init__(self) -> None:
-        self._windows: dict[str, ContextWindow] = {}
-        self._counter = 0
+    def __init__(
+        self,
+        max_context_tokens: int = 6000,
+        chars_per_token: float = 3.5,
+    ) -> None:
+        self._contexts: dict[str, AgentContext] = {}
+        self._max_tokens = max_context_tokens
+        self._chars_per_token = chars_per_token
+        self._shared_pool: list[ContextMessage] = []
         self._log = logger.bind(component="context_manager")
 
-    def create_window(
+    def _estimate_tokens(self, text: str) -> int:
+        return int(len(text) / self._chars_per_token)
+
+    def create_context(
         self,
-        model_id: str,
-        prune_strategy: PruneStrategy = PruneStrategy.HYBRID,
-        max_tokens: int = 0,
-    ) -> ContextWindow:
-        """Create a context window for a model."""
-        self._counter += 1
-
-        if max_tokens == 0:
-            max_tokens = MODEL_CONTEXT_SIZES.get(model_id, 4096)
-
-        window = ContextWindow(
-            window_id=f"ctx-{self._counter}",
-            model_id=model_id,
-            max_tokens=max_tokens,
-            prune_strategy=prune_strategy,
+        agent_id: str,
+        parent_id: str = "",
+        role: str = "",
+        depth: int = 0,
+    ) -> AgentContext:
+        """Create a new agent context."""
+        ctx = AgentContext(
+            agent_id=agent_id,
+            parent_id=parent_id,
+            depth=depth,
+            role=role,
         )
-        self._windows[window.window_id] = window
-        return window
 
-    def add_entry(
+        # Inherit from parent
+        if parent_id and parent_id in self._contexts:
+            parent = self._contexts[parent_id]
+            # Inherit recent messages from parent
+            recent_parent = parent.messages[-5:]
+            for msg in recent_parent:
+                inherited = ContextMessage(
+                    role=MessageRole.PARENT,
+                    content=msg.content,
+                    scope=ContextScope.INHERITED,
+                    agent_id=parent_id,
+                    timestamp=msg.timestamp,
+                    token_estimate=msg.token_estimate,
+                )
+                ctx.inherited_context.append(inherited)
+
+            # Inherit working memory
+            ctx.working_memory = list(parent.working_memory)
+
+        # Add shared context
+        ctx.shared_context = [
+            msg for msg in self._shared_pool
+            if msg.agent_id != agent_id
+        ][-3:]
+
+        self._contexts[agent_id] = ctx
+        return ctx
+
+    def add_message(
         self,
-        window_id: str,
+        agent_id: str,
+        role: MessageRole,
         content: str,
-        tier: ContextTier = ContextTier.CONVERSATION,
-        priority: int = 0,
-        pinned: bool = False,
-    ) -> ContextEntry | None:
-        """Add content to a context window."""
-        window = self._windows.get(window_id)
-        if not window:
+        scope: ContextScope = ContextScope.LOCAL,
+        metadata: dict[str, Any] | None = None,
+    ) -> ContextMessage | None:
+        """Add a message to agent's context."""
+        ctx = self._contexts.get(agent_id)
+        if not ctx:
             return None
 
         tokens = self._estimate_tokens(content)
-
-        entry = ContextEntry(
-            entry_id=f"entry-{window_id}-{len(window.entries)}",
-            tier=tier,
+        msg = ContextMessage(
+            role=role,
             content=content,
+            scope=scope,
+            agent_id=agent_id,
             token_estimate=tokens,
-            priority=priority,
-            pinned=pinned,
+            metadata=metadata or {},
         )
 
-        window.entries.append(entry)
+        ctx.messages.append(msg)
+        ctx.total_tokens += tokens
 
-        # Auto-prune if over budget
-        if window.used_tokens > window.max_tokens:
-            self._prune(window)
+        # Share if scope is shared/global
+        if scope in (ContextScope.SHARED, ContextScope.GLOBAL):
+            self._shared_pool.append(msg)
 
-        return entry
+        # Compress if over limit
+        if ctx.total_tokens > self._max_tokens:
+            self._compress_context(agent_id)
 
-    def _prune(self, window: ContextWindow) -> int:
-        """Prune context to fit within budget."""
-        if window.prune_strategy == PruneStrategy.SLIDING_WINDOW:
-            return self._prune_sliding(window)
-        elif window.prune_strategy == PruneStrategy.IMPORTANCE:
-            return self._prune_importance(window)
-        elif window.prune_strategy == PruneStrategy.HYBRID:
-            return self._prune_hybrid(window)
-        return 0
+        # Trim if too many messages
+        if len(ctx.messages) > ctx.max_messages:
+            self._trim_messages(agent_id)
 
-    def _prune_sliding(self, window: ContextWindow) -> int:
-        """Keep most recent entries, drop oldest."""
-        pruned = 0
-        while window.used_tokens > window.max_tokens and window.entries:
-            # Find oldest unpinned entry
-            for idx, entry in enumerate(window.entries):
-                if not entry.pinned and entry.tier != ContextTier.SYSTEM:
-                    window.entries.pop(idx)
-                    pruned += 1
-                    break
+        return msg
+
+    def add_to_working_memory(
+        self,
+        agent_id: str,
+        item: str,
+    ) -> None:
+        """Add item to working memory."""
+        ctx = self._contexts.get(agent_id)
+        if not ctx:
+            return
+
+        ctx.working_memory.append(item)
+
+        # Trim to max
+        while len(ctx.working_memory) > ctx.max_working_memory:
+            ctx.working_memory.pop(0)
+
+    def _compress_context(self, agent_id: str) -> None:
+        """Compress context by summarizing old messages."""
+        ctx = self._contexts.get(agent_id)
+        if not ctx or len(ctx.messages) < 10:
+            return
+
+        # Keep last 5 messages, summarize the rest
+        old_messages = ctx.messages[:-5]
+        recent_messages = ctx.messages[-5:]
+
+        # Create summary
+        summary_parts: list[str] = []
+        for msg in old_messages:
+            if msg.role == MessageRole.TOOL:
+                summary_parts.append(f"[Tool output: {msg.content[:50]}...]")
+            elif msg.role == MessageRole.ASSISTANT:
+                summary_parts.append(f"[Agent action: {msg.content[:50]}...]")
             else:
-                break
-        return pruned
+                summary_parts.append(f"[{msg.role.value}: {msg.content[:30]}...]")
 
-    def _prune_importance(self, window: ContextWindow) -> int:
-        """Drop lowest priority entries."""
-        pruned = 0
-        while window.used_tokens > window.max_tokens and window.entries:
-            # Find lowest priority unpinned entry
-            candidates = [
-                (idx, e) for idx, e in enumerate(window.entries)
-                if not e.pinned and e.tier != ContextTier.SYSTEM
-            ]
-            if not candidates:
-                break
+        summary = "CONTEXT SUMMARY:\n" + "\n".join(summary_parts[-10:])
+        tokens = self._estimate_tokens(summary)
 
-            candidates.sort(key=lambda x: x[1].priority)
-            idx, _ = candidates[0]
-            window.entries.pop(idx)
-            pruned += 1
-
-        return pruned
-
-    def _prune_hybrid(self, window: ContextWindow) -> int:
-        """Hybrid pruning: old conversation + low importance."""
-        pruned = 0
-        while window.used_tokens > window.max_tokens and window.entries:
-            candidates = [
-                (idx, e) for idx, e in enumerate(window.entries)
-                if not e.pinned and e.tier != ContextTier.SYSTEM
-            ]
-            if not candidates:
-                break
-
-            # Score: lower is more pruneable
-            now = time.time()
-            scored = []
-            for idx, entry in candidates:
-                age_s = now - entry.timestamp
-                age_score = min(1.0, age_s / 3600)  # Normalized to 1 hour
-                prio_score = entry.priority / 100.0
-                # Higher score = keep, lower score = prune
-                keep_score = prio_score * 0.6 + (1.0 - age_score) * 0.4
-                scored.append((idx, keep_score))
-
-            scored.sort(key=lambda x: x[1])
-            idx, _ = scored[0]
-            window.entries.pop(idx)
-            pruned += 1
-
-        return pruned
-
-    def get_tier_content(
-        self,
-        window_id: str,
-        tier: ContextTier,
-    ) -> str:
-        """Get all content for a specific tier."""
-        window = self._windows.get(window_id)
-        if not window:
-            return ""
-
-        return "\n".join(
-            e.content for e in window.entries
-            if e.tier == tier
+        summary_msg = ContextMessage(
+            role=MessageRole.SYSTEM,
+            content=summary,
+            scope=ContextScope.LOCAL,
+            agent_id=agent_id,
+            token_estimate=tokens,
         )
 
-    def get_full_context(self, window_id: str) -> str:
-        """Get full assembled context."""
-        window = self._windows.get(window_id)
-        if not window:
-            return ""
+        ctx.messages = [summary_msg] + recent_messages
+        ctx.total_tokens = sum(m.token_estimate for m in ctx.messages)
 
-        # Order by tier priority
-        tier_order = [
-            ContextTier.SYSTEM,
-            ContextTier.KNOWLEDGE,
-            ContextTier.TOOL_DOCS,
-            ContextTier.FINDINGS,
-            ContextTier.CONVERSATION,
-            ContextTier.WORKING,
-        ]
+    def _trim_messages(self, agent_id: str) -> None:
+        """Trim excess messages."""
+        ctx = self._contexts.get(agent_id)
+        if not ctx:
+            return
 
-        parts = []
-        for tier in tier_order:
-            tier_content = self.get_tier_content(window_id, tier)
-            if tier_content:
-                parts.append(tier_content)
+        while len(ctx.messages) > ctx.max_messages:
+            removed = ctx.messages.pop(0)
+            ctx.total_tokens -= removed.token_estimate
 
-        return "\n\n".join(parts)
-
-    def get_tier_budget(
+    def get_context_for_prompt(
         self,
-        window_id: str,
-        tier: ContextTier,
-    ) -> int:
-        """Get token budget for a specific tier."""
-        window = self._windows.get(window_id)
-        if not window:
-            return 0
+        agent_id: str,
+        max_tokens: int = 0,
+    ) -> list[dict[str, str]]:
+        """Get context formatted for LLM prompt."""
+        ctx = self._contexts.get(agent_id)
+        if not ctx:
+            return []
 
-        ratio = TIER_BUDGETS.get(tier.value, 0.1)
-        return int(window.max_tokens * ratio)
+        budget = max_tokens or self._max_tokens
+        messages: list[dict[str, str]] = []
+        used_tokens = 0
 
-    def get_tier_usage(
+        # Working memory first
+        if ctx.working_memory:
+            wm_text = "WORKING MEMORY:\n" + "\n".join(f"- {m}" for m in ctx.working_memory)
+            wm_tokens = self._estimate_tokens(wm_text)
+            if used_tokens + wm_tokens <= budget:
+                messages.append({"role": "system", "content": wm_text})
+                used_tokens += wm_tokens
+
+        # Then all messages (most recent first for budget fitting)
+        all_msgs = ctx.all_messages
+        for msg in reversed(all_msgs):
+            if used_tokens + msg.token_estimate > budget:
+                continue
+            role_map = {
+                MessageRole.SYSTEM: "system",
+                MessageRole.USER: "user",
+                MessageRole.ASSISTANT: "assistant",
+                MessageRole.TOOL: "user",
+                MessageRole.PARENT: "system",
+                MessageRole.CHILD: "user",
+            }
+            messages.insert(0, {
+                "role": role_map.get(msg.role, "user"),
+                "content": msg.content,
+            })
+            used_tokens += msg.token_estimate
+
+        return messages
+
+    def propagate_to_parent(
         self,
-        window_id: str,
-    ) -> dict[str, int]:
-        """Get token usage by tier."""
-        window = self._windows.get(window_id)
-        if not window:
-            return {}
+        child_id: str,
+        summary: str,
+    ) -> None:
+        """Send child results back to parent context."""
+        child = self._contexts.get(child_id)
+        if not child or not child.parent_id:
+            return
 
-        usage: dict[str, int] = {}
-        for entry in window.entries:
-            tier_name = entry.tier.value
-            usage[tier_name] = usage.get(tier_name, 0) + entry.token_estimate
+        self.add_message(
+            agent_id=child.parent_id,
+            role=MessageRole.CHILD,
+            content=f"[Child agent {child.role} result]: {summary}",
+            scope=ContextScope.LOCAL,
+        )
 
-        return usage
+    def snapshot(self, agent_id: str) -> dict[str, Any] | None:
+        """Snapshot agent context for persistence."""
+        ctx = self._contexts.get(agent_id)
+        if not ctx:
+            return None
 
-    def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count (~4 chars per token)."""
-        return len(text) // 4
+        return {
+            "agent_id": ctx.agent_id,
+            "parent_id": ctx.parent_id,
+            "depth": ctx.depth,
+            "role": ctx.role,
+            "working_memory": list(ctx.working_memory),
+            "total_tokens": ctx.total_tokens,
+            "message_count": len(ctx.messages),
+        }
+
+    def build_context_prompt(self, agent_id: str = "") -> str:
+        """Build context manager status prompt."""
+        lines = ["## Context State\n"]
+
+        lines.append(f"Active contexts: {len(self._contexts)}")
+        lines.append(f"Shared pool: {len(self._shared_pool)} messages")
+
+        if agent_id and agent_id in self._contexts:
+            ctx = self._contexts[agent_id]
+            lines.append(f"\nCurrent agent: {ctx.agent_id[:12]}")
+            lines.append(f"Depth: {ctx.depth}")
+            lines.append(f"Messages: {len(ctx.messages)}")
+            lines.append(f"Tokens: {ctx.total_tokens}/{self._max_tokens}")
+            lines.append(f"Working memory: {len(ctx.working_memory)} items")
+
+            if ctx.working_memory:
+                lines.append("WM:")
+                for item in ctx.working_memory[-3:]:
+                    lines.append(f"  - {item[:50]}")
+
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        total_tokens = sum(w.used_tokens for w in self._windows.values())
+        total_msgs = sum(len(c.messages) for c in self._contexts.values())
+        total_tokens = sum(c.total_tokens for c in self._contexts.values())
+        depths = [c.depth for c in self._contexts.values()]
+
         return {
-            "windows": len(self._windows),
+            "active_contexts": len(self._contexts),
+            "total_messages": total_msgs,
             "total_tokens": total_tokens,
-            "avg_utilization": round(
-                sum(w.utilization for w in self._windows.values()) /
-                max(1, len(self._windows)), 2,
-            ),
+            "shared_pool": len(self._shared_pool),
+            "max_depth": max(depths) if depths else 0,
         }

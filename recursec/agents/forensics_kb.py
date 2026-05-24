@@ -1,7 +1,7 @@
 """Digital forensics knowledge base.
 
-Deep knowledge about digital forensics techniques:
-1. Disk and file system forensics
+Deep knowledge about digital forensics:
+1. Disk forensics
 2. Memory forensics
 3. Network forensics
 4. Log analysis and timeline
@@ -20,7 +20,7 @@ logger = structlog.get_logger()
 
 @dataclass
 class ForensicsPattern:
-    """A digital forensics pattern."""
+    """A forensics pattern."""
     pattern_id: str = ""
     name: str = ""
     category: str = ""
@@ -39,208 +39,206 @@ class ForensicsPattern:
 
 FORENSICS_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "for-001", "name": "Disk and File System",
+        "id": "for-001", "name": "Disk Forensics",
         "category": "disk", "severity": "high",
-        "desc": "Disk and file system forensics techniques.",
+        "desc": "Disk and filesystem forensics.",
         "detection": (
-            "DISK AND FILE SYSTEM FORENSICS:\n"
+            "DISK FORENSICS:\n"
             "ACQUISITION:\n"
-            "  dd if=/dev/sda of=disk.img bs=4M  # Raw image\n"
-            "  dc3dd if=/dev/sda of=disk.img hash=sha256 log=log.txt  # Forensic dd\n"
+            "  # Create forensic image\n"
+            "  dd if=/dev/sda of=disk.raw bs=4M conv=noerror,sync\n"
+            "  dc3dd if=/dev/sda of=disk.raw log=acquisition.log\n"
             "  ewfacquire /dev/sda  # E01 format (compressed)\n"
-            "  # Always hash before and after\n"
-            "  sha256sum /dev/sda\n"
-            "  sha256sum disk.img\n"
-            "FILE SYSTEM ANALYSIS:\n"
-            "  # Autopsy (GUI) — Sleuth Kit frontend\n"
-            "  autopsy  # Web-based forensic analysis\n"
-            "  # Sleuth Kit (CLI)\n"
-            "  fls -r disk.img  # List files (including deleted)\n"
-            "  icat disk.img <inode>  # Extract file by inode\n"
-            "  tsk_recover -a disk.img output/  # Recover deleted files\n"
+            "  # Verify with hash\n"
+            "  sha256sum disk.raw\n"
+            "  # Write blocker: use hardware or software\n"
+            "ANALYSIS:\n"
+            "  # Autopsy (GUI)\n"
+            "  autopsy  # Sleuth Kit GUI\n"
+            "  # The Sleuth Kit (CLI)\n"
+            "  mmls disk.raw           # Partition table\n"
+            "  fls -o 2048 disk.raw    # File listing\n"
+            "  icat -o 2048 disk.raw 65  # Extract file by inode\n"
             "FILE CARVING:\n"
-            "  foremost -i disk.img -o output/  # Carve files by header\n"
-            "  scalpel -c scalpel.conf -o output/ disk.img\n"
-            "  photorec disk.img  # Data recovery\n"
-            "  # Recovers files based on magic bytes\n"
-            "TIMELINE:\n"
-            "  fls -m / -r disk.img > bodyfile.txt\n"
-            "  mactime -b bodyfile.txt -d > timeline.csv\n"
-            "  # MACB times: Modified, Accessed, Changed, Born\n"
-            "  # MFT analysis (NTFS)\n"
-            "  # Journal analysis (ext4)\n"
+            "  # Recover deleted files\n"
+            "  scalpel disk.raw -o output/\n"
+            "  photorec disk.raw\n"
+            "  foremost -i disk.raw -o output/\n"
+            "FILESYSTEM:\n"
+            "  - NTFS: $MFT, $LogFile, $UsnJrnl\n"
+            "  - EXT4: journal, inodes, superblock\n"
+            "  - APFS: snapshots, encryption\n"
+            "  - FAT: directory entries, clusters\n"
             "ARTIFACTS:\n"
-            "  - $MFT, $LogFile, $UsnJrnl (NTFS)\n"
-            "  - Prefetch files (C:\\Windows\\Prefetch\\)\n"
-            "  - ShimCache/AmCache\n"
+            "  - Browser history/cache/cookies\n"
+            "  - Registry hives (Windows)\n"
+            "  - Prefetch files (execution history)\n"
             "  - LNK files (recent files)\n"
-            "  - Jump lists (Windows taskbar)\n"
-            "  - Recycle Bin ($I/$R files)"
+            "  - Jump Lists, Shellbags\n"
+            "  - Recycle Bin ($I/$R files)\n"
+            "TOOLS:\n"
+            "  Autopsy/TSK, FTK, EnCase, AXIOM, scalpel"
         ),
-        "tools": ["autopsy", "sleuthkit", "foremost"],
+        "tools": ["autopsy", "scalpel"],
     },
     {
         "id": "for-002", "name": "Memory Forensics",
-        "category": "memory", "severity": "critical",
-        "desc": "Memory acquisition and analysis techniques.",
+        "category": "memory", "severity": "high",
+        "desc": "Memory forensics techniques.",
         "detection": (
             "MEMORY FORENSICS:\n"
             "ACQUISITION:\n"
             "  # Linux\n"
-            "  dd if=/proc/kcore of=memory.dump  # Kernel memory\n"
-            "  LiME (Linux Memory Extractor)  # Kernel module\n"
-            "  insmod lime.ko 'path=memory.lime format=lime'\n"
+            "  dd if=/dev/mem of=memdump.raw\n"
+            "  avml -o memdump.raw  # Azure VM mem acquisition\n"
+            "  lime  # Linux Memory Extractor (kernel module)\n"
             "  # Windows\n"
-            "  winpmem_mini.exe memory.raw\n"
-            "  # DumpIt.exe (single click)\n"
-            "  # FTK Imager (Forensic Toolkit)\n"
-            "VOLATILITY 3:\n"
-            "  # Process listing\n"
-            "  vol -f memory.raw windows.pslist\n"
-            "  vol -f memory.raw windows.pstree\n"
-            "  vol -f memory.raw windows.cmdline\n"
-            "  # Network connections\n"
-            "  vol -f memory.raw windows.netscan\n"
-            "  # DLL listing\n"
-            "  vol -f memory.raw windows.dlllist\n"
-            "  # File scanning\n"
-            "  vol -f memory.raw windows.filescan\n"
-            "  vol -f memory.raw windows.dumpfiles --pid <pid>\n"
-            "  # Registry\n"
-            "  vol -f memory.raw windows.registry.hivelist\n"
-            "  vol -f memory.raw windows.registry.printkey\n"
-            "  # Malware detection\n"
-            "  vol -f memory.raw windows.malfind  # Injected code\n"
-            "  vol -f memory.raw windows.hollowprocesses\n"
-            "  # Strings extraction\n"
-            "  strings -e l memory.raw | grep -i password\n"
-            "LINUX ANALYSIS:\n"
-            "  vol -f memory.raw linux.pslist\n"
-            "  vol -f memory.raw linux.bash\n"
-            "  vol -f memory.raw linux.lsof"
+            "  winpmem_mini_x64.exe memdump.raw\n"
+            "  DumpIt.exe  # One-click dump\n"
+            "  # Crash dumps, hibernation files\n"
+            "ANALYSIS (Volatility 3):\n"
+            "  vol -f memdump.raw windows.info\n"
+            "  vol -f memdump.raw windows.pslist    # Process list\n"
+            "  vol -f memdump.raw windows.pstree    # Process tree\n"
+            "  vol -f memdump.raw windows.netscan   # Network connections\n"
+            "  vol -f memdump.raw windows.malfind   # Injected code\n"
+            "  vol -f memdump.raw windows.dlllist   # Loaded DLLs\n"
+            "  vol -f memdump.raw windows.handles   # Open handles\n"
+            "  vol -f memdump.raw windows.cmdline   # Command lines\n"
+            "  vol -f memdump.raw windows.registry.hivelist\n"
+            "KEY ARTIFACTS:\n"
+            "  - Process hollowing (malfind)\n"
+            "  - DLL injection (dlllist + handles)\n"
+            "  - Hidden processes (psxview)\n"
+            "  - Network connections (netscan)\n"
+            "  - Registry keys in memory\n"
+            "  - Encryption keys (aeskeyfind)\n"
+            "  - Passwords in memory\n"
+            "TOOLS:\n"
+            "  Volatility3, Rekall, MemProcFS, WinDbg"
         ),
-        "tools": ["volatility3", "lime"],
+        "tools": ["volatility"],
     },
     {
         "id": "for-003", "name": "Network Forensics",
-        "category": "network", "severity": "high",
-        "desc": "Network traffic forensics techniques.",
+        "category": "network", "severity": "medium",
+        "desc": "Network forensics techniques.",
         "detection": (
             "NETWORK FORENSICS:\n"
-            "PACKET CAPTURE:\n"
-            "  tcpdump -i any -w capture.pcap\n"
-            "  tcpdump -i eth0 -w capture.pcap port 80\n"
-            "  tshark -i any -w capture.pcap\n"
+            "CAPTURE:\n"
+            "  # Full packet capture\n"
+            "  tcpdump -i eth0 -w capture.pcap\n"
+            "  dumpcap -i eth0 -w capture.pcap\n"
+            "  # Netflow/IPFIX (metadata only)\n"
+            "  # DNS logs (passive DNS)\n"
             "ANALYSIS:\n"
             "  # Wireshark (GUI)\n"
             "  wireshark capture.pcap\n"
-            "  # Tshark (CLI)\n"
+            "  # tshark (CLI)\n"
             "  tshark -r capture.pcap -Y 'http.request'\n"
             "  tshark -r capture.pcap -Y 'dns' -T fields -e dns.qry.name\n"
-            "  tshark -r capture.pcap -Y 'tcp.flags.syn==1' -T fields -e ip.dst\n"
-            "DNS ANALYSIS:\n"
-            "  tshark -r capture.pcap -Y 'dns.qry.type==1' -T fields -e dns.qry.name\n"
-            "  # DNS tunneling: Long subdomains, high query rate, TXT records\n"
-            "  # Entropy analysis of DNS queries\n"
-            "HTTP ANALYSIS:\n"
-            "  tshark -r capture.pcap -Y 'http' -T fields -e http.request.uri\n"
-            "  # Extract files: File → Export Objects → HTTP\n"
-            "  # Check for: POST data, cookies, credentials\n"
-            "TLS ANALYSIS:\n"
-            "  # JA3/JA3S fingerprinting\n"
-            "  tshark -r capture.pcap -Y 'tls.handshake.type==1' -T fields -e ja3.hash\n"
-            "  # With SSLKEYLOGFILE: Decrypt TLS traffic\n"
-            "FLOW ANALYSIS:\n"
-            "  # NetFlow/sFlow/IPFIX\n"
-            "  nfdump -r nfcapd.2024* -s srcip/flows\n"
-            "  # Zeek (Bro) for conn.log, dns.log, http.log\n"
+            "  # NetworkMiner\n"
+            "  # Zeek (Bro) — protocol analysis\n"
             "  zeek -r capture.pcap\n"
-            "  # RITA (Real Intelligence Threat Analytics)\n"
-            "  rita import capture.pcap dataset\n"
-            "  rita show-beacons dataset"
+            "  # Generates: conn.log, dns.log, http.log, etc.\n"
+            "INVESTIGATION:\n"
+            "  - C2 communication patterns\n"
+            "  - Data exfiltration (large outbound transfers)\n"
+            "  - DNS tunneling (long subdomain queries)\n"
+            "  - Beaconing (regular interval connections)\n"
+            "  - Lateral movement (SMB, RDP, WinRM)\n"
+            "  - Encrypted C2 (JA3/JA4 TLS fingerprints)\n"
+            "FLOW:\n"
+            "  - Connection timing analysis\n"
+            "  - Unusual port usage\n"
+            "  - Geographic anomalies\n"
+            "  - Volume anomalies\n"
+            "TOOLS:\n"
+            "  Wireshark, tcpdump, Zeek, NetworkMiner, RITA"
         ),
-        "tools": ["wireshark", "tshark", "zeek"],
+        "tools": ["wireshark", "zeek"],
     },
     {
-        "id": "for-004", "name": "Log Analysis",
+        "id": "for-004", "name": "Log Analysis and Timeline",
         "category": "logs", "severity": "medium",
         "desc": "Log analysis and timeline reconstruction.",
         "detection": (
-            "LOG ANALYSIS:\n"
+            "LOG ANALYSIS AND TIMELINE:\n"
             "WINDOWS LOGS:\n"
-            "  # Event Viewer / wevtutil\n"
-            "  wevtutil qe Security /f:text /c:100\n"
-            "  # Key Event IDs:\n"
-            "  4624  # Successful logon\n"
-            "  4625  # Failed logon\n"
-            "  4648  # Logon using explicit credentials\n"
-            "  4672  # Special privileges assigned\n"
-            "  4688  # New process created\n"
-            "  4697  # Service installed\n"
-            "  4698  # Scheduled task created\n"
-            "  7045  # Service installed (System)\n"
-            "  1102  # Audit log cleared\n"
-            "  # Sysmon events:\n"
-            "  1  # Process creation\n"
-            "  3  # Network connection\n"
-            "  7  # Image loaded (DLL)\n"
-            "  8  # CreateRemoteThread\n"
-            "  11  # File created\n"
+            "  - Security.evtx (logon, policy changes)\n"
+            "  - System.evtx (services, drivers)\n"
+            "  - Application.evtx\n"
+            "  - PowerShell/Operational.evtx\n"
+            "  - Sysmon (if installed — process creation, network)\n"
+            "  KEY EVENT IDs:\n"
+            "    4624: Successful logon\n"
+            "    4625: Failed logon\n"
+            "    4688: Process creation\n"
+            "    4720: User account created\n"
+            "    4732: Member added to group\n"
+            "    7045: Service installed\n"
+            "    1102: Audit log cleared\n"
             "LINUX LOGS:\n"
-            "  /var/log/auth.log  # Authentication\n"
-            "  /var/log/syslog  # System\n"
-            "  /var/log/secure  # RHEL auth\n"
-            "  /var/log/apache2/access.log  # Web\n"
-            "  /var/log/audit/audit.log  # Auditd\n"
-            "  journalctl -u sshd  # Systemd\n"
-            "  last -f /var/log/wtmp  # Login history\n"
+            "  - /var/log/auth.log (authentication)\n"
+            "  - /var/log/syslog or /var/log/messages\n"
+            "  - /var/log/kern.log (kernel)\n"
+            "  - /var/log/apache2/ or /var/log/nginx/\n"
+            "  - journalctl (systemd)\n"
+            "  - .bash_history, .zsh_history\n"
             "TIMELINE:\n"
-            "  # Plaso (log2timeline)\n"
-            "  log2timeline.py timeline.plaso disk.img\n"
-            "  psort.py -o l2tcsv timeline.plaso\n"
-            "  # Combine: disk + memory + logs + network"
+            "  # Plaso/log2timeline\n"
+            "  log2timeline.py timeline.plaso disk.raw\n"
+            "  psort.py -o l2tcsv timeline.plaso -w timeline.csv\n"
+            "  # Timeline Explorer (view in Excel)\n"
+            "  # Timesketch (web UI)\n"
+            "TOOLS:\n"
+            "  Plaso/log2timeline, Timesketch, Chainsaw, hayabusa"
         ),
-        "tools": ["plaso", "evtx"],
+        "tools": ["plaso", "chainsaw"],
     },
     {
         "id": "for-005", "name": "Anti-Forensics Detection",
-        "category": "anti_forensics", "severity": "critical",
+        "category": "anti_forensics", "severity": "high",
         "desc": "Detecting anti-forensics techniques.",
         "detection": (
             "ANTI-FORENSICS DETECTION:\n"
-            "TIMESTAMP MANIPULATION:\n"
-            "  - $STANDARD_INFORMATION vs $FILE_NAME (NTFS)\n"
-            "  - Timestomping detection (Volatility, MFT analysis)\n"
-            "  - Journal/UsnJrnl analysis\n"
-            "  - Filesystem vs application timestamps\n"
-            "DATA DESTRUCTION:\n"
-            "  - Secure delete (sdelete, shred, srm)\n"
-            "  - Disk wiping (DBAN, nwipe)\n"
-            "  - File slack space analysis\n"
-            "  - Unallocated space analysis\n"
-            "  - Detect: gaps in file numbering, journal gaps\n"
-            "LOG TAMPERING:\n"
-            "  - Event log clearing (Event ID 1102)\n"
-            "  - Selective log deletion\n"
-            "  - Log rotation manipulation\n"
-            "  - Detect: gaps in event sequence numbers\n"
-            "  - Detect: EventRecordID jumps\n"
-            "ENCRYPTION:\n"
-            "  - Full disk encryption (BitLocker, LUKS)\n"
-            "  - Container encryption (VeraCrypt)\n"
-            "  - Detect: entropy analysis\n"
-            "  - Detect: known header patterns\n"
-            "STEGANOGRAPHY:\n"
-            "  - Data hidden in images, audio, video\n"
-            "  - Detect: stegdetect, zsteg, binwalk\n"
-            "  - Statistical analysis of LSB\n"
-            "MEMORY EVASION:\n"
-            "  - Fileless malware\n"
-            "  - Process injection cleanup\n"
-            "  - AMSI bypass\n"
-            "  - ETW patching"
+            "TECHNIQUES:\n"
+            "  TIMESTOMPING:\n"
+            "    - Modified file timestamps\n"
+            "    - Detect: compare $MFT vs $STDINFO timestamps\n"
+            "    - $MFT $FN timestamps cannot be easily modified\n"
+            "    - Mismatched created/modified dates\n"
+            "  LOG CLEARING:\n"
+            "    - Event ID 1102 (Security log cleared)\n"
+            "    - Event ID 104 (System log cleared)\n"
+            "    - Gap analysis in log timeline\n"
+            "    - wevtutil cl Security\n"
+            "  DATA DESTRUCTION:\n"
+            "    - Secure deletion tools (BleachBit, SDelete)\n"
+            "    - Full disk encryption (post-incident)\n"
+            "    - File wiping (shred, wipe)\n"
+            "    - Overwritten slack space\n"
+            "  HIDING:\n"
+            "    - Alternate Data Streams (NTFS ADS)\n"
+            "    - Hidden partitions\n"
+            "    - Steganography (data in images)\n"
+            "    - Encrypted containers (VeraCrypt)\n"
+            "    - Slack space hiding\n"
+            "  LIVING OFF THE LAND:\n"
+            "    - Using built-in tools (PowerShell, WMI)\n"
+            "    - Fileless malware (memory only)\n"
+            "    - DLL sideloading\n"
+            "    - No new files on disk\n"
+            "DETECTION:\n"
+            "  - $MFT timeline analysis\n"
+            "  - USN Journal analysis\n"
+            "  - Memory forensics (fileless detection)\n"
+            "  - Entropy analysis (encrypted data)\n"
+            "  - YARA rules for known tools\n"
+            "TOOLS:\n"
+            "  Timestomp Detector, ADS Scanner, stegdetect"
         ),
-        "tools": ["volatility3", "autopsy"],
+        "tools": [],
     },
 ]
 
@@ -248,8 +246,7 @@ FORENSICS_PATTERNS: list[dict[str, Any]] = [
 class ForensicsKB:
     """Digital forensics knowledge base.
 
-    Provides digital forensics patterns
-    injected into agent prompts.
+    Provides forensics patterns injected into agent prompts.
     """
 
     def __init__(self) -> None:
@@ -284,7 +281,7 @@ class ForensicsKB:
         max_patterns: int = 4,
     ) -> str:
         """Build forensics prompt."""
-        lines = ["## Digital Forensics Techniques\n"]
+        lines = ["## Digital Forensics\n"]
         count = 0
         for pattern in self._patterns.values():
             if categories and pattern.category.lower() not in [c.lower() for c in categories]:
