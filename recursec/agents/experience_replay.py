@@ -1,20 +1,19 @@
-"""Experience replay buffer — stores and replays past strategies.
+"""Experience replay — learning from past operations.
 
-Implements:
-1. Experience storage (state-action-reward tuples)
-2. Prioritized replay (higher reward = more likely)
-3. Episode tracking (full assessment sequences)
-4. Strategy extraction from successful runs
-5. Similarity-based experience retrieval
-6. Replay prompt for LLM
+Stores, indexes, and replays past task executions to
+improve future performance:
+1. Episode storage — full execution traces with outcomes
+2. Pattern extraction — identify successful strategies
+3. Failure analysis — learn from errors and dead ends
+4. Strategy ranking — score approaches by effectiveness
+5. Prompt enrichment — inject relevant past experience into LLM context
 """
 
 from __future__ import annotations
 
-import random
 import time
-from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -22,337 +21,377 @@ import structlog
 logger = structlog.get_logger()
 
 
+class EpisodeOutcome(str, Enum):
+    SUCCESS = "success"
+    PARTIAL_SUCCESS = "partial_success"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+    BLOCKED = "blocked"
+
+
+class ActionType(str, Enum):
+    TOOL_EXECUTION = "tool_execution"
+    LLM_REASONING = "llm_reasoning"
+    AGENT_SPAWN = "agent_spawn"
+    KB_LOOKUP = "kb_lookup"
+    STRATEGY_CHANGE = "strategy_change"
+    FINDING_REPORT = "finding_report"
+    VALIDATION = "validation"
+    ESCALATION = "escalation"
+
+
 @dataclass
-class Experience:
-    """A single state-action-reward experience."""
-    experience_id: str = ""
-    episode_id: str = ""
-    step: int = 0
-    state: dict[str, Any] = field(default_factory=dict)
-    action: str = ""
-    action_params: dict[str, Any] = field(default_factory=dict)
-    reward: float = 0.0
-    next_state: dict[str, Any] = field(default_factory=dict)
-    target_type: str = ""
-    tool_used: str = ""
-    model_used: str = ""
-    finding_severity: str = ""
+class ActionRecord:
+    """A single action within an episode."""
+    action_id: str = ""
+    action_type: ActionType = ActionType.TOOL_EXECUTION
+    description: str = ""
+    tool_name: str = ""
+    input_summary: str = ""
+    output_summary: str = ""
+    duration_s: float = 0.0
+    tokens_used: int = 0
+    success: bool = True
+    error_message: str = ""
     timestamp: float = field(default_factory=time.time)
-    priority: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "action": self.action[:15],
-            "reward": f"{self.reward:.2f}",
-            "tool": self.tool_used[:10],
-            "sev": self.finding_severity[:4] or "none",
+            "type": self.action_type.value[:8],
+            "tool": self.tool_name[:10],
+            "ok": self.success,
+            "dur": f"{self.duration_s:.1f}s",
         }
 
 
 @dataclass
 class Episode:
-    """A complete assessment episode."""
+    """A complete task execution episode."""
     episode_id: str = ""
+    task_description: str = ""
+    task_intent: str = ""
     target: str = ""
-    target_type: str = ""
-    experiences: list[str] = field(default_factory=list)  # experience_ids
-    total_reward: float = 0.0
+    actions: list[ActionRecord] = field(default_factory=list)
+    outcome: EpisodeOutcome = EpisodeOutcome.SUCCESS
     findings_count: int = 0
-    critical_count: int = 0
-    duration_s: float = 0.0
-    strategy_summary: str = ""
+    critical_findings: int = 0
+    total_duration_s: float = 0.0
+    total_tokens: int = 0
+    kbs_used: list[str] = field(default_factory=list)
+    models_used: list[str] = field(default_factory=list)
+    tools_used: list[str] = field(default_factory=list)
+    strategies_used: list[str] = field(default_factory=list)
+    error_messages: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     completed_at: float = 0.0
 
+    @property
+    def success_rate(self) -> float:
+        if not self.actions:
+            return 0.0
+        ok = sum(1 for a in self.actions if a.success)
+        return ok / len(self.actions)
+
+    @property
+    def efficiency(self) -> float:
+        if self.total_duration_s <= 0 or self.findings_count <= 0:
+            return 0.0
+        return self.findings_count / self.total_duration_s
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "target": self.target[:15],
-            "reward": f"{self.total_reward:.1f}",
+            "id": self.episode_id[:8],
+            "intent": self.task_intent[:12],
+            "outcome": self.outcome.value[:8],
+            "actions": len(self.actions),
             "findings": self.findings_count,
-            "critical": self.critical_count,
+            "success_rate": f"{self.success_rate:.2f}",
         }
 
 
-class ExperienceReplayBuffer:
-    """Prioritized experience replay for agent learning.
+@dataclass
+class StrategyScore:
+    """Score for a particular strategy approach."""
+    strategy_name: str = ""
+    intent: str = ""
+    uses: int = 0
+    successes: int = 0
+    failures: int = 0
+    avg_findings: float = 0.0
+    avg_duration_s: float = 0.0
+    avg_tokens: float = 0.0
 
-    Stores past assessment experiences, enables
-    replay of successful strategies, and provides
-    similarity-based retrieval for new targets.
+    @property
+    def success_rate(self) -> float:
+        if self.uses == 0:
+            return 0.0
+        return self.successes / self.uses
+
+    @property
+    def score(self) -> float:
+        return (
+            self.success_rate * 0.4
+            + min(self.avg_findings / 10.0, 1.0) * 0.3
+            + (1.0 - min(self.avg_duration_s / 600.0, 1.0)) * 0.15
+            + (1.0 - min(self.avg_tokens / 50000.0, 1.0)) * 0.15
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": self.strategy_name[:15],
+            "uses": self.uses,
+            "success": f"{self.success_rate:.2f}",
+            "score": f"{self.score:.2f}",
+        }
+
+
+@dataclass
+class PatternInsight:
+    """An insight extracted from episode patterns."""
+    insight_id: str = ""
+    insight_type: str = ""
+    description: str = ""
+    confidence: float = 0.0
+    supporting_episodes: int = 0
+    recommendation: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.insight_type[:10],
+            "conf": f"{self.confidence:.2f}",
+            "episodes": self.supporting_episodes,
+        }
+
+
+class ExperienceReplay:
+    """Experience replay memory system.
+
+    Stores past episodes and extracts patterns
+    to improve future performance.
     """
 
-    def __init__(
-        self,
-        max_experiences: int = 5000,
-        max_episodes: int = 100,
-        priority_alpha: float = 0.6,
-    ) -> None:
-        self._experiences: dict[str, Experience] = {}
-        self._episodes: dict[str, Episode] = {}
-        self._buffer: deque[str] = deque(maxlen=max_experiences)
-        self._exp_counter = 0
+    def __init__(self, max_episodes: int = 1000) -> None:
+        self._episodes: list[Episode] = []
+        self._max_episodes = max_episodes
+        self._strategy_scores: dict[str, StrategyScore] = {}
+        self._insights: list[PatternInsight] = []
         self._episode_counter = 0
-        self._priority_alpha = priority_alpha
-        self._rng = random.Random(42)
-        self._log = logger.bind(component="replay")
+        self._insight_counter = 0
+        self._log = logger.bind(component="experience_replay")
 
-    def start_episode(
+    def store_episode(self, episode: Episode) -> None:
+        """Store a completed episode."""
+        self._episodes.append(episode)
+        if len(self._episodes) > self._max_episodes:
+            self._episodes = self._episodes[-self._max_episodes // 2:]
+
+        # Update strategy scores
+        for strategy in episode.strategies_used:
+            key = f"{episode.task_intent}:{strategy}"
+            score = self._strategy_scores.get(key)
+            if not score:
+                score = StrategyScore(
+                    strategy_name=strategy,
+                    intent=episode.task_intent,
+                )
+                self._strategy_scores[key] = score
+
+            score.uses += 1
+            if episode.outcome in (
+                EpisodeOutcome.SUCCESS, EpisodeOutcome.PARTIAL_SUCCESS,
+            ):
+                score.successes += 1
+            else:
+                score.failures += 1
+
+            # Running averages
+            n = score.uses
+            score.avg_findings = (
+                score.avg_findings * (n - 1) + episode.findings_count
+            ) / n
+            score.avg_duration_s = (
+                score.avg_duration_s * (n - 1) + episode.total_duration_s
+            ) / n
+            score.avg_tokens = (
+                score.avg_tokens * (n - 1) + episode.total_tokens
+            ) / n
+
+    def get_best_strategies(
         self,
-        target: str = "",
-        target_type: str = "",
-    ) -> Episode:
-        """Start a new assessment episode."""
-        self._episode_counter += 1
-        episode = Episode(
-            episode_id=f"ep-{self._episode_counter}",
-            target=target,
-            target_type=target_type,
-        )
-        self._episodes[episode.episode_id] = episode
-        return episode
-
-    def end_episode(self, episode_id: str) -> Episode | None:
-        """End an episode and calculate totals."""
-        episode = self._episodes.get(episode_id)
-        if not episode:
-            return None
-
-        episode.completed_at = time.time()
-        episode.duration_s = episode.completed_at - episode.started_at
-
-        # Calculate totals
-        total_reward = 0.0
-        findings = 0
-        critical = 0
-
-        for exp_id in episode.experiences:
-            exp = self._experiences.get(exp_id)
-            if exp:
-                total_reward += exp.reward
-                if exp.finding_severity:
-                    findings += 1
-                    if exp.finding_severity == "critical":
-                        critical += 1
-
-        episode.total_reward = total_reward
-        episode.findings_count = findings
-        episode.critical_count = critical
-
-        return episode
-
-    def store(
-        self,
-        episode_id: str,
-        state: dict[str, Any],
-        action: str,
-        reward: float,
-        next_state: dict[str, Any] | None = None,
-        action_params: dict[str, Any] | None = None,
-        target_type: str = "",
-        tool_used: str = "",
-        model_used: str = "",
-        finding_severity: str = "",
-    ) -> Experience:
-        """Store an experience."""
-        self._exp_counter += 1
-
-        # Priority based on reward (higher reward = higher priority)
-        priority = max(0.1, abs(reward) + 0.1) ** self._priority_alpha
-
-        exp = Experience(
-            experience_id=f"exp-{self._exp_counter}",
-            episode_id=episode_id,
-            step=self._exp_counter,
-            state=state,
-            action=action,
-            action_params=action_params or {},
-            reward=reward,
-            next_state=next_state or {},
-            target_type=target_type,
-            tool_used=tool_used,
-            model_used=model_used,
-            finding_severity=finding_severity,
-            priority=priority,
-        )
-
-        self._experiences[exp.experience_id] = exp
-        self._buffer.append(exp.experience_id)
-
-        # Add to episode
-        episode = self._episodes.get(episode_id)
-        if episode:
-            episode.experiences.append(exp.experience_id)
-
-        return exp
-
-    def sample(self, n: int = 10) -> list[Experience]:
-        """Sample experiences with priority weighting."""
-        if not self._buffer:
-            return []
-
-        n = min(n, len(self._buffer))
-
-        # Priority-weighted sampling
-        exp_ids = list(self._buffer)
-        priorities = []
-        for eid in exp_ids:
-            exp = self._experiences.get(eid)
-            priorities.append(exp.priority if exp else 1.0)
-
-        total = sum(priorities)
-        if total == 0:
-            return []
-
-        probs = [p / total for p in priorities]
-
-        # Weighted sample without replacement
-        indices = []
-        remaining_probs = list(probs)
-        remaining_indices = list(range(len(exp_ids)))
-
-        for _ in range(n):
-            if not remaining_indices:
-                break
-            total_p = sum(remaining_probs)
-            if total_p <= 0:
-                break
-
-            r = self._rng.random() * total_p
-            cumulative = 0.0
-            chosen = 0
-            for i, p in enumerate(remaining_probs):
-                cumulative += p
-                if cumulative >= r:
-                    chosen = i
-                    break
-
-            indices.append(remaining_indices[chosen])
-            remaining_probs.pop(chosen)
-            remaining_indices.pop(chosen)
-
-        return [
-            self._experiences[exp_ids[i]]
-            for i in indices
-            if exp_ids[i] in self._experiences
+        intent: str,
+        top_n: int = 5,
+    ) -> list[StrategyScore]:
+        """Get the best-scoring strategies for an intent."""
+        relevant = [
+            s for s in self._strategy_scores.values()
+            if s.intent == intent and s.uses >= 2
         ]
+        return sorted(relevant, key=lambda s: s.score, reverse=True)[:top_n]
 
-    def retrieve_similar(
+    def get_similar_episodes(
         self,
-        target_type: str = "",
-        action: str = "",
-        max_results: int = 5,
-    ) -> list[Experience]:
-        """Retrieve experiences similar to current situation."""
-        matches = []
+        intent: str,
+        target: str = "",
+        top_n: int = 5,
+    ) -> list[Episode]:
+        """Find episodes with similar intent and target."""
+        scored: list[tuple[float, Episode]] = []
+        for ep in self._episodes:
+            sim = 0.0
+            if ep.task_intent == intent:
+                sim += 0.6
+            if target and ep.target and target in ep.target:
+                sim += 0.3
+            if ep.outcome == EpisodeOutcome.SUCCESS:
+                sim += 0.1
+            scored.append((sim, ep))
 
-        for exp in self._experiences.values():
-            score = 0.0
-            if target_type and exp.target_type == target_type:
-                score += 0.5
-            if action and exp.action == action:
-                score += 0.3
-            if exp.reward > 0:
-                score += min(0.2, exp.reward / 10)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [ep for _, ep in scored[:top_n] if scored[0][0] > 0.3]
 
-            if score > 0:
-                matches.append((exp, score))
+    def extract_insights(self) -> list[PatternInsight]:
+        """Extract pattern insights from episode history."""
+        insights: list[PatternInsight] = []
 
-        matches.sort(key=lambda x: x[1], reverse=True)
-        return [m[0] for m in matches[:max_results]]
+        # Insight: Tool effectiveness
+        tool_success: dict[str, list[bool]] = {}
+        for ep in self._episodes:
+            for action in ep.actions:
+                if action.action_type == ActionType.TOOL_EXECUTION:
+                    if action.tool_name not in tool_success:
+                        tool_success[action.tool_name] = []
+                    tool_success[action.tool_name].append(action.success)
 
-    def get_best_episodes(self, n: int = 5) -> list[Episode]:
-        """Get episodes with highest total reward."""
-        episodes = sorted(
-            self._episodes.values(),
-            key=lambda e: e.total_reward,
-            reverse=True,
-        )
-        return episodes[:n]
-
-    def get_tool_effectiveness(self) -> dict[str, dict[str, float]]:
-        """Analyze tool effectiveness from experiences."""
-        tool_stats: dict[str, dict[str, float]] = {}
-
-        for exp in self._experiences.values():
-            if not exp.tool_used:
+        for tool, results in tool_success.items():
+            if len(results) < 3:
                 continue
+            rate = sum(results) / len(results)
+            if rate < 0.5:
+                self._insight_counter += 1
+                insights.append(PatternInsight(
+                    insight_id=f"insight-{self._insight_counter}",
+                    insight_type="tool_reliability",
+                    description=f"{tool} has low success rate ({rate:.0%})",
+                    confidence=min(len(results) / 10.0, 1.0),
+                    supporting_episodes=len(results),
+                    recommendation=f"Consider alternatives to {tool}",
+                ))
 
-            tool = exp.tool_used
-            if tool not in tool_stats:
-                tool_stats[tool] = {
-                    "uses": 0,
-                    "total_reward": 0.0,
-                    "findings": 0,
-                    "avg_reward": 0.0,
-                }
+        # Insight: Intent-outcome patterns
+        intent_outcomes: dict[str, list[EpisodeOutcome]] = {}
+        for ep in self._episodes:
+            if ep.task_intent not in intent_outcomes:
+                intent_outcomes[ep.task_intent] = []
+            intent_outcomes[ep.task_intent].append(ep.outcome)
 
-            tool_stats[tool]["uses"] += 1
-            tool_stats[tool]["total_reward"] += exp.reward
-            if exp.finding_severity:
-                tool_stats[tool]["findings"] += 1
+        for intent, outcomes in intent_outcomes.items():
+            if len(outcomes) < 3:
+                continue
+            fail_count = sum(
+                1 for o in outcomes
+                if o in (EpisodeOutcome.FAILURE, EpisodeOutcome.ERROR)
+            )
+            fail_rate = fail_count / len(outcomes)
+            if fail_rate > 0.5:
+                self._insight_counter += 1
+                insights.append(PatternInsight(
+                    insight_id=f"insight-{self._insight_counter}",
+                    insight_type="intent_difficulty",
+                    description=f"{intent} tasks fail frequently ({fail_rate:.0%})",
+                    confidence=min(len(outcomes) / 10.0, 1.0),
+                    supporting_episodes=len(outcomes),
+                    recommendation=f"Use ensemble mode for {intent} tasks",
+                ))
 
-        # Calculate averages
-        for stats in tool_stats.values():
-            if stats["uses"] > 0:
-                stats["avg_reward"] = stats["total_reward"] / stats["uses"]
+        # Insight: KB effectiveness
+        kb_findings: dict[str, list[int]] = {}
+        for ep in self._episodes:
+            for kb in ep.kbs_used:
+                if kb not in kb_findings:
+                    kb_findings[kb] = []
+                kb_findings[kb].append(ep.findings_count)
 
-        return tool_stats
+        for kb, findings in kb_findings.items():
+            if len(findings) < 3:
+                continue
+            avg = sum(findings) / len(findings)
+            if avg > 5:
+                self._insight_counter += 1
+                insights.append(PatternInsight(
+                    insight_id=f"insight-{self._insight_counter}",
+                    insight_type="kb_effectiveness",
+                    description=f"{kb} correlates with high finding count (avg={avg:.1f})",
+                    confidence=min(len(findings) / 10.0, 1.0),
+                    supporting_episodes=len(findings),
+                    recommendation=f"Prioritize {kb} in prompt assembly",
+                ))
 
-    def build_replay_prompt(
+        self._insights = insights
+        return insights
+
+    def build_experience_prompt(
         self,
-        target_type: str = "",
-        max_experiences: int = 5,
+        intent: str,
+        target: str = "",
+        max_tokens: int = 1000,
     ) -> str:
-        """Build replay context for LLM."""
-        lines = ["## Experience Replay\n"]
-        lines.append(f"Episodes: {len(self._episodes)}")
-        lines.append(f"Experiences: {len(self._experiences)}")
+        """Build LLM prompt enriched with relevant experience."""
+        lines = ["## Past Experience\n"]
 
-        # Best episodes
-        best = self.get_best_episodes(3)
-        if best:
-            lines.append("\nBest episodes:")
-            for ep in best:
+        # Best strategies
+        strategies = self.get_best_strategies(intent, top_n=3)
+        if strategies:
+            lines.append("### Best Strategies")
+            for strat in strategies:
                 lines.append(
-                    f"  {ep.target[:15]}: reward={ep.total_reward:.1f}, "
+                    f"  - {strat.strategy_name}: "
+                    f"success={strat.success_rate:.0%}, "
+                    f"avg_findings={strat.avg_findings:.1f}"
+                )
+            lines.append("")
+
+        # Similar episodes
+        similar = self.get_similar_episodes(intent, target, top_n=3)
+        if similar:
+            lines.append("### Similar Past Tasks")
+            for ep in similar:
+                lines.append(
+                    f"  - {ep.task_description[:40]}: "
+                    f"{ep.outcome.value}, "
                     f"findings={ep.findings_count}"
                 )
+                if ep.tools_used:
+                    lines.append(f"    Tools: {', '.join(ep.tools_used[:5])}")
+            lines.append("")
 
-        # Similar experiences
-        if target_type:
-            similar = self.retrieve_similar(target_type=target_type, max_results=max_experiences)
-            if similar:
-                lines.append(f"\nSimilar to '{target_type}':")
-                for exp in similar:
-                    lines.append(
-                        f"  {exp.action[:15]} → reward={exp.reward:.1f} "
-                        f"(tool={exp.tool_used[:8]})"
-                    )
+        # Insights
+        relevant_insights = [
+            ins for ins in self._insights
+            if intent in ins.description.lower() or ins.confidence > 0.7
+        ]
+        if relevant_insights:
+            lines.append("### Learned Insights")
+            for ins in relevant_insights[:3]:
+                lines.append(f"  - {ins.recommendation}")
+            lines.append("")
 
-        # Tool effectiveness
-        tools = self.get_tool_effectiveness()
-        if tools:
-            top_tools = sorted(
-                tools.items(),
-                key=lambda x: x[1]["avg_reward"],
-                reverse=True,
-            )[:5]
-            lines.append("\nTop tools:")
-            for tool, stats in top_tools:
-                lines.append(
-                    f"  {tool[:12]}: avg={stats['avg_reward']:.1f}, "
-                    f"findings={stats['findings']:.0f}"
-                )
-
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        # Rough token estimation: ~4 chars per token
+        if len(result) > max_tokens * 4:
+            result = result[:max_tokens * 4] + "\n..."
+        return result
 
     def get_stats(self) -> dict[str, Any]:
+        """Get experience replay statistics."""
+        outcome_counts: dict[str, int] = {}
+        for ep in self._episodes:
+            key = ep.outcome.value
+            outcome_counts[key] = outcome_counts.get(key, 0) + 1
+
         return {
-            "episodes": len(self._episodes),
-            "experiences": len(self._experiences),
-            "buffer_size": len(self._buffer),
-            "tool_effectiveness": {
-                t: s["avg_reward"]
-                for t, s in self.get_tool_effectiveness().items()
-            },
+            "total_episodes": len(self._episodes),
+            "strategy_scores": len(self._strategy_scores),
+            "insights": len(self._insights),
+            "outcomes": outcome_counts,
         }

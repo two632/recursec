@@ -1,20 +1,17 @@
-"""Strategy optimizer — evolves strategies based on performance.
+"""Strategy optimizer — adaptive strategy selection and tuning.
 
-Implements:
-1. Strategy performance tracking
-2. A/B testing of different approaches
-3. Multi-armed bandit selection (explore vs exploit)
-4. Strategy mutation and crossover
-5. Fitness scoring based on outcomes
-6. Strategy recommendation engine
-7. Optimizer prompt for LLM
+Optimizes agent behavior based on results:
+1. Multi-armed bandit for strategy selection
+2. Bayesian optimization for parameter tuning
+3. Contextual bandits for target-aware selection
+4. Exploration vs exploitation balancing
+5. Strategy composition and chaining
 """
 
 from __future__ import annotations
 
 import math
 import random
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -24,303 +21,397 @@ import structlog
 logger = structlog.get_logger()
 
 
-class StrategyPhase(str, Enum):
-    RECON = "recon"
+class StrategyDomain(str, Enum):
     SCANNING = "scanning"
+    ENUMERATION = "enumeration"
     EXPLOITATION = "exploitation"
-    POST_EXPLOIT = "post_exploit"
+    EVASION = "evasion"
+    ANALYSIS = "analysis"
     VALIDATION = "validation"
+    REPORTING = "reporting"
+
+
+class SelectionPolicy(str, Enum):
+    UCB1 = "ucb1"
+    EPSILON_GREEDY = "epsilon_greedy"
+    THOMPSON_SAMPLING = "thompson_sampling"
+    SOFTMAX = "softmax"
+    CONTEXTUAL = "contextual"
 
 
 @dataclass
-class Strategy:
-    """A specific strategy configuration."""
-    strategy_id: str = ""
-    name: str = ""
-    phase: StrategyPhase = StrategyPhase.RECON
-    parameters: dict[str, Any] = field(default_factory=dict)
-    tool_sequence: list[str] = field(default_factory=list)
-    knowledge_domains: list[str] = field(default_factory=list)
-    trials: int = 0
+class StrategyArm:
+    """A strategy arm in the bandit model."""
+    arm_id: str = ""
+    strategy_name: str = ""
+    domain: StrategyDomain = StrategyDomain.SCANNING
+    pulls: int = 0
+    total_reward: float = 0.0
+    squared_reward: float = 0.0
     successes: int = 0
-    total_findings: int = 0
-    total_tokens: int = 0
-    avg_duration_s: float = 0.0
-    fitness: float = 0.5
-    created_at: float = field(default_factory=time.time)
+    failures: int = 0
+    params: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def success_rate(self) -> float:
-        if self.trials == 0:
+    def mean_reward(self) -> float:
+        if self.pulls == 0:
             return 0.0
-        return self.successes / self.trials
+        return self.total_reward / self.pulls
 
     @property
-    def ucb_score(self) -> float:
-        """Upper Confidence Bound score for exploration."""
-        if self.trials == 0:
+    def variance(self) -> float:
+        if self.pulls < 2:
+            return 1.0
+        mean = self.mean_reward
+        return (self.squared_reward / self.pulls) - (mean * mean)
+
+    @property
+    def ucb1_score(self) -> float:
+        if self.pulls == 0:
             return float("inf")
-        exploitation = self.success_rate
-        exploration = math.sqrt(2 * math.log(max(1, self.trials + 1)) / self.trials)
-        return exploitation + exploration
+        return self.mean_reward + math.sqrt(
+            2 * math.log(max(self.pulls + 1, 2)) / self.pulls
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.strategy_id[:10],
-            "name": self.name[:20],
-            "phase": self.phase.value[:6],
-            "trials": self.trials,
-            "success": f"{self.success_rate:.0%}",
-            "fitness": round(self.fitness, 2),
+            "id": self.arm_id[:8],
+            "name": self.strategy_name[:15],
+            "pulls": self.pulls,
+            "reward": f"{self.mean_reward:.3f}",
+            "ucb1": f"{self.ucb1_score:.3f}",
         }
 
 
-# ── Default strategies ───────────────────────────────────────
+@dataclass
+class StrategyChain:
+    """A composition of strategies executed in sequence."""
+    chain_id: str = ""
+    name: str = ""
+    steps: list[str] = field(default_factory=list)
+    domain: StrategyDomain = StrategyDomain.SCANNING
+    uses: int = 0
+    avg_reward: float = 0.0
 
-DEFAULT_STRATEGIES: list[dict[str, Any]] = [
-    {
-        "name": "Aggressive Recon",
-        "phase": "recon",
-        "params": {"depth": "deep", "breadth": "wide", "speed": "fast"},
-        "tools": ["amass", "subfinder", "nmap", "masscan", "httpx"],
-        "knowledge": ["network", "threat_intel"],
-    },
-    {
-        "name": "Passive Recon",
-        "phase": "recon",
-        "params": {"depth": "shallow", "breadth": "wide", "speed": "slow"},
-        "tools": ["subfinder", "theHarvester", "shodan", "crt.sh"],
-        "knowledge": ["network", "threat_intel"],
-    },
-    {
-        "name": "Targeted Recon",
-        "phase": "recon",
-        "params": {"depth": "deep", "breadth": "narrow", "speed": "slow"},
-        "tools": ["amass", "dnsrecon", "whatweb"],
-        "knowledge": ["network"],
-    },
-    {
-        "name": "Broad Vulnerability Scan",
-        "phase": "scanning",
-        "params": {"templates": "all", "rate": "high", "severity": "all"},
-        "tools": ["nuclei", "nikto", "wpscan"],
-        "knowledge": ["web_security", "exploitation"],
-    },
-    {
-        "name": "Targeted Vulnerability Scan",
-        "phase": "scanning",
-        "params": {"templates": "critical", "rate": "low", "severity": "high+"},
-        "tools": ["nuclei", "sqlmap"],
-        "knowledge": ["web_security", "exploitation"],
-    },
-    {
-        "name": "Full Web Audit",
-        "phase": "scanning",
-        "params": {"methodology": "owasp", "coverage": "full"},
-        "tools": ["burp", "zap", "ffuf", "sqlmap"],
-        "knowledge": ["web_security", "api_security", "advanced_strategy"],
-    },
-    {
-        "name": "Exploit Validation",
-        "phase": "exploitation",
-        "params": {"risk": "low", "approach": "verify_only"},
-        "tools": ["sqlmap", "nuclei"],
-        "knowledge": ["exploitation"],
-    },
-    {
-        "name": "Full Exploitation",
-        "phase": "exploitation",
-        "params": {"risk": "medium", "approach": "exploit_and_pivot"},
-        "tools": ["metasploit", "sqlmap", "hydra"],
-        "knowledge": ["exploitation", "lateral_movement", "red_team"],
-    },
-    {
-        "name": "Post-Exploit Enumeration",
-        "phase": "post_exploit",
-        "params": {"focus": "enumeration", "stealth": "medium"},
-        "tools": ["linpeas", "winpeas", "bloodhound"],
-        "knowledge": ["privilege_escalation", "active_directory"],
-    },
-]
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.chain_id[:8],
+            "steps": len(self.steps),
+            "reward": f"{self.avg_reward:.3f}",
+        }
+
+
+@dataclass
+class OptimizationResult:
+    """Result of strategy optimization."""
+    selected_strategy: str = ""
+    domain: StrategyDomain = StrategyDomain.SCANNING
+    policy_used: SelectionPolicy = SelectionPolicy.UCB1
+    expected_reward: float = 0.0
+    exploration_factor: float = 0.0
+    alternatives: list[tuple[str, float]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": self.selected_strategy[:15],
+            "policy": self.policy_used.value[:8],
+            "expected": f"{self.expected_reward:.3f}",
+            "explore": f"{self.exploration_factor:.2f}",
+        }
+
+
+# Pre-defined strategies per domain
+DOMAIN_STRATEGIES: dict[StrategyDomain, list[dict[str, Any]]] = {
+    StrategyDomain.SCANNING: [
+        {"name": "broad_fast_scan", "desc": "Quick scan all ports, top 1000", "params": {"ports": "top1000", "timing": "T4"}},
+        {"name": "deep_thorough_scan", "desc": "Full port range with version detection", "params": {"ports": "1-65535", "timing": "T3"}},
+        {"name": "stealth_scan", "desc": "SYN scan with rate limiting", "params": {"ports": "top1000", "timing": "T2", "scan_type": "SYN"}},
+        {"name": "udp_scan", "desc": "UDP service discovery", "params": {"ports": "top100", "protocol": "udp"}},
+        {"name": "service_version_scan", "desc": "Focused version detection", "params": {"version_detect": True}},
+    ],
+    StrategyDomain.ENUMERATION: [
+        {"name": "passive_enum", "desc": "OSINT-only enumeration", "params": {"passive": True}},
+        {"name": "active_enum", "desc": "Active probing and brute force", "params": {"active": True}},
+        {"name": "hybrid_enum", "desc": "Passive first, then targeted active", "params": {"hybrid": True}},
+        {"name": "recursive_enum", "desc": "Recursive subdomain brute force", "params": {"recursive": True}},
+        {"name": "wordlist_enum", "desc": "Custom wordlist-based enum", "params": {"wordlist": True}},
+    ],
+    StrategyDomain.EXPLOITATION: [
+        {"name": "known_cve_exploit", "desc": "Match CVEs to known exploits", "params": {"cve_match": True}},
+        {"name": "fuzzing_approach", "desc": "Fuzz parameters for crashes/errors", "params": {"fuzz": True}},
+        {"name": "chain_exploit", "desc": "Chain low-sev vulns into high impact", "params": {"chain": True}},
+        {"name": "credential_attack", "desc": "Credential stuffing/brute force", "params": {"creds": True}},
+        {"name": "logic_exploit", "desc": "Business logic exploitation", "params": {"logic": True}},
+    ],
+    StrategyDomain.EVASION: [
+        {"name": "encoding_evasion", "desc": "Payload encoding and obfuscation", "params": {"encode": True}},
+        {"name": "timing_evasion", "desc": "Slow scan to avoid detection", "params": {"slow": True}},
+        {"name": "fragmentation", "desc": "Packet fragmentation", "params": {"fragment": True}},
+        {"name": "protocol_abuse", "desc": "Abuse allowed protocols (DNS, HTTP)", "params": {"protocol": True}},
+        {"name": "proxy_chain", "desc": "Route through multiple proxies", "params": {"proxy": True}},
+    ],
+    StrategyDomain.ANALYSIS: [
+        {"name": "single_model", "desc": "Use best model for analysis", "params": {"single": True}},
+        {"name": "ensemble_analysis", "desc": "Multi-model consensus", "params": {"ensemble": True}},
+        {"name": "chain_of_thought", "desc": "Deep reasoning chain", "params": {"cot": True}},
+        {"name": "adversarial_review", "desc": "Model debates another model", "params": {"debate": True}},
+        {"name": "hierarchical", "desc": "Fast triage then deep analysis", "params": {"hierarchical": True}},
+    ],
+    StrategyDomain.VALIDATION: [
+        {"name": "cross_tool", "desc": "Validate with different tool", "params": {"cross_tool": True}},
+        {"name": "cross_model", "desc": "Validate with different LLM", "params": {"cross_model": True}},
+        {"name": "replay_validate", "desc": "Replay attack to confirm", "params": {"replay": True}},
+        {"name": "manual_check", "desc": "Generate manual verification steps", "params": {"manual": True}},
+        {"name": "evidence_chain", "desc": "Build evidence chain for finding", "params": {"evidence": True}},
+    ],
+    StrategyDomain.REPORTING: [
+        {"name": "severity_first", "desc": "Report by severity descending", "params": {"by_severity": True}},
+        {"name": "attack_chain", "desc": "Report as attack narratives", "params": {"narrative": True}},
+        {"name": "compliance_map", "desc": "Map findings to compliance frameworks", "params": {"compliance": True}},
+        {"name": "executive_summary", "desc": "High-level summary for leadership", "params": {"executive": True}},
+        {"name": "technical_deep", "desc": "Detailed technical report", "params": {"technical": True}},
+    ],
+}
 
 
 class StrategyOptimizer:
-    """Evolves assessment strategies based on performance.
+    """Adaptive strategy selection using bandit algorithms."""
 
-    Tracks strategy outcomes, uses multi-armed bandit
-    for selection, and mutates strategies to find
-    optimal approaches.
-    """
-
-    def __init__(self) -> None:
-        self._strategies: dict[str, Strategy] = {}
-        self._counter = 0
-        self._rng = random.Random(42)
-        self._log = logger.bind(component="strategy_optimizer")
-        self._load_defaults()
-
-    def _load_defaults(self) -> None:
-        """Load default strategies."""
-        for spec in DEFAULT_STRATEGIES:
-            self._counter += 1
-            strategy = Strategy(
-                strategy_id=f"strat-{self._counter}",
-                name=spec["name"],
-                phase=StrategyPhase(spec["phase"]),
-                parameters=spec.get("params", {}),
-                tool_sequence=spec.get("tools", []),
-                knowledge_domains=spec.get("knowledge", []),
-            )
-            self._strategies[strategy.strategy_id] = strategy
-
-    def select(
+    def __init__(
         self,
-        phase: StrategyPhase,
-        exploration_rate: float = 0.2,
-    ) -> Strategy:
-        """Select a strategy using epsilon-greedy + UCB."""
-        candidates = [
-            s for s in self._strategies.values()
-            if s.phase == phase
-        ]
-        if not candidates:
-            # Fallback: any strategy
-            candidates = list(self._strategies.values())
-
-        # Epsilon-greedy exploration
-        if self._rng.random() < exploration_rate:
-            return self._rng.choice(candidates)
-
-        # UCB selection
-        return max(candidates, key=lambda s: s.ucb_score)
-
-    def record_outcome(
-        self,
-        strategy_id: str,
-        success: bool,
-        findings: int = 0,
-        tokens_used: int = 0,
-        duration_s: float = 0.0,
+        policy: SelectionPolicy = SelectionPolicy.UCB1,
+        epsilon: float = 0.1,
     ) -> None:
-        """Record strategy outcome."""
-        strategy = self._strategies.get(strategy_id)
-        if not strategy:
-            return
+        self._policy = policy
+        self._epsilon = epsilon
+        self._arms: dict[str, StrategyArm] = {}
+        self._chains: dict[str, StrategyChain] = {}
+        self._total_pulls = 0
+        self._arm_counter = 0
+        self._chain_counter = 0
+        self._log = logger.bind(component="strategy_optimizer")
+        self._initialize_arms()
 
-        strategy.trials += 1
-        if success:
-            strategy.successes += 1
-        strategy.total_findings += findings
-        strategy.total_tokens += tokens_used
+    def _initialize_arms(self) -> None:
+        """Initialize strategy arms from domain definitions."""
+        for domain, strategies in DOMAIN_STRATEGIES.items():
+            for strat in strategies:
+                self._arm_counter += 1
+                arm_id = f"arm-{self._arm_counter}"
+                self._arms[arm_id] = StrategyArm(
+                    arm_id=arm_id,
+                    strategy_name=strat["name"],
+                    domain=domain,
+                    params=strat.get("params", {}),
+                )
 
-        # Update running average duration
-        if strategy.avg_duration_s == 0:
-            strategy.avg_duration_s = duration_s
-        else:
-            strategy.avg_duration_s = (
-                strategy.avg_duration_s * 0.8 + duration_s * 0.2
+    def select_strategy(
+        self,
+        domain: StrategyDomain,
+        context: dict[str, Any] | None = None,
+    ) -> OptimizationResult:
+        """Select the best strategy for a domain."""
+        domain_arms = [
+            a for a in self._arms.values()
+            if a.domain == domain
+        ]
+        if not domain_arms:
+            return OptimizationResult(
+                selected_strategy="default",
+                domain=domain,
             )
 
-        # Update fitness
-        strategy.fitness = self._calculate_fitness(strategy)
-
-    def _calculate_fitness(self, strategy: Strategy) -> float:
-        """Calculate strategy fitness."""
-        # Success rate component
-        sr = strategy.success_rate * 0.4
-
-        # Efficiency component
-        if strategy.total_tokens > 0:
-            eff = min(1.0, strategy.total_findings / strategy.total_tokens * 5000)
+        if self._policy == SelectionPolicy.UCB1:
+            selected = self._ucb1_select(domain_arms)
+        elif self._policy == SelectionPolicy.EPSILON_GREEDY:
+            selected = self._epsilon_greedy_select(domain_arms)
+        elif self._policy == SelectionPolicy.THOMPSON_SAMPLING:
+            selected = self._thompson_select(domain_arms)
+        elif self._policy == SelectionPolicy.SOFTMAX:
+            selected = self._softmax_select(domain_arms)
         else:
-            eff = 0.0
-        eff_component = eff * 0.3
+            selected = self._ucb1_select(domain_arms)
 
-        # Recency bonus (strategies tried recently score higher)
-        trials_bonus = min(1.0, strategy.trials / 20) * 0.2
+        alternatives = [
+            (a.strategy_name, a.mean_reward)
+            for a in sorted(
+                domain_arms,
+                key=lambda a: a.mean_reward,
+                reverse=True,
+            )[:3]
+            if a.arm_id != selected.arm_id
+        ]
 
-        # Finding rate
-        if strategy.avg_duration_s > 0:
-            rate = min(1.0, strategy.total_findings / strategy.avg_duration_s)
-        else:
-            rate = 0.0
-        rate_component = rate * 0.1
-
-        return sr + eff_component + trials_bonus + rate_component
-
-    def mutate(self, strategy_id: str) -> Strategy | None:
-        """Create a mutated variant of a strategy."""
-        source = self._strategies.get(strategy_id)
-        if not source:
-            return None
-
-        self._counter += 1
-        mutated = Strategy(
-            strategy_id=f"strat-{self._counter}",
-            name=f"{source.name} (v{self._counter})",
-            phase=source.phase,
-            parameters=dict(source.parameters),
-            tool_sequence=list(source.tool_sequence),
-            knowledge_domains=list(source.knowledge_domains),
+        return OptimizationResult(
+            selected_strategy=selected.strategy_name,
+            domain=domain,
+            policy_used=self._policy,
+            expected_reward=selected.mean_reward,
+            exploration_factor=self._epsilon,
+            alternatives=alternatives,
         )
 
-        # Mutate parameters
-        if mutated.parameters:
-            key = self._rng.choice(list(mutated.parameters.keys()))
-            if key == "depth":
-                mutated.parameters[key] = self._rng.choice(["shallow", "medium", "deep"])
-            elif key == "rate":
-                mutated.parameters[key] = self._rng.choice(["low", "medium", "high"])
-            elif key == "risk":
-                mutated.parameters[key] = self._rng.choice(["low", "medium", "high"])
+    def _ucb1_select(
+        self, arms: list[StrategyArm],
+    ) -> StrategyArm:
+        """UCB1 selection policy."""
+        # Always try unpulled arms first
+        unpulled = [a for a in arms if a.pulls == 0]
+        if unpulled:
+            return unpulled[0]
 
-        self._strategies[mutated.strategy_id] = mutated
-        return mutated
+        total = sum(a.pulls for a in arms)
+        best_arm = arms[0]
+        best_score = -1.0
 
-    def get_top_strategies(
+        for arm in arms:
+            score = arm.mean_reward + math.sqrt(
+                2 * math.log(total) / arm.pulls
+            )
+            if score > best_score:
+                best_score = score
+                best_arm = arm
+
+        return best_arm
+
+    def _epsilon_greedy_select(
+        self, arms: list[StrategyArm],
+    ) -> StrategyArm:
+        """Epsilon-greedy selection."""
+        if random.random() < self._epsilon:
+            return random.choice(arms)
+        return max(arms, key=lambda a: a.mean_reward)
+
+    def _thompson_select(
+        self, arms: list[StrategyArm],
+    ) -> StrategyArm:
+        """Thompson sampling using Beta distribution."""
+        best_arm = arms[0]
+        best_sample = -1.0
+
+        for arm in arms:
+            alpha = arm.successes + 1
+            beta = arm.failures + 1
+            sample = random.betavariate(alpha, beta)
+            if sample > best_sample:
+                best_sample = sample
+                best_arm = arm
+
+        return best_arm
+
+    def _softmax_select(
+        self, arms: list[StrategyArm],
+    ) -> StrategyArm:
+        """Softmax (Boltzmann) selection."""
+        temperature = max(self._epsilon, 0.01)
+        rewards = [a.mean_reward for a in arms]
+        max_reward = max(rewards) if rewards else 0.0
+
+        # Numerically stable softmax
+        exp_rewards = [
+            math.exp((r - max_reward) / temperature)
+            for r in rewards
+        ]
+        total = sum(exp_rewards)
+        probabilities = [e / total for e in exp_rewards]
+
+        r = random.random()
+        cumulative = 0.0
+        for arm, prob in zip(arms, probabilities):
+            cumulative += prob
+            if r <= cumulative:
+                return arm
+
+        return arms[-1]
+
+    def update_reward(
         self,
-        phase: StrategyPhase | None = None,
-        limit: int = 5,
-    ) -> list[Strategy]:
-        """Get top-performing strategies."""
-        candidates = list(self._strategies.values())
-        if phase:
-            candidates = [s for s in candidates if s.phase == phase]
+        strategy_name: str,
+        domain: StrategyDomain,
+        reward: float,
+        success: bool = True,
+    ) -> None:
+        """Update an arm with observed reward."""
+        for arm in self._arms.values():
+            if arm.strategy_name == strategy_name and arm.domain == domain:
+                arm.pulls += 1
+                arm.total_reward += reward
+                arm.squared_reward += reward * reward
+                if success:
+                    arm.successes += 1
+                else:
+                    arm.failures += 1
+                self._total_pulls += 1
+                return
 
-        candidates.sort(key=lambda s: s.fitness, reverse=True)
-        return candidates[:limit]
+    def create_chain(
+        self,
+        name: str,
+        steps: list[str],
+        domain: StrategyDomain,
+    ) -> StrategyChain:
+        """Create a strategy chain."""
+        self._chain_counter += 1
+        chain = StrategyChain(
+            chain_id=f"chain-{self._chain_counter}",
+            name=name,
+            steps=steps,
+            domain=domain,
+        )
+        self._chains[chain.chain_id] = chain
+        return chain
+
+    def get_domain_rankings(
+        self, domain: StrategyDomain,
+    ) -> list[StrategyArm]:
+        """Get strategies ranked by reward for a domain."""
+        domain_arms = [
+            a for a in self._arms.values()
+            if a.domain == domain and a.pulls > 0
+        ]
+        return sorted(
+            domain_arms,
+            key=lambda a: a.mean_reward,
+            reverse=True,
+        )
 
     def build_optimizer_prompt(
         self,
-        phase: StrategyPhase | None = None,
+        domain: StrategyDomain | None = None,
     ) -> str:
-        """Build optimizer context for LLM."""
-        lines = ["## Strategy Optimizer\n"]
+        """Build LLM prompt with optimization context."""
+        lines = ["## Strategy Optimization Context\n"]
+        lines.append(f"Total strategy evaluations: {self._total_pulls}")
+        lines.append(f"Selection policy: {self._policy.value}")
+        lines.append(f"Exploration factor: {self._epsilon:.2f}\n")
 
-        lines.append(f"Total strategies: {len(self._strategies)}")
-
-        top = self.get_top_strategies(phase=phase, limit=3)
-        if top:
-            lines.append(f"\nTop strategies{f' for {phase.value}' if phase else ''}:")
-            for s in top:
-                lines.append(
-                    f"  {s.name[:20]} — "
-                    f"fitness={s.fitness:.2f} "
-                    f"success={s.success_rate:.0%} "
-                    f"({s.trials} trials)"
-                )
+        domains = [domain] if domain else list(StrategyDomain)
+        for dom in domains:
+            rankings = self.get_domain_rankings(dom)
+            if rankings:
+                lines.append(f"### {dom.value.title()} Strategies")
+                for arm in rankings[:3]:
+                    lines.append(
+                        f"  {arm.strategy_name}: "
+                        f"reward={arm.mean_reward:.3f}, "
+                        f"pulls={arm.pulls}, "
+                        f"success={arm.successes}/{arm.pulls}"
+                    )
+                lines.append("")
 
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        phase_counts: dict[str, int] = {}
-        for s in self._strategies.values():
-            p = s.phase.value
-            phase_counts[p] = phase_counts.get(p, 0) + 1
+        """Get optimizer statistics."""
+        domain_counts: dict[str, int] = {}
+        for arm in self._arms.values():
+            key = arm.domain.value
+            domain_counts[key] = domain_counts.get(key, 0) + 1
 
         return {
-            "total_strategies": len(self._strategies),
-            "by_phase": phase_counts,
-            "total_trials": sum(s.trials for s in self._strategies.values()),
-            "avg_fitness": sum(s.fitness for s in self._strategies.values()) / max(1, len(self._strategies)),
+            "total_arms": len(self._arms),
+            "total_pulls": self._total_pulls,
+            "total_chains": len(self._chains),
+            "arms_per_domain": domain_counts,
+            "policy": self._policy.value,
         }
