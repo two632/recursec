@@ -340,6 +340,30 @@ KB_REGISTRY: dict[str, KBEntry] = {
         pattern_count=4, related_domains=["satellite", "rf"],
         tags=["maritime", "ship", "ais", "port", "navigation"], priority=5,
     ),
+    "aviation": KBEntry(
+        domain="aviation", module_path="recursec.agents.aviation_security_kb",
+        build_func_name="build_aviation_security_prompt", description="Aviation/aerospace security (ADS-B, ACARS, avionics, EFB, ground systems)",
+        pattern_count=5, related_domains=["satellite", "rf"],
+        tags=["aviation", "adsb", "acars", "avionics", "efb", "aircraft"], priority=7,
+    ),
+    "financial": KBEntry(
+        domain="financial", module_path="recursec.agents.financial_security_kb",
+        build_func_name="build_financial_security_prompt", description="Financial systems security (SWIFT, trading, payment, DeFi, banking apps)",
+        pattern_count=5, related_domains=["blockchain", "web_vuln"],
+        tags=["financial", "swift", "trading", "payment", "defi", "banking"], priority=8,
+    ),
+    "gaming": KBEntry(
+        domain="gaming", module_path="recursec.agents.gaming_security_kb",
+        build_func_name="build_gaming_security_prompt", description="Gaming/anti-cheat security (client hacking, server exploit, economy, anti-cheat bypass)",
+        pattern_count=5, related_domains=["binary_exploitation", "network"],
+        tags=["gaming", "anti-cheat", "game-hacking", "esports"], priority=4,
+    ),
+    "critical_infrastructure": KBEntry(
+        domain="critical_infrastructure", module_path="recursec.agents.critical_infra_kb",
+        build_func_name="build_critical_infra_prompt", description="Critical infrastructure (power grid, water, nuclear, transportation, oil & gas)",
+        pattern_count=5, related_domains=["scada", "iot_ics"],
+        tags=["critical-infrastructure", "power-grid", "water", "nuclear", "pipeline"], priority=9,
+    ),
 }
 
 
