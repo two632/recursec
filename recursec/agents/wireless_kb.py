@@ -1,11 +1,11 @@
 """Wireless security knowledge base.
 
-Deep knowledge about wireless attack vectors:
-1. WiFi attacks (WPA2/WPA3, Evil Twin, PMKID)
-2. Bluetooth exploitation
-3. Zigbee/Z-Wave attacks
-4. Cellular network attacks
-5. RFID/NFC security
+Deep knowledge about wireless security:
+1. WiFi security assessment
+2. Bluetooth and BLE attacks
+3. RFID/NFC security
+4. Satellite and radio security
+5. Cellular network security
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ class WirelessPattern:
     """A wireless security pattern."""
     pattern_id: str = ""
     name: str = ""
-    protocol: str = ""
+    category: str = ""
     severity: str = "high"
     description: str = ""
     detection_strategy: str = ""
@@ -33,168 +33,213 @@ class WirelessPattern:
         return {
             "id": self.pattern_id,
             "name": self.name[:25],
-            "protocol": self.protocol[:10],
+            "category": self.category[:12],
         }
 
 
 WIRELESS_PATTERNS: list[dict[str, Any]] = [
     {
-        "id": "wifi-001", "name": "WPA2 PMKID Attack",
-        "protocol": "wifi", "severity": "high",
-        "desc": "Capturing PMKID for offline WPA2 cracking.",
+        "id": "wl-001", "name": "WiFi Security Assessment",
+        "category": "wifi", "severity": "high",
+        "desc": "WiFi protocol attacks.",
         "detection": (
-            "WPA2 PMKID ATTACK:\n"
-            "CAPTURE:\n"
-            "  # Put interface in monitor mode\n"
-            "  airmon-ng start wlan0\n"
-            "  # Capture PMKID (no client needed)\n"
-            "  hcxdumptool -i wlan0mon -o capture.pcapng --enable_status=1\n"
-            "  # Extract hash for hashcat\n"
-            "  hcxpcapngtool -o hash.22000 capture.pcapng\n"
-            "CRACKING:\n"
-            "  hashcat -m 22000 hash.22000 <wordlist>\n"
-            "  hashcat -m 22000 hash.22000 -a 3 ?d?d?d?d?d?d?d?d  # 8-digit\n"
-            "ADVANTAGES:\n"
-            "  - No client deauthentication needed\n"
-            "  - Single frame capture sufficient\n"
-            "  - Works against most WPA2 networks\n"
-            "DETECTION:\n"
-            "  - Monitor for unusual association attempts\n"
-            "  - IDS alerts for PMKID capture attempts"
+            "WIFI SECURITY:\n"
+            "RECONNAISSANCE:\n"
+            "  # airmon-ng start wlan0\n"
+            "  # airodump-ng wlan0mon\n"
+            "  # Capture networks, clients, signal\n"
+            "  # Hidden SSID discovery\n"
+            "WPA2-PSK:\n"
+            "  - 4-way handshake capture\n"
+            "    # airodump-ng -c CH --bssid BSSID wlan0mon\n"
+            "    # aireplay-ng -0 5 -a BSSID wlan0mon (deauth)\n"
+            "  - PMKID capture (clientless)\n"
+            "    # hcxdumptool -i wlan0mon --enable_status=1\n"
+            "  - Cracking\n"
+            "    # hashcat -m 22000 capture.hc22000 wordlist\n"
+            "    # aircrack-ng capture.cap -w wordlist\n"
+            "WPA2-ENTERPRISE:\n"
+            "  - Evil twin AP\n"
+            "    # hostapd-mana\n"
+            "    # eaphammer\n"
+            "  - RADIUS credential capture\n"
+            "  - Certificate validation bypass\n"
+            "WPA3:\n"
+            "  - Dragonblood attacks\n"
+            "  - Downgrade attacks\n"
+            "  - Side-channel attacks\n"
+            "WPS:\n"
+            "  - PIN brute force\n"
+            "    # reaver -i wlan0mon -b BSSID\n"
+            "    # bully -b BSSID -c CH wlan0mon\n"
+            "  - Pixie Dust attack\n"
+            "TOOLS:\n"
+            "  aircrack-ng suite, hashcat, hostapd-mana"
         ),
-        "tools": ["hcxdumptool", "hcxpcapngtool", "hashcat"],
+        "tools": [],
     },
     {
-        "id": "wifi-002", "name": "Evil Twin / Rogue AP",
-        "protocol": "wifi", "severity": "critical",
-        "desc": "Creating fake access point for MITM attacks.",
+        "id": "wl-002", "name": "Bluetooth/BLE Attacks",
+        "category": "bluetooth", "severity": "medium",
+        "desc": "Bluetooth and BLE security.",
         "detection": (
-            "EVIL TWIN ATTACK:\n"
-            "SETUP:\n"
-            "  # Create fake AP matching target SSID\n"
-            "  hostapd evil_twin.conf\n"
-            "  # Start DHCP server\n"
-            "  dnsmasq -C dnsmasq.conf\n"
-            "  # Enable NAT/routing\n"
-            "  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE\n"
-            "CAPTIVE PORTAL:\n"
-            "  - Serve fake login page matching target portal\n"
-            "  - Capture credentials when user authenticates\n"
-            "  - Tools: wifiphisher, fluxion, airgeddon\n"
-            "KARMA ATTACK:\n"
-            "  - Respond to ALL probe requests\n"
-            "  - Devices auto-connect to 'known' networks\n"
-            "  - Tool: hostapd-mana\n"
-            "TRAFFIC INTERCEPTION:\n"
-            "  - All client traffic passes through attacker\n"
-            "  - SSL stripping: sslstrip\n"
-            "  - DNS spoofing: modify dnsmasq for specific domains\n"
-            "  - Credential capture: ettercap, bettercap"
+            "BLUETOOTH/BLE ATTACKS:\n"
+            "CLASSIC BLUETOOTH:\n"
+            "  Discovery:\n"
+            "    # hcitool scan\n"
+            "    # hcitool inq\n"
+            "    # sdptool browse TARGET\n"
+            "  Attacks:\n"
+            "    - BlueBorne (CVE-2017-0785)\n"
+            "    - KNOB attack (key negotiation)\n"
+            "    - PIN cracking\n"
+            "    - Bluetooth impersonation\n"
+            "BLE (Bluetooth Low Energy):\n"
+            "  Scanning:\n"
+            "    # hcitool lescan\n"
+            "    # bettercap ble.recon on\n"
+            "  GATT Enumeration:\n"
+            "    # gatttool -b TARGET -I\n"
+            "    # primary (list services)\n"
+            "    # characteristics (list chars)\n"
+            "    # char-read-hnd HANDLE\n"
+            "  Attacks:\n"
+            "    - Sniffing (Ubertooth)\n"
+            "    - MITM (btlejack)\n"
+            "    - Relay attacks (BLE Relay)\n"
+            "    - Characteristic write\n"
+            "    - Jamming\n"
+            "TOOLS:\n"
+            "  Ubertooth, btlejack, bettercap, GATTacker"
         ),
-        "tools": ["hostapd", "wifiphisher", "bettercap"],
+        "tools": [],
     },
     {
-        "id": "wifi-003", "name": "WPA3 Dragonblood Attacks",
-        "protocol": "wifi", "severity": "high",
-        "desc": "Attacking WPA3's Dragonfly handshake.",
+        "id": "wl-003", "name": "RFID/NFC Security",
+        "category": "rfid_nfc", "severity": "high",
+        "desc": "RFID and NFC security.",
         "detection": (
-            "WPA3 DRAGONBLOOD:\n"
-            "ATTACKS:\n"
-            "  Side-channel (CVE-2019-9494):\n"
-            "    - Timing and cache-based side channels\n"
-            "    - Leak information about password during SAE handshake\n"
-            "    - Requires physical proximity\n"
-            "  Downgrade (CVE-2019-9496):\n"
-            "    - Force WPA3-capable device to use WPA2\n"
-            "    - Then apply traditional WPA2 attacks\n"
-            "    - Transition mode exploitation\n"
-            "  Group Downgrade:\n"
-            "    - Force use of weaker elliptic curve group\n"
-            "    - Reduces brute-force complexity\n"
-            "  DoS:\n"
-            "    - SAE handshake is computationally expensive\n"
-            "    - Flood with commit messages → CPU exhaustion\n"
-            "TESTING:\n"
-            "  - Check if WPA3 transition mode is enabled\n"
-            "  - Test downgrade to WPA2 with deauth + probe\n"
-            "  - Use dragonslayer/dragonforce tools\n"
-            "  - Monitor for WPA3-SAE timing variations"
-        ),
-        "tools": ["dragonslayer", "dragonforce", "aircrack-ng"],
-    },
-    {
-        "id": "ble-001", "name": "Bluetooth Low Energy Exploitation",
-        "protocol": "ble", "severity": "high",
-        "desc": "BLE protocol security weaknesses.",
-        "detection": (
-            "BLE EXPLOITATION:\n"
-            "SCANNING:\n"
-            "  hcitool lescan  # Discover BLE devices\n"
-            "  bettercap -eval 'ble.recon on'  # Active scanning\n"
-            "  btlejack -d <device_addr>  # Sniff connections\n"
-            "GATT ENUMERATION:\n"
-            "  gatttool -b <device_addr> -I  # Interactive\n"
-            "  > primary  # List services\n"
-            "  > characteristics  # List characteristics\n"
-            "  > char-read-hnd <handle>  # Read data\n"
-            "ATTACKS:\n"
-            "  Just Works Pairing:\n"
-            "    - No MITM protection\n"
-            "    - Intercept and spoof pairing\n"
-            "  Static Passkey:\n"
-            "    - Common: 000000, 123456\n"
-            "    - Brute force 6-digit passkey (1M combinations)\n"
-            "  KNOB Attack (CVE-2019-9506):\n"
-            "    - Force low entropy in encryption key\n"
-            "    - Reduce key to 1 byte → brute force\n"
-            "  BLURtooth (CVE-2020-15802):\n"
-            "    - Cross-transport key derivation\n"
-            "    - Classic Bluetooth key → BLE key"
-        ),
-        "tools": ["bettercap", "gatttool", "btlejack"],
-    },
-    {
-        "id": "rfid-001", "name": "RFID/NFC Cloning",
-        "protocol": "rfid", "severity": "medium",
-        "desc": "Cloning and spoofing RFID/NFC credentials.",
-        "detection": (
-            "RFID/NFC ATTACKS:\n"
+            "RFID/NFC SECURITY:\n"
             "LOW FREQUENCY (125kHz):\n"
-            "  - HID/EM4100 cards: Easily clonable\n"
-            "  - Proxmark3: lf hid read, lf hid clone\n"
-            "  - No authentication, pure replay\n"
+            "  - HID/EM4100 card cloning\n"
+            "    # Proxmark3: lf search\n"
+            "    # Proxmark3: lf em 410x clone\n"
+            "  - T55xx tag emulation\n"
+            "  - Brute force card IDs\n"
             "HIGH FREQUENCY (13.56MHz):\n"
             "  MIFARE Classic:\n"
-            "    - Known crypto weakness (CRYPTO1)\n"
-            "    - Attack: mfoc (nested attack), mfcuk (hardnested)\n"
-            "    - Proxmark3: hf mf autopwn\n"
-            "    - Full card clone possible\n"
+            "    # Proxmark3: hf mf autopwn\n"
+            "    # Known key attacks\n"
+            "    # Nested attack\n"
+            "    # Darkside attack\n"
+            "    # Hardnested attack\n"
             "  MIFARE DESFire:\n"
-            "    - Stronger crypto (AES/3DES)\n"
-            "    - Attack: Side-channel on some implementations\n"
-            "  NFC:\n"
-            "    - NFCProxy: relay NFC communications\n"
-            "    - Relay attack: Extend range using two devices\n"
+            "    # Key diversification\n"
+            "    # Side-channel attacks\n"
+            "  iCLASS:\n"
+            "    # Default key exploitation\n"
+            "    # Cloning with Proxmark3\n"
+            "NFC:\n"
+            "  - Relay attacks\n"
+            "    # NFCGate\n"
+            "    # Phone-to-phone relay\n"
+            "  - Eavesdropping\n"
+            "  - Emulation\n"
+            "    # Flipper Zero\n"
+            "    # ChameleonMini\n"
+            "  - Payment card skimming\n"
             "TOOLS:\n"
-            "  - Proxmark3: Most versatile RFID tool\n"
-            "  - Flipper Zero: Portable, multi-protocol\n"
-            "  - ChameleonMini: Card emulation\n"
-            "  - ACR122U: USB NFC reader/writer\n"
-            "TESTING:\n"
-            "  1. Identify card technology and frequency\n"
-            "  2. Attempt read/dump of card data\n"
-            "  3. Test for weak authentication\n"
-            "  4. Attempt clone to blank card"
+            "  Proxmark3, Flipper Zero, ChameleonMini, libnfc"
         ),
-        "tools": ["proxmark3", "mfoc", "nfc-tools"],
+        "tools": [],
+    },
+    {
+        "id": "wl-004", "name": "SDR and Radio Security",
+        "category": "sdr", "severity": "medium",
+        "desc": "Software-defined radio security.",
+        "detection": (
+            "SDR & RADIO SECURITY:\n"
+            "EQUIPMENT:\n"
+            "  - HackRF One (1MHz-6GHz, TX/RX)\n"
+            "  - RTL-SDR (25MHz-1.7GHz, RX only)\n"
+            "  - YARD Stick One (sub-1GHz)\n"
+            "  - Flipper Zero (sub-1GHz)\n"
+            "  - BladeRF (300MHz-3.8GHz)\n"
+            "ATTACKS:\n"
+            "  Car Key Fobs:\n"
+            "    - Rolling code attacks\n"
+            "    - RollJam attack\n"
+            "    - Signal capture and replay\n"
+            "  Garage Doors:\n"
+            "    - Fixed code replay\n"
+            "    - Brute force\n"
+            "  Pagers:\n"
+            "    - POCSAG decoding\n"
+            "    - FLEX decoding\n"
+            "  ADS-B:\n"
+            "    - Aircraft tracking\n"
+            "    - Message injection\n"
+            "    # dump1090\n"
+            "  TPMS:\n"
+            "    - Tire pressure sensor sniffing\n"
+            "    - Vehicle tracking\n"
+            "ANALYSIS:\n"
+            "  # GNU Radio\n"
+            "  # Universal Radio Hacker (URH)\n"
+            "  # inspectrum (signal analysis)\n"
+            "TOOLS:\n"
+            "  HackRF, RTL-SDR, GNU Radio, URH, Flipper Zero"
+        ),
+        "tools": [],
+    },
+    {
+        "id": "wl-005", "name": "Cellular Network Security",
+        "category": "cellular", "severity": "high",
+        "desc": "Cellular network security.",
+        "detection": (
+            "CELLULAR SECURITY:\n"
+            "2G (GSM):\n"
+            "  - IMSI catching\n"
+            "    # OpenBTS, osmocom-bb\n"
+            "    # Fake base station\n"
+            "  - A5/1 decryption\n"
+            "    # Known weaknesses\n"
+            "    # Rainbow tables\n"
+            "  - SMS interception\n"
+            "  - Call interception\n"
+            "3G/4G:\n"
+            "  - IMSI catcher (Stingray-like)\n"
+            "    # srsRAN\n"
+            "    # OpenLTE\n"
+            "  - Diameter protocol attacks\n"
+            "  - GTP tunneling attacks\n"
+            "  - SS7 exploitation\n"
+            "    # Track location\n"
+            "    # Intercept calls/SMS\n"
+            "    # Redirect calls\n"
+            "5G:\n"
+            "  - SUPI exposure\n"
+            "  - Downgrade to 4G/3G\n"
+            "  - RAN protocol attacks\n"
+            "  - Network slicing escape\n"
+            "  - API exposure (NEF)\n"
+            "SIM:\n"
+            "  - SIM cloning\n"
+            "  - SIM swapping (social eng)\n"
+            "  - eSIM vulnerabilities\n"
+            "  - SIMjacker\n"
+            "TOOLS:\n"
+            "  srsRAN, osmocom, OpenBTS, SigPloit"
+        ),
+        "tools": [],
     },
 ]
 
 
-class WirelessSecurityKB:
+class WirelessKB:
     """Wireless security knowledge base.
 
-    Provides wireless attack patterns injected
+    Provides wireless patterns injected
     into agent prompts.
     """
 
@@ -209,7 +254,7 @@ class WirelessSecurityKB:
             pattern = WirelessPattern(
                 pattern_id=data["id"],
                 name=data["name"],
-                protocol=data.get("protocol", ""),
+                category=data.get("category", ""),
                 severity=data.get("severity", "high"),
                 description=data.get("desc", ""),
                 detection_strategy=data.get("detection", ""),
@@ -217,37 +262,37 @@ class WirelessSecurityKB:
             )
             self._patterns[pattern.pattern_id] = pattern
 
-    def get_by_protocol(self, protocol: str) -> list[WirelessPattern]:
-        """Get patterns by protocol."""
+    def get_by_category(self, category: str) -> list[WirelessPattern]:
+        """Get patterns by category."""
         return [
             p for p in self._patterns.values()
-            if p.protocol.lower() == protocol.lower()
+            if p.category.lower() == category.lower()
         ]
 
     def build_wireless_prompt(
         self,
-        protocols: list[str] | None = None,
+        categories: list[str] | None = None,
         max_patterns: int = 4,
     ) -> str:
         """Build wireless security prompt."""
-        lines = ["## Wireless Security Patterns\n"]
+        lines = ["## Wireless Security\n"]
         count = 0
         for pattern in self._patterns.values():
-            if protocols and pattern.protocol.lower() not in [p.lower() for p in protocols]:
+            if categories and pattern.category.lower() not in [c.lower() for c in categories]:
                 continue
             if count >= max_patterns:
                 break
-            lines.append(f"### {pattern.name} [{pattern.protocol.upper()}]")
+            lines.append(f"### {pattern.name} [{pattern.category.upper()}]")
             lines.append(pattern.detection_strategy)
             lines.append("")
             count += 1
         return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
-        proto_counts: dict[str, int] = {}
+        cat_counts: dict[str, int] = {}
         for p in self._patterns.values():
-            proto_counts[p.protocol] = proto_counts.get(p.protocol, 0) + 1
+            cat_counts[p.category] = cat_counts.get(p.category, 0) + 1
         return {
             "patterns": len(self._patterns),
-            "by_protocol": proto_counts,
+            "by_category": cat_counts,
         }
